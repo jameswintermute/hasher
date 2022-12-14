@@ -1,13 +1,12 @@
 #!/bin/bash
-# Author James Bartosik
+# Author James Bartosik, December 2022. 
 
 #Count the number of CPU cores
 cores=`cat /proc/cpuinfo | grep processor | wc -l`
-multiplier=$(( 4* $cores ))
+multiplier=$(( 2* $cores ))
 
 # Set the output filename
 filename='hasher-'`date +"%Y-%m-%d-%H%M"`'.txt'
-error='hasher-'`date +"%Y-%m-%d-%H%M"`'-error.txt'
 
 #Read the path to hash
 echo "Welcome to Hasher."
@@ -15,9 +14,12 @@ echo Your current path is: $(pwd)
 read -p "Please enter a path to start hashing from: " $r1
 parent=$(dirname "$r1")
 
+
+# Files to exclude reading
+exclude=$("#recycle" ".DS_Store"}
+
 # Create hash file
 
-	echo $lines
-	touch $filename
-	time find "$parent" -type f -print0 | pv -trb | xargs -P $cores -L $multiplier -0 sha1sum >> $filename 2> $error | date >> $filename
-	echo Hashing results output to $filename
+        touch $filename
+        time find "$parent" -type f -print0 ! $exclude | xargs -P $cores -L $multiplier -0 sha1sum >> $filename| pv | date >> $filename
+        echo Hashing results output to $filename
