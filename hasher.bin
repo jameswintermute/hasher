@@ -1,0 +1,21 @@
+#!/bin/bash
+# Author James Bartosik
+
+#Count the number of CPU cores
+cores=`cat /proc/cpuinfo | grep processor | wc -l`
+multiplier=$(( 2* $cores ))
+
+# Set the output filename
+filename='hasher-'`date +"%Y-%m-%d-%H%M"`'.txt'
+
+#Read the path to hash
+echo "Welcome to Hasher."
+echo Your current path is: $(pwd)
+read -p "Please enter a path to start hashing from: " $r1
+parent=$(dirname "$r1")
+
+# Create hash file
+
+	touch $filename
+	time find "$parent" -type f -print0 | pv | xargs -P $cores -L $multiplier -0 sha1sum >> $filename | date >> $filename
+	echo Hashing results output to $filename
