@@ -16,7 +16,7 @@ parent=$(dirname "$r1")
 
 
 # Files to exclude reading
-exclude=$('.#recycle') # ".DS_Store")
+# exclude=$('.#recycle') # ".DS_Store")
 # Create hash file
         touch $filename
         time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum >> $filename| date >> $filename
