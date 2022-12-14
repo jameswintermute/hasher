@@ -3,10 +3,11 @@
 
 #Count the number of CPU cores
 cores=`cat /proc/cpuinfo | grep processor | wc -l`
-multiplier=$(( 2* $cores ))
+multiplier=$(( 4* $cores ))
 
 # Set the output filename
 filename='hasher-'`date +"%Y-%m-%d-%H%M"`'.txt'
+error='hasher-'`date +"%Y-%m-%d-%H%M"`'-error.txt'
 
 #Read the path to hash
 echo "Welcome to Hasher."
@@ -16,6 +17,7 @@ parent=$(dirname "$r1")
 
 # Create hash file
 
+	echo $lines
 	touch $filename
-	time find "$parent" -type f -print0 | pv | xargs -P $cores -L $multiplier -0 sha1sum >> $filename | date >> $filename
+	time find "$parent" -type f -print0 | pv -trb | xargs -P $cores -L $multiplier -0 sha1sum >> $filename 2> $error | date >> $filename
 	echo Hashing results output to $filename
