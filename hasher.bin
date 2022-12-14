@@ -19,5 +19,5 @@ parent=$(dirname "$r1")
 exclude=$('.#recycle') # ".DS_Store")
 # Create hash file
         touch $filename
-        time find "$parent" -type f -print0 ! -name $exclude | xargs -P $cores -L $multiplier -0 sha1sum >> $filename| date >> $filename
+        time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum >> $filename| date >> $filename
         echo Hashing results output to $filename
