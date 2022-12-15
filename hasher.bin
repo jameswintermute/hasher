@@ -21,6 +21,6 @@ parent=$(dirname "$r1")
 # exclude=$('.#recycle') # ".DS_Store")
 # Create hash file
         touch $filename
-        time find -type d -name '.wdmc' | find -type f -name 'Thumbs.db' | xargs -P $cores -L $multiplier -0 sha1sum >> $cleanup 2>> $error | date >> $cleanup
+        time find -type d -name '.wdmc' | find -type f -name 'Thumbs.db' | xargs -P $cores -L $multiplier >> $cleanup 2>> $error | date >> $cleanup
         time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum >> $filename 2>> $error | date >> $filename
         echo Hashing results output to $filename
