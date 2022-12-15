@@ -3,10 +3,12 @@
 
 #Count the number of CPU cores
 cores=`cat /proc/cpuinfo | grep processor | wc -l`
-multiplier=$(( 2* $cores ))
+multiplier=$(( 4* $cores ))
 
 # Set the output filename
 filename='hasher-'`date +"%Y-%m-%d-%H%M"`'.txt'
+error='hasher-'`date +"%Y-%m-%d-%H%M"`'-error.txt'
+cleanup='hasher-'`date +"%Y-%m-%d-%H%M"`'-cleanup.txt'
 
 #Read the path to hash
 echo "Welcome to Hasher."
@@ -19,5 +21,6 @@ parent=$(dirname "$r1")
 # exclude=$('.#recycle') # ".DS_Store")
 # Create hash file
         touch $filename
-        time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum >> $filename| date >> $filename
+        time find -type d -name '.wdmc' | find -type f -name 'Thumbs.db' | xargs -P $cores -L $multiplier -0 sha1sum >> $cleanup 2>> $error | date >> $cleanup
+        time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum >> $filename 2>> $error | date >> $filename
         echo Hashing results output to $filename
