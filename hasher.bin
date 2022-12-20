@@ -32,3 +32,8 @@ dir_clean_list=('.wdmc')
 	cat $filename | cut -f1 -d"," | uniq -d
 	
 # final line to split | awk -F, '{$(NF+1)=++i;}1'
+
+
+# Testing
+# Below allows simple testing of further commands:
+# find . -type f -print0 | xargs -0 sha1sum
