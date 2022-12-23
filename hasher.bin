@@ -26,9 +26,9 @@ file_include_list=( "Thumbs.db"
 dir_clean_list=('.wdmc')
 
 # Create hash file
-        find -type d -name $dir_clean_list | find -type f -name $file_include_list | xargs -P $cores -L $multiplier >> $cleanup 2>$error
+        find -type d -name $dir_clean_list | find -type f -name $file_include_list | xargs -P $cores -L $multiplier 1>$cleanup 2>$error
 	echo "Cleanup list written. Moving to main hashing."
-	time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum | sed 's\  \,\g' >> $filename 2>>$error | watch tail -n 5 $filename
+	time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum | sed 's\  \,\g' 1>>$filename 2>>$error | watch tail -n 5 $filename
 	echo Hashing results output to $filename
 	echo Outputting duplicate hashes
 	cat $filename | cut -f1 -d"," | uniq -d >> $duplicate
