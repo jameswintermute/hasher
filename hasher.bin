@@ -9,6 +9,7 @@ multiplier=$(( 4* $cores ))
 filename='hasher-'`date +"%Y-%m-%d-%H%M"`'.txt'
 error='hasher-'`date +"%Y-%m-%d-%H%M"`'-error.txt'
 cleanup='hasher-'`date +"%Y-%m-%d-%H%M"`'-cleanup.txt'
+duplicate='hasher-'`date +"%Y-%m-%d-%H%M"`'-duplicate-hashes.txt'
 
 #Read the path to hash
 echo "Welcome to Hasher."
@@ -26,10 +27,11 @@ dir_clean_list=('.wdmc')
 
 # Create hash file
         find -type d -name $dir_clean_list | find -type f -name $file_include_list | xargs -P $cores -L $multiplier >> $cleanup 2>> $error
+	echo Cleanup list written. Moving to main hashing. I'm going outside and may be some time...
         time find "$parent" -type f -print0 | xargs -P $cores -L $multiplier -0 sha1sum | sed 's\  \,\g' >> $filename 2>> $error
 	echo Hashing results output to $filename
 	echo Outputting duplicate hashes
-	cat $filename | cut -f1 -d"," | uniq -d
+	cat $filename | cut -f1 -d"," | uniq -d >> $duplicate
 	
 # final line to split | awk -F, '{$(NF+1)=++i;}1'
 
