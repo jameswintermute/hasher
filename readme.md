@@ -11,7 +11,13 @@ The point of this project is the following:
 - Store this and use it as a point of reference in disk rotation to spot significant amounts of file change
 - Ransomware and Malware are increasingly destructive and how would a user identify if many of their files had been corrupted or destroyed
 - Allow the file to be ingested into a SIEM tool such as Splunk
-- For spotting duplicate files across a filesystem, an additional module may be required for this element
+
+Cleanup function
+================
+- For spotting duplicate files across a filesystem
+- This has been tested and spotted numerous zero data files with the same hash, duplicate files, photos etc.
+- Output the duplicate hashes to a file to inform the user
+- Also inform the user of files such as .wdmc, thumbs etc which are pointless artefacts on a NAS drive.
 
 # Errors
 - Tail is not currently operating in a while loop, unclear how to use find as the input to check. This means it must be cancelled when no input seen via  ctrl-c
@@ -32,3 +38,5 @@ The point of this project is the following:
 
 Future expansion
 ================
+- Awaiting input.
+
