@@ -19,6 +19,7 @@ Improvements
 - Improve the output to make it easy to see the duplicates and their paths
 
 Compare module
+##############
 - Have a percentage readout of the overall differences. e.g.
 
 50,100 files read
