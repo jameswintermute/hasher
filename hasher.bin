@@ -23,7 +23,8 @@ file_include_list=( "Thumbs.db"
 ".DS_Store")
 
 # Dirs to find
-dir_clean_list=('.wdmc')
+dir_clean_list=( '.wdmc'
+'@eaDir')
 
 # Create hash file
         find -type d -name $dir_clean_list | find -type f -name $file_include_list | xargs -P $cores -L $multiplier 1>$cleanup 2>$error
