@@ -20,6 +20,7 @@ parent=$(dirname "$r1")
 # Files to find
 file_include_list=( "Thumbs.db"
 "desktop.ini"
+"._.DS_Store"
 ".DS_Store")
 
 # Dirs to find
