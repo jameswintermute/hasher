@@ -12,6 +12,12 @@ The point of this project is the following:
 - Ransomware and Malware are increasingly destructive and how would a user identify if many of their files had been corrupted or destroyed
 - Allow the file to be ingested into a SIEM tool such as Splunk
 
+Code
+====
+- Itention is to keep this as native Bash
+- This allows it to be ported to any native linux system with the minimum of compatibility issues
+- If it becomes unviable to continue into Python or Perl this can be explored but the preference is Bash
+
 Cleanup artifacts function
 ==========================
 - For spotting duplicate files across a filesystem
