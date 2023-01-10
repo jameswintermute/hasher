@@ -47,3 +47,7 @@ Future expansion
 ================
 - Awaiting input.
 
+See also
+========
+- https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/
+
