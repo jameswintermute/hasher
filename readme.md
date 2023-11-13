@@ -17,6 +17,7 @@ The point of this project is the following:
 - This allows it to be ported to any native linux system with the minimum of compatibility issues
 - If it becomes unviable to continue into Python or Perl this can be explored but the preference is Bash
 - Phase 2: Improve to allow it to be run on Apple Mac. Windows, Meh perhaps one day.
+- See the logical flow document
 
 ## Cleanup artifacts function
 
