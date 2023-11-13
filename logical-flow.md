@@ -1,3 +1,5 @@
+# How Hasher should work:
+
 
 ## Menu
 - Welcome Banner, explain function
@@ -39,8 +41,10 @@ Example:
 
 - Show progress bar, or ongoing Tail-F Or percentage
 	- Ensure minimal packages and dependencies required
-	
+
+
 ## Hashing Completes
+- Sort all output in order of file path, this is because xargs creates inconsistencies in order, I think a sort is tidy?
 - Write the time taken for the task to the tail of the file OR to an ancilliary file to avoid messing up the csv format
 
 ## Cron
