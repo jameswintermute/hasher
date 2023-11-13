@@ -1,5 +1,4 @@
 #!/bin/bash
-# Author James Wintermute, December 2022. 
 
 #Count the number of CPU cores
 cores=`cat /proc/cpuinfo | grep processor | wc -l`
