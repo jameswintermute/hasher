@@ -1,6 +1,6 @@
 
 ## About
-A project by James Wintermute, jameswinter@protonmail.ch. Started December 2022.
+A project by James Wintermute, jameswinter@protonmail.ch. Started December 2022. The project is closed source until it is ready for 'beta' release.
 
 ## Purpose
 The point of this project is the following:
