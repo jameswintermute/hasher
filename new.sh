@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# ───── Run using: ─────
+# find . -type f -print0 | xargs -0 ./hasher.sh
+mkdir hasher
+
 # ───── Colors ─────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,7 +16,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ───── Defaults ─────
-OUTPUT="hasher-$(date +'%Y-%m-%d').txt"
+OUTPUT="hasher/hasher-$(date +'%Y-%m-%d').txt"
 ALGO="sha256sum"
 
 # ───── Parse Flags ─────
@@ -89,6 +93,3 @@ for file in "${FILES[@]}"; do
     log_info "Hashed '$file'"
     echo "$DATE,File:'$file',Hash:($ALGO): $HASH,Dir:$PWD" | tee -a "$OUTPUT"
 done
-
-# Run via:
-# find . -type f -print0 | xargs -0 ./new.sh
