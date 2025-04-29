@@ -1,4 +1,8 @@
 #!/bin/bash
+cores=`cat /proc/cpuinfo | grep processor | wc -l`
+multiplier=$(( 4* $cores ))
+
+filename='hasher-'`date +"%Y-%m-%d"`'.txt'
 
 # Check if a file is provided
 if [ -z "$1" ]; then
@@ -27,4 +31,10 @@ STAT=$(stat "$FILE" -x -y -z)
 CHECKSUM=$(sha256sum "$FILE" | awk '{print $1}')
 
 # Output result
-echo "Checksum of file:'$FILE',$CHECKSUM At: $DATE, $TYPE, $STAT"
+for file in "$@"; do
+    echo "Processing file: $file"
+    echo xargs -P $cores -L $multiplier -0 "Checksum of file:'$FILE',$CHECKSUM At: $DATE, $TYPE, $STAT"
+done
+
+# Execute example:
+# find . -type f -print0 | xargs -0 ./new.sh
