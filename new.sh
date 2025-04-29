@@ -87,5 +87,8 @@ for file in "${FILES[@]}"; do
     TYPE=$(file "$file" -b)
 
     log_info "Hashed '$file'"
-    echo "[$DATE] File: '$file' | Hash ($ALGO): $HASH | Type: $TYPE | Dir: $PWD" | tee -a "$OUTPUT"
+    echo "$DATE File: '$file' | Hash ($ALGO): $HASH | Type: $TYPE | Dir: $PWD" | tee -a "$OUTPUT"
 done
+
+# Run via:
+# find . -type f -print0 | xargs -0 ./new.sh
