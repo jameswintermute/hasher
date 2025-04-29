@@ -84,10 +84,10 @@ for file in "${FILES[@]}"; do
     HASH=$(eval "$ALGO" \"\$file\" | awk '{print $1}')
     DATE=$(date +"%Y-%m-%d %H:%M:%S")
     PWD=$(pwd -L)
-    TYPE=$(file "$file" -b)
+    #TYPE=$(file "$file" -b)
 
     log_info "Hashed '$file'"
-    echo "$DATE File: '$file' | Hash ($ALGO): $HASH | Type: $TYPE | Dir: $PWD" | tee -a "$OUTPUT"
+    echo "$DATE,File:'$file',Hash:($ALGO): $HASH,Dir:$PWD" | tee -a "$OUTPUT"
 done
 
 # Run via:
