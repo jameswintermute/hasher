@@ -21,19 +21,18 @@ fi
 # Get current date
 DATE=$(date +"%Y-%m-%d %H:%M:%S")
 
+# pwd
+PWD=$(pwd)
+
 # File
 TYPE=$(file "$FILE" -b)
-
-#MACB
-STAT=$(stat "$FILE" -x -y -z)
 
 # Compute sha256sum
 CHECKSUM=$(sha256sum "$FILE" | awk '{print $1}')
 
 # Output result
 for file in "$@"; do
-    echo "Processing file: $file"
-    echo xargs -P $cores -L $multiplier -0 "Checksum of file:'$FILE',$CHECKSUM At: $DATE, $TYPE, $STAT"
+    xargs -P $cores -L $multiplier -0 | echo "SHA256 of file:'$FILE',$CHECKSUM At:$DATE,Type:$TYPE,PWD:$PWD"
 done
 
 # Execute example:
