@@ -91,5 +91,5 @@ for file in "${FILES[@]}"; do
     #TYPE=$(file "$file" -b)
 
     log_info "Hashed '$file'"
-    echo "$DATE,File:'$file',Hash:($ALGO): $HASH,Dir:$PWD" | tee -a "$OUTPUT"
+    echo "Hash:($ALGO):, $DATE,File:'$file', $HASH,Dir:$PWD" | tee -a "$OUTPUT"
 done
