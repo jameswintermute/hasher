@@ -2,7 +2,7 @@
 
 # ───── Flags & Config ─────
 HASHER_DIR="hasher"
-HASHES_DIR="$HASHER_DIR/hashes"
+HASHES_DIR="hashes"    # Changed to top-level 'hashes' folder
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
             RUN_IN_BACKGROUND=true
             shift
             ;;
-        --internal)  # Accept and ignore this flag to avoid errors on background relaunch
+        --internal)
             shift
             ;;
         -*)
