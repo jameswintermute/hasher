@@ -67,7 +67,7 @@ done
 # ───── Relaunch in Background ─────
 if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
     mkdir -p "$HASHER_DIR"
-    nohup bash "$0" --internal "${POSITIONAL[@]}" 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' >> "$BACKGROUND_LOG" &
+    nohup bash "$0" --internal "${POSITIONAL[@]}" </dev/null 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' >> "$BACKGROUND_LOG" &
     echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $BACKGROUND_LOG"
     exit 0
 fi
