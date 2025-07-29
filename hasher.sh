@@ -2,11 +2,13 @@
 
 # ───── Flags & Config ─────
 HASHER_DIR="hasher"
+HASHES_DIR="$HASHER_DIR/hashes"
 RUN_IN_BACKGROUND=false
-OUTPUT="$HASHER_DIR/hasher-$(date +'%Y-%m-%d').txt"
+DATE_TAG="$(date +'%Y-%m-%d')"
+OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
 LOG_FILE="$HASHER_DIR/hasher-logs.txt"
-ALGO="sha256sum"
 POSITIONAL=()
+ALGO="sha256sum"
 PATHFILE=""
 
 # ───── Colors ─────
@@ -70,13 +72,12 @@ main() {
     START_TIME=$(date +%s)
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
-    # ───── Directory Setup ─────
-    if [ -d "$HASHER_DIR" ]; then
-        log_warn "Directory '$HASHER_DIR' already exists. Using existing directory."
-    else
-        mkdir -p "$HASHER_DIR"
-        log_info "Created directory '$HASHER_DIR'."
-    fi
+    # ───── Create Output Directories ─────
+    mkdir -p "$HASHER_DIR"
+    mkdir -p "$HASHES_DIR"
+
+    # ───── Inform User ─────
+    log_info "Using output file: $OUTPUT"
 
     # ───── Read pathfile if given ─────
     if [[ -n "$PATHFILE" ]]; then
