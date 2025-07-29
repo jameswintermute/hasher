@@ -1,7 +1,8 @@
 
 ## About
-A project by James Wintermute, jameswinter@protonmail.ch. Started December 2022. 
-
+- A project by James Wintermute, jameswinter@protonmail.ch. Started December 2022. 
+- Overhauled Summer 2025 with assistance from ChatGPT
+ 
 ## Purpose
 The point of this project is the following:
 
@@ -9,6 +10,7 @@ The point of this project is the following:
 - Store this and use it as a point of reference in disk rotation to spot significant amounts of file change
 - Ransomware and Malware are increasingly destructive and how would a user identify if many of their files had been corrupted or destroyed
 - Allow the file to be ingested into a SIEM tool such as Splunk
+- Recognise and delete duplicate hashes
 
 ## Examples
 
@@ -21,9 +23,7 @@ The point of this project is the following:
 ## Directory structure
 
 <pre>
-hasher/
 ├── background.log
-├── hasher-logs.txt
 └── hashes/
     ├── hasher-2025-07-29.txt
     └── hasher-YYYY-MM-DD.txt (future runs)
