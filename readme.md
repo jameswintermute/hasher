@@ -13,7 +13,8 @@ The point of this project is the following:
 ## Examples
 
 <pre>
- ./hasher.sh --pathfile paths.txt --algo sha256 --output custom_hashes.txt
+ ./hasher.sh --pathfile paths.txt --algo sha256 --background
+ ./hasher.sh --pathfile paths.txt --algo sha256
  ./find-duplicates.sh hasher/hasher-2025-07-29.txt
 </pre>
 
