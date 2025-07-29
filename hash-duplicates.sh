@@ -25,8 +25,19 @@ if [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
-# ───── Extract, Sort, Find Duplicates ─────
-cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d > "$OUTPUT_FILE"
+# ───── Step 1: Find Duplicate Hashes ─────
+DUP_HASHES=$(cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d)
 
-# ───── Done ─────
-log_info "Duplicate hashes saved to '$OUTPUT_FILE'"
+if [[ -z "$DUP_HASHES" ]]; then
+    log_info "No duplicate hashes found."
+    exit 0
+fi
+
+# ───── Step 2: Extract Matching Lines ─────
+echo "$DUP_HASHES" | while read -r hash; do
+    echo "Duplicate hash: $hash" >> "$OUTPUT_FILE"
+    grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
+    echo "" >> "$OUTPUT_FILE"
+done
+
+log_info "Duplicate hashes with file paths saved to '$OUTPUT_FILE'"
