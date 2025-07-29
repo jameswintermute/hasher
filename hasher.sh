@@ -7,6 +7,7 @@ RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
 LOG_FILE="$HASHER_DIR/hasher-logs.txt"
+BACKGROUND_LOG="background.log"
 POSITIONAL=()
 ALGO="sha256sum"
 PATHFILE=""
@@ -49,6 +50,9 @@ while [[ $# -gt 0 ]]; do
             RUN_IN_BACKGROUND=true
             shift
             ;;
+        --internal)  # Accept and ignore this flag to avoid errors on background relaunch
+            shift
+            ;;
         -*)
             log_error "Unknown option $1"
             exit 1
@@ -63,8 +67,8 @@ done
 # ───── Relaunch in Background ─────
 if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
     mkdir -p "$HASHER_DIR"
-    nohup bash "$0" --internal "${POSITIONAL[@]}" > "$HASHER_DIR/background.log" 2>&1 &
-    echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $HASHER_DIR/background.log"
+    nohup bash "$0" --internal "${POSITIONAL[@]}" > "$BACKGROUND_LOG" 2>&1 &
+    echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $BACKGROUND_LOG"
     exit 0
 fi
 
