@@ -1,13 +1,12 @@
 #!/bin/bash
 
 # ───── Flags & Config ─────
-HASHER_DIR="hasher"
 HASHES_DIR="hashes"    # hashes output goes here (top-level)
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
-LOG_FILE="$HASHER_DIR/hasher-logs.txt"
-BACKGROUND_LOG="background.log"
+LOG_FILE="hasher-logs.txt"     # now in main dir
+BACKGROUND_LOG="background.log" # now in main dir
 POSITIONAL=()
 ALGO="sha256sum"
 PATHFILE=""
@@ -66,7 +65,7 @@ done
 
 # ───── Relaunch in Background ─────
 if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
-    mkdir -p "$HASHER_DIR"
+    mkdir -p "$HASHES_DIR"
     nohup bash "$0" --internal "${POSITIONAL[@]}" </dev/null 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' >> "$BACKGROUND_LOG" &
     echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $BACKGROUND_LOG"
     exit 0
@@ -76,8 +75,7 @@ main() {
     START_TIME=$(date +%s)
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
-    # ───── Create Output Directories ─────
-    mkdir -p "$HASHER_DIR"
+    # ───── Create Output Directory ─────
     mkdir -p "$HASHES_DIR"
 
     # ───── Ensure output file exists and is empty ─────
@@ -145,7 +143,7 @@ main() {
             continue
         fi
 
-        HASH=$(stdbuf -oL eval "$ALGO" \"\$file\" | awk '{print $1}')
+        HASH=$(stdbuf -oL "$ALGO" "$file" | awk '{print $1}')
         DATE=$(date +"%Y-%m-%d %H:%M:%S")
         PWD=$(pwd -L)
 
