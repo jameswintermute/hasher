@@ -14,7 +14,7 @@ The point of this project is the following:
 
 <pre>
  ./hasher.sh --pathfile paths.txt --algo sha256 --output custom_hashes.txt
- ./hash-duplicates.sh hasher/hasher-2025-07-29.txt
+ ./find-duplicates.sh hasher/hasher-2025-07-29.txt
 </pre>
 
 ## See also:
