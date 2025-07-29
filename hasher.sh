@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ───── Flags & Config ─────
-HASHER_DIR=""
+HASHER_DIR="hasher"
 HASHES_DIR="$HASHER_DIR/hashes"
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
