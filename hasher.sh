@@ -76,7 +76,9 @@ main() {
     mkdir -p "$HASHER_DIR"
     mkdir -p "$HASHES_DIR"
 
-    # ───── Inform User ─────
+    # ───── Ensure output file exists and is empty ─────
+    : > "$OUTPUT"
+
     log_info "Using output file: $OUTPUT"
 
     # ───── Read pathfile if given ─────
