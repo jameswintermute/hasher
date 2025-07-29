@@ -1,1 +1,4 @@
+# Place the relative disk paths you wish to hash below:
+# e.g. '/volume1/Media'
+
 
