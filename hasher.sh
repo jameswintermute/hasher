@@ -115,6 +115,36 @@ main() {
         fi
     done
 
+    # ───── File count summary per path ─────
+    echo "Starting Hasher" | tee -a "$LOG_FILE"
+    total_count=0
+    for path in "$@"; do
+        if [ -d "$path" ]; then
+            count=$(find "$path" -type f 2>/dev/null | wc -l)
+        elif [ -f "$path" ]; then
+            count=1
+        else
+            count=0
+        fi
+
+        if command -v numfmt >/dev/null 2>&1; then
+            count_fmt=$(numfmt --grouping <<< "$count")
+        else
+            count_fmt="$count"
+        fi
+
+        echo "- $count_fmt $path" | tee -a "$LOG_FILE"
+        total_count=$((total_count + count))
+    done
+
+    if command -v numfmt >/dev/null 2>&1; then
+        total_fmt=$(numfmt --grouping <<< "$total_count")
+    else
+        total_fmt="$total_count"
+    fi
+
+    echo "- Total files to hash: $total_fmt" | tee -a "$LOG_FILE"
+
     TOTAL=${#FILES[@]}
     COUNT=0
 
