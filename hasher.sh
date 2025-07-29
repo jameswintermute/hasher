@@ -118,10 +118,19 @@ main() {
     TOTAL=${#FILES[@]}
     COUNT=0
 
+    # ───── Progress Count File ─────
+    PROGRESS_COUNT_FILE=".hasher_progress_count"
+    echo 0 > "$PROGRESS_COUNT_FILE"
+
     # ───── Background progress logger ─────
     PROGRESS_LOGGER_RUNNING=true
     progress_logger() {
         while $PROGRESS_LOGGER_RUNNING; do
+            if [[ -f "$PROGRESS_COUNT_FILE" ]]; then
+                COUNT=$(cat "$PROGRESS_COUNT_FILE")
+            else
+                COUNT=0
+            fi
             PERCENT=0
             if (( TOTAL > 0 )); then
                 PERCENT=$((COUNT * 100 / TOTAL))
@@ -133,9 +142,11 @@ main() {
     progress_logger &  # run in background
     PROGRESS_LOGGER_PID=$!
 
-    # ───── Hashing loop ─────
+    # ───── Hash Files ─────
     for file in "${FILES[@]}"; do
         COUNT=$((COUNT + 1))
+        echo "$COUNT" > "$PROGRESS_COUNT_FILE"
+
         printf "[%d/%d] Processing: %s\n" "$COUNT" "$TOTAL" "$file"
 
         if [ ! -f "$file" ]; then
@@ -154,6 +165,9 @@ main() {
     # ───── Stop progress logger ─────
     PROGRESS_LOGGER_RUNNING=false
     wait "$PROGRESS_LOGGER_PID" 2>/dev/null
+
+    # ───── Remove progress count file ─────
+    rm -f "$PROGRESS_COUNT_FILE"
 
     # ───── Summary Logging ─────
     END_TIME=$(date +%s)
