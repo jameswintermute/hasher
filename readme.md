@@ -14,6 +14,8 @@ The point of this project is the following:
 
 ./hasher.sh --pathfile paths.txt --algo sha256 --output custom_hashes.txt
 
+./hash-duplicates.sh hasher/hasher-2025-07-29.txt
+
 
 ## See also:
 [Facebook Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
