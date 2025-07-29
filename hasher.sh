@@ -4,6 +4,7 @@
 HASHER_DIR="hasher"
 RUN_IN_BACKGROUND=false
 OUTPUT="$HASHER_DIR/hasher-$(date +'%Y-%m-%d').txt"
+LOG_FILE="$HASHER_DIR/hasher-logs.txt"
 ALGO="sha256sum"
 POSITIONAL=()
 PATHFILE=""
@@ -65,9 +66,11 @@ if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
     exit 0
 fi
 
-# ───── Only Internal Runs Reach Here ─────
 main() {
-    # ───── Directory Check ─────
+    START_TIME=$(date +%s)
+    NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
+
+    # ───── Directory Setup ─────
     if [ -d "$HASHER_DIR" ]; then
         log_warn "Directory '$HASHER_DIR' already exists. Using existing directory."
     else
@@ -89,15 +92,12 @@ main() {
 
     set -- "${POSITIONAL[@]}"
 
-    # ───── Validate Input ─────
     if [ $# -eq 0 ]; then
         echo -e "${YELLOW}Usage:${NC} $0 [--output file] [--algo sha256|sha1|md5] [--pathfile file] [--background] <file_or_dir1> [...]"
         exit 1
     fi
 
-    # ───── Collect Files ─────
     FILES=()
-
     for path in "$@"; do
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
@@ -110,7 +110,6 @@ main() {
         fi
     done
 
-    # ───── Hash Files ─────
     TOTAL=${#FILES[@]}
     COUNT=0
 
@@ -130,7 +129,23 @@ main() {
         log_info "Hashed '$file'"
         echo "$HASH, Dir: $PWD, File: '$file', $ALGO, Time: $DATE" | tee -a "$OUTPUT"
     done
+
+    # ───── Summary Logging ─────
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+
+    {
+        echo "========================================="
+        echo "Hasher run completed: $NOW_HUMAN"
+        echo "Algorithm used      : $ALGO"
+        echo "Files hashed        : $TOTAL"
+        echo "Output file         : $OUTPUT"
+        echo "Run time (seconds)  : $DURATION"
+        echo "========================================="
+        echo ""
+    } >> "$LOG_FILE"
+
+    log_info "Summary written to '$LOG_FILE'"
 }
 
-# ───── Execute Main ─────
 main
