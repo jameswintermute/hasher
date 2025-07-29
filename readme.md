@@ -30,5 +30,5 @@ The point of this project is the following:
 </pre>
 
 ## See also:
-[Facebook Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
+[Facebook Silent Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
 
