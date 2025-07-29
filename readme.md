@@ -18,6 +18,17 @@ The point of this project is the following:
  ./find-duplicates.sh hasher/hasher-2025-07-29.txt
 </pre>
 
+## Directory structure
+
+<pre>
+hasher/
+├── background.log
+├── hasher-logs.txt
+└── hashes/
+    ├── hasher-2025-07-29.txt
+    └── hasher-YYYY-MM-DD.txt (future runs)
+</pre>
+
 ## See also:
 [Facebook Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
 
