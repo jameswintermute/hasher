@@ -2,7 +2,7 @@
 
 # ───── Flags & Config ─────
 HASHER_DIR="hasher"
-HASHES_DIR="hashes"    # Changed to top-level 'hashes' folder
+HASHES_DIR="hashes"    # hashes output goes here (top-level)
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
@@ -67,7 +67,7 @@ done
 # ───── Relaunch in Background ─────
 if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
     mkdir -p "$HASHER_DIR"
-    nohup bash "$0" --internal "${POSITIONAL[@]}" > "$BACKGROUND_LOG" 2>&1 &
+    nohup bash "$0" --internal "${POSITIONAL[@]}" 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' >> "$BACKGROUND_LOG" &
     echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $BACKGROUND_LOG"
     exit 0
 fi
@@ -120,6 +120,22 @@ main() {
     TOTAL=${#FILES[@]}
     COUNT=0
 
+    # ───── Background progress logger ─────
+    PROGRESS_LOGGER_RUNNING=true
+    progress_logger() {
+        while $PROGRESS_LOGGER_RUNNING; do
+            PERCENT=0
+            if (( TOTAL > 0 )); then
+                PERCENT=$((COUNT * 100 / TOTAL))
+            fi
+            echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $COUNT / $TOTAL files hashed ($PERCENT%)" >> "$BACKGROUND_LOG"
+            sleep 15
+        done
+    }
+    progress_logger &  # run in background
+    PROGRESS_LOGGER_PID=$!
+
+    # ───── Hashing loop ─────
     for file in "${FILES[@]}"; do
         COUNT=$((COUNT + 1))
         printf "[%d/%d] Processing: %s\n" "$COUNT" "$TOTAL" "$file"
@@ -129,13 +145,17 @@ main() {
             continue
         fi
 
-        HASH=$(eval "$ALGO" \"\$file\" | awk '{print $1}')
+        HASH=$(stdbuf -oL eval "$ALGO" \"\$file\" | awk '{print $1}')
         DATE=$(date +"%Y-%m-%d %H:%M:%S")
         PWD=$(pwd -L)
 
         log_info "Hashed '$file'"
         echo "$HASH, Dir: $PWD, File: '$file', $ALGO, Time: $DATE" | tee -a "$OUTPUT"
     done
+
+    # ───── Stop progress logger ─────
+    PROGRESS_LOGGER_RUNNING=false
+    wait "$PROGRESS_LOGGER_PID" 2>/dev/null
 
     # ───── Summary Logging ─────
     END_TIME=$(date +%s)
