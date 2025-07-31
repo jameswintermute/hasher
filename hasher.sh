@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ───── Flags & Config ─────
-HASHES_DIR="hashes"    # hashes output goes here (top-level)
+HASHES_DIR="hashes"
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.txt"
-LOG_FILE="hasher-logs.txt"     # now in main dir
-BACKGROUND_LOG="background.log" # now in main dir
+LOG_FILE="hasher-logs.txt"
+BACKGROUND_LOG="background.log"
 POSITIONAL=()
 ALGO="sha256sum"
 PATHFILE=""
@@ -77,10 +77,7 @@ main() {
 
     # ───── Create Output Directory ─────
     mkdir -p "$HASHES_DIR"
-
-    # ───── Ensure output file exists and is empty ─────
     : > "$OUTPUT"
-
     log_info "Using output file: $OUTPUT"
 
     # ───── Read pathfile if given ─────
@@ -148,14 +145,14 @@ main() {
     TOTAL=${#FILES[@]}
     COUNT=0
 
-    # ───── Progress Count File ─────
     PROGRESS_COUNT_FILE=".hasher_progress_count"
+    PROGRESS_FLAG_FILE=".hasher_running"
     echo 0 > "$PROGRESS_COUNT_FILE"
+    touch "$PROGRESS_FLAG_FILE"
 
     # ───── Background progress logger ─────
-    PROGRESS_LOGGER_RUNNING=true
     progress_logger() {
-        while $PROGRESS_LOGGER_RUNNING; do
+        while [[ -f "$PROGRESS_FLAG_FILE" ]]; do
             if [[ -f "$PROGRESS_COUNT_FILE" ]]; then
                 COUNT=$(cat "$PROGRESS_COUNT_FILE")
             else
@@ -169,7 +166,7 @@ main() {
             sleep 15
         done
     }
-    progress_logger &  # run in background
+    progress_logger &
     PROGRESS_LOGGER_PID=$!
 
     # ───── Hash Files ─────
@@ -192,14 +189,11 @@ main() {
         echo "$HASH, Dir: $PWD, File: '$file', $ALGO, Time: $DATE" | tee -a "$OUTPUT"
     done
 
-    # ───── Stop progress logger ─────
-    PROGRESS_LOGGER_RUNNING=false
+    # ───── Cleanup and Summary ─────
+    rm -f "$PROGRESS_FLAG_FILE"
     wait "$PROGRESS_LOGGER_PID" 2>/dev/null
-
-    # ───── Remove progress count file ─────
     rm -f "$PROGRESS_COUNT_FILE"
 
-    # ───── Summary Logging ─────
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
 
