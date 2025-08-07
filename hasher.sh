@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
         --internal)
             shift
             ;;
-        -*)
+        -*|--*)
             log_error "Unknown option $1"
             exit 1
             ;;
@@ -75,12 +75,10 @@ main() {
     START_TIME=$(date +%s)
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
-    # ───── Create Output Directory ─────
     mkdir -p "$HASHES_DIR"
     : > "$OUTPUT"
     log_info "Using output file: $OUTPUT"
 
-    # ───── Read pathfile if given ─────
     if [[ -n "$PATHFILE" ]]; then
         if [[ ! -f "$PATHFILE" ]]; then
             log_error "Path file '$PATHFILE' does not exist."
@@ -104,7 +102,7 @@ main() {
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
                 FILES+=("$file")
-            done < <(find "$path" -type f -print0)
+            done < <(find "$path" -type d -name '#recycle' -prune -o -type f -print0)
         elif [ -f "$path" ]; then
             FILES+=("$path")
         else
@@ -112,12 +110,11 @@ main() {
         fi
     done
 
-    # ───── File count summary per path ─────
     echo "Starting Hasher" | tee -a "$LOG_FILE"
     total_count=0
     for path in "$@"; do
         if [ -d "$path" ]; then
-            count=$(find "$path" -type f 2>/dev/null | wc -l)
+            count=$(find "$path" -type d -name '#recycle' -prune -o -type f -print 2>/dev/null | wc -l)
         elif [ -f "$path" ]; then
             count=1
         else
@@ -150,7 +147,6 @@ main() {
     echo 0 > "$PROGRESS_COUNT_FILE"
     touch "$PROGRESS_FLAG_FILE"
 
-    # ───── Background progress logger ─────
     progress_logger() {
         while [[ -f "$PROGRESS_FLAG_FILE" ]]; do
             if [[ -f "$PROGRESS_COUNT_FILE" ]]; then
@@ -169,7 +165,6 @@ main() {
     progress_logger &
     PROGRESS_LOGGER_PID=$!
 
-    # ───── Hash Files ─────
     for file in "${FILES[@]}"; do
         COUNT=$((COUNT + 1))
         echo "$COUNT" > "$PROGRESS_COUNT_FILE"
@@ -189,7 +184,6 @@ main() {
         echo "$HASH, Dir: $PWD, File: '$file', $ALGO, Time: $DATE" | tee -a "$OUTPUT"
     done
 
-    # ───── Cleanup and Summary ─────
     rm -f "$PROGRESS_FLAG_FILE"
     wait "$PROGRESS_LOGGER_PID" 2>/dev/null
     rm -f "$PROGRESS_COUNT_FILE"
