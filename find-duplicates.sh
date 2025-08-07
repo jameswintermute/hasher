@@ -33,11 +33,16 @@ if [[ -z "$DUP_HASHES" ]]; then
     exit 0
 fi
 
-# ───── Step 2: Extract Matching Lines ─────
+# ───── Step 2: Extract Matching Lines with Count ─────
+echo "" > "$OUTPUT_FILE"  # clear or create output
+ID=1
+
 echo "$DUP_HASHES" | while read -r hash; do
+    echo "# Duplicate hash ID: $ID" >> "$OUTPUT_FILE"
     echo "Duplicate hash: $hash" >> "$OUTPUT_FILE"
     grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
     echo "" >> "$OUTPUT_FILE"
+    ID=$((ID + 1))
 done
 
 log_info "Duplicate hashes with file paths saved to '$OUTPUT_FILE'"
