@@ -51,7 +51,7 @@ for i in "${!FILES[@]}"; do
 done
 echo ""
 
-read -rp "Enter file number or filename: " selection
+read -p "Enter file number or filename: " selection
 
 if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#FILES[@]} )); then
     INPUT_FILE="${FILES[$((selection - 1))]}"
@@ -67,13 +67,14 @@ log_info "Selected file: $(basename "$INPUT_FILE")"
 # ───── Extract Duplicate Hashes ─────
 log_info "Scanning for duplicate hashes... This may take a moment."
 
-# Use a temp file here to avoid huge variable issues
-TMP_DUP_HASHES=$(mktemp)
-cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d > "$TMP_DUP_HASHES"
+# Get all hashes with counts (single pass)
+HASH_COUNTS=$(cut -d',' -f1 "$INPUT_FILE" | sort | uniq -c | awk '{print $1","$2}')
 
-if [[ ! -s "$TMP_DUP_HASHES" ]]; then
+# Filter duplicates (count > 1)
+DUP_COUNTS=$(echo "$HASH_COUNTS" | awk -F, '$1 > 1')
+
+if [[ -z "$DUP_COUNTS" ]]; then
     log_info "No duplicate hashes found."
-    rm -f "$TMP_DUP_HASHES"
     exit 0
 fi
 
@@ -82,17 +83,8 @@ DATE_TAG=$(basename "$INPUT_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
 OUTPUT_FILE="$HASH_DIR/${DATE_TAG}-duplicate-hashes.txt"
 : > "$OUTPUT_FILE"
 
-# ───── Process and Sort by File Count ─────
-log_info "Calculating duplicate file groups..."
-
-TMP_SORTED=$(mktemp)
-while IFS= read -r hash; do
-    count=$(grep -c "^$hash" "$INPUT_FILE")
-    echo "$count,$hash" >> "$TMP_SORTED"
-done < "$TMP_DUP_HASHES"
-
-SORTED_HASHES=$(sort -t',' -k1,1nr "$TMP_SORTED" | cut -d',' -f2)
-rm -f "$TMP_SORTED" "$TMP_DUP_HASHES"
+# ───── Sort duplicates by count descending ─────
+SORTED_HASHES=$(echo "$DUP_COUNTS" | sort -t',' -k1,1nr | cut -d',' -f2)
 
 # ───── Display Progress with Progress Bar ─────
 HASHES_ARRAY=($SORTED_HASHES)
@@ -110,8 +102,7 @@ for hash in "${HASHES_ARRAY[@]}"; do
     grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
     echo "" >> "$OUTPUT_FILE"
 
-    # Optional slight delay for smooth progress bar animation
-    sleep 0.05
+    sleep 0.05  # Slow down for smoother visual
 done
 
 echo -e "\n${GREEN}[INFO]${NC} Done! Duplicate hashes written to: $OUTPUT_FILE"
