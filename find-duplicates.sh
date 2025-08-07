@@ -9,104 +9,64 @@ NC='\033[0m'
 # ───── Logging ─────
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
-# ───── Functions ─────
-draw_progress_bar() {
-    local current=$1
-    local total=$2
-    local width=40
-
-    local percent=$(( current * 100 / total ))
-    local filled=$(( width * current / total ))
-    local empty=$(( width - filled ))
-
-    local bar=""
-    for ((i=0; i<filled; i++)); do bar+='#'; done
-    for ((i=0; i<empty; i++)); do bar+='-'; done
-
-    echo -ne "${YELLOW}[${bar}]${NC} $current / $total duplicate hashes processed (${percent}%)\r"
-}
-
-# ───── Select Hash File ─────
-HASH_DIR="hashes"
-if [ ! -d "$HASH_DIR" ]; then
-    log_error "Directory '$HASH_DIR' does not exist."
+# ───── Usage ─────
+if [ $# -ne 1 ]; then
+    echo -e "${YELLOW}Usage:${NC} $0 <hasher_output_file>"
     exit 1
 fi
 
-log_info "Scanning most recent hash files in '$HASH_DIR'..."
-FILES=($(ls -t "$HASH_DIR"/hasher-*.txt 2>/dev/null | head -n 10))
-if [ ${#FILES[@]} -eq 0 ]; then
-    log_error "No hasher-*.txt files found in '$HASH_DIR'"
+INPUT_FILE="$1"
+OUTPUT_FILE="duplicates-hashes.txt"
+
+# ───── Check File ─────
+if [ ! -f "$INPUT_FILE" ]; then
+    log_error "File '$INPUT_FILE' does not exist."
     exit 1
 fi
 
-echo ""
-echo "Select a hash file to process:"
-for i in "${!FILES[@]}"; do
-    index=$((i + 1))
-    filename=$(basename "${FILES[$i]}")
-    echo "  [$index] $filename"
+log_info "Calculating duplicate file groups... (this may take a moment)"
+
+# Run heavy command in background
+TMP_DUP_HASHES=$(mktemp)
+(
+    cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d > "$TMP_DUP_HASHES"
+) &
+PID=$!
+
+# Show progress dots every second with elapsed time
+i=0
+while kill -0 "$PID" 2>/dev/null; do
+    sleep 1
+    i=$((i+1))
+    printf "."
+    if [ $((i % 10)) -eq 0 ]; then
+        printf " [%ds elapsed]\n" "$i"
+    fi
 done
 echo ""
+wait "$PID"
 
-read -p "Enter file number or filename: " selection
-
-if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#FILES[@]} )); then
-    INPUT_FILE="${FILES[$((selection - 1))]}"
-elif [[ -f "$HASH_DIR/$selection" ]]; then
-    INPUT_FILE="$HASH_DIR/$selection"
-else
-    log_error "Invalid selection. Exiting."
-    exit 1
-fi
-
-log_info "Selected file: $(basename "$INPUT_FILE")"
-
-# ───── Extract Duplicate Hashes ─────
-log_info "Scanning for duplicate hashes... This may take a moment."
-DUP_HASHES=$(cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d)
+DUP_HASHES=$(cat "$TMP_DUP_HASHES")
+rm -f "$TMP_DUP_HASHES"
 
 if [[ -z "$DUP_HASHES" ]]; then
     log_info "No duplicate hashes found."
     exit 0
 fi
 
-# ───── Setup Output File ─────
-DATE_TAG=$(basename "$INPUT_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
-OUTPUT_FILE="$HASH_DIR/${DATE_TAG}-duplicate-hashes.txt"
-: > "$OUTPUT_FILE"
+log_info "Found $(echo "$DUP_HASHES" | wc -l) duplicate hash groups."
 
-# ───── Process and Sort by File Count ─────
-log_info "Calculating duplicate file groups..."
-
-TMP_SORTED=$(mktemp)
-while IFS= read -r hash; do
+# ───── Step 2: Extract Matching Lines ─────
+echo "" > "$OUTPUT_FILE"
+group_id=1
+for hash in $DUP_HASHES; do
     count=$(grep -c "^$hash" "$INPUT_FILE")
-    echo "$count,$hash" >> "$TMP_SORTED"
-done <<< "$DUP_HASHES"
-
-SORTED_HASHES=$(sort -t',' -k1,1nr "$TMP_SORTED" | cut -d',' -f2)
-rm -f "$TMP_SORTED"
-
-# ───── Display Progress with Progress Bar ─────
-HASHES_ARRAY=($SORTED_HASHES)
-TOTAL_HASHES=${#HASHES_ARRAY[@]}
-COUNT=0
-
-echo -e "\n${GREEN}[INFO]${NC} Processing ${TOTAL_HASHES} duplicate hash groups..."
-
-for hash in "${HASHES_ARRAY[@]}"; do
-    COUNT=$((COUNT + 1))
-    draw_progress_bar "$COUNT" "$TOTAL_HASHES"
-
-    echo "Duplicate hash ID: $COUNT" >> "$OUTPUT_FILE"
+    echo "Duplicate hash ID: $group_id (files: $count)" >> "$OUTPUT_FILE"
     echo "Duplicate hash: $hash" >> "$OUTPUT_FILE"
     grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
     echo "" >> "$OUTPUT_FILE"
-
-    sleep 0.05  # Slow down for smoother visual
+    ((group_id++))
 done
 
-echo -e "\n${GREEN}[INFO]${NC} Done! Duplicate hashes written to: $OUTPUT_FILE"
+log_info "Duplicate hashes with file paths saved to '$OUTPUT_FILE'"
