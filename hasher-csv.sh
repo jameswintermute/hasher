@@ -1,5 +1,4 @@
 #!/bin/bash
-# New csv tabular eval version
 
 # ───── Flags & Config ─────
 HASHES_DIR="hashes"
@@ -205,4 +204,12 @@ main() {
         echo "Algorithm used      : $ALGO"
         echo "Files hashed        : $TOTAL"
         echo "Output file         : $OUTPUT"
-        echo "Run time (seconds)
+        echo "Run time (seconds)  : $DURATION"
+        echo "========================================="
+        echo ""
+    } >> "$LOG_FILE"
+
+    log_info "Summary written to '$LOG_FILE'"
+}
+
+main
