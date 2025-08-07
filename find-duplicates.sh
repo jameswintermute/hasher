@@ -28,8 +28,13 @@ draw_progress_bar() {
     echo -ne "${YELLOW}[${bar}]${NC} $current / $total duplicate hashes processed (${percent}%)\r"
 }
 
-# ───── Select Hash File ─────
+# ───── Setup Directories ─────
 HASH_DIR="hashes"
+DUP_DIR="duplicate-hashes"
+
+mkdir -p "$HASH_DIR"
+mkdir -p "$DUP_DIR"
+
 if [ ! -d "$HASH_DIR" ]; then
     log_error "Directory '$HASH_DIR' does not exist."
     exit 1
@@ -43,6 +48,7 @@ if [ ${#FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
+# ───── User Selection ─────
 echo ""
 echo "Select a hash file to process:"
 for i in "${!FILES[@]}"; do
@@ -74,13 +80,13 @@ if [[ -z "$DUP_HASHES" ]]; then
     exit 0
 fi
 
-# ───── Setup Output File ─────
+# ───── Setup Output File in Separate Folder ─────
 DATE_TAG=$(basename "$INPUT_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
-OUTPUT_FILE="$HASH_DIR/${DATE_TAG}-duplicate-hashes.txt"
+OUTPUT_FILE="$DUP_DIR/${DATE_TAG}-duplicate-hashes.txt"
 : > "$OUTPUT_FILE"
 
-# ───── Count Occurrences for Each Duplicate Hash (fast, single pass) ─────
-log_info "Counting occurrences for each duplicate hash... (this might take a minute)"
+# ───── Count Occurrences Quickly ─────
+log_info "Counting occurrences for each duplicate hash..."
 
 dup_hash_file=$(mktemp)
 echo "$DUP_HASHES" > "$dup_hash_file"
@@ -95,15 +101,14 @@ awk -F, '
 
 rm -f "$dup_hash_file"
 
-# ───── Sort by count descending ─────
+# ───── Sort by frequency ─────
 SORTED_HASHES=$(sort -t',' -k1,1nr "$TMP_SORTED" | cut -d',' -f2)
 rm -f "$TMP_SORTED"
 
-# ───── Calculate summary for output header ─────
+# ───── Summary ─────
 TOTAL_DUPLICATE_GROUPS=$(echo "$DUP_HASHES" | wc -l)
 TOTAL_DUPLICATE_FILES=$(cut -d',' -f1 "$INPUT_FILE" | grep -F -f <(echo "$DUP_HASHES") | wc -l)
 
-# ───── Write header comment to output file ─────
 {
     echo "# Duplicate Hashes Report"
     echo "# Source file          : $(basename "$INPUT_FILE")"
@@ -113,7 +118,7 @@ TOTAL_DUPLICATE_FILES=$(cut -d',' -f1 "$INPUT_FILE" | grep -F -f <(echo "$DUP_HA
     echo "#"
 } >> "$OUTPUT_FILE"
 
-# ───── Process and display progress ─────
+# ───── Display Progress ─────
 HASHES_ARRAY=($SORTED_HASHES)
 TOTAL_HASHES=${#HASHES_ARRAY[@]}
 COUNT=0
@@ -129,7 +134,7 @@ for hash in "${HASHES_ARRAY[@]}"; do
     grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
     echo "" >> "$OUTPUT_FILE"
 
-    sleep 0.01  # slight delay for smoother progress bar visual
+    sleep 0.01
 done
 
 echo -e "\n${GREEN}[INFO]${NC} Done! Duplicate hashes written to: $OUTPUT_FILE"
