@@ -12,13 +12,25 @@ The point of this project is the following:
 - Allow the file to be ingested into a SIEM tool such as Splunk
 - Recognise and delete duplicate hashes
 
-## Examples
+
+## Setup
+- Download the project from Git
+- On your NAS drive create a new folder called 'hasher'
+- SCP or copy the hasher project into this space and check the permissions and ownership
+- run hasher.sh to begin the main process
+
+### Examples Stage1 - Hashing
 
 <pre>
  ./hasher.sh --pathfile paths.txt --algo sha256 --background
  ./hasher.sh --pathfile paths.txt --algo sha256
  ./find-duplicates.sh hasher/hasher-2025-07-29.txt
 </pre>
+
+## Stage 2 - Duplicates
+- Run the 'find-duplicates.sh' process
+- This will output all the duplicate hashes
+- A later stage of the project will assist with the deletion of identified duplicates
 
 ## Directory structure
 
