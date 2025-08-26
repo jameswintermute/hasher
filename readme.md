@@ -96,4 +96,4 @@ Notes
 Related Reading
 
     Facebook Silent Data Corruption
-
+https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/
