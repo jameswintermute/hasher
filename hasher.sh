@@ -10,6 +10,7 @@ BACKGROUND_LOG="background.log"
 POSITIONAL=()
 ALGO="sha256sum"
 PATHFILE=""
+EXCLUSIONS_FILE="exclusions.txt"
 
 # ───── Colors ─────
 RED='\033[0;31m'
@@ -76,43 +77,20 @@ main() {
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
     mkdir -p "$HASHES_DIR"
+    echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
+    log_info "Using output file: $OUTPUT"
 
-    # ───── Load Exclusions ─────
-    EXCLUSIONS_FILE="exclusions.txt"
-    EXCLUDE_ARGS=()
-    ACTIVE_EXCLUSIONS=()
-
+    # ───── Load exclusions ─────
+    EXCLUSIONS=()
     if [[ -f "$EXCLUSIONS_FILE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" || "$line" =~ ^# ]] && continue
-            EXCLUDE_ARGS+=(-name "$line" -o)
-            ACTIVE_EXCLUSIONS+=("$line")
+            EXCLUSIONS+=("$line")
         done < "$EXCLUSIONS_FILE"
-        log_info "Loaded exclusions from $EXCLUSIONS_FILE: ${ACTIVE_EXCLUSIONS[*]}"
-    else
-        # Default exclusions if no file exists
-        EXCLUDE_ARGS=(-name "#recycle" -o -name "@SynoEAStream" -o)
-        ACTIVE_EXCLUSIONS=("#recycle" "@SynoEAStream")
-        log_info "No exclusions.txt found, using defaults: ${ACTIVE_EXCLUSIONS[*]}"
+        log_info "Loaded ${#EXCLUSIONS[@]} exclusions from $EXCLUSIONS_FILE"
     fi
 
-    # Write CSV header and exclusions note
-    {
-        echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\""
-        echo "# Exclusions: ${ACTIVE_EXCLUSIONS[*]}"
-    } > "$OUTPUT"
-
-    # Append exclusions list to run log
-    {
-        echo "Hasher run exclusions:"
-        for ex in "${ACTIVE_EXCLUSIONS[@]}"; do
-            echo " - $ex"
-        done
-        echo ""
-    } >> "$LOG_FILE"
-
-    log_info "Using output file: $OUTPUT"
-
+    # ───── Load paths from --pathfile if given ─────
     if [[ -n "$PATHFILE" ]]; then
         if [[ ! -f "$PATHFILE" ]]; then
             log_error "Path file '$PATHFILE' does not exist."
@@ -131,15 +109,19 @@ main() {
         exit 1
     fi
 
-    # ───── Collect Files ─────
     FILES=()
     for path in "$@"; do
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
-                FILES+=("$file")
-            done < <(
-                find "$path" \( "${EXCLUDE_ARGS[@]}" -false \) -prune -o -type f -print0
-            )
+                skip=false
+                for excl in "${EXCLUSIONS[@]}"; do
+                    if [[ "$file" == *"$excl"* ]]; then
+                        skip=true
+                        break
+                    fi
+                done
+                $skip || FILES+=("$file")
+            done < <(find "$path" -type f -print0)
         elif [ -f "$path" ]; then
             FILES+=("$path")
         else
@@ -147,11 +129,21 @@ main() {
         fi
     done
 
+    # ───── Counting section ─────
     echo "Starting Hasher" | tee -a "$LOG_FILE"
     total_count=0
     for path in "$@"; do
         if [ -d "$path" ]; then
-            count=$(find "$path" \( "${EXCLUDE_ARGS[@]}" -false \) -prune -o -type f -print 2>/dev/null | wc -l)
+            count=$(find "$path" -type f 2>/dev/null | while read -r f; do
+                skip=false
+                for excl in "${EXCLUSIONS[@]}"; do
+                    if [[ "$f" == *"$excl"* ]]; then
+                        skip=true
+                        break
+                    fi
+                done
+                $skip || echo "$f"
+            done | wc -l)
         elif [ -f "$path" ]; then
             count=1
         else
@@ -173,7 +165,6 @@ main() {
     else
         total_fmt="$total_count"
     fi
-
     echo "- Total files to hash: $total_fmt" | tee -a "$LOG_FILE"
 
     TOTAL=${#FILES[@]}
@@ -231,6 +222,9 @@ main() {
     rm -f "$PROGRESS_FLAG_FILE"
     wait "$PROGRESS_LOGGER_PID" 2>/dev/null
     rm -f "$PROGRESS_COUNT_FILE"
+
+    # ───── Final Progress Log ─────
+    echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $TOTAL / $TOTAL files hashed (100%)" >> "$BACKGROUND_LOG"
 
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
