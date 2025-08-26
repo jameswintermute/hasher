@@ -1,5 +1,13 @@
+# Exclusions for hasher
+# Lines starting with # are comments
+
+# Common recycle / Synology folders
 #recycle
 @SynoEAStream
+
+# Development artifacts
 node_modules
-.DS_Store
 .git
+
+# macOS system file
+.DS_Store
