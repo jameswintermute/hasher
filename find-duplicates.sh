@@ -40,17 +40,17 @@ if [ ! -d "$HASH_DIR" ]; then
     exit 1
 fi
 
-log_info "Scanning most recent hash files in '$HASH_DIR'..."
+log_info "Scanning most recent CSV hash files in '$HASH_DIR'..."
 
-FILES=($(ls -t "$HASH_DIR"/hasher-*.txt 2>/dev/null | head -n 10))
+FILES=($(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 10))
 if [ ${#FILES[@]} -eq 0 ]; then
-    log_error "No hasher-*.txt files found in '$HASH_DIR'"
+    log_error "No hasher-*.csv files found in '$HASH_DIR'"
     exit 1
 fi
 
 # ───── User Selection ─────
 echo ""
-echo "Select a hash file to process:"
+echo "Select a CSV hash file to process:"
 for i in "${!FILES[@]}"; do
     index=$((i + 1))
     filename=$(basename "${FILES[$i]}")
@@ -93,7 +93,7 @@ echo "$DUP_HASHES" > "$dup_hash_file"
 
 TMP_SORTED=$(mktemp)
 
-awk -F, '
+awk -F',' '
     NR==FNR { d[$1]=1; next }
     d[$1] { counts[$1]++ }
     END { for (h in counts) print counts[h] "," h }
