@@ -2,7 +2,7 @@
 # Lines starting with # are comments
 
 # Common recycle / Synology folders
-#recycle
+\#recycle
 @SynoEAStream
 
 # Development artifacts
