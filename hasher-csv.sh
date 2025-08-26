@@ -76,7 +76,41 @@ main() {
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
     mkdir -p "$HASHES_DIR"
-    echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
+
+    # ───── Load Exclusions ─────
+    EXCLUSIONS_FILE="exclusions.txt"
+    EXCLUDE_ARGS=()
+    ACTIVE_EXCLUSIONS=()
+
+    if [[ -f "$EXCLUSIONS_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            EXCLUDE_ARGS+=(-name "$line" -o)
+            ACTIVE_EXCLUSIONS+=("$line")
+        done < "$EXCLUSIONS_FILE"
+        log_info "Loaded exclusions from $EXCLUSIONS_FILE: ${ACTIVE_EXCLUSIONS[*]}"
+    else
+        # Default exclusions if no file exists
+        EXCLUDE_ARGS=(-name "#recycle" -o -name "@SynoEAStream" -o)
+        ACTIVE_EXCLUSIONS=("#recycle" "@SynoEAStream")
+        log_info "No exclusions.txt found, using defaults: ${ACTIVE_EXCLUSIONS[*]}"
+    fi
+
+    # Write CSV header and exclusions note
+    {
+        echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\""
+        echo "# Exclusions: ${ACTIVE_EXCLUSIONS[*]}"
+    } > "$OUTPUT"
+
+    # Append exclusions list to run log
+    {
+        echo "Hasher run exclusions:"
+        for ex in "${ACTIVE_EXCLUSIONS[@]}"; do
+            echo " - $ex"
+        done
+        echo ""
+    } >> "$LOG_FILE"
+
     log_info "Using output file: $OUTPUT"
 
     if [[ -n "$PATHFILE" ]]; then
@@ -97,12 +131,15 @@ main() {
         exit 1
     fi
 
+    # ───── Collect Files ─────
     FILES=()
     for path in "$@"; do
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
                 FILES+=("$file")
-            done < <(find "$path" -type d -name '#recycle' -prune -o -type f -print0)
+            done < <(
+                find "$path" \( "${EXCLUDE_ARGS[@]}" -false \) -prune -o -type f -print0
+            )
         elif [ -f "$path" ]; then
             FILES+=("$path")
         else
@@ -114,7 +151,7 @@ main() {
     total_count=0
     for path in "$@"; do
         if [ -d "$path" ]; then
-            count=$(find "$path" -type d -name '#recycle' -prune -o -type f -print 2>/dev/null | wc -l)
+            count=$(find "$path" \( "${EXCLUDE_ARGS[@]}" -false \) -prune -o -type f -print 2>/dev/null | wc -l)
         elif [ -f "$path" ]; then
             count=1
         else
