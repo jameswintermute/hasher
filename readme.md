@@ -1,46 +1,99 @@
+# NAS File Hasher & Duplicate Finder
 
-## About
-- A project by James Wintermute, jameswinter@protonmail.ch. Started December 2022. 
-- Overhauled Summer 2025 with assistance from ChatGPT
- 
-## Purpose
-The point of this project is the following:
+## Quickstart
 
-- Create a hash of all files on a NAS drive, user(s) home paths.
-- Store this and use it as a point of reference in disk rotation to spot significant amounts of file change
-- Ransomware and Malware are increasingly destructive and how would a user identify if many of their files had been corrupted or destroyed
-- Allow the file to be ingested into a SIEM tool such as Splunk
-- Recognise and delete duplicate hashes
+```bash
+# Clone the repo
+git clone https://github.com/yourusername/hasher.git
+cd hasher
 
+# Make scripts executable
+chmod +x hasher.sh find-duplicates.sh
 
-## Setup
-- Download the project from Git
-- On your NAS drive create a new folder called 'hasher'
-- SCP or copy the hasher project into this space and check the permissions and ownership
-- run hasher.sh to begin the main process
+# Run hasher (foreground example)
+./hasher.sh --pathfile paths.txt --algo sha256
 
-### Examples Stage1 - Hashing
+# Run duplicate finder
+./find-duplicates.sh
 
-<pre>
- ./hasher.sh --pathfile paths.txt --algo sha256 --background
- ./hasher.sh --pathfile paths.txt --algo sha256
- ./find-duplicates.sh hasher/hasher-2025-07-29.txt
-</pre>
+About
 
-## Stage 2 - Duplicates
-- Run the 'find-duplicates.sh' process
-- This will output all the duplicate hashes
-- A later stage of the project will assist with the deletion of identified duplicates
+    A project by James Wintermute (jameswinter@protonmail.ch).
 
-## Directory structure
+    Originally started in December 2022.
 
-<pre>
+    Overhauled in Summer 2025 with assistance from ChatGPT.
+
+Purpose
+
+This project is designed to help protect NAS-stored data by:
+
+    Generating cryptographic hashes of all files in user home directories.
+
+    Providing a baseline for monitoring changes during disk rotation.
+
+    Helping detect mass corruption or destruction of files (e.g., from ransomware/malware).
+
+    Supporting ingestion into SIEM tools (e.g., Splunk) for further monitoring and alerting.
+
+    Identifying and managing duplicate files via duplicate hash detection.
+
+Setup
+
+    Download or clone this repository.
+
+    On your NAS, create a working directory (e.g. hasher/).
+
+    Copy the project files into this directory, ensuring correct permissions and ownership.
+
+    Run the hashing script (hasher.sh) to start generating hashes.
+
+Usage
+Stage 1 – Hashing
+
+Run the hasher with your chosen options:
+
+# Run in background
+./hasher.sh --pathfile paths.txt --algo sha256 --background
+
+# Run in foreground
+./hasher.sh --pathfile paths.txt --algo sha256
+
+This generates a dated CSV file under hashes/.
+Stage 2 – Duplicate Detection
+
+Run the duplicate finder:
+
+./find-duplicates.sh
+
+    The script will prompt you to select a recent hash CSV file.
+
+    It outputs a summary report of duplicate hashes to duplicate-hashes/.
+
+    (Future update: automated duplicate cleanup options).
+
+Directory Structure
+
+Example layout after a few runs:
+
 ├── background.log
-└── hashes/
-    ├── hasher-2025-07-29.txt
-    └── hasher-YYYY-MM-DD.txt (future runs)
-</pre>
+├── hashes/
+│   ├── hasher-2025-07-29.csv
+│   ├── hasher-2025-08-05.csv
+│   └── hasher-YYYY-MM-DD.csv
+└── duplicate-hashes/
+    ├── 2025-07-29-duplicate-hashes.txt
+    └── 2025-08-05-duplicate-hashes.txt
 
-## See also:
-[Facebook Silent Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
+Notes
+
+    Exclusions are configurable (e.g., .git, node_modules, system files).
+
+    Hash algorithm is selectable (sha256 recommended).
+
+    Scripts are POSIX-compliant and tested on Linux (Synology DSM & Ubuntu).
+
+Related Reading
+
+    Facebook Silent Data Corruption
 
