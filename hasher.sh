@@ -5,7 +5,7 @@ HASHES_DIR="hashes"
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
-ZERO_FILE_CSV="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
+ZERO_OUTPUT="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
 LOG_FILE="hasher-logs.txt"
 BACKGROUND_LOG="background.log"
 POSITIONAL=()
@@ -27,41 +27,18 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 # ───── Parse Flags ─────
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --output)
-            OUTPUT="$2"
-            shift 2
-            ;;
+        --output) OUTPUT="$2"; shift 2 ;;
         --algo)
             case "$2" in
-                sha256|sha1|md5)
-                    ALGO="${2}sum"
-                    ;;
-                *)
-                    log_error "Unsupported algorithm: $2. Use sha256, sha1, or md5."
-                    exit 1
-                    ;;
+                sha256|sha1|md5) ALGO="${2}sum";;
+                *) log_error "Unsupported algorithm: $2"; exit 1 ;;
             esac
-            shift 2
-            ;;
-        --pathfile)
-            PATHFILE="$2"
-            shift 2
-            ;;
-        --background)
-            RUN_IN_BACKGROUND=true
-            shift
-            ;;
-        --internal)
-            shift
-            ;;
-        -*|--*)
-            log_error "Unknown option $1"
-            exit 1
-            ;;
-        *)
-            POSITIONAL+=("$1")
-            shift
-            ;;
+            shift 2 ;;
+        --pathfile) PATHFILE="$2"; shift 2 ;;
+        --background) RUN_IN_BACKGROUND=true; shift ;;
+        --internal) shift ;;  # used for background re-invoke
+        -*|--*) log_error "Unknown option $1"; exit 1 ;;
+        *) POSITIONAL+=("$1"); shift ;;
     esac
 done
 
@@ -79,10 +56,9 @@ main() {
 
     mkdir -p "$HASHES_DIR"
     echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
-    echo "\"Directory\",\"File\",\"Timestamp\"" > "$ZERO_FILE_CSV"
-
+    echo "\"File\",\"Directory\",\"Timestamp\"" > "$ZERO_OUTPUT"
     log_info "Using output file: $OUTPUT"
-    log_info "Zero-length files will be logged to: $ZERO_FILE_CSV"
+    log_info "Zero-length files will be logged to: $ZERO_OUTPUT"
 
     # ───── Load exclusions ─────
     EXCLUSIONS=()
@@ -107,12 +83,12 @@ main() {
     fi
 
     set -- "${POSITIONAL[@]}"
-
     if [ $# -eq 0 ]; then
         echo -e "${YELLOW}Usage:${NC} $0 [--output file] [--algo sha256|sha1|md5] [--pathfile file] [--background] <file_or_dir1> [...]"
         exit 1
     fi
 
+    # ───── Build file list ─────
     FILES=()
     for path in "$@"; do
         if [ -d "$path" ]; then
@@ -130,31 +106,20 @@ main() {
         fi
     done
 
-    # ───── Counting section ─────
+    # ───── Counting ─────
     echo "Starting Hasher" | tee -a "$LOG_FILE"
-    total_count=0
-    for path in "$@"; do
-        if [ -d "$path" ]; then
-            count=$(find "$path" -type f 2>/dev/null | while read -r f; do
-                skip=false
-                for excl in "${EXCLUSIONS[@]}"; do
-                    [[ "$f" == *"$excl"* ]] && skip=true && break
-                done
-                $skip || echo "$f"
-            done | wc -l)
-        elif [ -f "$path" ]; then
-            count=1
-        else
-            count=0
-        fi
-        total_count=$((total_count + count))
-        echo "- $count $path" | tee -a "$LOG_FILE"
-    done
-    echo "- Total files to hash: $total_count" | tee -a "$LOG_FILE"
-
     TOTAL=${#FILES[@]}
-    COUNT=0
+    echo "- Total files to hash: $TOTAL" | tee -a "$LOG_FILE"
 
+    # ───── Multi-core check ─────
+    MULTICORE=false
+    NPROC=$(nproc 2>/dev/null || echo 1)
+    if (( NPROC > 1 )); then
+        read -rp "System has $NPROC cores, use multi-core hashing? (y/N): " use_multi
+        [[ "$use_multi" =~ ^[Yy]$ ]] && MULTICORE=true
+    fi
+
+    # ───── Setup progress tracking ─────
     PROGRESS_COUNT_FILE=".hasher_progress_count"
     PROGRESS_FLAG_FILE=".hasher_running"
     echo 0 > "$PROGRESS_COUNT_FILE"
@@ -162,13 +127,9 @@ main() {
 
     progress_logger() {
         while [[ -f "$PROGRESS_FLAG_FILE" ]]; do
-            if [[ -f "$PROGRESS_COUNT_FILE" ]]; then
-                COUNT=$(cat "$PROGRESS_COUNT_FILE")
-            else
-                COUNT=0
-            fi
+            COUNT=$(cat "$PROGRESS_COUNT_FILE" 2>/dev/null || echo 0)
             PERCENT=0
-            (( TOTAL > 0 )) && PERCENT=$((COUNT * 100 / TOTAL))
+            (( TOTAL>0 )) && PERCENT=$((COUNT*100/TOTAL))
             echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $COUNT / $TOTAL files hashed ($PERCENT%)" >> "$BACKGROUND_LOG"
             sleep 15
         done
@@ -176,41 +137,53 @@ main() {
     progress_logger &
     PROGRESS_LOGGER_PID=$!
 
-    # ───── Main hashing loop ─────
-    for file in "${FILES[@]}"; do
-        COUNT=$((COUNT + 1))
-        echo "$COUNT" > "$PROGRESS_COUNT_FILE"
-
-        printf "[%d/%d] Processing: %s\n" "$COUNT" "$TOTAL" "$file"
-
+    # ───── Hashing loop ─────
+    hash_file() {
+        local file="$1"
         if [ ! -f "$file" ]; then
             log_error "File '$file' not found!"
-            continue
+            return
         fi
 
         SIZE_BYTES=$(stat -c %s "$file" 2>/dev/null)
-        if [[ -z "$SIZE_BYTES" || "$SIZE_BYTES" == "0" ]]; then
-            DATE=$(date +"%Y-%m-%d %H:%M:%S")
-            DIRNAME=$(dirname "$file")
-            echo "\"$DIRNAME\",\"$file\",\"$DATE\"" >> "$ZERO_FILE_CSV"
-            log_warn "Zero-length file skipped: $file"
-            continue
+        if [[ "$SIZE_BYTES" -eq 0 ]]; then
+            echo "\"$file\",\"$(dirname "$file")\",\"$(date +"%Y-%m-%d %H:%M:%S")\"" >> "$ZERO_OUTPUT"
+            return
         fi
 
         HASH=$(stdbuf -oL "$ALGO" "$file" | awk '{print $1}')
         DATE=$(date +"%Y-%m-%d %H:%M:%S")
-        PWD=$(dirname "$file")
+        DIR=$(dirname "$file")
         SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
 
-        log_info "Hashed '$file'"
-        echo "\"$HASH\",\"$PWD\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\"" >> "$OUTPUT"
-    done
+        # ───── flock write for safety ─────
+        {
+            flock 200
+            echo "\"$HASH\",\"$DIR\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\"" >> "$OUTPUT"
+        } 200>"$OUTPUT".lock
 
+        echo "$file" >> "$PROGRESS_COUNT_FILE" # count progress
+        log_info "Hashed '$file'"
+    }
+
+    if [ "$MULTICORE" = true ]; then
+        export -f hash_file
+        export OUTPUT PROGRESS_COUNT_FILE ALGO
+        printf "%s\n" "${FILES[@]}" | xargs -n 1 -P "$NPROC" -I {} bash -c 'hash_file "$@"' _ {}
+    else
+        for file in "${FILES[@]}"; do
+            COUNT=$((COUNT+1))
+            echo "$COUNT" > "$PROGRESS_COUNT_FILE"
+            hash_file "$file"
+        done
+    fi
+
+    # ───── Cleanup progress ─────
     rm -f "$PROGRESS_FLAG_FILE"
     wait "$PROGRESS_LOGGER_PID" 2>/dev/null
     rm -f "$PROGRESS_COUNT_FILE"
 
-    # ───── Final Progress Log ─────
+    # ───── Final explicit 100% progress ─────
     echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $TOTAL / $TOTAL files hashed (100%)" >> "$BACKGROUND_LOG"
 
     END_TIME=$(date +%s)
@@ -222,7 +195,7 @@ main() {
         echo "Algorithm used      : $ALGO"
         echo "Files hashed        : $TOTAL"
         echo "Output file         : $OUTPUT"
-        echo "Zero-length files   : $ZERO_FILE_CSV"
+        echo "Zero-length files   : $ZERO_OUTPUT"
         echo "Run time (seconds)  : $DURATION"
         echo "========================================="
         echo ""
