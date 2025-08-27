@@ -51,6 +51,7 @@ choose_report() {
 
     flush_input
     read -rp "Enter report number: " choice
+
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice >= i )); then
         log_error "Invalid selection"
         exit 1
