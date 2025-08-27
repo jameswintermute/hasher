@@ -1,7 +1,7 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
-# Added --preview mode
+# Added --preview mode, fixed report selection
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
@@ -23,24 +23,14 @@ done
 
 mkdir -p "$REPORT_DIR"
 
-log_info() {
-    echo -e "[INFO] $*"
-}
+log_info() { echo -e "[INFO] $*"; }
+log_warn() { echo -e "[WARN] $*" >&2; }
+log_error() { echo -e "[ERROR] $*" >&2; }
 
-log_warn() {
-    echo -e "[WARN] $*" >&2
-}
-
-log_error() {
-    echo -e "[ERROR] $*" >&2
-}
-
-# Flush any buffered input (run once at start)
 flush_input() {
     while read -t 0.1 -r -n 10000; do :; done
 }
 
-# Calculate expected disk saving so far
 calc_plan_size() {
     if [[ -f "$PLAN_FILE" ]]; then
         awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
@@ -49,37 +39,39 @@ calc_plan_size() {
     fi
 }
 
-# Prompt user to pick report
-choose_report() {
-    local reports=("$REPORT_DIR"/*-duplicate-hashes.txt)
-    if [[ ! -e "${reports[0]}" ]]; then
-        log_error "No duplicate reports found in $REPORT_DIR"
-        exit 1
-    fi
+# -------------------------
+# Corrected report selection
+# -------------------------
+mapfile -t reports < <(ls -1t "$REPORT_DIR"/*-duplicate-hashes.txt 2>/dev/null)
 
-    log_info "Available duplicate reports:"
-    local i=1
-    for r in "${reports[@]}"; do
-        echo "  [$i] $(basename "$r")"
-        ((i++))
-    done
+if [[ ${#reports[@]} -eq 0 ]]; then
+    log_error "No duplicate reports found in $REPORT_DIR"
+    exit 1
+fi
 
+log_info "Available duplicate reports:"
+for i in "${!reports[@]}"; do
+    echo "  [$((i+1))] $(basename "${reports[$i]}")"
+done
+
+while true; do
     read -rp "Enter report number: " choice
-
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice >= i )); then
-        log_error "Invalid selection"
-        exit 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#reports[@]} )); then
+        REPORT_FILE="${reports[$((choice-1))]}"
+        break
+    else
+        echo "[WARN] Invalid selection, try again."
     fi
+done
 
-    echo "${reports[$((choice-1))]}"
-}
-
-flush_input
-
-REPORT_FILE=$(choose_report)
 REPORT_NAME=$(basename "$REPORT_FILE")
 log_info "Using report: $REPORT_NAME"
 
+flush_input
+
+# -------------------------
+# Prepare duplicate groups
+# -------------------------
 TMP_GROUPS=$(mktemp)
 awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
@@ -125,7 +117,7 @@ while read -r HASH; do
 
     if [[ "$PREVIEW_MODE" == true ]]; then
         echo "[Preview mode] Skipping deletion prompt..."
-        sleep 1
+        read -rp "Press Enter to continue..."
         ((GROUPS_PROCESSED++))
         continue
     fi
@@ -138,7 +130,6 @@ while read -r HASH; do
         echo "  $((i+1)) = Delete file: ${FILES[$i]} (${SIZES[$i]} MB)"
     done
 
-    # Wait for valid input
     while true; do
         read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
         choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
