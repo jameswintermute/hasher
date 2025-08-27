@@ -113,6 +113,11 @@ main() {
     for path in "$@"; do
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
+                # Skip zero-length and metadata files
+                [[ ! -s "$file" ]] && continue
+                [[ "$file" =~ @eaDir ]] && continue
+                [[ "$file" =~ SynoResource ]] && continue
+
                 skip=false
                 for excl in "${EXCLUSIONS[@]}"; do
                     if [[ "$file" == *"$excl"* ]]; then
@@ -123,6 +128,7 @@ main() {
                 $skip || FILES+=("$file")
             done < <(find "$path" -type f -print0)
         elif [ -f "$path" ]; then
+            [[ ! -s "$path" ]] && continue
             FILES+=("$path")
         else
             log_warn "Path '$path' does not exist or is not a regular file/directory."
@@ -135,17 +141,17 @@ main() {
     for path in "$@"; do
         if [ -d "$path" ]; then
             count=$(find "$path" -type f 2>/dev/null | while read -r f; do
+                [[ ! -s "$f" ]] && continue
+                [[ "$f" =~ @eaDir ]] && continue
+                [[ "$f" =~ SynoResource ]] && continue
                 skip=false
                 for excl in "${EXCLUSIONS[@]}"; do
-                    if [[ "$f" == *"$excl"* ]]; then
-                        skip=true
-                        break
-                    fi
+                    [[ "$f" == *"$excl"* ]] && skip=true
                 done
                 $skip || echo "$f"
             done | wc -l)
         elif [ -f "$path" ]; then
-            count=1
+            [[ ! -s "$path" ]] && count=0 || count=1
         else
             count=0
         fi
@@ -193,6 +199,7 @@ main() {
     progress_logger &
     PROGRESS_LOGGER_PID=$!
 
+    # ───── Hashing section ─────
     for file in "${FILES[@]}"; do
         COUNT=$((COUNT + 1))
         echo "$COUNT" > "$PROGRESS_COUNT_FILE"
