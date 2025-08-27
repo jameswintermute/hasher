@@ -1,14 +1,16 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
-# Added --preview mode, fixed report selection
+# Fixed report selection, robust interactive review
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
 CHECKPOINT_FILE="$REPORT_DIR/.checkpoint"
 PREVIEW_MODE=false
 
+# --------------------------
 # Parse flags
+# --------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
         --preview)
@@ -39,10 +41,12 @@ calc_plan_size() {
     fi
 }
 
-# -------------------------
+# --------------------------
 # Corrected report selection
-# -------------------------
-mapfile -t reports < <(ls -1t "$REPORT_DIR"/*-duplicate-hashes.txt 2>/dev/null)
+# --------------------------
+shopt -s nullglob
+reports=("$REPORT_DIR"/*-duplicate-hashes.txt)
+shopt -u nullglob
 
 if [[ ${#reports[@]} -eq 0 ]]; then
     log_error "No duplicate reports found in $REPORT_DIR"
@@ -54,6 +58,7 @@ for i in "${!reports[@]}"; do
     echo "  [$((i+1))] $(basename "${reports[$i]}")"
 done
 
+# Prompt user for selection
 while true; do
     read -rp "Enter report number: " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#reports[@]} )); then
@@ -66,12 +71,11 @@ done
 
 REPORT_NAME=$(basename "$REPORT_FILE")
 log_info "Using report: $REPORT_NAME"
-
 flush_input
 
-# -------------------------
+# --------------------------
 # Prepare duplicate groups
-# -------------------------
+# --------------------------
 TMP_GROUPS=$(mktemp)
 awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
