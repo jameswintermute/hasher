@@ -54,9 +54,10 @@ truncate_path() {
 
 sanitize_path() {
     local path="$1"
-    path="${path//\"/}"       # remove quotes
-    path="${path%@*}"         # remove @SynoResource or @ metadata
-    path="${path%"'"}"        # remove trailing single quote
+    path="${path//\"/}"             # remove quotes
+    path="${path%@*}"               # remove @SynoResource or @ metadata
+    path="${path%"'"}"              # remove trailing single quote
+    path="$(echo -e "${path}" | tr -d '\r')"  # remove carriage returns
     path="$(echo -e "${path}" | sed -e 's/[[:space:]]*$//')"  # remove trailing whitespace
     echo "$path"
 }
@@ -126,7 +127,6 @@ echo "" >> "$PLAN_FILE"
 # --------------------------
 log_info "Starting interactive review..."
 while read -r HASH; do
-    # Skip empty hashes
     [[ -z "$HASH" ]] && continue
 
     ((CURRENT_GROUP++))
@@ -135,14 +135,19 @@ while read -r HASH; do
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
     echo "Duplicate hash: \"$HASH\""
 
-    # Extract files and sizes
+    # Extract files and sizes, sanitize, and deduplicate
+    declare -A seen
     FILES=()
     SIZES=()
     while IFS=, read -r csv_hash _ path _ _ size _; do
         csv_hash="${csv_hash//\"/}"
         [[ "$csv_hash" != "$HASH" ]] && continue
         sanitized=$(sanitize_path "$path")
-        [[ -n "$sanitized" ]] && FILES+=("$sanitized") && SIZES+=("$size")
+        [[ -n "$sanitized" ]] || continue
+        [[ -n "${seen[$sanitized]}" ]] && continue
+        seen["$sanitized"]=1
+        FILES+=("$sanitized")
+        SIZES+=("$size")
     done < "$REPORT_FILE"
 
     # Skip group if less than 2 valid files
