@@ -5,7 +5,7 @@ HASHES_DIR="hashes"
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
-ZERO_LEN_FILE="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
+ZERO_FILE="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
 LOG_FILE="hasher-logs.txt"
 BACKGROUND_LOG="background.log"
 POSITIONAL=()
@@ -74,15 +74,16 @@ if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
     exit 0
 fi
 
+# ───── Main function ─────
 main() {
     START_TIME=$(date +%s)
     NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
 
     mkdir -p "$HASHES_DIR"
     echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
-    echo "\"File\",\"Directory\",\"Timestamp\",\"Size_MB\"" > "$ZERO_LEN_FILE"
+    echo "\"File\",\"Directory\",\"Timestamp\"" > "$ZERO_FILE"
     log_info "Using output file: $OUTPUT"
-    log_info "Zero-length files will be logged to: $ZERO_LEN_FILE"
+    log_info "Zero-length files will be logged to: $ZERO_FILE"
 
     # ───── Load exclusions ─────
     EXCLUSIONS=()
@@ -107,7 +108,6 @@ main() {
     fi
 
     set -- "${POSITIONAL[@]}"
-
     if [ $# -eq 0 ]; then
         echo -e "${YELLOW}Usage:${NC} $0 [--output file] [--algo sha256|sha1|md5] [--pathfile file] [--background] <file_or_dir1> [...]"
         exit 1
@@ -119,10 +119,7 @@ main() {
             while IFS= read -r -d '' file; do
                 skip=false
                 for excl in "${EXCLUSIONS[@]}"; do
-                    if [[ "$file" == *"$excl"* ]]; then
-                        skip=true
-                        break
-                    fi
+                    [[ "$file" == *"$excl"* ]] && skip=true && break
                 done
                 $skip || FILES+=("$file")
             done < <(find "$path" -type f -print0)
@@ -134,28 +131,14 @@ main() {
     done
 
     TOTAL=${#FILES[@]}
-    echo "Starting Hasher"
-    echo "- Total files to hash: $TOTAL"
-
-    MULTICORE=false
-    if [ "$RUN_IN_BACKGROUND" = false ] && command -v nproc >/dev/null 2>&1; then
-        NUM_CORES=$(nproc)
-        read -rp "System has $NUM_CORES cores, use multi-core hashing? (y/N): " choice
-        if [[ "$choice" =~ ^[Yy]$ ]]; then
-            MULTICORE=true
-        fi
-    elif command -v nproc >/dev/null 2>&1; then
-        NUM_CORES=$(nproc)
-        log_info "Background mode: system has $NUM_CORES cores. Running multi-core hashing automatically."
-        MULTICORE=true
-    fi
-
     COUNT=0
+
     PROGRESS_COUNT_FILE=".hasher_progress_count"
     PROGRESS_FLAG_FILE=".hasher_running"
     echo 0 > "$PROGRESS_COUNT_FILE"
     touch "$PROGRESS_FLAG_FILE"
 
+    # ───── Progress logger ─────
     progress_logger() {
         while [[ -f "$PROGRESS_FLAG_FILE" ]]; do
             if [[ -f "$PROGRESS_COUNT_FILE" ]]; then
@@ -164,9 +147,7 @@ main() {
                 COUNT=0
             fi
             PERCENT=0
-            if (( TOTAL > 0 )); then
-                PERCENT=$((COUNT * 100 / TOTAL))
-            fi
+            (( TOTAL > 0 )) && PERCENT=$((COUNT * 100 / TOTAL))
             echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $COUNT / $TOTAL files hashed ($PERCENT%)" >> "$BACKGROUND_LOG"
             sleep 15
         done
@@ -174,9 +155,9 @@ main() {
     progress_logger &
     PROGRESS_LOGGER_PID=$!
 
+    # ───── Function to hash a single file ─────
     hash_file() {
         local file="$1"
-
         if [ ! -f "$file" ]; then
             log_error "File '$file' not found!"
             return
@@ -184,25 +165,38 @@ main() {
 
         SIZE_BYTES=$(stat -c %s "$file" 2>/dev/null)
         if [[ "$SIZE_BYTES" -eq 0 ]]; then
-            DATE=$(date +"%Y-%m-%d %H:%M:%S")
-            flock "$ZERO_LEN_FILE" bash -c "echo \"$file\",\"$(dirname "$file")\",\"$DATE\",\"0.00\" >> \"$ZERO_LEN_FILE\""
+            DATE_NOW=$(date +"%Y-%m-%d %H:%M:%S")
+            echo "\"$file\",\"$(dirname "$file")\",\"$DATE_NOW\"" >> "$ZERO_FILE"
             return
         fi
 
-        SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
         HASH=$(stdbuf -oL "$ALGO" "$file" | awk '{print $1}')
         DATE=$(date +"%Y-%m-%d %H:%M:%S")
         PWD=$(dirname "$file")
+        SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
 
-        flock "$OUTPUT" bash -c "echo \"$HASH\",\"$PWD\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\" >> \"$OUTPUT\""
+        # ───── FLOCK to avoid concurrent writes ─────
+        (
+            flock 200
+            echo "\"$HASH\",\"$PWD\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\"" >> "$OUTPUT"
+        ) 200>"$OUTPUT".lock
+
         log_info "Hashed '$file'"
     }
 
-    export -f hash_file
-    export ALGO OUTPUT ZERO_LEN_FILE LOG_FILE
+    # ───── Multi-core detection ─────
+    NUM_CORES=$(nproc 2>/dev/null || echo 1)
+    MULTICORE=false
+    if [ "$NUM_CORES" -gt 1 ]; then
+        read -p "System has $NUM_CORES cores, use multi-core hashing? (y/N): " yn
+        case "$yn" in
+            [Yy]*) MULTICORE=true ;;
+        esac
+    fi
 
+    # ───── Main hashing loop ─────
     if [ "$MULTICORE" = true ]; then
-        printf "%s\n" "${FILES[@]}" | xargs -0 -n1 -P"$NUM_CORES" bash -c 'hash_file "$0"' 
+        printf "%s\0" "${FILES[@]}" | xargs -0 -n1 -P"$NUM_CORES" bash -c 'hash_file "$0"' 
     else
         for file in "${FILES[@]}"; do
             COUNT=$((COUNT + 1))
@@ -227,8 +221,8 @@ main() {
         echo "Algorithm used      : $ALGO"
         echo "Files hashed        : $TOTAL"
         echo "Output file         : $OUTPUT"
+        echo "Zero-length files   : $ZERO_FILE"
         echo "Run time (seconds)  : $DURATION"
-        echo "Zero-length files   : $ZERO_LEN_FILE"
         echo "========================================="
         echo ""
     } >> "$LOG_FILE"
