@@ -1,6 +1,7 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
+# Enhanced: auto-detect file sizes from filesystem
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
@@ -89,8 +90,8 @@ flush_input
 # --------------------------
 TMP_GROUPS=$(mktemp)
 
-# ONLY take lines starting with a SHA256 hash (64 hex chars), ignore comments and IDs
-grep -E '^"[0-9a-f]{64}"' "$REPORT_FILE" | awk -F, '{print $1}' | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
+# Only lines starting with quoted SHA256 hash
+grep -E '^"[0-9a-f]{64}"' "$REPORT_FILE" | awk -F, '{print $1}' | tr -d '"' | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
 TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
@@ -123,23 +124,27 @@ while read -r HASH; do
     echo "Duplicate hash: \"$HASH\""
 
     # --------------------------
-    # Extract valid file paths and sizes safely
+    # Extract file paths
     # --------------------------
     declare -A seen
     FILES=()
     SIZES=()
-    while IFS=',' read -r fhash _ _ filepath _ _ size _; do
-        [[ "$fhash" != "$HASH" ]] && continue
-        filepath="${filepath//\"/}"
-        filepath="${filepath%@*}"
-        filepath="$(echo -e "$filepath" | tr -d '\r')"
+    while IFS=',' read -r fhash _ _ filepath _ _ _; do
+        fhash_clean=$(echo "$fhash" | tr -d '"' | tr -d '\r')
+        [[ "$fhash_clean" != "$HASH" ]] && continue
+        filepath=$(echo "$filepath" | tr -d '"' | tr -d '\r')
         [[ -z "$filepath" ]] && continue
         [[ -n "${seen[$filepath]}" ]] && continue
         seen["$filepath"]=1
         FILES+=("$filepath")
-        size="${size//\"/}"
-        [[ -z "$size" ]] && size="N/A"
-        SIZES+=("$size")
+
+        # Get actual file size from filesystem
+        if [[ -f "$filepath" ]]; then
+            size_mb=$(du -m "$filepath" 2>/dev/null | cut -f1)
+        else
+            size_mb="N/A"
+        fi
+        SIZES+=("$size_mb")
     done < "$REPORT_FILE"
 
     if (( ${#FILES[@]} < 2 )); then
@@ -164,10 +169,8 @@ while read -r HASH; do
     printf "  %-4s | %-${TABLE_WIDTH}s | %6s MB\n" "No." "File path" "Size"
     echo "  $(printf -- '─%.0s' {1..$((TABLE_WIDTH+16))})"
     for i in "${!FILES[@]}"; do
-        size_display="${SIZES[$i]}"
-        [[ -z "$size_display" ]] && size_display="N/A"
         truncated=$(truncate_path "${FILES[$i]}" $TABLE_WIDTH)
-        printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "$size_display"
+        printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "${SIZES[$i]}"
     done
 
     # Prompt user for valid input
