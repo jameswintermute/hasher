@@ -5,6 +5,7 @@ HASHES_DIR="hashes"
 RUN_IN_BACKGROUND=false
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+ZERO_FILE_CSV="$HASHES_DIR/zero-length-files.csv"
 LOG_FILE="hasher-logs.txt"
 BACKGROUND_LOG="background.log"
 POSITIONAL=()
@@ -78,7 +79,10 @@ main() {
 
     mkdir -p "$HASHES_DIR"
     echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
+    echo "\"Directory\",\"File\",\"Timestamp\"" > "$ZERO_FILE_CSV"
+
     log_info "Using output file: $OUTPUT"
+    log_info "Zero-length files will be logged to: $ZERO_FILE_CSV"
 
     # ───── Load exclusions ─────
     EXCLUSIONS=()
@@ -113,22 +117,13 @@ main() {
     for path in "$@"; do
         if [ -d "$path" ]; then
             while IFS= read -r -d '' file; do
-                # Skip zero-length and metadata files
-                [[ ! -s "$file" ]] && continue
-                [[ "$file" =~ @eaDir ]] && continue
-                [[ "$file" =~ SynoResource ]] && continue
-
                 skip=false
                 for excl in "${EXCLUSIONS[@]}"; do
-                    if [[ "$file" == *"$excl"* ]]; then
-                        skip=true
-                        break
-                    fi
+                    [[ "$file" == *"$excl"* ]] && skip=true && break
                 done
                 $skip || FILES+=("$file")
             done < <(find "$path" -type f -print0)
         elif [ -f "$path" ]; then
-            [[ ! -s "$path" ]] && continue
             FILES+=("$path")
         else
             log_warn "Path '$path' does not exist or is not a regular file/directory."
@@ -141,37 +136,21 @@ main() {
     for path in "$@"; do
         if [ -d "$path" ]; then
             count=$(find "$path" -type f 2>/dev/null | while read -r f; do
-                [[ ! -s "$f" ]] && continue
-                [[ "$f" =~ @eaDir ]] && continue
-                [[ "$f" =~ SynoResource ]] && continue
                 skip=false
                 for excl in "${EXCLUSIONS[@]}"; do
-                    [[ "$f" == *"$excl"* ]] && skip=true
+                    [[ "$f" == *"$excl"* ]] && skip=true && break
                 done
                 $skip || echo "$f"
             done | wc -l)
         elif [ -f "$path" ]; then
-            [[ ! -s "$path" ]] && count=0 || count=1
+            count=1
         else
             count=0
         fi
-
-        if command -v numfmt >/dev/null 2>&1; then
-            count_fmt=$(numfmt --grouping <<< "$count")
-        else
-            count_fmt="$count"
-        fi
-
-        echo "- $count_fmt $path" | tee -a "$LOG_FILE"
         total_count=$((total_count + count))
+        echo "- $count $path" | tee -a "$LOG_FILE"
     done
-
-    if command -v numfmt >/dev/null 2>&1; then
-        total_fmt=$(numfmt --grouping <<< "$total_count")
-    else
-        total_fmt="$total_count"
-    fi
-    echo "- Total files to hash: $total_fmt" | tee -a "$LOG_FILE"
+    echo "- Total files to hash: $total_count" | tee -a "$LOG_FILE"
 
     TOTAL=${#FILES[@]}
     COUNT=0
@@ -189,9 +168,7 @@ main() {
                 COUNT=0
             fi
             PERCENT=0
-            if (( TOTAL > 0 )); then
-                PERCENT=$((COUNT * 100 / TOTAL))
-            fi
+            (( TOTAL > 0 )) && PERCENT=$((COUNT * 100 / TOTAL))
             echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $COUNT / $TOTAL files hashed ($PERCENT%)" >> "$BACKGROUND_LOG"
             sleep 15
         done
@@ -199,7 +176,7 @@ main() {
     progress_logger &
     PROGRESS_LOGGER_PID=$!
 
-    # ───── Hashing section ─────
+    # ───── Main hashing loop ─────
     for file in "${FILES[@]}"; do
         COUNT=$((COUNT + 1))
         echo "$COUNT" > "$PROGRESS_COUNT_FILE"
@@ -211,16 +188,19 @@ main() {
             continue
         fi
 
+        SIZE_BYTES=$(stat -c %s "$file" 2>/dev/null)
+        if [[ -z "$SIZE_BYTES" || "$SIZE_BYTES" == "0" ]]; then
+            DATE=$(date +"%Y-%m-%d %H:%M:%S")
+            DIRNAME=$(dirname "$file")
+            echo "\"$DIRNAME\",\"$file\",\"$DATE\"" >> "$ZERO_FILE_CSV"
+            log_warn "Zero-length file skipped: $file"
+            continue
+        fi
+
         HASH=$(stdbuf -oL "$ALGO" "$file" | awk '{print $1}')
         DATE=$(date +"%Y-%m-%d %H:%M:%S")
         PWD=$(dirname "$file")
-
-        SIZE_BYTES=$(stat -c %s "$file" 2>/dev/null)
-        if [[ -n "$SIZE_BYTES" && "$SIZE_BYTES" =~ ^[0-9]+$ ]]; then
-            SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
-        else
-            SIZE_MB="N/A"
-        fi
+        SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
 
         log_info "Hashed '$file'"
         echo "\"$HASH\",\"$PWD\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\"" >> "$OUTPUT"
@@ -242,6 +222,7 @@ main() {
         echo "Algorithm used      : $ALGO"
         echo "Files hashed        : $TOTAL"
         echo "Output file         : $OUTPUT"
+        echo "Zero-length files   : $ZERO_FILE_CSV"
         echo "Run time (seconds)  : $DURATION"
         echo "========================================="
         echo ""
