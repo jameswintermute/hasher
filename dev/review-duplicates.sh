@@ -1,131 +1,109 @@
 #!/bin/bash
 # review-duplicates.sh
-# Interactively review duplicate hashes and build a safe deletion plan (resumable)
+# Interactive duplicate file reviewer for hasher project
 
-# ───── Colors ─────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+REPORT_DIR="duplicate-hashes"
+PLAN_FILE="$REPORT_DIR/delete-plan.sh"
+CHECKPOINT_FILE="$REPORT_DIR/.checkpoint"
 
-# ───── Logging ─────
-log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+mkdir -p "$REPORT_DIR"
 
-# ───── Setup ─────
-DUP_DIR="duplicate-hashes"
-PLAN_FILE="$DUP_DIR/delete-plan.sh"
-CHECKPOINT_FILE="$DUP_DIR/review-checkpoint.txt"
+log_info() {
+    echo -e "[INFO] $*"
+}
 
-mkdir -p "$DUP_DIR"
+log_warn() {
+    echo -e "[WARN] $*" >&2
+}
 
-# ───── Select duplicate report ─────
-echo ""
-log_info "Available duplicate reports:"
-mapfile -t REPORTS < <(ls -t "$DUP_DIR"/*-duplicate-hashes.txt 2>/dev/null)
+log_error() {
+    echo -e "[ERROR] $*" >&2
+}
 
-if [ ${#REPORTS[@]} -eq 0 ]; then
-    log_error "No duplicate reports found in '$DUP_DIR'."
-    exit 1
-fi
+# Flush any buffered input (avoids Enter scrolling issues)
+flush_input() {
+    while read -t 0.1 -r -n 10000; do :; done
+}
 
-for i in "${!REPORTS[@]}"; do
-    idx=$((i + 1))
-    echo "  [$idx] $(basename "${REPORTS[$i]}")"
-done
-echo ""
+# Calculate expected disk saving so far
+calc_plan_size() {
+    if [[ -f "$PLAN_FILE" ]]; then
+        awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
+    else
+        echo 0
+    fi
+}
 
-read -p "Enter report number: " selection
-if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#REPORTS[@]} )); then
-    REPORT_FILE="${REPORTS[$((selection - 1))]}"
-else
-    log_error "Invalid selection. Exiting."
-    exit 1
-fi
+# Prompt user to pick report
+choose_report() {
+    local reports=("$REPORT_DIR"/*-duplicate-hashes.txt)
+    if [[ ! -e "${reports[0]}" ]]; then
+        log_error "No duplicate reports found in $REPORT_DIR"
+        exit 1
+    fi
 
+    log_info "Available duplicate reports:"
+    local i=1
+    for r in "${reports[@]}"; do
+        echo "  [$i] $(basename "$r")"
+        ((i++))
+    done
+
+    flush_input
+    read -rp "Enter report number: " choice
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice >= i )); then
+        log_error "Invalid selection"
+        exit 1
+    fi
+
+    echo "${reports[$((choice-1))]}"
+}
+
+REPORT_FILE=$(choose_report)
 REPORT_NAME=$(basename "$REPORT_FILE")
 log_info "Using report: $REPORT_NAME"
-echo ""
 
-# ───── Handle checkpoint ─────
-START_GROUP=1
-if [ -f "$CHECKPOINT_FILE" ]; then
-    LAST_REPORT=$(head -n1 "$CHECKPOINT_FILE")
-    LAST_GROUP=$(tail -n1 "$CHECKPOINT_FILE")
+TMP_GROUPS=$(mktemp)
+awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
-    if [[ "$LAST_REPORT" == "$REPORT_NAME" ]]; then
-        echo "Resume review from group $LAST_GROUP? (y/N)"
-        read -r resume
-        if [[ "$resume" =~ ^[Yy]$ ]]; then
-            START_GROUP=$LAST_GROUP
-            log_info "Resuming from group $START_GROUP..."
-        else
-            log_info "Starting fresh review..."
-        fi
-    else
-        log_info "Checkpoint is from a different report, starting fresh..."
+TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
+CURRENT_GROUP=0
+QUEUED_DELETES=0
+GROUPS_PROCESSED=0
+
+# Resume if checkpoint exists
+if [[ -f "$CHECKPOINT_FILE" ]]; then
+    saved_report=$(head -n1 "$CHECKPOINT_FILE")
+    saved_group=$(tail -n1 "$CHECKPOINT_FILE")
+    if [[ "$saved_report" == "$REPORT_NAME" ]]; then
+        log_info "Resuming from group: $saved_group"
+        TMP_RESUME=$(mktemp)
+        awk -v start="$saved_group" '$0==start {found=1; next} found' "$TMP_GROUPS" > "$TMP_RESUME"
+        mv "$TMP_RESUME" "$TMP_GROUPS"
     fi
 fi
 
-# ───── Prepare deletion plan ─────
-if [ $START_GROUP -eq 1 ]; then
-    {
-        echo "#!/bin/bash"
-        echo "# Deletion plan generated on $(date)"
-        echo ""
-    } > "$PLAN_FILE"
-    chmod +x "$PLAN_FILE"
-fi
-
-# Counters
-GROUPS_PROCESSED=0
-QUEUED_DELETES=0
-CURRENT_GROUP=0
+echo "#!/bin/bash" > "$PLAN_FILE"
+echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
+echo "" >> "$PLAN_FILE"
 
 log_info "Starting interactive review..."
 
-# ───── Split groups into a temp file ─────
-TMP_GROUPS=$(mktemp)
-awk 'BEGIN{RS=""; ORS="\n\n"} /^Duplicate hash ID:/' "$REPORT_FILE" > "$TMP_GROUPS"
-
-TOTAL_GROUPS=$(grep -c "Duplicate hash ID:" "$REPORT_FILE")
-
-# ───── Helper: calculate total size in MB of planned deletions ─────
-calc_plan_size() {
-    local total_bytes=0
-    while IFS= read -r line; do
-        # Extract the file path from: rm -f -- "path"
-        filepath=$(echo "$line" | sed -E 's/^rm -f -- (.*)$/\1/' | sed 's/^"\(.*\)"$/\1/')
-        if [ -f "$filepath" ]; then
-            size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-            total_bytes=$((total_bytes + size))
-        fi
-    done < <(grep '^rm -f' "$PLAN_FILE")
-    echo $(( total_bytes / 1024 / 1024 ))  # MB
-}
-
-# Loop through groups safely
-while IFS= read -r -d '' BLOCK; do
+while read -r HASH; do
     ((CURRENT_GROUP++))
-    if (( CURRENT_GROUP < START_GROUP )); then
-        continue
-    fi
-    ((GROUPS_PROCESSED++))
 
-    echo -e "${CYAN}────────────────────────────────────────────${NC}"
+    echo ""
+    echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
-    echo "$BLOCK"
-    echo -e "${CYAN}────────────────────────────────────────────${NC}"
+    echo "Duplicate hash: \"$HASH\""
+    grep -F "$HASH" "$REPORT_FILE"
+    echo "────────────────────────────────────────────"
 
-    # Extract file paths from CSV rows
-    mapfile -t FILES < <(printf '%s\n' "$BLOCK" \
-        | grep '^"' \
-        | awk -F',' '{f=$3; gsub(/^"|"$/, "", f); print f}')
+    mapfile -t FILES < <(grep -F "$HASH" "$REPORT_FILE" | awk -F, '{print $3}' | sed 's/"//g')
+    mapfile -t SIZES < <(grep -F "$HASH" "$REPORT_FILE" | awk -F, '{print $6}' | sed 's/"//g')
 
-    if [ ${#FILES[@]} -lt 2 ]; then
-        log_warn "Group skipped (found ${#FILES[@]} file path(s))."
+    if (( ${#FILES[@]} < 2 )); then
+        log_warn "Group skipped (less than 2 files found)."
         continue
     fi
 
@@ -134,70 +112,63 @@ while IFS= read -r -d '' BLOCK; do
     echo "  S = Skip this group"
     echo "  Q = Quit review (you can resume later)"
     for i in "${!FILES[@]}"; do
-        idx=$((i + 1))
-        echo "  $idx = Delete file: ${FILES[$i]}"
+        echo "  $((i+1)) = Delete file: ${FILES[$i]} (${SIZES[$i]} MB)"
     done
-    echo ""
 
-    # Wait for user input
-    read -p "Your choice (S, Q or 1-${#FILES[@]}): " choice
-
-    if [[ "$choice" =~ ^[Qq]$ ]]; then
-        echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
-        echo "$CURRENT_GROUP" >> "$CHECKPOINT_FILE"
-        SAVED_MB=$(calc_plan_size)
+    flush_input
+    while true; do
         echo ""
-        log_info "Quitting. Progress saved at group $CURRENT_GROUP."
-        log_info "Groups processed so far : $GROUPS_PROCESSED"
-        log_info "Deletions queued so far : $QUEUED_DELETES"
-        log_info "Expected disk saving    : ${SAVED_MB} MB"
-        log_info "Run again later to resume."
-        rm -f "$TMP_GROUPS"
-        exit 0
-    fi
+        read -r -p "Your choice (S, Q or 1-${#FILES[@]}): " choice
 
-    if [[ "$choice" =~ ^[Ss]$ ]]; then
-        log_info "Skipped this group."
-        echo ""
-        continue
-    fi
+        if [[ "$choice" =~ ^[Qq]$ ]]; then
+            echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
+            echo "$HASH" >> "$CHECKPOINT_FILE"
+            SAVED_MB=$(calc_plan_size)
+            echo ""
+            log_info "Quitting. Progress saved at group $CURRENT_GROUP."
+            log_info "Groups processed so far : $GROUPS_PROCESSED"
+            log_info "Deletions queued so far : $QUEUED_DELETES"
+            log_info "Expected disk saving    : ${SAVED_MB} MB"
+            log_info "Run again later to resume."
+            rm -f "$TMP_GROUPS"
+            exit 0
+        elif [[ "$choice" =~ ^[Ss]$ ]]; then
+            log_info "Skipped this group."
+            echo ""
+            break
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILES[@]} )); then
+            target="${FILES[$((choice - 1))]}"
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILES[@]} )); then
-        target="${FILES[$((choice - 1))]}"
-
-        echo ""
-        echo "Selected for deletion:"
-        echo "  $target"
-        read -p "Confirm add to deletion plan? (y/N): " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
-            ((QUEUED_DELETES++))
-            log_info "Added to deletion plan."
+            echo ""
+            echo "Selected for deletion:"
+            echo "  $target"
+            read -r -p "Confirm add to deletion plan? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
+                ((QUEUED_DELETES++))
+                log_info "Added to deletion plan."
+            else
+                log_info "Skipped deletion for this group."
+            fi
+            echo ""
+            break
         else
-            log_info "Skipped deletion for this group."
+            log_warn "Invalid input. Please try again."
         fi
-        echo ""
-    else
-        log_warn "Invalid input. Group skipped."
-        echo ""
-    fi
+    done
 
-    # Save checkpoint after each group
-    echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
-    echo "$((CURRENT_GROUP + 1))" >> "$CHECKPOINT_FILE"
+    ((GROUPS_PROCESSED++))
+done < "$TMP_GROUPS"
 
-done < <(awk 'BEGIN{RS=""; ORS="\0"} /^Duplicate hash ID:/' "$REPORT_FILE")
+rm -f "$TMP_GROUPS" "$CHECKPOINT_FILE"
 
-rm -f "$TMP_GROUPS"
-rm -f "$CHECKPOINT_FILE"  # clean up, review finished
-
-FINAL_MB=$(calc_plan_size)
+SAVED_MB=$(calc_plan_size)
 
 echo ""
 log_info "Interactive review complete."
-log_info "Groups processed : $GROUPS_PROCESSED"
-log_info "Deletions queued : $QUEUED_DELETES"
-log_info "Expected saving  : ${FINAL_MB} MB"
+log_info "Groups processed total : $GROUPS_PROCESSED"
+log_info "Deletions queued total : $QUEUED_DELETES"
+log_info "Expected disk saving   : ${SAVED_MB} MB"
 log_info "Deletion plan saved to: $PLAN_FILE"
-echo "Review it, then execute to delete:"
-echo "  $PLAN_FILE"
+echo "You can review and run it manually with:"
+echo "  bash $PLAN_FILE"
