@@ -26,11 +26,11 @@ done
 mkdir -p "$REPORT_DIR"
 
 # --------------------------
-# Logging with color
+# Logging functions
 # --------------------------
-log_info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-log_warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
-log_error() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
+log_info() { echo -e "\e[32m[INFO]\e[0m $*"; }
+log_warn() { echo -e "\e[33m[WARN]\e[0m $*" >&2; }
+log_error() { echo -e "\e[31m[ERROR]\e[0m $*" >&2; }
 
 flush_input() {
     while read -t 0.1 -r -n 10000; do :; done
@@ -79,7 +79,7 @@ while true; do
         REPORT_FILE="${reports[$((choice-1))]}"
         break
     else
-        echo "[WARN] Invalid selection, try again."
+        log_warn "Invalid selection, try again."
     fi
 done
 
@@ -88,107 +88,85 @@ log_info "Using report: $REPORT_NAME"
 flush_input
 
 # --------------------------
-# Build duplicates map
+# Prepare duplicate groups
 # --------------------------
-declare -A FILE_MAP
-declare -A SIZE_MAP
+TMP_GROUPS=$(mktemp)
 
-while IFS=',' read -r hash _ file _ _ size; do
-    # Remove quotes
-    hash="${hash//\"/}"
-    file="${file//\"/}"
-    size="${size//\"/}"
-    if [[ -n "$file" ]]; then
-        FILE_MAP["$hash"]+="$file"$'\n'
-        SIZE_MAP["$file"]="$size"
-    fi
-done < <(grep -E '^[0-9a-f]{64},' "$REPORT_FILE")
+# Filter only non-empty hashes
+awk -F, '/^"/ {hash=$1; gsub(/"/,"",hash); if(length(hash)>0) print hash}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
-# Filter hashes with 2 or more files
-HASHES=()
-for hash in "${!FILE_MAP[@]}"; do
-    count=$(echo -n "${FILE_MAP[$hash]}" | grep -c '^')
-    if (( count > 1 )); then
-        HASHES+=("$hash")
-    fi
-done
-
-TOTAL_GROUPS=${#HASHES[@]}
+TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
 QUEUED_DELETES=0
 GROUPS_PROCESSED=0
 
-# --------------------------
-# Resume from checkpoint
-# --------------------------
+# Resume if checkpoint exists
 if [[ -f "$CHECKPOINT_FILE" ]]; then
     saved_report=$(head -n1 "$CHECKPOINT_FILE")
     saved_hash=$(tail -n1 "$CHECKPOINT_FILE")
     if [[ "$saved_report" == "$REPORT_NAME" ]]; then
         log_info "Resuming from hash: $saved_hash"
-        TMP=()
-        resume=false
-        for h in "${HASHES[@]}"; do
-            if [[ "$resume" = true ]]; then
-                TMP+=("$h")
-            elif [[ "$h" == "$saved_hash" ]]; then
-                resume=true
-            fi
-        done
-        HASHES=("${TMP[@]}")
+        TMP_RESUME=$(mktemp)
+        awk -v skip="$saved_hash" '$0!=skip' "$TMP_GROUPS" > "$TMP_RESUME"
+        mv "$TMP_RESUME" "$TMP_GROUPS"
     fi
 fi
 
-# --------------------------
-# Prepare deletion plan
-# --------------------------
+# Prepare delete plan
 echo "#!/bin/bash" > "$PLAN_FILE"
 echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
 echo "" >> "$PLAN_FILE"
 
-# --------------------------
-# Interactive review
-# --------------------------
 log_info "Starting interactive review..."
-for HASH in "${HASHES[@]}"; do
+while read -r HASH; do
     ((CURRENT_GROUP++))
     echo ""
     echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
-    echo "Duplicate hash: \"$HASH\""
+    echo -e "\e[36mDuplicate hash:\e[0m \"$HASH\""
 
-    mapfile -t FILES < <(echo -n "${FILE_MAP[$HASH]}" | sed '/^\s*$/d')
+    # Extract file paths and sizes, filter out @eaDir and SynoResource files
+    mapfile -t FILES < <(
+        grep -F "$HASH" "$REPORT_FILE" | awk -F, '{gsub(/"/,"",$3); if($3!="" && $3 !~ /@eaDir/ && $3 !~ /SynoResource/) print $3}'
+    )
+    mapfile -t SIZES < <(
+        grep -F "$HASH" "$REPORT_FILE" | awk -F, '{gsub(/"/,"",$6); if($3!="" && $3 !~ /@eaDir/ && $3 !~ /SynoResource/) print $6}'
+    )
 
+    # Skip group if less than 2 valid files
     if (( ${#FILES[@]} < 2 )); then
         log_warn "Group skipped (less than 2 valid files found)."
         continue
     fi
 
-    # Display table
-    echo ""
-    echo "Options:"
-    echo "  S = Skip this group"
-    echo "  Q = Quit review (you can resume later)"
-    printf "  %-4s | %-${TABLE_WIDTH}s | %6s MB\n" "No." "File path" "Size"
-    echo "  $(printf -- '─%.0s' {1..$((TABLE_WIDTH+16))})"
-
-    for i in "${!FILES[@]}"; do
-        file="${FILES[$i]}"
-        size="${SIZE_MAP[$file]}"
-        [[ -z "$size" ]] && size="N/A"
-        truncated=$(truncate_path "$file" $TABLE_WIDTH)
-        printf "  %-4s | %s | %6s\n" "$((i+1))" "$truncated" "$size"
-    done
-
     if [[ "$PREVIEW_MODE" == true ]]; then
-        read -rp "Press Enter to continue to next group..."
+        echo "[Preview mode] Skipping deletion prompt..."
+        read -rp "Press Enter to continue..."
         ((GROUPS_PROCESSED++))
         continue
     fi
 
-    # User interaction
+    # --------------------------
+    # Display compact table
+    # --------------------------
+    echo ""
+    echo "Options:"
+    echo "  S = Skip this group"
+    echo "  Q = Quit review (you can resume later)"
+    echo ""
+    echo "Select the file number to DELETE (the other file(s) will be kept):"
+    printf "  %-4s | %-${TABLE_WIDTH}s | %6s MB\n" "No." "File path" "Size"
+    echo "  $(printf -- '─%.0s' {1..$((TABLE_WIDTH+16))})"
+    for i in "${!FILES[@]}"; do
+        size_display="${SIZES[$i]}"
+        [[ -z "$size_display" ]] && size_display="N/A"
+        truncated=$(truncate_path "${FILES[$i]}" $TABLE_WIDTH)
+        printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "$size_display"
+    done
+
+    # Prompt user for valid input
     while true; do
-        read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
+        read -rp "Your choice (S, Q or 1-${#FILES[@]} to DELETE): " choice
         choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
 
         if [[ "$choice_upper" == "Q" ]]; then
@@ -204,7 +182,8 @@ for HASH in "${HASHES[@]}"; do
             log_info "Skipped this group."
             break
         elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILES[@]} )); then
-            target="${FILES[$((choice-1))]}"
+            target="${FILES[$((choice - 1))]}"
+            echo "You chose to DELETE: $target"
             read -rp "Confirm add to deletion plan? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
@@ -218,12 +197,14 @@ for HASH in "${HASHES[@]}"; do
             log_warn "Invalid input. Please try again."
         fi
     done
-    ((GROUPS_PROCESSED++))
-done
 
-rm -f "$CHECKPOINT_FILE"
+    ((GROUPS_PROCESSED++))
+done < "$TMP_GROUPS"
+
+rm -f "$TMP_GROUPS" "$CHECKPOINT_FILE"
 
 SAVED_MB=$(calc_plan_size)
+
 echo ""
 log_info "Interactive review complete."
 log_info "Groups processed total : $GROUPS_PROCESSED"
