@@ -1,10 +1,25 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
+# Added --preview mode
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
 CHECKPOINT_FILE="$REPORT_DIR/.checkpoint"
+PREVIEW_MODE=false
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --preview)
+            PREVIEW_MODE=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 mkdir -p "$REPORT_DIR"
 
@@ -85,12 +100,12 @@ if [[ -f "$CHECKPOINT_FILE" ]]; then
     fi
 fi
 
+# Prepare delete plan
 echo "#!/bin/bash" > "$PLAN_FILE"
 echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
 echo "" >> "$PLAN_FILE"
 
 log_info "Starting interactive review..."
-
 while read -r HASH; do
     ((CURRENT_GROUP++))
     echo ""
@@ -105,6 +120,13 @@ while read -r HASH; do
 
     if (( ${#FILES[@]} < 2 )); then
         log_warn "Group skipped (less than 2 files found)."
+        continue
+    fi
+
+    if [[ "$PREVIEW_MODE" == true ]]; then
+        echo "[Preview mode] Skipping deletion prompt..."
+        sleep 1
+        ((GROUPS_PROCESSED++))
         continue
     fi
 
