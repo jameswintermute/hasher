@@ -1,13 +1,21 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
-# Enhanced: auto-detect file sizes from filesystem
+# Fully functional with colorized output and filesystem file sizes
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
 CHECKPOINT_FILE="$REPORT_DIR/.checkpoint"
 PREVIEW_MODE=false
-TABLE_WIDTH=80
+TABLE_WIDTH=140
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+RESET='\033[0m'
 
 # --------------------------
 # Parse flags
@@ -70,7 +78,6 @@ for i in "${!reports[@]}"; do
     echo "  [$((i+1))] $(basename "${reports[$i]}")"
 done
 
-# Prompt user for selection
 while true; do
     read -rp "Enter report number: " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#reports[@]} )); then
@@ -86,12 +93,32 @@ log_info "Using report: $REPORT_NAME"
 flush_input
 
 # --------------------------
+# Build hash -> files map
+# --------------------------
+declare -A FILE_MAP
+declare -A SIZE_MAP
+while IFS=',' read -r fhash _ _ filepath _ _ _; do
+    # Clean hash and filepath
+    fhash=$(echo "$fhash" | tr -d '"' | tr -d '\r')
+    filepath=$(echo "$filepath" | tr -d '"' | tr -d '\r')
+    [[ -z "$fhash" || -z "$filepath" ]] && continue
+    FILE_MAP["$fhash"]+="$filepath"$'\n'
+
+    if [[ -f "$filepath" ]]; then
+        SIZE_MAP["$filepath"]=$(du -m "$filepath" 2>/dev/null | cut -f1)
+    else
+        SIZE_MAP["$filepath"]="N/A"
+    fi
+done < <(grep -E '^"[0-9a-f]{64}"' "$REPORT_FILE")
+
+# --------------------------
 # Prepare duplicate groups
 # --------------------------
 TMP_GROUPS=$(mktemp)
-
-# Only lines starting with quoted SHA256 hash
-grep -E '^"[0-9a-f]{64}"' "$REPORT_FILE" | awk -F, '{print $1}' | tr -d '"' | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
+for h in "${!FILE_MAP[@]}"; do
+    n_files=$(echo "${FILE_MAP[$h]}" | wc -l)
+    (( n_files > 1 )) && echo "$h" >> "$TMP_GROUPS"
+done
 
 TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
@@ -119,33 +146,11 @@ log_info "Starting interactive review..."
 while read -r HASH; do
     ((CURRENT_GROUP++))
     echo ""
-    echo "────────────────────────────────────────────"
-    echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
-    echo "Duplicate hash: \"$HASH\""
+    echo "${CYAN}────────────────────────────────────────────${RESET}"
+    echo "${CYAN}Group $CURRENT_GROUP of $TOTAL_GROUPS${RESET}"
+    echo "${CYAN}Duplicate hash: \"$HASH\"${RESET}"
 
-    # --------------------------
-    # Extract file paths
-    # --------------------------
-    declare -A seen
-    FILES=()
-    SIZES=()
-    while IFS=',' read -r fhash _ _ filepath _ _ _; do
-        fhash_clean=$(echo "$fhash" | tr -d '"' | tr -d '\r')
-        [[ "$fhash_clean" != "$HASH" ]] && continue
-        filepath=$(echo "$filepath" | tr -d '"' | tr -d '\r')
-        [[ -z "$filepath" ]] && continue
-        [[ -n "${seen[$filepath]}" ]] && continue
-        seen["$filepath"]=1
-        FILES+=("$filepath")
-
-        # Get actual file size from filesystem
-        if [[ -f "$filepath" ]]; then
-            size_mb=$(du -m "$filepath" 2>/dev/null | cut -f1)
-        else
-            size_mb="N/A"
-        fi
-        SIZES+=("$size_mb")
-    done < "$REPORT_FILE"
+    mapfile -t FILES < <(echo -e "${FILE_MAP[$HASH]}")
 
     if (( ${#FILES[@]} < 2 )); then
         log_warn "Group skipped (less than 2 valid files found)."
@@ -160,7 +165,7 @@ while read -r HASH; do
     fi
 
     # --------------------------
-    # Display compact table
+    # Display table with colors
     # --------------------------
     echo ""
     echo "Options:"
@@ -169,11 +174,14 @@ while read -r HASH; do
     printf "  %-4s | %-${TABLE_WIDTH}s | %6s MB\n" "No." "File path" "Size"
     echo "  $(printf -- '─%.0s' {1..$((TABLE_WIDTH+16))})"
     for i in "${!FILES[@]}"; do
-        truncated=$(truncate_path "${FILES[$i]}" $TABLE_WIDTH)
-        printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "${SIZES[$i]}"
+        f="${FILES[$i]}"
+        truncated=$(truncate_path "$f" $TABLE_WIDTH)
+        size="${SIZE_MAP[$f]}"
+        color=$((i%2==0 ? GREEN : YELLOW))
+        printf "  ${!color}%-4s | %-s | %6s${RESET}\n" "$((i+1))" "$truncated" "$size"
     done
 
-    # Prompt user for valid input
+    # Prompt user for input
     while true; do
         read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
         choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
