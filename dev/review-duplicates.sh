@@ -52,6 +52,15 @@ truncate_path() {
     fi
 }
 
+sanitize_path() {
+    local path="$1"
+    path="${path//\"/}"       # remove quotes
+    path="${path%@*}"         # remove @SynoResource or @ metadata
+    path="${path%"'"}"        # remove trailing single quote
+    path="$(echo -e "${path}" | sed -e 's/[[:space:]]*$//')"  # remove trailing whitespace
+    echo "$path"
+}
+
 # --------------------------
 # Report selection
 # --------------------------
@@ -126,15 +135,14 @@ while read -r HASH; do
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
     echo "Duplicate hash: \"$HASH\""
 
-    # Extract files and sizes, remove @SynoResource metadata
+    # Extract files and sizes
     FILES=()
     SIZES=()
     while IFS=, read -r csv_hash _ path _ _ size _; do
         csv_hash="${csv_hash//\"/}"
-        path="${path//\"/}"
-        path="${path%@*}"      # remove Synology resource suffix
-        size="${size//\"/}"
-        [[ "$csv_hash" == "$HASH" && -n "$path" ]] && FILES+=("$path") && SIZES+=("$size")
+        [[ "$csv_hash" != "$HASH" ]] && continue
+        sanitized=$(sanitize_path "$path")
+        [[ -n "$sanitized" ]] && FILES+=("$sanitized") && SIZES+=("$size")
     done < "$REPORT_FILE"
 
     # Skip group if less than 2 valid files
