@@ -20,7 +20,7 @@ log_error() {
     echo -e "[ERROR] $*" >&2
 }
 
-# Flush any buffered input (avoids Enter scrolling issues)
+# Flush any buffered input (run once at start)
 flush_input() {
     while read -t 0.1 -r -n 10000; do :; done
 }
@@ -49,7 +49,6 @@ choose_report() {
         ((i++))
     done
 
-    flush_input
     read -rp "Enter report number: " choice
 
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice >= i )); then
@@ -59,6 +58,8 @@ choose_report() {
 
     echo "${reports[$((choice-1))]}"
 }
+
+flush_input
 
 REPORT_FILE=$(choose_report)
 REPORT_NAME=$(basename "$REPORT_FILE")
@@ -75,11 +76,11 @@ GROUPS_PROCESSED=0
 # Resume if checkpoint exists
 if [[ -f "$CHECKPOINT_FILE" ]]; then
     saved_report=$(head -n1 "$CHECKPOINT_FILE")
-    saved_group=$(tail -n1 "$CHECKPOINT_FILE")
+    saved_hash=$(tail -n1 "$CHECKPOINT_FILE")
     if [[ "$saved_report" == "$REPORT_NAME" ]]; then
-        log_info "Resuming from group: $saved_group"
+        log_info "Resuming from hash: $saved_hash"
         TMP_RESUME=$(mktemp)
-        awk -v start="$saved_group" '$0==start {found=1; next} found' "$TMP_GROUPS" > "$TMP_RESUME"
+        awk -v skip="$saved_hash" '$0!=skip' "$TMP_GROUPS" > "$TMP_RESUME"
         mv "$TMP_RESUME" "$TMP_GROUPS"
     fi
 fi
@@ -92,7 +93,6 @@ log_info "Starting interactive review..."
 
 while read -r HASH; do
     ((CURRENT_GROUP++))
-
     echo ""
     echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
@@ -116,42 +116,33 @@ while read -r HASH; do
         echo "  $((i+1)) = Delete file: ${FILES[$i]} (${SIZES[$i]} MB)"
     done
 
-    flush_input
+    # Wait for valid input
     while true; do
-        echo ""
-        read -r -p "Your choice (S, Q or 1-${#FILES[@]}): " choice
+        read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
+        choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
 
-        if [[ "$choice" =~ ^[Qq]$ ]]; then
+        if [[ "$choice_upper" == "Q" ]]; then
             echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
             echo "$HASH" >> "$CHECKPOINT_FILE"
             SAVED_MB=$(calc_plan_size)
-            echo ""
             log_info "Quitting. Progress saved at group $CURRENT_GROUP."
             log_info "Groups processed so far : $GROUPS_PROCESSED"
             log_info "Deletions queued so far : $QUEUED_DELETES"
             log_info "Expected disk saving    : ${SAVED_MB} MB"
-            log_info "Run again later to resume."
-            rm -f "$TMP_GROUPS"
             exit 0
-        elif [[ "$choice" =~ ^[Ss]$ ]]; then
+        elif [[ "$choice_upper" == "S" ]]; then
             log_info "Skipped this group."
-            echo ""
             break
         elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILES[@]} )); then
             target="${FILES[$((choice - 1))]}"
-
-            echo ""
-            echo "Selected for deletion:"
-            echo "  $target"
-            read -r -p "Confirm add to deletion plan? (y/N): " confirm
+            read -rp "Confirm add to deletion plan? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
                 ((QUEUED_DELETES++))
                 log_info "Added to deletion plan."
             else
-                log_info "Skipped deletion for this group."
+                log_info "Skipped deletion for this file."
             fi
-            echo ""
             break
         else
             log_warn "Invalid input. Please try again."
