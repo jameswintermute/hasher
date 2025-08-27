@@ -1,12 +1,12 @@
 #!/bin/bash
 # review-duplicates.sh
 # Interactive duplicate file reviewer for hasher project
-# Fixed report selection, robust interactive review
 
 REPORT_DIR="duplicate-hashes"
 PLAN_FILE="$REPORT_DIR/delete-plan.sh"
 CHECKPOINT_FILE="$REPORT_DIR/.checkpoint"
 PREVIEW_MODE=false
+TABLE_WIDTH=80
 
 # --------------------------
 # Parse flags
@@ -41,8 +41,19 @@ calc_plan_size() {
     fi
 }
 
+truncate_path() {
+    local path="$1"
+    local maxlen=$2
+    local len=${#path}
+    if (( len <= maxlen )); then
+        echo "$path"
+    else
+        echo "...${path: -$((maxlen-3))}"
+    fi
+}
+
 # --------------------------
-# Corrected report selection
+# Report selection
 # --------------------------
 shopt -s nullglob
 reports=("$REPORT_DIR"/*-duplicate-hashes.txt)
@@ -108,14 +119,18 @@ while read -r HASH; do
     echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
     echo "Duplicate hash: \"$HASH\""
-    grep -F "$HASH" "$REPORT_FILE"
-    echo "────────────────────────────────────────────"
 
-    mapfile -t FILES < <(grep -F "$HASH" "$REPORT_FILE" | awk -F, '{print $3}' | sed 's/"//g')
-    mapfile -t SIZES < <(grep -F "$HASH" "$REPORT_FILE" | awk -F, '{print $6}' | sed 's/"//g')
+    # Extract only valid file paths and sizes
+    mapfile -t FILES < <(
+        grep -F "$HASH" "$REPORT_FILE" | awk -F, '{gsub(/"/,"",$3); if($3!="") print $3}'
+    )
+    mapfile -t SIZES < <(
+        grep -F "$HASH" "$REPORT_FILE" | awk -F, '{gsub(/"/,"",$6); if($3!="") print $6}'
+    )
 
+    # Skip group if less than 2 valid files
     if (( ${#FILES[@]} < 2 )); then
-        log_warn "Group skipped (less than 2 files found)."
+        log_warn "Group skipped (less than 2 valid files found)."
         continue
     fi
 
@@ -126,14 +141,23 @@ while read -r HASH; do
         continue
     fi
 
+    # --------------------------
+    # Display compact table
+    # --------------------------
     echo ""
     echo "Options:"
     echo "  S = Skip this group"
     echo "  Q = Quit review (you can resume later)"
+    printf "  %-4s | %-${TABLE_WIDTH}s | %6s MB\n" "No." "File path" "Size"
+    echo "  $(printf -- '─%.0s' {1..$((TABLE_WIDTH+16))})"
     for i in "${!FILES[@]}"; do
-        echo "  $((i+1)) = Delete file: ${FILES[$i]} (${SIZES[$i]} MB)"
+        size_display="${SIZES[$i]}"
+        [[ -z "$size_display" ]] && size_display="N/A"
+        truncated=$(truncate_path "${FILES[$i]}" $TABLE_WIDTH)
+        printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "$size_display"
     done
 
+    # Prompt user for valid input
     while true; do
         read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
         choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
