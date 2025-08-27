@@ -35,8 +35,7 @@ flush_input() {
 
 calc_plan_size() {
     if [[ -f "$PLAN_FILE" ]]; then
-        awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" \
-        | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
+        awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
     else
         echo 0
     fi
@@ -114,7 +113,6 @@ echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
 echo "" >> "$PLAN_FILE"
 
 log_info "Starting interactive review..."
-
 while read -r HASH; do
     ((CURRENT_GROUP++))
     echo ""
@@ -128,20 +126,17 @@ while read -r HASH; do
     declare -A seen
     FILES=()
     SIZES=()
-    while IFS= read -r line; do
-        csv_hash=$(echo "$line" | cut -d',' -f1 | tr -d '"')
-        [[ "$csv_hash" != "$HASH" ]] && continue
-        path=$(echo "$line" | cut -d',' -f3)
-        size=$(echo "$line" | cut -d',' -f6)
-        # sanitize
-        path="${path//\"/}"
-        path="${path%@*}"
-        path="$(echo -e "$path" | tr -d '\r')"
-        path="$(echo -e "$path" | sed -e 's/[[:space:]]*$//')"
-        [[ -z "$path" ]] && continue
-        [[ -n "${seen[$path]}" ]] && continue
-        seen["$path"]=1
-        FILES+=("$path")
+    while IFS=',' read -r fhash _ _ filepath _ _ size _; do
+        [[ "$fhash" != "$HASH" ]] && continue
+        filepath="${filepath//\"/}"
+        filepath="${filepath%@*}"
+        filepath="$(echo -e "$filepath" | tr -d '\r')"
+        [[ -z "$filepath" ]] && continue
+        [[ -n "${seen[$filepath]}" ]] && continue
+        seen["$filepath"]=1
+        FILES+=("$filepath")
+        size="${size//\"/}"
+        [[ -z "$size" ]] && size="N/A"
         SIZES+=("$size")
     done < "$REPORT_FILE"
 
@@ -151,7 +146,6 @@ while read -r HASH; do
         continue
     fi
 
-    # Preview mode
     if [[ "$PREVIEW_MODE" == true ]]; then
         echo "[Preview mode] Skipping deletion prompt..."
         read -rp "Press Enter to continue..."
@@ -175,9 +169,7 @@ while read -r HASH; do
         printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "$size_display"
     done
 
-    # --------------------------
     # Prompt user for valid input
-    # --------------------------
     while true; do
         read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
         choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
