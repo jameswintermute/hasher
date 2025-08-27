@@ -85,8 +85,8 @@ DATE_TAG=$(basename "$INPUT_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
 OUTPUT_FILE="$DUP_DIR/${DATE_TAG}-duplicate-hashes.txt"
 : > "$OUTPUT_FILE"
 
-# ───── Count Occurrences Quickly ─────
-log_info "Counting occurrences for each duplicate hash..."
+# ───── Count Occurrences Quickly, Skipping Zero-Length Files ─────
+log_info "Counting occurrences for each duplicate hash (zero-length files will be skipped)..."
 
 dup_hash_file=$(mktemp)
 echo "$DUP_HASHES" > "$dup_hash_file"
@@ -95,7 +95,7 @@ TMP_SORTED=$(mktemp)
 
 awk -F',' '
     NR==FNR { d[$1]=1; next }
-    d[$1] { counts[$1]++ }
+    d[$1] && $6 != "0.00" { counts[$1]++ }
     END { for (h in counts) print counts[h] "," h }
 ' "$dup_hash_file" "$INPUT_FILE" > "$TMP_SORTED"
 
@@ -107,7 +107,11 @@ rm -f "$TMP_SORTED"
 
 # ───── Summary ─────
 TOTAL_DUPLICATE_GROUPS=$(echo "$DUP_HASHES" | wc -l)
-TOTAL_DUPLICATE_FILES=$(cut -d',' -f1 "$INPUT_FILE" | grep -F -f <(echo "$DUP_HASHES") | wc -l)
+TOTAL_DUPLICATE_FILES=$(awk -F',' -v hashes="$DUP_HASHES" '
+    BEGIN { while (getline h < "/dev/stdin") d[h]=1 }
+    d[$1] && $6 != "0.00" { c++ }
+    END { print c }
+' <(echo "$DUP_HASHES") "$INPUT_FILE")
 
 {
     echo "# Duplicate Hashes Report"
@@ -131,7 +135,12 @@ for hash in "${HASHES_ARRAY[@]}"; do
 
     echo "Duplicate hash ID: $COUNT" >> "$OUTPUT_FILE"
     echo "Duplicate hash: $hash" >> "$OUTPUT_FILE"
-    grep "^$hash" "$INPUT_FILE" >> "$OUTPUT_FILE"
+
+    grep "^$hash" "$INPUT_FILE" | while IFS=, read -r h d f a t s; do
+        [[ "$s" == "0.00" ]] && continue
+        echo "$h,$d,$f,$a,$t,$s" >> "$OUTPUT_FILE"
+    done
+
     echo "" >> "$OUTPUT_FILE"
 
     sleep 0.01
