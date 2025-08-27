@@ -88,7 +88,9 @@ flush_input
 # Prepare duplicate groups
 # --------------------------
 TMP_GROUPS=$(mktemp)
-awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
+
+# ONLY take lines starting with a SHA256 hash (64 hex chars), ignore comments and IDs
+grep -E '^"[0-9a-f]{64}"' "$REPORT_FILE" | awk -F, '{print $1}' | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
 TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
@@ -140,7 +142,6 @@ while read -r HASH; do
         SIZES+=("$size")
     done < "$REPORT_FILE"
 
-    # Skip group if less than 2 valid files
     if (( ${#FILES[@]} < 2 )); then
         log_warn "Group skipped (less than 2 valid files found)."
         continue
