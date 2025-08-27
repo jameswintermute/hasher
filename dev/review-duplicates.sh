@@ -52,31 +52,6 @@ truncate_path() {
     fi
 }
 
-read_choice() {
-    local prompt="$1"
-    local min="$2"
-    local max="$3"
-    local allow_s="$4"
-    local allow_q="$5"
-    local input
-    while true; do
-        read -rp "$prompt" input
-        input_upper=$(echo "$input" | tr '[:lower:]' '[:upper:]')
-        if [[ "$allow_q" == "true" && "$input_upper" == "Q" ]]; then
-            echo "Q"
-            return
-        elif [[ "$allow_s" == "true" && "$input_upper" == "S" ]]; then
-            echo "S"
-            return
-        elif [[ "$input" =~ ^[0-9]+$ ]] && (( input >= min && input <= max )); then
-            echo "$input"
-            return
-        else
-            log_warn "Invalid input. Please try again."
-        fi
-    done
-}
-
 # --------------------------
 # Report selection
 # --------------------------
@@ -94,8 +69,17 @@ for i in "${!reports[@]}"; do
     echo "  [$((i+1))] $(basename "${reports[$i]}")"
 done
 
-choice=$(read_choice "Enter report number: " 1 ${#reports[@]} false false)
-REPORT_FILE="${reports[$((choice-1))]}"
+# Prompt user for selection
+while true; do
+    read -rp "Enter report number: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#reports[@]} )); then
+        REPORT_FILE="${reports[$((choice-1))]}"
+        break
+    else
+        echo "[WARN] Invalid selection, try again."
+    fi
+done
+
 REPORT_NAME=$(basename "$REPORT_FILE")
 log_info "Using report: $REPORT_NAME"
 flush_input
@@ -104,7 +88,7 @@ flush_input
 # Prepare duplicate groups
 # --------------------------
 TMP_GROUPS=$(mktemp)
-awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
+awk -F',' '{gsub(/"/,"",$1); if($1!="") print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
 TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
@@ -128,26 +112,38 @@ echo "#!/bin/bash" > "$PLAN_FILE"
 echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
 echo "" >> "$PLAN_FILE"
 
+# --------------------------
+# Start interactive review
+# --------------------------
 log_info "Starting interactive review..."
 while read -r HASH; do
+    # Skip empty hashes
+    [[ -z "$HASH" ]] && continue
+
     ((CURRENT_GROUP++))
     echo ""
     echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
     echo "Duplicate hash: \"$HASH\""
 
-    # Extract files and sizes
+    # Extract files and sizes, remove @SynoResource metadata
     FILES=()
     SIZES=()
-    while IFS=, read -r _ _ path _ _ size _; do
-        [[ -n "$path" ]] && FILES+=("${path//\"/}") && SIZES+=("${size//\"/}")
-    done < <(grep -F "$HASH" "$REPORT_FILE")
+    while IFS=, read -r csv_hash _ path _ _ size _; do
+        csv_hash="${csv_hash//\"/}"
+        path="${path//\"/}"
+        path="${path%@*}"      # remove Synology resource suffix
+        size="${size//\"/}"
+        [[ "$csv_hash" == "$HASH" && -n "$path" ]] && FILES+=("$path") && SIZES+=("$size")
+    done < "$REPORT_FILE"
 
+    # Skip group if less than 2 valid files
     if (( ${#FILES[@]} < 2 )); then
         log_warn "Group skipped (less than 2 valid files found)."
         continue
     fi
 
+    # Preview mode
     if [[ "$PREVIEW_MODE" == true ]]; then
         echo "[Preview mode] Skipping deletion prompt..."
         read -rp "Press Enter to continue..."
@@ -171,32 +167,40 @@ while read -r HASH; do
         printf "  %-4s | %-s | %6s\n" "$((i+1))" "$truncated" "$size_display"
     done
 
-    user_choice=$(read_choice "Your choice (S, Q or 1-${#FILES[@]}): " 1 ${#FILES[@]} true true)
+    # --------------------------
+    # Prompt user for valid input
+    # --------------------------
+    while true; do
+        read -rp "Your choice (S, Q or 1-${#FILES[@]}): " choice
+        choice_upper=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
 
-    if [[ "$user_choice" == "Q" ]]; then
-        echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
-        echo "$HASH" >> "$CHECKPOINT_FILE"
-        SAVED_MB=$(calc_plan_size)
-        log_info "Quitting. Progress saved at group $CURRENT_GROUP."
-        log_info "Groups processed so far : $GROUPS_PROCESSED"
-        log_info "Deletions queued so far : $QUEUED_DELETES"
-        log_info "Expected disk saving    : ${SAVED_MB} MB"
-        exit 0
-    elif [[ "$user_choice" == "S" ]]; then
-        log_info "Skipped this group."
-        ((GROUPS_PROCESSED++))
-        continue
-    else
-        target="${FILES[$((user_choice-1))]}"
-        read -rp "Confirm add to deletion plan? (y/N): " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
-            ((QUEUED_DELETES++))
-            log_info "Added to deletion plan."
+        if [[ "$choice_upper" == "Q" ]]; then
+            echo "$REPORT_NAME" > "$CHECKPOINT_FILE"
+            echo "$HASH" >> "$CHECKPOINT_FILE"
+            SAVED_MB=$(calc_plan_size)
+            log_info "Quitting. Progress saved at group $CURRENT_GROUP."
+            log_info "Groups processed so far : $GROUPS_PROCESSED"
+            log_info "Deletions queued so far : $QUEUED_DELETES"
+            log_info "Expected disk saving    : ${SAVED_MB} MB"
+            exit 0
+        elif [[ "$choice_upper" == "S" ]]; then
+            log_info "Skipped this group."
+            break
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILES[@]} )); then
+            target="${FILES[$((choice - 1))]}"
+            read -rp "Confirm add to deletion plan? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                printf 'rm -f -- %q\n' "$target" >> "$PLAN_FILE"
+                ((QUEUED_DELETES++))
+                log_info "Added to deletion plan."
+            else
+                log_info "Skipped deletion for this file."
+            fi
+            break
         else
-            log_info "Skipped deletion for this file."
+            log_warn "Invalid input. Please try again."
         fi
-    fi
+    done
 
     ((GROUPS_PROCESSED++))
 done < "$TMP_GROUPS"
