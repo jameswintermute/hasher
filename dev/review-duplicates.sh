@@ -35,7 +35,8 @@ flush_input() {
 
 calc_plan_size() {
     if [[ -f "$PLAN_FILE" ]]; then
-        awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
+        awk '{for(i=2;i<=NF;i++) print $i}' "$PLAN_FILE" \
+        | xargs -r du -m 2>/dev/null | awk '{s+=$1} END {print s+0}'
     else
         echo 0
     fi
@@ -50,16 +51,6 @@ truncate_path() {
     else
         echo "...${path: -$((maxlen-3))}"
     fi
-}
-
-sanitize_path() {
-    local path="$1"
-    path="${path//\"/}"             # remove quotes
-    path="${path%@*}"               # remove @SynoResource or @ metadata
-    path="${path%"'"}"              # remove trailing single quote
-    path="$(echo -e "${path}" | tr -d '\r')"  # remove carriage returns
-    path="$(echo -e "${path}" | sed -e 's/[[:space:]]*$//')"  # remove trailing whitespace
-    echo "$path"
 }
 
 # --------------------------
@@ -98,7 +89,7 @@ flush_input
 # Prepare duplicate groups
 # --------------------------
 TMP_GROUPS=$(mktemp)
-awk -F',' '{gsub(/"/,"",$1); if($1!="") print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
+awk -F, '{print $1}' "$REPORT_FILE" | sort | uniq -c | awk '$1>1 {print $2}' > "$TMP_GROUPS"
 
 TOTAL_GROUPS=$(wc -l < "$TMP_GROUPS")
 CURRENT_GROUP=0
@@ -122,31 +113,35 @@ echo "#!/bin/bash" > "$PLAN_FILE"
 echo "# Deletion plan generated on $(date)" >> "$PLAN_FILE"
 echo "" >> "$PLAN_FILE"
 
-# --------------------------
-# Start interactive review
-# --------------------------
 log_info "Starting interactive review..."
-while read -r HASH; do
-    [[ -z "$HASH" ]] && continue
 
+while read -r HASH; do
     ((CURRENT_GROUP++))
     echo ""
     echo "────────────────────────────────────────────"
     echo "Group $CURRENT_GROUP of $TOTAL_GROUPS"
     echo "Duplicate hash: \"$HASH\""
 
-    # Extract files and sizes, sanitize, and deduplicate
+    # --------------------------
+    # Extract valid file paths and sizes safely
+    # --------------------------
     declare -A seen
     FILES=()
     SIZES=()
-    while IFS=, read -r csv_hash _ path _ _ size _; do
-        csv_hash="${csv_hash//\"/}"
+    while IFS= read -r line; do
+        csv_hash=$(echo "$line" | cut -d',' -f1 | tr -d '"')
         [[ "$csv_hash" != "$HASH" ]] && continue
-        sanitized=$(sanitize_path "$path")
-        [[ -n "$sanitized" ]] || continue
-        [[ -n "${seen[$sanitized]}" ]] && continue
-        seen["$sanitized"]=1
-        FILES+=("$sanitized")
+        path=$(echo "$line" | cut -d',' -f3)
+        size=$(echo "$line" | cut -d',' -f6)
+        # sanitize
+        path="${path//\"/}"
+        path="${path%@*}"
+        path="$(echo -e "$path" | tr -d '\r')"
+        path="$(echo -e "$path" | sed -e 's/[[:space:]]*$//')"
+        [[ -z "$path" ]] && continue
+        [[ -n "${seen[$path]}" ]] && continue
+        seen["$path"]=1
+        FILES+=("$path")
         SIZES+=("$size")
     done < "$REPORT_FILE"
 
