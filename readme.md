@@ -21,8 +21,8 @@ chmod +x hasher.sh find-duplicates.sh zero-length-delete.sh
 
 ## About
 
-A project by James Wintermute ([jameswinter@protonmail.ch](mailto:jameswinter@protonmail.ch)).  
-Originally started in December 2022.  
+A project by James Wintermute ([jameswinter@protonmail.ch](mailto:jameswinter@protonmail.ch)).
+Originally started in December 2022.
 Overhauled in Summer 2025 with assistance from ChatGPT.
 
 ---
@@ -56,24 +56,14 @@ This project helps protect NAS-stored data by:
 Run the hasher with your chosen options:
 
 ```bash
-# Foreground (interactive progress shown in terminal)
-./hasher.sh --pathfile paths.txt --algo sha256
-
-# Background (detaches and logs progress to hasher-logs.txt)
-./hasher.sh --pathfile paths.txt --algo sha256 --background
-
-# **Nohup mode (recommended for Synology DSM – survives logout, logs to hasher-nohup.log)**
+# Run in background using nohup (recommended for Synology DSM)
 ./hasher.sh --pathfile paths.txt --algo sha256 --nohup
+
+# Run in foreground
+./hasher.sh --pathfile paths.txt --algo sha256
 ```
 
-**Modes explained:**
-- **Foreground:** Runs directly in your shell, printing progress inline.  
-- **Background:** Detaches from the shell but continues running, logging periodic progress updates into `hasher-logs.txt`.  
-- **Nohup (Recommended for Synology DSM):** Uses `nohup` so the process continues even if your SSH session ends. Output and progress go to `hasher-nohup.log`.  
-
-Each run generates:
-- A dated CSV file under `hashes/`  
-- A zero-length file report under `hashes/zero-length-files-YYYY-MM-DD.csv`
+This generates a dated CSV file under `hashes/` and logs zero-length files separately as `hashes/zero-length-files-YYYY-MM-DD.csv`.
 
 ---
 
@@ -135,25 +125,18 @@ Example layout after a few runs:
 * Hash algorithm is selectable (`sha256` recommended).
 * Scripts are POSIX-compliant and tested on Linux (Synology DSM & Ubuntu).
 * Multi-core hashing is supported for faster processing on supported systems.
-* Foreground, background, and nohup modes provide flexibility depending on your workflow.
-* **On Synology DSM, `--nohup` is the most reliable mode for long-running hash jobs.**
+* Background mode logging is included to monitor progress asynchronously.
 
 ---
 
 ## Best Practice on Synology
 
-For Synology DSM environments, it is strongly recommended to run hashing jobs using:
-
-```bash
-./hasher.sh --pathfile paths.txt --algo sha256 --nohup
-```
-
-This ensures that hashing continues even if your SSH session is interrupted or you log out.  
-Foreground and background modes are fine for testing or short jobs, but **`--nohup` is the safest option for production use.**
+* Always run with `--nohup` unless you plan to stay connected via SSH.
+* This prevents NAS disconnections or session drops from terminating the hashing process.
 
 ---
 
 ## Related Reading
 
-* Facebook Silent Data Corruption:  
+* Facebook Silent Data Corruption:
   [https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
