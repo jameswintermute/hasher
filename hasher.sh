@@ -132,7 +132,7 @@ parse_ini() {
     case "$section" in
       logging)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+          key="${BASH_REMATCH[1],,}"; val="${BASHREMATCH[2]}"
           case "$key" in
             background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
           esac
@@ -140,7 +140,7 @@ parse_ini() {
         ;;
       exclusions)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+          key="${BASHREMATCH[1],,}"; val="${BASHREMATCH[2]}"
           case "$key" in
             glob) EXCLUDE_GLOBS+=("$val") ;;
             inherit-defaults)
@@ -228,12 +228,6 @@ load_excludes
 # ─────────────────────── Background mode ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export HASHER_CONFIG="${CONFIG_FILE}"
-  printf '[%s] [RUN %s] [INFO] Exec: nohup bash "%s" --pathfile "%s" --algo "%s" %s %s --run-id "%s" --headless >>"%s" 2>&1 &\n' \
-    "$(ts)" "$RUN_ID" "$0" "$PATHFILE" "$ALGO" \
-    "${CONFIG_FILE:+--config \"$CONFIG_FILE\"}" \
-    "${EXCLUDE_FILE:+--exclude-file \"$EXCLUDE_FILE\"}" \
-    "$RUN_ID" "$LOG_FILE" >>"$LOG_FILE"
-
   nohup bash "$0" \
     --pathfile "$PATHFILE" --algo "$ALGO" \
     ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
@@ -265,7 +259,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$PATHFILE"
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
-# ───────────── Discovery → unique file list with heartbeat ─
+# ───────────── Discovery → (no-dedupe) with heartbeat ─────
 DISCOVERY_START=$(date +%s)
 DISC_LAST_PRINT=$DISCOVERY_START
 DISCOVERED=0
@@ -293,17 +287,8 @@ for p in "${SEARCH_PATHS[@]}"; do
   fi
 done
 
-# De-duplicate filelist by path (BusyBox-safe)
-TMP="$FILELIST.tmp"
-if sort --help 2>/dev/null | grep -q -- ' -z'; then
-  sort -z -u "$FILELIST" -o "$FILELIST"
-else
-  tr '\0' '\n' <"$FILELIST" | sort -u | tr '\n' '\0' >"$TMP" && mv -f "$TMP" "$FILELIST"
-fi
-
-# Count entries without fragile pipelines (BusyBox-safe)
-TOTAL=0
-while IFS= read -r -d '' _f; do ((TOTAL++)); done <"$FILELIST"
+# NO DEDUPE (BusyBox-safe, and matches your “keep everything” requirement)
+TOTAL="$DISCOVERED"
 
 DISCOVERY_END=$(date +%s)
 log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
