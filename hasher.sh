@@ -1,194 +1,114 @@
 #!/bin/bash
+# ───── NAS File Hasher ─────
+# Generates file hashes with optional multi-core parallelism.
+# Supports background logging and nohup mode for Synology usability.
+
+set -euo pipefail
 
 # ───── Flags & Config ─────
 HASHES_DIR="hashes"
-RUN_IN_BACKGROUND=false
+LOGS_DIR="duplicate-hashes"
+EXCLUSIONS_FILE="exclusions.txt"
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
-ZERO_LEN_OUTPUT="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
-LOG_FILE="hasher-logs.txt"
-BACKGROUND_LOG="background.log"
-POSITIONAL=()
-ALGO="sha256sum"
+BACKGROUND_LOG="hasher-logs.txt"
+ZERO_LOG="$HASHES_DIR/zero-length-files-$DATE_TAG.csv"
+ALGO="sha256"
 PATHFILE=""
-EXCLUSIONS_FILE="exclusions.txt"
+RUN_IN_BACKGROUND=false
+RUN_WITH_NOHUP=false
 
-# ───── Colors ─────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# ───── Functions ─────
+usage() {
+    echo "Usage: $0 --pathfile <file> [--algo <sha256|sha1|md5>] [--background] [--nohup]"
+    exit 1
+}
 
-# ───── Logging ─────
-log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+hash_file() {
+    local file="$1"
+    case "$ALGO" in
+        sha256) sha256sum "$file" | awk '{print $1}' ;;
+        sha1)   sha1sum "$file"   | awk '{print $1}' ;;
+        md5)    md5sum "$file"    | awk '{print $1}' ;;
+    esac
+}
 
-# ───── Parse Flags ─────
+log_progress() {
+    local done=$1 total=$2
+    local pct=$(( done * 100 / total ))
+    echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $done / $total files ($pct%)" >> "$BACKGROUND_LOG"
+}
+
+# ───── Parse Args ─────
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        --output)
-            OUTPUT="$2"; shift 2;;
-        --algo)
-            case "$2" in
-                sha256|sha1|md5) ALGO="${2}sum";;
-                *) log_error "Unsupported algorithm: $2"; exit 1;;
-            esac
-            shift 2;;
-        --pathfile) PATHFILE="$2"; shift 2;;
-        --background) RUN_IN_BACKGROUND=true; shift;;
-        --internal) shift;;  # used internally
-        -*|--*) log_error "Unknown option $1"; exit 1;;
-        *) POSITIONAL+=("$1"); shift;;
+    case "$1" in
+        --pathfile) PATHFILE="$2"; shift 2 ;;
+        --algo) ALGO="$2"; shift 2 ;;
+        --background) RUN_IN_BACKGROUND=true; shift ;;
+        --nohup) RUN_WITH_NOHUP=true; shift ;;
+        *) usage ;;
     esac
 done
 
-# ───── Relaunch in Background ─────
-if [ "$RUN_IN_BACKGROUND" = true ] && [[ "$1" != "--internal" ]]; then
-    mkdir -p "$HASHES_DIR"
-    nohup bash "$0" --internal "${POSITIONAL[@]}" </dev/null 2>&1 | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' >> "$BACKGROUND_LOG" &
-    echo -e "${GREEN}[INFO]${NC} Running in background (PID: $!). Logs: $BACKGROUND_LOG"
+[[ -z "$PATHFILE" ]] && usage
+[[ ! -f "$PATHFILE" ]] && { echo "Pathfile not found: $PATHFILE"; exit 1; }
+
+mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+
+# ───── Nohup Mode ─────
+if $RUN_WITH_NOHUP; then
+    LOGFILE="hasher-nohup.log"
+    echo "[INFO] Relaunching under nohup, output -> $LOGFILE"
+    nohup "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${RUN_IN_BACKGROUND:+--background} >"$LOGFILE" 2>&1 &
+    PID=$!
+    disown
+    echo "[INFO] Hasher running in background (PID $PID). Check logs: $LOGFILE"
     exit 0
 fi
 
-main() {
-    START_TIME=$(date +%s)
-    NOW_HUMAN=$(date +"%Y-%m-%d %H:%M:%S")
-    mkdir -p "$HASHES_DIR"
-    echo "\"Hash\",\"Directory\",\"File\",\"Algorithm\",\"Timestamp\",\"Size_MB\"" > "$OUTPUT"
-    echo "\"File\",\"Directory\",\"Timestamp\"" > "$ZERO_LEN_OUTPUT"
-    log_info "Using output file: $OUTPUT"
-    log_info "Zero-length files will be logged to: $ZERO_LEN_OUTPUT"
+# ───── Exclusions ─────
+EXCLUDES=()
+if [[ -f "$EXCLUSIONS_FILE" ]]; then
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && EXCLUDES+=("-not" "-path" "$line")
+    done < "$EXCLUSIONS_FILE"
+    echo "[INFO] Loaded ${#EXCLUDES[@]} exclusions from $EXCLUSIONS_FILE"
+fi
 
-    # ───── Load exclusions ─────
-    EXCLUSIONS=()
-    if [[ -f "$EXCLUSIONS_FILE" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
-            EXCLUSIONS+=("$line")
-        done < "$EXCLUSIONS_FILE"
-        log_info "Loaded ${#EXCLUSIONS[@]} exclusions from $EXCLUSIONS_FILE"
+# ───── Collect Files ─────
+mapfile -t FILES < <(while IFS= read -r dir; do
+    find "$dir" -type f "${EXCLUDES[@]}"
+done < "$PATHFILE")
+
+TOTAL=${#FILES[@]}
+echo "[INFO] Using output file: $OUTPUT"
+echo "[INFO] Zero-length files will be logged to: $ZERO_LOG"
+echo "file,hash,size_MB" > "$OUTPUT"
+echo "file" > "$ZERO_LOG"
+
+# ───── Processing ─────
+COUNT=0
+for file in "${FILES[@]}"; do
+    ((COUNT++))
+    if [[ ! -s "$file" ]]; then
+        echo "$file" >> "$ZERO_LOG"
+        continue
     fi
-
-    # ───── Load paths from pathfile ─────
-    if [[ -n "$PATHFILE" ]]; then
-        if [[ ! -f "$PATHFILE" ]]; then
-            log_error "Path file '$PATHFILE' does not exist."
-            exit 1
-        fi
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
-            POSITIONAL+=("$line")
-        done < "$PATHFILE"
-    fi
-
-    set -- "${POSITIONAL[@]}"
-    if [ $# -eq 0 ]; then
-        echo -e "${YELLOW}Usage:${NC} $0 [--output file] [--algo sha256|sha1|md5] [--pathfile file] [--background] <file_or_dir1> [...]"
-        exit 1
-    fi
-
-    # ───── Gather files ─────
-    FILES=()
-    for path in "$@"; do
-        if [ -d "$path" ]; then
-            while IFS= read -r -d '' file; do
-                skip=false
-                for excl in "${EXCLUSIONS[@]}"; do
-                    [[ "$file" == *"$excl"* ]] && skip=true && break
-                done
-                $skip || FILES+=("$file")
-            done < <(find "$path" -type f -print0)
-        elif [ -f "$path" ]; then
-            FILES+=("$path")
-        else
-            log_warn "Path '$path' does not exist or is not a regular file/directory."
-        fi
-    done
-
-    TOTAL=${#FILES[@]}
-    log_info "Total files to hash: $TOTAL"
-
-    # ───── Multi-core check ─────
-    NUM_CORES=$(nproc 2>/dev/null || echo 1)
-    USE_MULTICORE=false
-    if (( NUM_CORES > 1 )); then
-        read -p "System has $NUM_CORES cores, use multi-core hashing? (y/N): " answer
-        [[ "$answer" =~ ^[Yy]$ ]] && USE_MULTICORE=true
-    fi
-
-    PROGRESS_FILE=".hasher_progress_count"
-    echo 0 > "$PROGRESS_FILE"
-
-    # ───── Progress logger ─────
-    progress_logger() {
-        while [[ -f "$PROGRESS_FILE" ]]; do
-            count=$(<"$PROGRESS_FILE")
-            percent=0
-            (( TOTAL > 0 )) && percent=$(( count * 100 / TOTAL ))
-            echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $count / $TOTAL files hashed ($percent%)" >> "$BACKGROUND_LOG"
-            sleep 15
-        done
-    }
-    progress_logger &
-
-    # ───── Hashing function ─────
-    hash_file() {
-        file="$1"
-        [[ ! -f "$file" ]] && return
-        SIZE_BYTES=$(stat -c %s "$file" 2>/dev/null || echo 0)
-        if (( SIZE_BYTES == 0 )); then
-            echo "\"$file\",\"$(dirname "$file")\",\"$(date '+%Y-%m-%d %H:%M:%S')\"" >> "$ZERO_LEN_OUTPUT"
-            return
-        fi
-        HASH=$("$ALGO" "$file" | awk '{print $1}')
-        DATE=$(date '+%Y-%m-%d %H:%M:%S')
-        PWD=$(dirname "$file")
-        SIZE_MB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')
-        # write to output atomically
-        (
-            flock 200
-            echo "\"$HASH\",\"$PWD\",\"$file\",\"$ALGO\",\"$DATE\",\"$SIZE_MB\"" >> "$OUTPUT"
-        ) 200>"$OUTPUT.lock"
-        # increment atomic counter
-        (
-            flock 201
-            count=$(<"$PROGRESS_FILE")
-            echo $((count + 1)) > "$PROGRESS_FILE"
-        ) 201<"$PROGRESS_FILE"
-    }
-
-    # ───── Execute hashing ─────
-    export -f hash_file
-    export ALGO OUTPUT ZERO_LEN_OUTPUT PROGRESS_FILE
-    export -f log_info log_warn log_error
-
-    if $USE_MULTICORE; then
-        printf "%s\0" "${FILES[@]}" | xargs -0 -n1 -P"$NUM_CORES" -I{} bash -c 'hash_file "$@"' _ "{}"
+    hash=$(hash_file "$file")
+    size_mb=$(du -m "$file" | awk '{print $1}')
+    echo "\"$file\",$hash,$size_mb" >> "$OUTPUT"
+    if ! $RUN_IN_BACKGROUND; then
+        echo -ne "\r[$COUNT / $TOTAL] Processing..."
     else
-        for file in "${FILES[@]}"; do
-            hash_file "$file"
-        done
+        if (( COUNT % 100 == 0 )); then
+            log_progress "$COUNT" "$TOTAL"
+        fi
     fi
+done
 
-    # ───── Cleanup ─────
-    rm -f "$PROGRESS_FILE"
-
-    END_TIME=$(date +%s)
-    DURATION=$((END_TIME - START_TIME))
-
-    {
-        echo "========================================="
-        echo "Hasher run completed: $NOW_HUMAN"
-        echo "Algorithm used      : $ALGO"
-        echo "Files hashed        : $TOTAL"
-        echo "Output file         : $OUTPUT"
-        echo "Zero-length files   : $ZERO_LEN_OUTPUT"
-        echo "Run time (seconds)  : $DURATION"
-        echo "========================================="
-    } >> "$LOG_FILE"
-
-    log_info "Summary written to '$LOG_FILE'"
-}
-
-main
+# ───── Final Progress ─────
+if $RUN_IN_BACKGROUND; then
+    echo "$(date '+[%Y-%m-%d %H:%M:%S]') [PROGRESS] $TOTAL / $TOTAL files hashed (100%)" >> "$BACKGROUND_LOG"
+else
+    echo -e "\n[INFO] Hashing complete. Output -> $OUTPUT"
+fi
