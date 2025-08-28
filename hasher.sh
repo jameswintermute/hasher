@@ -71,8 +71,10 @@ log() {
   local level="$1"; shift || true
   local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   if $IS_CHILD; then
+    # Background/headless: stdout is redirected to $LOG_FILE; do NOT also append.
     printf '%s\n' "$line" >&1
   else
+    # Foreground: print and append to per-run file for a durable audit trail.
     printf '%s\n' "$line" >&1
     { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
   fi
@@ -132,7 +134,7 @@ parse_ini() {
     case "$section" in
       logging)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASHREMATCH[2]}"
+          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
             background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
           esac
@@ -140,7 +142,7 @@ parse_ini() {
         ;;
       exclusions)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASHREMATCH[1],,}"; val="${BASHREMATCH[2]}"
+          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
             glob) EXCLUDE_GLOBS+=("$val") ;;
             inherit-defaults)
@@ -158,19 +160,28 @@ parse_ini() {
 # ───────────────────────── Excludes ────────────────────────
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
+  # 1) Config file (flag)
   if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
+  # 2) Fallback env var if flag not set
   if [[ -z "$CONFIG_FILE" && -n "$HASHER_CONFIG" && -f "$HASHER_CONFIG" ]]; then
-    CONFIG_FILE="$HASHER_CONFIG"; parse_ini "$CONFIG_FILE"
+    CONFIG_FILE="$HASHER_CONFIG"
+    parse_ini "$CONFIG_FILE"
   fi
+  # 3) Legacy exclude file (only if no config)
   if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
+  # built-ins unless disabled
   if $INHERIT_DEFAULT_EXCLUDES; then
-    while IFS= read -r line; do [[ -n "$line" ]] && EXCLUDE_GLOBS+=("$line"); done <<<"$EXCLUDE_DEFAULTS"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      EXCLUDE_GLOBS+=("$line")
+    done <<<"$EXCLUDE_DEFAULTS"
   fi
+  # never hash our own outputs
   EXCLUDE_GLOBS+=("$HASHES_DIR/*")
 }
 
@@ -259,7 +270,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$PATHFILE"
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
-# ───────────── Discovery → (no-dedupe) with heartbeat ─────
+# ───────────── Discovery → (no dedupe) with heartbeat ─────
 DISCOVERY_START=$(date +%s)
 DISC_LAST_PRINT=$DISCOVERY_START
 DISCOVERED=0
@@ -287,7 +298,7 @@ for p in "${SEARCH_PATHS[@]}"; do
   fi
 done
 
-# NO DEDUPE (BusyBox-safe, and matches your “keep everything” requirement)
+# NO DEDUPE: keep every discovered path (for full point-in-time record)
 TOTAL="$DISCOVERED"
 
 DISCOVERY_END=$(date +%s)
@@ -318,7 +329,8 @@ hash_one() {
   local f="$1"
   if [[ ! -r "$f" ]]; then ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1; fi
   local sum
-  if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
+  # BusyBox-friendly: strip after first whitespace without awk dependency quirks
+  if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | sed 's/[[:space:]].*$//')"; then
     ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
   fi
   local bytes size_mb
