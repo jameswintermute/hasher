@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hasher.sh — robust file hasher with CSV output, background mode, Run-ID, and 15s heartbeats
+# hasher.sh — robust file hasher with CSV output, background mode, Run-ID, INI config, unique file list, and heartbeats
 set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
@@ -17,8 +17,11 @@ ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
 PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false
-EXCLUDE_FILE=""
-PROGRESS_INTERVAL=15  # seconds
+
+CONFIG_FILE=""       # preferred: INI file
+EXCLUDE_FILE=""      # legacy: extra globs only
+
+PROGRESS_INTERVAL=15 # default seconds, can be overridden by config [logging] background-interval=...
 
 # ───────────────────── Built-in excludes ───────────────────
 read -r -d '' EXCLUDE_DEFAULTS <<'GLOBS' || true
@@ -38,6 +41,7 @@ Thumbs.db
 */.synology*/**
 *@SynoResource*
 GLOBS
+INHERIT_DEFAULT_EXCLUDES=true
 
 # ───────────────────────── Helpers ─────────────────────────
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -49,9 +53,9 @@ gen_run_id() {
   fi
 }
 RUN_ID="$(gen_run_id)"
+FILELIST="$LOGS_DIR/files-$RUN_ID.lst"   # null-delimited list of files to hash
 
 log() {
-  # $1=LEVEL, rest=message
   local level="$1"; shift || true
   local line
   line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
@@ -64,10 +68,26 @@ die() { log ERROR "$*"; exit 1; }
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2] [--nohup] [--exclude-file excludes.txt]
+  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2] [--nohup] [--config hasher.conf] [--exclude-file excludes.txt]
 
-Output CSV: $OUTPUT
-Columns: timestamp,path,algo,hash,size_mb
+Flags:
+  --pathfile FILE        File with one path per line (# comments ok).
+  --algo NAME            Hash algorithm (default: sha256).
+  --nohup                Re-exec in background; live log: $BACKGROUND_LOG
+  --config FILE          INI config. Sections: [logging], [exclusions]
+  --exclude-file FILE    (Legacy) Extra globs to exclude (one per line). Ignored if --config is provided.
+
+INI example:
+  [logging]
+  background-interval = 5
+  [exclusions]
+  inherit-defaults = true
+  *.tmp
+  */Cache/*
+  glob = */.Trash*/**
+
+CSV columns:
+  timestamp,path,algo,hash,size_mb
 EOF
 }
 
@@ -81,24 +101,74 @@ portable_stat_size() {
   fi
 }
 
-format_secs() { local s=$1; printf '%02d:%02d:%02d' "$((s/3600))" "$(((s%3600)/60))" "$((s%60))"; }
+format_secs() { local s=$1; (( s<0 )) && s=0; printf '%02d:%02d:%02d' "$((s/3600))" "$(((s%3600)/60))" "$((s%60))"; }
+
+# ─────────────────────── INI parser ────────────────────────
+parse_ini() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local section="" line key val raw
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    raw="${line%%[#;]*}"
+    raw="$(echo -n "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$raw" ]] && continue
+
+    if [[ "$raw" =~ ^\[(.+)\]$ ]]; then
+      section="${BASH_REMATCH[1],,}"
+      continue
+    fi
+
+    case "$section" in
+      logging)
+        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+          key="${BASH_REMATCH[1],,}"
+          val="${BASH_REMATCH[2]}"
+          case "$key" in
+            background-interval|progress-interval)
+              [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val"
+              ;;
+          esac
+        fi
+        ;;
+      exclusions)
+        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+          key="${BASH_REMATCH[1],,}"
+          val="${BASH_REMATCH[2]}"
+          case "$key" in
+            glob) EXCLUDE_GLOBS+=("$val") ;;
+            inherit-defaults)
+              case "${val,,}" in false|no|0) INHERIT_DEFAULT_EXCLUDES=false ;; esac
+              ;;
+          esac
+        else
+          EXCLUDE_GLOBS+=("$raw")
+        fi
+        ;;
+    esac
+  done <"$file"
+}
 
 # ───────────────────────── Excludes ────────────────────────
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
-  while IFS= read -r line; do
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    EXCLUDE_GLOBS+=("$line")
-  done <<<"$EXCLUDE_DEFAULTS"
+  if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
 
-  if [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
+  if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
 
-  EXCLUDE_GLOBS+=("$HASHES_DIR/*")  # never hash our own outputs
+  if $INHERIT_DEFAULT_EXCLUDES; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      EXCLUDE_GLOBS+=("$line")
+    done <<<"$EXCLUDE_DEFAULTS"
+  fi
+
+  EXCLUDE_GLOBS+=("$HASHES_DIR/*")
 }
 
 is_excluded() {
@@ -127,8 +197,9 @@ while (($#)); do
     --pathfile)      PATHFILE="${2:-}"; shift 2 ;;
     --algo)          ALGO="${2:-}"; shift 2 ;;
     --nohup)         RUN_IN_BACKGROUND=true; shift ;;
-    --headless)      IS_CHILD=true; shift ;;   # internal
+    --headless)      IS_CHILD=true; shift ;;
     --exclude-file)  EXCLUDE_FILE="${2:-}"; shift 2 ;;
+    --config)        CONFIG_FILE="${2:-}"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
     *)               die "Unknown arg: $1 (use -h for help)";;
   esac
@@ -141,7 +212,7 @@ load_excludes
 
 # ─────────────────────── Background mode ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > "$LOGS_DIR/.hasher.pid" ) >/dev/null 2>&1
+  ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${CONFIG_FILE:+--config "$CONFIG_FILE"} ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > "$LOGS_DIR/.hasher.pid" ) >/dev/null 2>&1
   pid="$(cat "$LOGS_DIR/.hasher.pid" 2>/dev/null || true)"; rm -f "$LOGS_DIR/.hasher.pid"
   printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "${pid:-?}" "$RUN_ID" "$OUTPUT"
   exit 0
@@ -149,6 +220,7 @@ fi
 
 # ─────────────────────── Preparation ───────────────────────
 log INFO "Run-ID: $RUN_ID"
+log INFO "Config: ${CONFIG_FILE:-<none>} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES}"
 log INFO "Hasher initiated — please standby; initial file discovery may take some time."
 
 # Ensure CSV header exists
@@ -166,79 +238,95 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$PATHFILE"
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
-# ─────────────────── Discovery with heartbeat ──────────────
+# ─────────────────── Discovery → unique file list ──────────
 log INFO "Preparing file list..."
-DISCOVERED=0
 DISCOVERY_START=$(date +%s)
 DISC_LAST_PRINT=$DISCOVERY_START
+DISCOVERED=0
 
-count_files_in() {
-  local path="$1"
-  local cnt=0
-  local now
-  while IFS= read -r -d '' f; do
-    if ! is_excluded "$f"; then
-      ((cnt+=1))
-      ((DISCOVERED+=1))
-      now=$(date +%s)
-      if (( now - DISC_LAST_PRINT >= PROGRESS_INTERVAL )); then
-        log PROGRESS "Discovery: scanned=$DISCOVERED (current path: $path)"
-        DISC_LAST_PRINT=$now
-      fi
-    fi
-  done < <(find "$path" -type f -print0 2>/dev/null)
-  printf '%s' "$cnt"
+: >"$FILELIST"  # truncate/create
+
+add_file_if_included() {
+  local f="$1"
+  is_excluded "$f" && return 1
+  printf '%s\0' "$f" >>"$FILELIST"
+  ((DISCOVERED+=1))
+  local now=$(date +%s)
+  if (( now - DISC_LAST_PRINT >= PROGRESS_INTERVAL )); then
+    log PROGRESS "Discovery: scanned=$DISCOVERED (last: $f)"
+    DISC_LAST_PRINT=$now
+  fi
 }
 
-TOTAL=0
+# Collect (raw), then de-dup by path
 for p in "${SEARCH_PATHS[@]}"; do
   if [[ -d "$p" || -f "$p" ]]; then
-    c=$(count_files_in "$p" || printf '0')
-    TOTAL=$((TOTAL + c))
+    while IFS= read -r -d '' f; do
+      add_file_if_included "$f"
+    done < <(find "$p" -type f -print0 2>/dev/null)
   else
     log WARN "Path does not exist or is not accessible: $p"
   fi
 done
 
+# Deduplicate by path while preserving NULs (awk trick)
+TMP="$FILELIST.tmp"
+awk -v RS='\0' '!seen[$0]++{printf "%s\0",$0}' "$FILELIST" >"$TMP" && mv -f "$TMP" "$FILELIST"
+
+# Count unique entries
+TOTAL=$(awk -v RS='\0' 'END{print NR}' "$FILELIST")
 DISCOVERY_END=$(date +%s)
 log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
+log INFO "File list saved: $FILELIST"
 
 # ───────────────────────── Hashing ─────────────────────────
 START_TS=$(date +%s)
 PROCESSED=0
 LAST_PRINT=$START_TS
+FAILED=0
 
 log INFO "Starting hash: algo=$ALGO_NAME total_files=$TOTAL output=$OUTPUT"
 
-# ✅ FIXED: safe quoting — variables expand at trap time, not here
-trap 'log WARN "Interrupted. Processed ${PROCESSED}/${TOTAL}. Partial CSV: ${OUTPUT}"' INT TERM
+trap 'log WARN "Interrupted. Processed ${PROCESSED}/${TOTAL}. Failed=${FAILED}. Partial CSV: ${OUTPUT}"' INT TERM
+
+percent_of() {
+  local p="$1" t="$2"
+  if (( t<=0 )); then echo 0; return; fi
+  local pct=$(( (p * 100) / t ))
+  (( pct<0 )) && pct=0
+  (( pct>100 )) && pct=100
+  echo "$pct"
+}
 
 progress_tick() {
-  local now elapsed pct eta rem
+  local now elapsed eta rem pct
   now=$(date +%s)
   elapsed=$((now - START_TS))
   if (( PROCESSED > 0 )); then
     rem=$(( TOTAL - PROCESSED ))
-    eta=$(( elapsed * rem / PROCESSED ))
+    (( rem<0 )) && rem=0
+    eta=$(( PROCESSED>0 ? (elapsed * rem / PROCESSED) : 0 ))
   else
     eta=0
   fi
-  if (( TOTAL > 0 )); then
-    pct=$(( PROCESSED * 100 / TOTAL ))
-  else
-    pct=100
-  fi
-  log PROGRESS "Hashing: [$pct%%] $PROCESSED/$TOTAL | elapsed=$(format_secs "$elapsed") eta=$(format_secs "$eta")"
+  pct=$(percent_of "$PROCESSED" "$TOTAL")
+  log PROGRESS "Hashing: [${pct}%] ${PROCESSED}/${TOTAL} | elapsed=$(format_secs "$elapsed") eta=$(format_secs "$eta")"
 }
 
 hash_one() {
   local f="$1"
-  is_excluded "$f" && return 0
+  # File may have disappeared since discovery
+  if [[ ! -r "$f" ]]; then
+    ((FAILED+=1))
+    log WARN "Skipped (missing/unreadable): $f"
+    return 1
+  fi
 
   local sum
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
+    ((FAILED+=1))
     log WARN "Failed to hash: $f"
-    return 0
+    return 1
   fi
 
   local bytes size_mb
@@ -248,22 +336,23 @@ hash_one() {
   local row
   row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
+  return 0
 }
 
-for p in "${SEARCH_PATHS[@]}"; do
-  [[ -d "$p" || -f "$p" ]] || continue
-  while IFS= read -r -d '' f; do
-    hash_one "$f"
+# Hash exactly the discovered set
+while IFS= read -r -d '' f; do
+  if hash_one "$f"; then
     ((PROCESSED+=1))
-    now=$(date +%s)
-    if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
-      progress_tick
-      LAST_PRINT=$now
-    fi
-  done < <(find "$p" -type f -print0 2>/dev/null)
-done
+  fi
+
+  now=$(date +%s)
+  if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
+    progress_tick
+    LAST_PRINT=$now
+  fi
+done <"$FILELIST"
 
 # ───────────────────────── Summary ─────────────────────────
 END_TS=$(date +%s)
 ELAPSED=$((END_TS - START_TS))
-log INFO "Completed. Hashed $PROCESSED/$TOTAL files in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
+log INFO "Completed. Hashed ${PROCESSED}/${TOTAL} files (failures=${FAILED}) in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
