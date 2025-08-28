@@ -21,7 +21,7 @@ chmod +x hasher.sh find-duplicates.sh zero-length-delete.sh
 
 ## About
 
-A project by James Wintermute ([jameswinter@protonmail.ch](mailto:jameswinter@protonmail.ch)).
+A project by James Wintermute ([jameswintermute@protonmail.ch](mailto:jameswinter@protonmail.ch)).
 Originally started in December 2022.
 Overhauled in Summer 2025 with assistance from ChatGPT.
 
