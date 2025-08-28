@@ -176,4 +176,105 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%%#*}"
   line="$(echo -n "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
   [[ -z "$line" ]] && continue
-  SEARCH
+  SEARCH_PATHS+=("$line")
+done <"$PATHFILE"
+
+((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
+
+# Count files (without hashing) for progress
+count_files_in() {
+  local path="$1"
+  # Use process substitution to keep variables in the main shell
+  local cnt=0
+  while IFS= read -r -d '' f; do
+    if ! is_excluded "$f"; then
+      ((cnt++))
+    fi
+  done < <(find "$path" -type f -print0 2>/dev/null)
+  printf '%s' "$cnt"
+}
+
+TOTAL=0
+for p in "${SEARCH_PATHS[@]}"; do
+  if [[ -d "$p" || -f "$p" ]]; then
+    c=$(count_files_in "$p" || true)
+    TOTAL=$((TOTAL + c))
+  else
+    log WARN "Path does not exist or is not accessible: $p"
+  fi
+done
+
+START_TS=$(date +%s)
+PROCESSED=0
+
+log INFO "Starting hash: algo=$ALGO_NAME total_files=$TOTAL output=$OUTPUT"
+
+trap 'log WARN "Interrupted. Processed $PROCESSED/$TOTAL. Partial CSV: $OUTPUT"; exit 130' INT TERM
+
+progress_tick() {
+  local now elapsed pct eta rem
+  now=$(date +%s)
+  elapsed=$((now - START_TS))
+  if (( PROCESSED > 0 )); then
+    # ETA ≈ elapsed * (total - processed) / processed
+    rem=$(( TOTAL - PROCESSED ))
+    eta=$(( elapsed * (rem) / (PROCESSED) ))
+  else
+    eta=0
+  fi
+  if (( TOTAL > 0 )); then
+    pct=$(( PROCESSED * 100 / TOTAL ))
+  else
+    pct=100
+  fi
+  log PROGRESS "[$pct%%] $PROCESSED/$TOTAL | elapsed=$(format_secs "$elapsed") eta=$(format_secs "$eta")"
+}
+
+# ───────────────────────── Hashing ─────────────────────────
+hash_one() {
+  local f="$1"
+  # skip if excluded
+  if is_excluded "$f"; then
+    return 0
+  fi
+
+  # hash
+  local sum
+  # BusyBox coreutils-compatible parsing: first field is the digest
+  if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
+    log WARN "Failed to hash: $f"
+    return 0
+  fi
+
+  # size -> MB (2dp)
+  local bytes size_mb
+  bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
+  size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
+
+  # CSV row
+  local row
+  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
+  printf '%s\n' "$row" >>"$OUTPUT"
+}
+
+LAST_PRINT=$(date +%s)
+
+for p in "${SEARCH_PATHS[@]}"; do
+  [[ -d "$p" || -f "$p" ]] || continue
+  while IFS= read -r -d '' f; do
+    hash_one "$f"
+    ((PROCESSED++))
+
+    # Throttle progress updates to ~1/sec or at milestones
+    now=$(date +%s)
+    if (( now - LAST_PRINT >= 1 )) || (( PROCESSED == TOTAL )) || (( PROCESSED % 500 == 0 )); then
+      progress_tick
+      LAST_PRINT="$now"
+    fi
+  done < <(find "$p" -type f -print0 2>/dev/null)
+done
+
+# ───────────────────────── Summary ─────────────────────────
+END_TS=$(date +%s)
+ELAPSED=$((END_TS - START_TS))
+log INFO "Done. Hashed $PROCESSED/$TOTAL files in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
