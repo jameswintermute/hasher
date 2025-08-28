@@ -1,114 +1,179 @@
-#!/bin/sh
-# hasher.sh – NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPL v3 (https://www.gnu.org/licenses/)
+#!/usr/bin/env bash
+# hasher.sh — fast, robust file hasher with CSV output & background mode
+# Works well on NAS (e.g., Synology). No pv/parallel required.
 
-set -e
+set -Eeuo pipefail
+IFS=$'\n\t'
+LC_ALL=C
 
-PATHFILE=""
-ALGO="sha256"
-BACKGROUND=false
-NOHUP_MODE=false
-HASH_DIR="hashes"
-LOG_FILE="background.log"
-PROGRESS_FILE="/tmp/hasher-progress.tmp"
-NUM_CORES=1
+# ───────────────────────── Config ─────────────────────────
+HASHES_DIR="hashes"
+BACKGROUND_LOG="background.log"
+DATE_TAG="$(date +'%Y-%m-%d')"
+OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+
+ALGO="sha256"           # default algo (sha256|sha1|sha512|md5|blake2)
+PATHFILE=""             # file containing newline-delimited paths (supports # comments)
+RUN_IN_BACKGROUND=false
+IS_CHILD=false          # internal flag set when re-exec'ed under nohup
+EXCLUDE_FILE=""         # optional glob-per-line exclude file
+
+# Built-in excludes (NAS clutter, temp files, this script's output, etc)
+# These are globs matched against full file paths.
+read -r -d '' EXCLUDE_DEFAULTS <<'GLOBS' || true
+*@eaDir*
+*/#recycle/*
+*/.Recycle.Bin/*
+*/.Trash*/**
+*/lost+found/*
+*/.Spotlight-V100/*
+*/.fseventsd/*
+*/.AppleDouble/*
+*/._*
+*.DS_Store
+Thumbs.db
+*.part
+*.tmp
+*/.synology*/**
+*@SynoResource*
+GLOBS
+
+# ──────────────────────── Helpers ─────────────────────────
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log() {
+  local level="$1"; shift
+  # Foreground prints to console; background child’s stdout is already redirected to background.log
+  printf '[%s] [%s] %s\n' "$(ts)" "$level" "$*" >&1
+}
+
+die() { log ERROR "$*"; exit 1; }
 
 usage() {
-    echo "Usage: $0 --pathfile <file> --algo <algo> [--background] [--nohup]"
-    echo "Options:"
-    echo "  --pathfile FILE   File containing directories to hash"
-    echo "  --algo ALGO       Hash algorithm (sha256, sha1, md5)"
-    echo "  --background      Run in background"
-    echo "  --nohup           Run with nohup (recommended on Synology DSM)"
-    exit 1
+  cat <<EOF
+Usage:
+  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2] [--nohup] [--exclude-file excludes.txt]
+
+Flags:
+  --pathfile FILE      File with one path per line (blank lines and #comments allowed).
+  --algo NAME          Hash algorithm (default: sha256).
+  --nohup              Re-execute in background; logs go to: $BACKGROUND_LOG
+  --exclude-file FILE  Optional file of globs to exclude (one per line). Evaluated in addition to built-ins.
+
+Output:
+  CSV at: $OUTPUT
+  Columns: timestamp,path,algo,hash,size_mb
+Examples:
+  $(basename "$0") --pathfile paths.txt --algo sha256
+  $(basename "$0") --pathfile paths.txt --algo sha256 --nohup && tail -f $BACKGROUND_LOG
+EOF
 }
 
-# Parse arguments
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --pathfile) PATHFILE="$2"; shift 2;;
-        --algo) ALGO="$2"; shift 2;;
-        --background) BACKGROUND=true; shift;;
-        --nohup) NOHUP_MODE=true; shift;;
-        *) usage;;
-    esac
+csv_quote() {
+  # Always quote; double-up internal quotes
+  local s=${1//\"/\"\"}
+  printf '"%s"' "$s"
+}
+
+portable_stat_size() {
+  local f="$1"
+  if stat -c%s "$f" >/dev/null 2>&1; then
+    stat -c%s "$f"
+  elif stat -f%z "$f" >/dev/null 2>&1; then
+    stat -f%z "$f"
+  else
+    wc -c <"$f" | tr -d ' '
+  fi
+}
+
+format_secs() {
+  # int seconds -> HH:MM:SS
+  local s=$1
+  printf '%02d:%02d:%02d' "$((s/3600))" "$(( (s%3600)/60 ))" "$((s%60))"
+}
+
+# Collect exclude globs into an array (built-ins + optional file)
+declare -a EXCLUDE_GLOBS=()
+load_excludes() {
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    EXCLUDE_GLOBS+=("$line")
+  done <<<"$EXCLUDE_DEFAULTS"
+
+  if [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      EXCLUDE_GLOBS+=("$line")
+    done <"$EXCLUDE_FILE"
+  fi
+
+  # Always exclude our output dir/files
+  EXCLUDE_GLOBS+=("$HASHES_DIR/*")
+}
+
+is_excluded() {
+  local path="$1"
+  for pat in "${EXCLUDE_GLOBS[@]}"; do
+    [[ "$path" == $pat ]] && return 0
+  done
+  return 1
+}
+
+resolve_algo_cmd() {
+  case "$ALGO" in
+    sha256)  HASH_CMD="sha256sum"; ALGO_NAME="sha256" ;;
+    sha1)    HASH_CMD="sha1sum";   ALGO_NAME="sha1" ;;
+    sha512)  HASH_CMD="sha512sum"; ALGO_NAME="sha512" ;;
+    md5)     HASH_CMD="md5sum";    ALGO_NAME="md5" ;;
+    blake2)  HASH_CMD="b2sum";     ALGO_NAME="blake2" ;;
+    *) die "Unknown --algo '$ALGO'. Use sha256|sha1|sha512|md5|blake2." ;;
+  esac
+
+  if ! command -v "$HASH_CMD" >/dev/null 2>&1; then
+    die "Required command '$HASH_CMD' not found on this system."
+  fi
+}
+
+# ───────────────────── Argument parsing ────────────────────
+while (($#)); do
+  case "${1:-}" in
+    --pathfile)      PATHFILE="${2:-}"; shift 2 ;;
+    --algo)          ALGO="${2:-}"; shift 2 ;;
+    --nohup)         RUN_IN_BACKGROUND=true; shift ;;
+    --headless)      IS_CHILD=true; shift ;;   # internal
+    --exclude-file)  EXCLUDE_FILE="${2:-}"; shift 2 ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               die "Unknown arg: $1 (use -h for help)";;
+  esac
 done
 
-if [ -z "$PATHFILE" ] || [ ! -f "$PATHFILE" ]; then
-    echo "Error: --pathfile missing or file does not exist"
-    exit 1
+[[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
+resolve_algo_cmd
+load_excludes
+
+# ─────────────────────── Background mode ───────────────────
+if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
+  mkdir -p "$(dirname "$BACKGROUND_LOG")"
+  # Re-exec this script with --headless, redirecting all output to the background log
+  ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > .hasher.pid ) >/dev/null 2>&1
+  pid="$(cat .hasher.pid 2>/dev/null || true)"; rm -f .hasher.pid
+  printf 'Hasher started with nohup (PID %s). Output: %s\n' "${pid:-?}" "$OUTPUT"
+  exit 0
 fi
 
-mkdir -p "$HASH_DIR"
-DATE_TAG="$(date +'%Y-%m-%d')"
-OUTPUT="$HASH_DIR/hasher-$DATE_TAG.csv"
-> "$PROGRESS_FILE"
-echo "[INFO] Hasher started: $OUTPUT" >> "$LOG_FILE"
+# ─────────────────────── Preparation ───────────────────────
+mkdir -p "$HASHES_DIR"
 
-# Detect number of CPU cores
-if command -v nproc >/dev/null 2>&1; then
-    NUM_CORES=$(nproc)
-elif [ -f /proc/cpuinfo ]; then
-    NUM_CORES=$(grep -c '^processor' /proc/cpuinfo)
-fi
-NUM_CORES=$((NUM_CORES > 0 ? NUM_CORES : 1))
-
-hash_file() {
-    FILE="$1"
-    if [ ! -f "$FILE" ]; then
-        return
-    fi
-
-    SIZE=$(stat -c%s "$FILE")
-    if [ "$SIZE" -eq 0 ]; then
-        echo "$(date +'%Y-%m-%d %H:%M:%S'),$FILE,zero-length" >> "$HASH_DIR/zero-length-files-$DATE_TAG.csv"
-        echo "0" >> "$PROGRESS_FILE"
-        return
-    fi
-
-    case "$ALGO" in
-        sha256) HASH=$(sha256sum "$FILE" | awk '{print $1}') ;;
-        sha1) HASH=$(sha1sum "$FILE" | awk '{print $1}') ;;
-        md5) HASH=$(md5sum "$FILE" | awk '{print $1}') ;;
-        *) HASH=$(sha256sum "$FILE" | awk '{print $1}') ;;
-    esac
-    echo "$(date +'%Y-%m-%d %H:%M:%S'),$FILE,$HASH" >> "$OUTPUT"
-    echo "1" >> "$PROGRESS_FILE"
-}
-
-export -f hash_file
-export HASH_DIR OUTPUT ALGO DATE_TAG PROGRESS_FILE
-
-# Read all files from pathfile
-FILES=$(while read -r dir; do find "$dir" -type f; done < "$PATHFILE")
-
-# Multi-core execution
-if command -v parallel >/dev/null 2>&1; then
-    echo "[INFO] Using GNU parallel ($NUM_CORES cores)" >> "$LOG_FILE"
-    echo "$FILES" | parallel -j "$NUM_CORES" hash_file {}
-else
-    echo "[INFO] Using xargs -P ($NUM_CORES cores)" >> "$LOG_FILE"
-    echo "$FILES" | xargs -n 1 -P "$NUM_CORES" sh -c 'hash_file "$0"' 
-fi &
-
-PID=$!
-if [ "$NOHUP_MODE" = true ]; then
-    nohup sh -c "wait $PID" >/dev/null 2>&1 &
-    echo "[INFO] Hasher started with nohup (PID $!)" >> "$LOG_FILE"
-elif [ "$BACKGROUND" = true ]; then
-    echo "[INFO] Hasher running in background (PID $PID)" >> "$LOG_FILE"
-else
-    # Foreground progress display
-    TOTAL=$(echo "$FILES" | wc -l)
-    while kill -0 "$PID" 2>/dev/null; do
-        DONE=$(wc -l < "$PROGRESS_FILE")
-        PCT=$((DONE * 100 / TOTAL))
-        echo "[PROGRESS] $DONE / $TOTAL files hashed ($PCT%)" >> "$LOG_FILE"
-        sleep 15
-    done
+# Ensure CSV header exists
+if [[ ! -s "$OUTPUT" ]]; then
+  printf '"timestamp","path","algo","hash","size_mb"\n' >"$OUTPUT"
 fi
 
-wait "$PID"
-rm -f "$PROGRESS_FILE"
-echo "[INFO] Hasher finished: $OUTPUT" >> "$LOG_FILE"
+# Read search paths from the file
+declare -a SEARCH_PATHS=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  # strip comments and trim
+  line="${line%%#*}"
+  line="$(echo -n "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  [[ -z "$line" ]] && continue
+  SEARCH
