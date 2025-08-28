@@ -1,149 +1,276 @@
 #!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder (Find Duplicates - Summary)
+# Copyright (C) 2025 James Wintermute <jameswinter@protonmail.ch>
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
-# ───── Colors ─────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+set -Eeuo pipefail
+IFS=$'\n\t'
+LC_ALL=C
 
-# ───── Logging ─────
-log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-
-# ───── Functions ─────
-draw_progress_bar() {
-    local current=$1
-    local total=$2
-    local width=40
-
-    local percent=$(( current * 100 / total ))
-    local filled=$(( width * current / total ))
-    local empty=$(( width - filled ))
-
-    local bar=""
-    for ((i=0; i<filled; i++)); do bar+='#'; done
-    for ((i=0; i<empty; i++)); do bar+='-'; done
-
-    echo -ne "${YELLOW}[${bar}]${NC} $current / $total duplicate hashes processed (${percent}%)\r"
-}
-
-# ───── Setup Directories ─────
+# ───────────────────────── Defaults ─────────────────────────
 HASH_DIR="hashes"
 DUP_DIR="duplicate-hashes"
+LOGS_DIR="logs"
+CONFIG_FILE=""
 
-mkdir -p "$HASH_DIR"
-mkdir -p "$DUP_DIR"
+# [logging] defaults (overridden by config)
+PROGRESS_INTERVAL=15
+LOG_LEVEL="info"    # debug|info|warn|error
+XTRACE=false
 
-if [ ! -d "$HASH_DIR" ]; then
-    log_error "Directory '$HASH_DIR' does not exist."
-    exit 1
-fi
+# [review] defaults (overridden by config) — shared semantics with review-duplicates.sh
+RV_INPUT="latest"             # latest|<filename>
+RV_SORT="count_desc"          # count_desc|size_desc|hash_asc
+RV_SKIP_ZERO=true             # skip_zero_size
+RV_MIN_MB="0.00"              # min_size_mb
+RV_INCLUDE_REGEX=""           # include_regex (POSIX ERE)
+RV_EXCLUDE_REGEX=""           # exclude_regex (POSIX ERE)
+RV_REPORT_DIR="$DUP_DIR"      # report_dir
+RV_REPORT_PREFIX_DATE=true    # report_prefix_date
 
-log_info "Scanning most recent CSV hash files in '$HASH_DIR'..."
+# runtime
+RUN_ID=""
+LOG_FILE=""
+BACKGROUND_LOG=""
+INPUT_FILE=""
 
-FILES=($(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 10))
-if [ ${#FILES[@]} -eq 0 ]; then
-    log_error "No hasher-*.csv files found in '$HASH_DIR'"
-    exit 1
-fi
+# ───────────────────────── Utilities ─────────────────────────
+ts(){ date '+%Y-%m-%d %H:%M:%S'; }
+gen_run_id(){
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid
+  else printf '%s-%s-%s' "$(date +'%Y%m%d-%H%M%S')" "$$" "$RANDOM"
+  fi
+}
+lvl_rank(){ case "$1" in debug)echo 10;;info)echo 20;;warn)echo 30;;error)echo 40;;*)echo 20;;esac; }
+LOG_RANK="$(lvl_rank "$LOG_LEVEL")"
+_log_core(){
+  local level="$1"; shift
+  local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
+  printf '%s\n' "$line"
+  { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
+}
+log(){ local level="$1"; shift||true; local want; want=$(lvl_rank "$level"); (( want >= LOG_RANK )) && _log_core "$level" "$@"; }
+die(){ _log_core ERROR "$*"; exit 1; }
 
-# ───── User Selection ─────
-echo ""
-echo "Select a CSV hash file to process:"
-for i in "${!FILES[@]}"; do
-    index=$((i + 1))
-    filename=$(basename "${FILES[$i]}")
-    echo "  [$index] $filename"
+usage(){
+  cat <<EOF
+Usage:
+  $(basename "$0") [--input hashes/hasher-YYYY-MM-DD.csv] [--config hasher.conf]
+
+Produces a quick duplicate summary:
+- Counts duplicate hash groups and files
+- Sums total duplicate storage (MB)
+- Lists groups sorted by configured strategy
+
+Honours [logging] and [review] (filters/sort) from hasher.conf.
+EOF
+}
+
+# ───────────────────────── INI parser ─────────────────────────
+parse_ini(){
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local section="" line raw key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    raw="${line%%[#;]*}"
+    raw="$(echo -n "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$raw" ]] && continue
+    if [[ "$raw" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1],,}"; continue; fi
+    case "$section" in
+      logging)
+        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+          case "$key" in
+            background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
+            level) LOG_LEVEL="${val,,}"; LOG_RANK="$(lvl_rank "$LOG_LEVEL")" ;;
+            xtrace) case "${val,,}" in true|1|yes) XTRACE=true ;; *) XTRACE=false ;; esac ;;
+          esac
+        fi
+        ;;
+      review)
+        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+          case "$key" in
+            input) RV_INPUT="$val" ;;
+            sort) RV_SORT="${val,,}" ;;
+            skip_zero_size) case "${val,,}" in true|1|yes) RV_SKIP_ZERO=true ;; *) RV_SKIP_ZERO=false ;; esac ;;
+            min_size_mb) RV_MIN_MB="$val" ;;
+            include_regex) RV_INCLUDE_REGEX="$val" ;;
+            exclude_regex) RV_EXCLUDE_REGEX="$val" ;;
+            report_dir) RV_REPORT_DIR="$val" ;;
+            report_prefix_date) case "${val,,}" in true|1|yes) RV_REPORT_PREFIX_DATE=true ;; *) RV_REPORT_PREFIX_DATE=false ;; esac ;;
+          esac
+        fi
+        ;;
+    esac
+  done <"$file"
+}
+
+# ───────────── CSV → TSV (robust to quotes/commas in path) ─────────────
+# Emits: ts \t path \t algo \t hash \t size_mb
+csv_to_tsv(){
+  awk -v RS='' '
+  function push_field() { f[++fc]=field }
+  function flush_row() { if (fc){ for(i=1;i<=fc;i++){ printf "%s%s", f[i], (i<fc?"\t":"\n") } fc=0 } }
+  {
+    gsub(/\r/,"")
+    n=split($0,lines,"\n")
+    for (li=1; li<=n; li++){
+      line=lines[li]; field=""; fc=0; inq=0
+      for (i=1;i<=length(line);i++){
+        c=substr(line,i,1); nc=(i<length(line)?substr(line,i+1,1):"")
+        if (inq){
+          if (c=="\"" && nc=="\""){ field=field "\""; i++ }
+          else if (c=="\""){ inq=0 }
+          else { field=field c }
+        } else {
+          if (c=="\""){ inq=1 }
+          else if (c==","){ push_field(); field="" }
+          else { field=field c }
+        }
+      }
+      push_field()
+      flush_row()
+    }
+  }'
+}
+
+# ───────────────────────── Arg parsing ─────────────────────────
+while (($#)); do
+  case "${1:-}" in
+    --input)  INPUT_FILE="${2:-}"; shift 2;;
+    --config) CONFIG_FILE="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --*) log WARN "Ignoring unknown flag: $1"; shift;;
+    *)   log WARN "Ignoring unexpected argument: $1"; shift;;
+  esac
 done
-echo ""
 
-read -p "Enter file number or filename: " selection
+# ───────────────────────── Setup ─────────────────────────
+mkdir -p "$HASH_DIR" "$DUP_DIR" "$LOGS_DIR"
+RUN_ID="$(gen_run_id)"
+LOG_FILE="$LOGS_DIR/find-duplicates-$RUN_ID.log"
+BACKGROUND_LOG="$LOGS_DIR/find-duplicates.log"
+: >"$LOG_FILE"
+ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG" || true
 
-if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#FILES[@]} )); then
-    INPUT_FILE="${FILES[$((selection - 1))]}"
-elif [[ -f "$HASH_DIR/$selection" ]]; then
-    INPUT_FILE="$HASH_DIR/$selection"
+# config
+if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
+
+# optional xtrace
+if $XTRACE 2>/dev/null; then
+  exec {__xtrace_fd}>>"$LOG_FILE" || true
+  if [[ -n "${__xtrace_fd:-}" ]]; then export BASH_XTRACEFD="$__xtrace_fd"; set -x; fi
+fi
+
+log INFO "Run-ID: $RUN_ID"
+log INFO "Config: ${CONFIG_FILE:-<none>} | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
+log INFO "Filters: skip_zero=$RV_SKIP_ZERO min_mb=$RV_MIN_MB | Sort: $RV_SORT"
+
+# ───────────────────────── Choose input CSV ─────────────────────────
+if [[ -z "$INPUT_FILE" ]]; then
+  if [[ "$RV_INPUT" = "latest" ]]; then
+    INPUT_FILE="$(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 1 || true)"
+    [[ -n "$INPUT_FILE" ]] || die "No hasher-*.csv files found in '$HASH_DIR'"
+    log INFO "Selected latest CSV: $(basename "$INPUT_FILE")"
+  else
+    if [[ -f "$HASH_DIR/$RV_INPUT" ]]; then
+      INPUT_FILE="$HASH_DIR/$RV_INPUT"
+    elif [[ -f "$RV_INPUT" ]]; then
+      INPUT_FILE="$RV_INPUT"
+    else
+      die "Configured input not found: $RV_INPUT"
+    fi
+    log INFO "Selected configured CSV: $(basename "$INPUT_FILE")"
+  fi
 else
-    log_error "Invalid selection. Exiting."
-    exit 1
+  [[ -f "$INPUT_FILE" ]] || die "Input CSV not found: $INPUT_FILE"
+  log INFO "Selected CLI CSV: $(basename "$INPUT_FILE")"
 fi
 
-log_info "Selected file: $(basename "$INPUT_FILE")"
+BASENAME="$(basename "$INPUT_FILE")"
+DATE_TAG="$(echo "$BASENAME" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)"
+[[ -n "$DATE_TAG" ]] || DATE_TAG="$(date +'%Y-%m-%d')"
 
-# ───── Extract Duplicate Hashes ─────
-log_info "Scanning for duplicate hashes... This may take a moment."
-DUP_HASHES=$(cut -d',' -f1 "$INPUT_FILE" | sort | uniq -d)
+mkdir -p "$RV_REPORT_DIR"
+REPORT="$RV_REPORT_DIR/${RV_REPORT_PREFIX_DATE:+$DATE_TAG-}duplicate-summary.txt"
+: >"$REPORT"
 
-if [[ -z "$DUP_HASHES" ]]; then
-    log_info "No duplicate hashes found."
-    exit 0
+# ───────────────────────── CSV → TSV ─────────────────────────
+TSV="$(mktemp)"; trap 'rm -f "$TSV"' EXIT
+csv_to_tsv <"$INPUT_FILE" >"$TSV"
+
+# Validate header (optional)
+read -r HDR <"$TSV" || true
+if ! echo "$HDR" | awk -F'\t' '{exit !($1=="timestamp" && $2=="path" && $3=="algo" && $4=="hash" && $5=="size_mb")}'; then
+  log WARN "CSV header unexpected; proceeding anyway."
 fi
 
-# ───── Setup Output File in Separate Folder ─────
-DATE_TAG=$(basename "$INPUT_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
-OUTPUT_FILE="$DUP_DIR/${DATE_TAG}-duplicate-hashes.txt"
-: > "$OUTPUT_FILE"
+# Build working rows: hash \t size_mb \t path
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+awk -F'\t' -v skip_zero="$RV_SKIP_ZERO" -v minmb="$RV_MIN_MB" '
+NR>1 {
+  size=$5+0
+  if (skip_zero && size<=0) next
+  if (size < minmb) next
+  printf "%s\t%.6f\t%s\n", $4, size, $2
+}' "$TSV" >"$TMP"
 
-# ───── Count Occurrences Quickly, Skipping Zero-Length Files ─────
-log_info "Counting occurrences for each duplicate hash (zero-length files will be skipped)..."
+# Apply include/exclude regex filters on path
+if [[ -n "$RV_INCLUDE_REGEX" ]]; then
+  grep -E "$RV_INCLUDE_REGEX" "$TMP" >"${TMP}.inc" || true
+  mv "${TMP}.inc" "$TMP"
+fi
+if [[ -n "$RV_EXCLUDE_REGEX" ]]; then
+  grep -Ev "$RV_EXCLUDE_REGEX" "$TMP" >"${TMP}.exc" || true
+  mv "${TMP}.exc" "$TMP"
+fi
 
-dup_hash_file=$(mktemp)
-echo "$DUP_HASHES" > "$dup_hash_file"
+# Identify duplicate hash groups (2+ occurrences)
+mapfile -t DUP_HASHES < <(cut -f1 "$TMP" | sort | uniq -d || true)
+(( ${#DUP_HASHES[@]} > 0 )) || { log INFO "No duplicate hashes found after filters."; echo "No duplicates found." >>"$REPORT"; exit 0; }
 
-TMP_SORTED=$(mktemp)
+# Compute per-group counts and total sizes for sorting + totals
+META="$(mktemp)"; trap 'rm -f "$META"' EXIT
+awk -F'\t' '
+{ c[$1]++; s[$1]+=$2 }
+END { for (h in c) printf "%s\t%d\t%.6f\n", h, c[h], s[h] }
+' "$TMP" >"$META"
 
-awk -F',' '
-    NR==FNR { d[$1]=1; next }
-    d[$1] && $6 != "0.00" { counts[$1]++ }
-    END { for (h in counts) print counts[h] "," h }
-' "$dup_hash_file" "$INPUT_FILE" > "$TMP_SORTED"
+TOTAL_GROUPS=$(wc -l <"$META" | tr -d ' ')
+TOTAL_FILES=$(awk -F'\t' '{t+=$2} END{print t+0}' "$META")
+TOTAL_MB=$(awk -F'\t' '{t+=$3} END{printf "%.2f", t+0}' "$META")
 
-rm -f "$dup_hash_file"
+# Sort groups
+case "$RV_SORT" in
+  count_desc) SORTED="$(sort -t$'\t' -k2,2nr -k3,3nr "$META")";;
+  size_desc)  SORTED="$(sort -t$'\t' -k3,3nr -k2,2nr "$META")";;
+  hash_asc)   SORTED="$(sort -t$'\t' -k1,1 "$META")";;
+  *)          SORTED="$(cat "$META")";;
+esac
 
-# ───── Sort by frequency ─────
-SORTED_HASHES=$(sort -t',' -k1,1nr "$TMP_SORTED" | cut -d',' -f2)
-rm -f "$TMP_SORTED"
-
-# ───── Summary ─────
-TOTAL_DUPLICATE_GROUPS=$(echo "$DUP_HASHES" | wc -l)
-TOTAL_DUPLICATE_FILES=$(awk -F',' -v hashes="$DUP_HASHES" '
-    BEGIN { while (getline h < "/dev/stdin") d[h]=1 }
-    d[$1] && $6 != "0.00" { c++ }
-    END { print c }
-' <(echo "$DUP_HASHES") "$INPUT_FILE")
-
+# ───────────────────────── Write summary report ─────────────────────────
 {
-    echo "# Duplicate Hashes Report"
-    echo "# Source file          : $(basename "$INPUT_FILE")"
-    echo "# Date of run          : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "# Total duplicate groups: $TOTAL_DUPLICATE_GROUPS"
-    echo "# Total duplicate files : $TOTAL_DUPLICATE_FILES"
-    echo "#"
-} >> "$OUTPUT_FILE"
+  echo "# Duplicate Summary"
+  echo "# Source file           : $BASENAME"
+  echo "# Date of run           : $(ts)"
+  echo "# Filters               : skip_zero=$RV_SKIP_ZERO min_mb=$RV_MIN_MB"
+  if [[ -n "$RV_INCLUDE_REGEX" ]]; then echo "# Include regex         : $RV_INCLUDE_REGEX"; fi
+  if [[ -n "$RV_EXCLUDE_REGEX" ]]; then echo "# Exclude regex         : $RV_EXCLUDE_REGEX"; fi
+  echo "# Groups (>=2)          : $TOTAL_GROUPS"
+  echo "# Files in groups       : $TOTAL_FILES"
+  echo "# Total duplicated size : ${TOTAL_MB} MB"
+  echo "# Sort                  : $RV_SORT"
+  echo
+  printf "%-14s %-10s %-s\n" "COUNT" "SIZE(MB)" "HASH"
+  printf "%-14s %-10s %-s\n" "-----" "--------" "----"
+  echo "$SORTED" | awk -F'\t' '{printf "%-14d %-10.2f %s\n", $2, $3, $1}'
+  echo
+  echo "# Tip: For interactive review & safe delete plan, run:"
+  echo "#   ./review-duplicates.sh --config hasher.conf"
+} >>"$REPORT"
 
-# ───── Display Progress ─────
-HASHES_ARRAY=($SORTED_HASHES)
-TOTAL_HASHES=${#HASHES_ARRAY[@]}
-COUNT=0
-
-log_info "Processing $TOTAL_HASHES duplicate hash groups..."
-
-for hash in "${HASHES_ARRAY[@]}"; do
-    COUNT=$((COUNT + 1))
-    draw_progress_bar "$COUNT" "$TOTAL_HASHES"
-
-    echo "Duplicate hash ID: $COUNT" >> "$OUTPUT_FILE"
-    echo "Duplicate hash: $hash" >> "$OUTPUT_FILE"
-
-    grep "^$hash" "$INPUT_FILE" | while IFS=, read -r h d f a t s; do
-        [[ "$s" == "0.00" ]] && continue
-        echo "$h,$d,$f,$a,$t,$s" >> "$OUTPUT_FILE"
-    done
-
-    echo "" >> "$OUTPUT_FILE"
-
-    sleep 0.01
-done
-
-echo -e "\n${GREEN}[INFO]${NC} Done! Duplicate hashes written to: $OUTPUT_FILE"
+log INFO "Summary written to: $REPORT"
+echo "Summary written to: $REPORT"
