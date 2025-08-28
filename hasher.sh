@@ -340,7 +340,7 @@ hash_one() {
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
   local row
-  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
+  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
   return 0
 }
