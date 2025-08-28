@@ -8,9 +8,13 @@ LC_ALL=C
 
 # ───────────────────────── Config ─────────────────────────
 HASHES_DIR="hashes"
-BACKGROUND_LOG="background.log"
+LOGS_DIR="logs"
+
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+
+BACKGROUND_LOG="$LOGS_DIR/background.log"  # captures stdout/stderr of background child
+LOG_FILE="$LOGS_DIR/hasher.log"            # canonical run log (always appended to)
 
 ALGO="sha256"           # default algo (sha256|sha1|sha512|md5|blake2)
 PATHFILE=""             # file containing newline-delimited paths (supports # comments)
@@ -41,10 +45,14 @@ GLOBS
 # ──────────────────────── Helpers ─────────────────────────
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# log() prints to stdout (goes to console or background.log) AND appends to LOG_FILE
 log() {
   local level="$1"; shift
-  # Foreground prints to console; background child’s stdout is already redirected to background.log
-  printf '[%s] [%s] %s\n' "$(ts)" "$level" "$*" >&1
+  local line
+  line=$(printf '[%s] [%s] %s\n' "$(ts)" "$level" "$*")
+  printf '%s\n' "$line" >&1
+  # best-effort append to canonical log
+  { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
 }
 
 die() { log ERROR "$*"; exit 1; }
@@ -149,21 +157,26 @@ done
 
 [[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
 resolve_algo_cmd
+
+# Ensure directories exist before any logging
+mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+
 load_excludes
 
 # ─────────────────────── Background mode ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  mkdir -p "$(dirname "$BACKGROUND_LOG")"
   # Re-exec this script with --headless, redirecting all output to the background log
-  ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > .hasher.pid ) >/dev/null 2>&1
-  pid="$(cat .hasher.pid 2>/dev/null || true)"; rm -f .hasher.pid
+  ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > "$LOGS_DIR/.hasher.pid" ) >/dev/null 2>&1
+  pid="$(cat "$LOGS_DIR/.hasher.pid" 2>/dev/null || true)"; rm -f "$LOGS_DIR/.hasher.pid"
   printf 'Hasher started with nohup (PID %s). Output: %s\n' "${pid:-?}" "$OUTPUT"
+  # Immediate reassurance line for the user in background.log (and canonical log)
+  msg="[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] hasher initiated, please standby, this may take some time"
+  echo "$msg" >>"$BACKGROUND_LOG"
+  echo "$msg" >>"$LOG_FILE" 2>/dev/null || true
   exit 0
 fi
 
 # ─────────────────────── Preparation ───────────────────────
-mkdir -p "$HASHES_DIR"
-
 # Ensure CSV header exists
 if [[ ! -s "$OUTPUT" ]]; then
   printf '"timestamp","path","algo","hash","size_mb"\n' >"$OUTPUT"
@@ -181,10 +194,11 @@ done <"$PATHFILE"
 
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
+log INFO "Hasher initiated, preparing file list..."
+
 # Count files (without hashing) for progress
 count_files_in() {
   local path="$1"
-  # Use process substitution to keep variables in the main shell
   local cnt=0
   while IFS= read -r -d '' f; do
     if ! is_excluded "$f"; then
@@ -216,7 +230,6 @@ progress_tick() {
   now=$(date +%s)
   elapsed=$((now - START_TS))
   if (( PROCESSED > 0 )); then
-    # ETA ≈ elapsed * (total - processed) / processed
     rem=$(( TOTAL - PROCESSED ))
     eta=$(( elapsed * (rem) / (PROCESSED) ))
   else
@@ -240,7 +253,7 @@ hash_one() {
 
   # hash
   local sum
-  # BusyBox coreutils-compatible parsing: first field is the digest
+  # BusyBox/coreutils-compatible parsing: first field is the digest
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
     log WARN "Failed to hash: $f"
     return 0
