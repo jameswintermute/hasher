@@ -25,6 +25,9 @@ EXCLUDE_FILE=""      # legacy plain excludes file
 : "${HASHER_CONFIG:=}"   # env fallback (parent exports to child)
 
 PROGRESS_INTERVAL=15 # seconds (override via config [logging] background-interval)
+LOG_LEVEL="info"     # debug|info|warn|error (override via config)
+XTRACE=false         # enable 'set -x' if true (override via config)
+
 PASSED_RUN_ID=""     # parent passes to child so IDs match
 
 # ───────────────────── Built-in excludes ───────────────────
@@ -62,25 +65,36 @@ gen_run_id() {
   fi
 }
 
+# Level filter
+lvl_rank() {
+  case "$1" in debug) echo 10 ;; info) echo 20 ;; warn) echo 30 ;; error) echo 40 ;; *) echo 20 ;; esac
+}
+LOG_RANK=$(lvl_rank "$LOG_LEVEL")
+
 RUN_ID="$(gen_run_id)"     # set early so errors include a Run-ID
 BACKGROUND_LOG=""          # symlink to per-run log (for tail -f)
 LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
 FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
 
-log() {
-  local level="$1"; shift || true
+_log_core() {
+  # $1=LEVEL, $2=msg
+  local level="$1"; shift
   local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   if $IS_CHILD; then
-    # Background/headless: stdout is redirected to $LOG_FILE; do NOT also append.
     printf '%s\n' "$line" >&1
   else
-    # Foreground: print and append to per-run file for a durable audit trail.
     printf '%s\n' "$line" >&1
     { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
   fi
 }
+log() {
+  # honor level
+  local level="$1"; shift || true
+  local want=$(lvl_rank "$level")
+  if (( want >= LOG_RANK )); then _log_core "$level" "$@"; fi
+}
 
-die() { log ERROR "$*"; exit 1; }
+die() { _log_core ERROR "$*"; exit 1; }
 
 usage() {
   cat <<EOF
@@ -92,7 +106,7 @@ Flags:
   --pathfile FILE        File with one path per line (# comments ok)
   --algo NAME            sha256|sha1|sha512|md5|blake2 (default sha256)
   --nohup                Re-exec in background (live log: logs/background.log)
-  --config FILE          INI config ([logging] background-interval=SECONDS; [exclusions] …)
+  --config FILE          INI config ([logging] background-interval, level, xtrace; [exclusions] …)
   --exclude-file FILE    Legacy extra globs (ignored if --config supplied)
   -h|--help              Show help
 
@@ -137,6 +151,8 @@ parse_ini() {
           key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
             background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
+            level) LOG_LEVEL="${val,,}"; LOG_RANK=$(lvl_rank "$LOG_LEVEL") ;;
+            xtrace) case "${val,,}" in true|1|yes) XTRACE=true ;; *) XTRACE=false ;; esac ;;
           esac
         fi
         ;;
@@ -233,10 +249,19 @@ mkdir -p "$HASHES_DIR" "$LOGS_DIR"
 ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log" || true
 ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
 
+# Optional shell tracing to the log (GNU bash supports BASH_XTRACEFD)
+if $XTRACE 2>/dev/null; then
+  exec {__xtrace_fd}>>"$LOG_FILE" || true
+  if [[ -n "${__xtrace_fd:-}" ]]; then
+    export BASH_XTRACEFD="$__xtrace_fd"
+    set -x
+  fi
+fi
+
 resolve_algo_cmd
 load_excludes
 
-# ─────────────────────── Background mode ───────────────────
+# ─────────────────────── Background mode (robust) ──────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export HASHER_CONFIG="${CONFIG_FILE}"
   nohup bash "$0" \
@@ -251,7 +276,7 @@ fi
 
 # ─────────────────────── Startup log ───────────────────────
 log INFO "Run-ID: $RUN_ID"
-log INFO "Config: ${CONFIG_FILE:-${HASHER_CONFIG:-<none>}} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES}"
+log INFO "Config: ${CONFIG_FILE:-${HASHER_CONFIG:-<none>}} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES} | Level: ${LOG_LEVEL}"
 log INFO "Hasher initiated — please standby; initial file discovery may take some time."
 log INFO "Preparing file list..."
 
@@ -270,37 +295,51 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$PATHFILE"
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
-# ───────────── Discovery → (no dedupe) with heartbeat ─────
+# ───────────── Discovery (FIFO-based, BusyBox-safe) ────────
 DISCOVERY_START=$(date +%s)
 DISC_LAST_PRINT=$DISCOVERY_START
 DISCOVERED=0
 : >"$FILELIST"
 
-add_file_if_included() {
-  local f="$1"
-  is_excluded "$f" && return 1
-  printf '%s\0' "$f" >>"$FILELIST"
-  ((DISCOVERED+=1))
-  local now=$(date +%s)
+FIFO="$LOGS_DIR/.findfifo-$RUN_ID"
+cleanup_fifo() { [[ -p "$FIFO" ]] && rm -f "$FIFO" || true; }
+trap cleanup_fifo EXIT INT TERM
+mkfifo "$FIFO"
+
+# Start find in the background writing NUL-delimited paths to FIFO
+(
+  # One 'find' per root so we still get early streaming if one path is huge
+  for p in "${SEARCH_PATHS[@]}"; do
+    if [[ -d "$p" || -f "$p" ]]; then
+      find "$p" -type f -print0 2>/dev/null || true
+    else
+      printf '[%s] [RUN %s] [WARN] Path does not exist or is not accessible: %s\n' "$(ts)" "$RUN_ID" "$p" >"$FIFO"
+    fi
+  done
+) >"$FIFO" &
+FIND_PID=$!
+
+# Reader: consume from FIFO in the *current* shell (no subshell), apply excludes, build FILELIST, heartbeat
+while true; do
+  IFS= read -r -d '' f <"$FIFO" || break
+  # Skip any injected WARN lines (if a path was missing and echoed into FIFO)
+  if [[ "$f" == \[*WARN* ]]; then _log_core WARN "${f#*WARN] }"; continue; fi
+  if ! is_excluded "$f"; then
+    printf '%s\0' "$f" >>"$FILELIST"
+    ((DISCOVERED+=1))
+  fi
+  now=$(date +%s)
   if (( now - DISC_LAST_PRINT >= PROGRESS_INTERVAL )); then
     log PROGRESS "Discovery: scanned=$DISCOVERED (last: $f)"
     DISC_LAST_PRINT=$now
   fi
-}
-
-for p in "${SEARCH_PATHS[@]}"; do
-  if [[ -d "$p" || -f "$p" ]]; then
-    while IFS= read -r -d '' f; do
-      add_file_if_included "$f"
-    done < <(find "$p" -type f -print0 2>/dev/null)
-  else
-    log WARN "Path does not exist or is not accessible: $p"
-  fi
 done
 
-# NO DEDUPE: keep every discovered path (for full point-in-time record)
-TOTAL="$DISCOVERED"
+# Wait for find to finish (avoid zombies)
+wait "$FIND_PID" 2>/dev/null || true
+cleanup_fifo
 
+TOTAL="$DISCOVERED"
 DISCOVERY_END=$(date +%s)
 log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
 log INFO "File list saved: $FILELIST"
@@ -329,7 +368,7 @@ hash_one() {
   local f="$1"
   if [[ ! -r "$f" ]]; then ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1; fi
   local sum
-  # BusyBox-friendly: strip after first whitespace without awk dependency quirks
+  # BusyBox-friendly: strip after first whitespace
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | sed 's/[[:space:]].*$//')"; then
     ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
   fi
@@ -342,14 +381,18 @@ hash_one() {
   return 0
 }
 
-while IFS= read -r -d '' f; do
-  if hash_one "$f"; then ((PROCESSED+=1)); fi
-  now=$(date +%s)
-  if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
-    progress_tick
-    LAST_PRINT=$now
-  fi
-done <"$FILELIST"
+if (( TOTAL == 0 )); then
+  log WARN "No files discovered. Nothing to hash."
+else
+  while IFS= read -r -d '' f; do
+    if hash_one "$f"; then ((PROCESSED+=1)); fi
+    now=$(date +%s)
+    if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
+      progress_tick
+      LAST_PRINT=$now
+    fi
+  done <"$FILELIST"
+fi
 
 # ───────────────────────── Summary ─────────────────────────
 END_TS=$(date +%s)
