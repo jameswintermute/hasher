@@ -22,8 +22,7 @@ IS_CHILD=false       # set when re-exec'ed under nohup
 # Config sources
 CONFIG_FILE=""       # INI config via --config
 EXCLUDE_FILE=""      # legacy plain excludes file
-# Fallback env (parent exports this to child too)
-: "${HASHER_CONFIG:=}"
+: "${HASHER_CONFIG:=}"   # env fallback (parent exports to child)
 
 PROGRESS_INTERVAL=15 # seconds (override via config [logging] background-interval)
 PASSED_RUN_ID=""     # parent passes to child so IDs match
@@ -69,14 +68,11 @@ LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
 FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
 
 log() {
-  # $1=LEVEL, rest=message
   local level="$1"; shift || true
   local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   if $IS_CHILD; then
-    # Background/headless: stdout is redirected to $LOG_FILE; do NOT also append.
     printf '%s\n' "$line" >&1
   else
-    # Foreground: print and append to per-run file for a durable audit trail.
     printf '%s\n' "$line" >&1
     { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
   fi
@@ -138,9 +134,7 @@ parse_ini() {
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
           key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
-            background-interval|progress-interval)
-              [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val"
-              ;;
+            background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
           esac
         fi
         ;;
@@ -164,28 +158,19 @@ parse_ini() {
 # ───────────────────────── Excludes ────────────────────────
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
-  # 1) Config file (flag)
   if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
-  # 2) Fallback env var if flag not set
   if [[ -z "$CONFIG_FILE" && -n "$HASHER_CONFIG" && -f "$HASHER_CONFIG" ]]; then
-    CONFIG_FILE="$HASHER_CONFIG"
-    parse_ini "$CONFIG_FILE"
+    CONFIG_FILE="$HASHER_CONFIG"; parse_ini "$CONFIG_FILE"
   fi
-  # 3) Legacy exclude file (only if no config)
   if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
-  # built-ins unless disabled
   if $INHERIT_DEFAULT_EXCLUDES; then
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      EXCLUDE_GLOBS+=("$line")
-    done <<<"$EXCLUDE_DEFAULTS"
+    while IFS= read -r line; do [[ -n "$line" ]] && EXCLUDE_GLOBS+=("$line"); done <<<"$EXCLUDE_DEFAULTS"
   fi
-  # never hash our own outputs
   EXCLUDE_GLOBS+=("$HASHES_DIR/*")
 }
 
@@ -228,13 +213,11 @@ done
 [[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
 
 # Initialize per-run paths
-BACKGROUND_LOG="$LOGS_DIR/background.log"            # symlink to per-run log
-LOG_FILE="$LOGS_DIR/hasher-$RUN_ID.log"              # per-run log file
-FILELIST="$LOGS_DIR/files-$RUN_ID.lst"               # per-run file list
+BACKGROUND_LOG="$LOGS_DIR/background.log"
+LOG_FILE="$LOGS_DIR/hasher-$RUN_ID.log"
+FILELIST="$LOGS_DIR/files-$RUN_ID.lst"
 
 mkdir -p "$HASHES_DIR" "$LOGS_DIR"
-
-# Touch per-run log so symlinks have a target; then create/update symlinks
 : >"$LOG_FILE"
 ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log" || true
 ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
@@ -242,11 +225,9 @@ ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
 resolve_algo_cmd
 load_excludes
 
-# ─────────────────────── Background mode (robust) ──────────
+# ─────────────────────── Background mode ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  # Export config path via env as a fallback in child
   export HASHER_CONFIG="${CONFIG_FILE}"
-  # Log the exec command for debugging
   printf '[%s] [RUN %s] [INFO] Exec: nohup bash "%s" --pathfile "%s" --algo "%s" %s %s --run-id "%s" --headless >>"%s" 2>&1 &\n' \
     "$(ts)" "$RUN_ID" "$0" "$PATHFILE" "$ALGO" \
     "${CONFIG_FILE:+--config \"$CONFIG_FILE\"}" \
@@ -257,8 +238,7 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
     --pathfile "$PATHFILE" --algo "$ALGO" \
     ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
     ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} \
-    --run-id "$RUN_ID" --headless \
-    >>"$LOG_FILE" 2>&1 &
+    --run-id "$RUN_ID" --headless >>"$LOG_FILE" 2>&1 &
   pid=$!
   printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "$pid" "$RUN_ID" "$OUTPUT"
   exit 0
@@ -313,17 +293,18 @@ for p in "${SEARCH_PATHS[@]}"; do
   fi
 done
 
-# De-duplicate filelist by path
+# De-duplicate filelist by path (BusyBox-safe)
 TMP="$FILELIST.tmp"
 if sort --help 2>/dev/null | grep -q -- ' -z'; then
-  # Prefer GNU sort with NUL support
   sort -z -u "$FILELIST" -o "$FILELIST"
 else
-  # Fallback: newline conversion (does not support filenames with literal newlines)
   tr '\0' '\n' <"$FILELIST" | sort -u | tr '\n' '\0' >"$TMP" && mv -f "$TMP" "$FILELIST"
 fi
 
-TOTAL=$(tr -cd '\000' <"$FILELIST" | wc -c | tr -d ' ')
+# Count entries without fragile pipelines (BusyBox-safe)
+TOTAL=0
+while IFS= read -r -d '' _f; do ((TOTAL++)); done <"$FILELIST"
+
 DISCOVERY_END=$(date +%s)
 log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
 log INFO "File list saved: $FILELIST"
@@ -342,8 +323,7 @@ progress_tick() {
   local now elapsed eta rem pct
   now=$(date +%s)
   elapsed=$((now - START_TS))
-  rem=$(( TOTAL - PROCESSED ))
-  (( rem<0 )) && rem=0
+  rem=$(( TOTAL - PROCESSED )); (( rem<0 )) && rem=0
   eta=$(( PROCESSED>0 ? (elapsed * rem / PROCESSED) : 0 ))
   pct=$(percent_of "$PROCESSED" "$TOTAL")
   log PROGRESS "Hashing: [${pct}%] ${PROCESSED}/${TOTAL} | elapsed=$(format_secs "$elapsed") eta=$(format_secs "$eta")"
@@ -351,9 +331,7 @@ progress_tick() {
 
 hash_one() {
   local f="$1"
-  if [[ ! -r "$f" ]]; then
-    ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1
-  fi
+  if [[ ! -r "$f" ]]; then ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1; fi
   local sum
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
     ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
@@ -362,8 +340,7 @@ hash_one() {
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
   local row
-  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO") ,$(csv_quote "$sum"),$(csv_quote "$size_mb")"
-  # (above keeps algo exactly as selected; change to $ALGO_NAME if you prefer normalized)
+  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
   return 0
 }
