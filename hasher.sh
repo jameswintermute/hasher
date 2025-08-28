@@ -77,7 +77,6 @@ LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
 FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
 
 _log_core() {
-  # $1=LEVEL, $2=msg
   local level="$1"; shift
   local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   if $IS_CHILD; then
@@ -88,9 +87,8 @@ _log_core() {
   fi
 }
 log() {
-  # honor level
   local level="$1"; shift || true
-  local want=$(lvl_rank "$level")
+  local want; want=$(lvl_rank "$level")
   if (( want >= LOG_RANK )); then _log_core "$level" "$@"; fi
 }
 
@@ -176,29 +174,23 @@ parse_ini() {
 # ───────────────────────── Excludes ────────────────────────
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
-  # 1) Config file (flag)
   if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
-  # 2) Fallback env var if flag not set
   if [[ -z "$CONFIG_FILE" && -n "$HASHER_CONFIG" && -f "$HASHER_CONFIG" ]]; then
-    CONFIG_FILE="$HASHER_CONFIG"
-    parse_ini "$CONFIG_FILE"
+    CONFIG_FILE="$HASHER_CONFIG"; parse_ini "$CONFIG_FILE"
   fi
-  # 3) Legacy exclude file (only if no config)
   if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
-  # built-ins unless disabled
   if $INHERIT_DEFAULT_EXCLUDES; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <<<"$EXCLUDE_DEFAULTS"
   fi
-  # never hash our own outputs
-  EXCLUDE_GLOBS+=("$HASHES_DIR/*")
+  EXCLUDE_GLOBS+=("$HASHES_DIR/*")  # never hash our own outputs
 }
 
 is_excluded() {
@@ -249,7 +241,7 @@ mkdir -p "$HASHES_DIR" "$LOGS_DIR"
 ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log" || true
 ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
 
-# Optional shell tracing to the log (GNU bash supports BASH_XTRACEFD)
+# Optional shell tracing to the log (if enabled via config)
 if $XTRACE 2>/dev/null; then
   exec {__xtrace_fd}>>"$LOG_FILE" || true
   if [[ -n "${__xtrace_fd:-}" ]]; then
@@ -308,21 +300,20 @@ mkfifo "$FIFO"
 
 # Start find in the background writing NUL-delimited paths to FIFO
 (
-  # One 'find' per root so we still get early streaming if one path is huge
   for p in "${SEARCH_PATHS[@]}"; do
     if [[ -d "$p" || -f "$p" ]]; then
       find "$p" -type f -print0 2>/dev/null || true
     else
-      printf '[%s] [RUN %s] [WARN] Path does not exist or is not accessible: %s\n' "$(ts)" "$RUN_ID" "$p" >"$FIFO"
+      # inject a WARN line for the reader to log
+      printf '[%s] [RUN %s] [WARN] Path does not exist or is not accessible: %s' "$(ts)" "$RUN_ID" "$p"
     fi
   done
 ) >"$FIFO" &
+
 FIND_PID=$!
 
-# Reader: consume from FIFO in the *current* shell (no subshell), apply excludes, build FILELIST, heartbeat
-while true; do
-  IFS= read -r -d '' f <"$FIFO" || break
-  # Skip any injected WARN lines (if a path was missing and echoed into FIFO)
+# Reader: consume from FIFO with ONE redirection (don’t reopen each loop!)
+while IFS= read -r -d '' f; do
   if [[ "$f" == \[*WARN* ]]; then _log_core WARN "${f#*WARN] }"; continue; fi
   if ! is_excluded "$f"; then
     printf '%s\0' "$f" >>"$FILELIST"
@@ -333,9 +324,9 @@ while true; do
     log PROGRESS "Discovery: scanned=$DISCOVERED (last: $f)"
     DISC_LAST_PRINT=$now
   fi
-done
+done <"$FIFO"
 
-# Wait for find to finish (avoid zombies)
+# Wait for find to finish and clean FIFO
 wait "$FIND_PID" 2>/dev/null || true
 cleanup_fifo
 
@@ -368,7 +359,6 @@ hash_one() {
   local f="$1"
   if [[ ! -r "$f" ]]; then ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1; fi
   local sum
-  # BusyBox-friendly: strip after first whitespace
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | sed 's/[[:space:]].*$//')"; then
     ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
   fi
