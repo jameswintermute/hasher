@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # hasher.sh — robust file hasher with CSV output, background mode,
 # Run-ID (consistent parent/child), INI config, per-run logs, unique file list, and heartbeats.
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
@@ -19,7 +20,7 @@ IS_CHILD=false
 CONFIG_FILE=""       # preferred: INI file
 EXCLUDE_FILE=""      # legacy: extra globs only
 
-PROGRESS_INTERVAL=15 # default seconds (can be overridden by config [logging] background-interval)
+PROGRESS_INTERVAL=15 # default seconds (override via config [logging] background-interval)
 PASSED_RUN_ID=""     # internal: provided by parent to child so Run-ID matches
 
 # ───────────────────── Built-in excludes ───────────────────
@@ -48,7 +49,7 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 gen_run_id() {
   if [[ -n "${PASSED_RUN_ID:-}" ]]; then
     printf '%s' "$PASSED_RUN_ID"
-  elif command -v uuidgen >/dev/null 2>&1; then
+  elif command -v uuidgen >/devnull 2>&1; then
     uuidgen
   elif [[ -r /proc/sys/kernel/random/uuid ]]; then
     cat /proc/sys/kernel/random/uuid
@@ -60,10 +61,10 @@ gen_run_id() {
 # Will be set after parsing args (since PASSED_RUN_ID may be provided)
 RUN_ID=""
 
-# These depend on RUN_ID; will be initialized after RUN_ID is set
-BACKGROUND_LOG=""   # symlink to the run log (for tail -f)
-LOG_FILE=""         # per-run log file: logs/hasher-$RUN_ID.log
-FILELIST=""         # per-run file list: logs/files-$RUN_ID.lst
+# These depend on RUN_ID; set after RUN_ID is initialized
+BACKGROUND_LOG=""          # symlink to per-run log for tail -f
+LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
+FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
 
 log() {
   local level="$1"; shift || true
@@ -84,8 +85,8 @@ Usage:
 Flags:
   --pathfile FILE        File with one path per line (# comments ok)
   --algo NAME            sha256|sha1|sha512|md5|blake2 (default sha256)
-  --nohup                Re-exec in background (live log symlink: logs/background.log)
-  --config FILE          INI config: [logging] background-interval=SECONDS; [exclusions] …
+  --nohup                Re-exec in background (live log: logs/background.log)
+  --config FILE          INI config ([logging] background-interval=SECONDS; [exclusions] …)
   --exclude-file FILE    Legacy extra globs (ignored if --config supplied)
   -h|--help              Show help
 
@@ -119,25 +120,17 @@ parse_ini() {
   local file="$1"
   [[ -f "$file" ]] || return 0
   local section="" line key val raw
-
   while IFS= read -r line || [[ -n "$line" ]]; do
     raw="${line%%[#;]*}"
     raw="$(echo -n "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
     [[ -z "$raw" ]] && continue
-
-    if [[ "$raw" =~ ^\[(.+)\]$ ]]; then
-      section="${BASH_REMATCH[1],,}"
-      continue
-    fi
-
+    if [[ "$raw" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1],,}"; continue; fi
     case "$section" in
       logging)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
           key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
-            background-interval|progress-interval)
-              [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val"
-              ;;
+            background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
           esac
         fi
         ;;
@@ -162,21 +155,18 @@ parse_ini() {
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
   if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
-
   if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
-
   if $INHERIT_DEFAULT_EXCLUDES; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <<<"$EXCLUDE_DEFAULTS"
   fi
-
   EXCLUDE_GLOBS+=("$HASHES_DIR/*")  # never hash our own outputs
 }
 
@@ -228,32 +218,33 @@ done
 
 # Initialize RUN_ID and per-run paths
 RUN_ID="$(gen_run_id)"
-BACKGROUND_LOG="$LOGS_DIR/background.log"            # will symlink to per-run log
+BACKGROUND_LOG="$LOGS_DIR/background.log"            # symlink to per-run log
 LOG_FILE="$LOGS_DIR/hasher-$RUN_ID.log"              # per-run log file
 FILELIST="$LOGS_DIR/files-$RUN_ID.lst"               # per-run file list
 
 mkdir -p "$HASHES_DIR" "$LOGS_DIR"
 
-# Ensure symlinks point to this run (best-effort)
-# Create empty per-run log first (so symlinks have a target)
+# Touch per-run log so symlinks have a target; then create/update symlinks
 : >"$LOG_FILE"
-ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log"       || true
-ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"            || true
+ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log" || true
+ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
 
 resolve_algo_cmd
 load_excludes
 
-# ─────────────────────── Background mode ───────────────────
+# ─────────────────────── Background mode (FIXED) ───────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  # Re-exec with consistent Run-ID and headless flag; redirect to background symlink (points at per-run log)
-  ( nohup bash "$0" \
-      --pathfile "$PATHFILE" --algo "$ALGO" \
-      ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
-      ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} \
-      --run-id "$RUN_ID" --headless >"$BACKGROUND_LOG" 2>&1 \
-      & echo $! > "$LOGS_DIR/.hasher.pid" ) >/dev/null 2>&1
-  pid="$(cat "$LOGS_DIR/.hasher.pid" 2>/dev/null || true)"; rm -f "$LOGS_DIR/.hasher.pid"
-  printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "${pid:-?}" "$RUN_ID" "$OUTPUT"
+  # Launch child in nohup, append directly to per-run log; no subshell indirection
+  nohup bash "$0" \
+    --pathfile "$PATHFILE" --algo "$ALGO" \
+    ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
+    ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} \
+    --run-id "$RUN_ID" --headless \
+    >>"$LOG_FILE" 2>&1 &
+
+  pid=$!
+  # Symlinks already point to $LOG_FILE, so tailing works immediately
+  printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "$pid" "$RUN_ID" "$OUTPUT"
   exit 0
 fi
 
@@ -325,6 +316,15 @@ log INFO "Starting hash: algo=$ALGO_NAME total_files=$TOTAL output=$OUTPUT"
 
 trap 'log WARN "Interrupted. Processed ${PROCESSED}/${TOTAL}. Failed=${FAILED}. Partial CSV: ${OUTPUT}"' INT TERM
 
+percent_of() {
+  local p="$1" t="$2"
+  if (( t<=0 )); then echo 0; return; fi
+  local pct=$(( (p * 100) / t ))
+  (( pct<0 )) && pct=0
+  (( pct>100 )) && pct=100
+  echo "$pct"
+}
+
 progress_tick() {
   local now elapsed eta rem pct
   now=$(date +%s)
@@ -343,18 +343,15 @@ hash_one() {
     log WARN "Skipped (missing/unreadable): $f"
     return 1
   fi
-
   local sum
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
     ((FAILED+=1))
     log WARN "Failed to hash: $f"
     return 1
   fi
-
   local bytes size_mb
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
-
   local row
   row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
