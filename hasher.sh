@@ -18,10 +18,14 @@ ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
 PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
-CONFIG_FILE=""       # INI config
-EXCLUDE_FILE=""      # legacy plain excludes file
 
-PROGRESS_INTERVAL=15 # seconds (can be overridden by config [logging] background-interval)
+# Config sources
+CONFIG_FILE=""       # INI config via --config
+EXCLUDE_FILE=""      # legacy plain excludes file
+# Fallback env (parent exports this to child too)
+: "${HASHER_CONFIG:=}"
+
+PROGRESS_INTERVAL=15 # seconds (override via config [logging] background-interval)
 PASSED_RUN_ID=""     # parent passes to child so IDs match
 
 # ───────────────────── Built-in excludes ───────────────────
@@ -59,7 +63,7 @@ gen_run_id() {
   fi
 }
 
-RUN_ID=""
+RUN_ID="$(gen_run_id)"     # set early so errors include a Run-ID
 BACKGROUND_LOG=""          # symlink to per-run log (for tail -f)
 LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
 FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
@@ -69,10 +73,10 @@ log() {
   local level="$1"; shift || true
   local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   if $IS_CHILD; then
-    # In background/headless mode stdout is redirected to $LOG_FILE; do NOT also append.
+    # Background/headless: stdout is redirected to $LOG_FILE; do NOT also append.
     printf '%s\n' "$line" >&1
   else
-    # Foreground runs: print and append to per-run file for a durable audit trail.
+    # Foreground: print and append to per-run file for a durable audit trail.
     printf '%s\n' "$line" >&1
     { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
   fi
@@ -160,20 +164,29 @@ parse_ini() {
 # ───────────────────────── Excludes ────────────────────────
 declare -a EXCLUDE_GLOBS=()
 load_excludes() {
+  # 1) Config file (flag)
   if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
+  # 2) Fallback env var if flag not set
+  if [[ -z "$CONFIG_FILE" && -n "$HASHER_CONFIG" && -f "$HASHER_CONFIG" ]]; then
+    CONFIG_FILE="$HASHER_CONFIG"
+    parse_ini "$CONFIG_FILE"
+  fi
+  # 3) Legacy exclude file (only if no config)
   if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <"$EXCLUDE_FILE"
   fi
+  # built-ins unless disabled
   if $INHERIT_DEFAULT_EXCLUDES; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       EXCLUDE_GLOBS+=("$line")
     done <<<"$EXCLUDE_DEFAULTS"
   fi
-  EXCLUDE_GLOBS+=("$HASHES_DIR/*")  # never hash our own outputs
+  # never hash our own outputs
+  EXCLUDE_GLOBS+=("$HASHES_DIR/*")
 }
 
 is_excluded() {
@@ -191,7 +204,7 @@ resolve_algo_cmd() {
     sha512)  HASH_CMD="sha512sum"; ALGO_NAME="sha512" ;;
     md5)     HASH_CMD="md5sum";    ALGO_NAME="md5" ;;
     blake2)  HASH_CMD="b2sum";     ALGO_NAME="blake2" ;;
-    *) die "Unknown --algo '$ALGO'. Use sha256|sha1|sha512|md5|blake2." ;;
+    *) log WARN "Unknown --algo '$ALGO'. Defaulting to sha256."; HASH_CMD="sha256sum"; ALGO_NAME="sha256" ;;
   esac
   command -v "$HASH_CMD" >/dev/null 2>&1 || die "Required command '$HASH_CMD' not found."
 }
@@ -203,18 +216,18 @@ while (($#)); do
     --algo)          ALGO="${2:-}"; shift 2 ;;
     --nohup)         RUN_IN_BACKGROUND=true; shift ;;
     --headless)      IS_CHILD=true; shift ;;                 # internal
-    --run-id)        PASSED_RUN_ID="${2:-}"; shift 2 ;;     # internal
+    --run-id)        PASSED_RUN_ID="${2:-}"; RUN_ID="$PASSED_RUN_ID"; shift 2 ;;  # internal
     --exclude-file)  EXCLUDE_FILE="${2:-}"; shift 2 ;;
     --config)        CONFIG_FILE="${2:-}"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
-    *)               die "Unknown arg: $1 (use -h for help)";;
+    --*)             log WARN "Ignoring unknown flag: $1"; shift ;;
+    *)               log WARN "Ignoring unexpected arg: $1"; shift ;;
   esac
 done
 
 [[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
 
-# Initialize RUN_ID and per-run paths
-RUN_ID="$(gen_run_id)"
+# Initialize per-run paths
 BACKGROUND_LOG="$LOGS_DIR/background.log"            # symlink to per-run log
 LOG_FILE="$LOGS_DIR/hasher-$RUN_ID.log"              # per-run log file
 FILELIST="$LOGS_DIR/files-$RUN_ID.lst"               # per-run file list
@@ -229,8 +242,17 @@ ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
 resolve_algo_cmd
 load_excludes
 
-# ─────────────────────── Background mode (FIXED) ───────────
+# ─────────────────────── Background mode (robust) ──────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
+  # Export config path via env as a fallback in child
+  export HASHER_CONFIG="${CONFIG_FILE}"
+  # Log the exec command for debugging
+  printf '[%s] [RUN %s] [INFO] Exec: nohup bash "%s" --pathfile "%s" --algo "%s" %s %s --run-id "%s" --headless >>"%s" 2>&1 &\n' \
+    "$(ts)" "$RUN_ID" "$0" "$PATHFILE" "$ALGO" \
+    "${CONFIG_FILE:+--config \"$CONFIG_FILE\"}" \
+    "${EXCLUDE_FILE:+--exclude-file \"$EXCLUDE_FILE\"}" \
+    "$RUN_ID" "$LOG_FILE" >>"$LOG_FILE"
+
   nohup bash "$0" \
     --pathfile "$PATHFILE" --algo "$ALGO" \
     ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
@@ -244,7 +266,7 @@ fi
 
 # ─────────────────────── Startup log ───────────────────────
 log INFO "Run-ID: $RUN_ID"
-log INFO "Config: ${CONFIG_FILE:-<none>} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES}"
+log INFO "Config: ${CONFIG_FILE:-${HASHER_CONFIG:-<none>}} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES}"
 log INFO "Hasher initiated — please standby; initial file discovery may take some time."
 log INFO "Preparing file list..."
 
@@ -340,7 +362,8 @@ hash_one() {
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
   local row
-  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
+  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO") ,$(csv_quote "$sum"),$(csv_quote "$size_mb")"
+  # (above keeps algo exactly as selected; change to $ALGO_NAME if you prefer normalized)
   printf '%s\n' "$row" >>"$OUTPUT"
   return 0
 }
