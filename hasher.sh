@@ -45,13 +45,24 @@ GLOBS
 # ──────────────────────── Helpers ─────────────────────────
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+gen_run_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    printf '%s-%s-%s' "$(date +'%Y%m%d-%H%M%S')" "$$" "$RANDOM"
+  fi
+}
+
+RUN_ID="$(gen_run_id)"
+
 # log() prints to stdout (goes to console or background.log) AND appends to LOG_FILE
 log() {
   local level="$1"; shift
   local line
-  line=$(printf '[%s] [%s] %s\n' "$(ts)" "$level" "$*")
+  line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
   printf '%s\n' "$line" >&1
-  # best-effort append to canonical log
   { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
 }
 
@@ -78,7 +89,6 @@ EOF
 }
 
 csv_quote() {
-  # Always quote; double-up internal quotes
   local s=${1//\"/\"\"}
   printf '"%s"' "$s"
 }
@@ -95,7 +105,6 @@ portable_stat_size() {
 }
 
 format_secs() {
-  # int seconds -> HH:MM:SS
   local s=$1
   printf '%02d:%02d:%02d' "$((s/3600))" "$(( (s%3600)/60 ))" "$((s%60))"
 }
@@ -156,11 +165,10 @@ while (($#)); do
 done
 
 [[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
-resolve_algo_cmd
 
-# Ensure directories exist before any logging
+# Ensure directories exist before any logging and resolve algo
 mkdir -p "$HASHES_DIR" "$LOGS_DIR"
-
+resolve_algo_cmd
 load_excludes
 
 # ─────────────────────── Background mode ───────────────────
@@ -168,15 +176,16 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   # Re-exec this script with --headless, redirecting all output to the background log
   ( nohup bash "$0" --pathfile "$PATHFILE" --algo "$ALGO" ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} --headless >"$BACKGROUND_LOG" 2>&1 & echo $! > "$LOGS_DIR/.hasher.pid" ) >/dev/null 2>&1
   pid="$(cat "$LOGS_DIR/.hasher.pid" 2>/dev/null || true)"; rm -f "$LOGS_DIR/.hasher.pid"
-  printf 'Hasher started with nohup (PID %s). Output: %s\n' "${pid:-?}" "$OUTPUT"
-  # Immediate reassurance line for the user in background.log (and canonical log)
-  msg="[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] hasher initiated, please standby, this may take some time"
-  echo "$msg" >>"$BACKGROUND_LOG"
-  echo "$msg" >>"$LOG_FILE" 2>/dev/null || true
+  printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "${pid:-?}" "$RUN_ID" "$OUTPUT"
+  # Note: no parent writes to $BACKGROUND_LOG — avoids interleaving.
   exit 0
 fi
 
 # ─────────────────────── Preparation ───────────────────────
+# Immediate reassurance from the single writer (this process)
+log INFO "Run-ID: $RUN_ID"
+log INFO "Hasher initiated — please standby; initial file discovery may take some time."
+
 # Ensure CSV header exists
 if [[ ! -s "$OUTPUT" ]]; then
   printf '"timestamp","path","algo","hash","size_mb"\n' >"$OUTPUT"
@@ -185,7 +194,6 @@ fi
 # Read search paths from the file
 declare -a SEARCH_PATHS=()
 while IFS= read -r line || [[ -n "$line" ]]; do
-  # strip comments and trim
   line="${line%%#*}"
   line="$(echo -n "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
   [[ -z "$line" ]] && continue
@@ -194,7 +202,7 @@ done <"$PATHFILE"
 
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
-log INFO "Hasher initiated, preparing file list..."
+log INFO "Preparing file list..."
 
 # Count files (without hashing) for progress
 count_files_in() {
@@ -223,7 +231,7 @@ PROCESSED=0
 
 log INFO "Starting hash: algo=$ALGO_NAME total_files=$TOTAL output=$OUTPUT"
 
-trap 'log WARN "Interrupted. Processed $PROCESSED/$TOTAL. Partial CSV: $OUTPUT"; exit 130' INT TERM
+trap 'log WARN "Interrupted. Processed '"$PROCESSED"'/'"$TOTAL"'. Partial CSV: '"$OUTPUT"'' INT TERM
 
 progress_tick() {
   local now elapsed pct eta rem
@@ -246,25 +254,20 @@ progress_tick() {
 # ───────────────────────── Hashing ─────────────────────────
 hash_one() {
   local f="$1"
-  # skip if excluded
   if is_excluded "$f"; then
     return 0
   fi
 
-  # hash
   local sum
-  # BusyBox/coreutils-compatible parsing: first field is the digest
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
     log WARN "Failed to hash: $f"
     return 0
   fi
 
-  # size -> MB (2dp)
   local bytes size_mb
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
 
-  # CSV row
   local row
   row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
@@ -278,7 +281,6 @@ for p in "${SEARCH_PATHS[@]}"; do
     hash_one "$f"
     ((PROCESSED++))
 
-    # Throttle progress updates to ~1/sec or at milestones
     now=$(date +%s)
     if (( now - LAST_PRINT >= 1 )) || (( PROCESSED == TOTAL )) || (( PROCESSED % 500 == 0 )); then
       progress_tick
@@ -290,4 +292,4 @@ done
 # ───────────────────────── Summary ─────────────────────────
 END_TS=$(date +%s)
 ELAPSED=$((END_TS - START_TS))
-log INFO "Done. Hashed $PROCESSED/$TOTAL files in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
+log INFO "Completed. Hashed $PROCESSED/$TOTAL files in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
