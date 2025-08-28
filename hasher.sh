@@ -1,6 +1,8 @@
-#!/usr/bin/env bash
-# hasher.sh — robust file hasher with CSV output, background mode,
-# Run-ID (consistent parent/child), INI config, per-run logs, unique file list, and heartbeats.
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute <jameswinter@protonmail.ch>
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -15,13 +17,12 @@ OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
 ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
 PATHFILE=""
 RUN_IN_BACKGROUND=false
-IS_CHILD=false
+IS_CHILD=false       # set when re-exec'ed under nohup
+CONFIG_FILE=""       # INI config
+EXCLUDE_FILE=""      # legacy plain excludes file
 
-CONFIG_FILE=""       # preferred: INI file
-EXCLUDE_FILE=""      # legacy: extra globs only
-
-PROGRESS_INTERVAL=15 # default seconds (override via config [logging] background-interval)
-PASSED_RUN_ID=""     # internal: provided by parent to child so Run-ID matches
+PROGRESS_INTERVAL=15 # seconds (can be overridden by config [logging] background-interval)
+PASSED_RUN_ID=""     # parent passes to child so IDs match
 
 # ───────────────────── Built-in excludes ───────────────────
 read -r -d '' EXCLUDE_DEFAULTS <<'GLOBS' || true
@@ -49,7 +50,7 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 gen_run_id() {
   if [[ -n "${PASSED_RUN_ID:-}" ]]; then
     printf '%s' "$PASSED_RUN_ID"
-  elif command -v uuidgen >/devnull 2>&1; then
+  elif command -v uuidgen >/dev/null 2>&1; then
     uuidgen
   elif [[ -r /proc/sys/kernel/random/uuid ]]; then
     cat /proc/sys/kernel/random/uuid
@@ -58,20 +59,23 @@ gen_run_id() {
   fi
 }
 
-# Will be set after parsing args (since PASSED_RUN_ID may be provided)
 RUN_ID=""
-
-# These depend on RUN_ID; set after RUN_ID is initialized
-BACKGROUND_LOG=""          # symlink to per-run log for tail -f
+BACKGROUND_LOG=""          # symlink to per-run log (for tail -f)
 LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
 FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
 
 log() {
+  # $1=LEVEL, rest=message
   local level="$1"; shift || true
-  local line
-  line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
-  printf '%s\n' "$line" >&1
-  { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
+  local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
+  if $IS_CHILD; then
+    # In background/headless mode stdout is redirected to $LOG_FILE; do NOT also append.
+    printf '%s\n' "$line" >&1
+  else
+    # Foreground runs: print and append to per-run file for a durable audit trail.
+    printf '%s\n' "$line" >&1
+    { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
+  fi
 }
 
 die() { log ERROR "$*"; exit 1; }
@@ -79,8 +83,8 @@ die() { log ERROR "$*"; exit 1; }
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2] [--nohup]
-                   [--config hasher.conf] [--exclude-file excludes.txt]
+  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2]
+                   [--nohup] [--config hasher.conf] [--exclude-file excludes.txt]
 
 Flags:
   --pathfile FILE        File with one path per line (# comments ok)
@@ -89,15 +93,6 @@ Flags:
   --config FILE          INI config ([logging] background-interval=SECONDS; [exclusions] …)
   --exclude-file FILE    Legacy extra globs (ignored if --config supplied)
   -h|--help              Show help
-
-INI example:
-  [logging]
-  background-interval = 5
-  [exclusions]
-  inherit-defaults = true
-  *.tmp
-  */Cache/*
-  glob = */.Trash*/**
 
 CSV columns: timestamp,path,algo,hash,size_mb
 EOF
@@ -115,6 +110,15 @@ portable_stat_size() {
 
 format_secs() { local s=$1; (( s<0 )) && s=0; printf '%02d:%02d:%02d' "$((s/3600))" "$(((s%3600)/60))" "$((s%60))"; }
 
+percent_of() {
+  local p="$1" t="$2"
+  if (( t<=0 )); then echo 0; return; fi
+  local pct=$(( (p * 100) / t ))
+  (( pct<0 )) && pct=0
+  (( pct>100 )) && pct=100
+  echo "$pct"
+}
+
 # ─────────────────────── INI parser ────────────────────────
 parse_ini() {
   local file="$1"
@@ -130,7 +134,9 @@ parse_ini() {
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
           key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
           case "$key" in
-            background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
+            background-interval|progress-interval)
+              [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val"
+              ;;
           esac
         fi
         ;;
@@ -190,15 +196,6 @@ resolve_algo_cmd() {
   command -v "$HASH_CMD" >/dev/null 2>&1 || die "Required command '$HASH_CMD' not found."
 }
 
-percent_of() {
-  local p="$1" t="$2"
-  if (( t<=0 )); then echo 0; return; fi
-  local pct=$(( (p * 100) / t ))
-  (( pct<0 )) && pct=0
-  (( pct>100 )) && pct=100
-  echo "$pct"
-}
-
 # ───────────────────── Argument parsing ────────────────────
 while (($#)); do
   case "${1:-}" in
@@ -206,7 +203,7 @@ while (($#)); do
     --algo)          ALGO="${2:-}"; shift 2 ;;
     --nohup)         RUN_IN_BACKGROUND=true; shift ;;
     --headless)      IS_CHILD=true; shift ;;                 # internal
-    --run-id)        PASSED_RUN_ID="${2:-}"; shift 2 ;;     # internal: parent passes to child
+    --run-id)        PASSED_RUN_ID="${2:-}"; shift 2 ;;     # internal
     --exclude-file)  EXCLUDE_FILE="${2:-}"; shift 2 ;;
     --config)        CONFIG_FILE="${2:-}"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
@@ -234,24 +231,22 @@ load_excludes
 
 # ─────────────────────── Background mode (FIXED) ───────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  # Launch child in nohup, append directly to per-run log; no subshell indirection
   nohup bash "$0" \
     --pathfile "$PATHFILE" --algo "$ALGO" \
     ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
     ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} \
     --run-id "$RUN_ID" --headless \
     >>"$LOG_FILE" 2>&1 &
-
   pid=$!
-  # Symlinks already point to $LOG_FILE, so tailing works immediately
   printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "$pid" "$RUN_ID" "$OUTPUT"
   exit 0
 fi
 
-# ─────────────────────── Preparation ───────────────────────
+# ─────────────────────── Startup log ───────────────────────
 log INFO "Run-ID: $RUN_ID"
 log INFO "Config: ${CONFIG_FILE:-<none>} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES}"
 log INFO "Hasher initiated — please standby; initial file discovery may take some time."
+log INFO "Preparing file list..."
 
 # Ensure CSV header exists
 if [[ ! -s "$OUTPUT" ]]; then
@@ -269,7 +264,6 @@ done <"$PATHFILE"
 ((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
 
 # ───────────── Discovery → unique file list with heartbeat ─
-log INFO "Preparing file list..."
 DISCOVERY_START=$(date +%s)
 DISC_LAST_PRINT=$DISCOVERY_START
 DISCOVERED=0
@@ -297,11 +291,17 @@ for p in "${SEARCH_PATHS[@]}"; do
   fi
 done
 
-# Deduplicate by path while preserving NULs
+# De-duplicate filelist by path
 TMP="$FILELIST.tmp"
-awk -v RS='\0' '!seen[$0]++{printf "%s\0",$0}' "$FILELIST" >"$TMP" && mv -f "$TMP" "$FILELIST"
+if sort --help 2>/dev/null | grep -q -- ' -z'; then
+  # Prefer GNU sort with NUL support
+  sort -z -u "$FILELIST" -o "$FILELIST"
+else
+  # Fallback: newline conversion (does not support filenames with literal newlines)
+  tr '\0' '\n' <"$FILELIST" | sort -u | tr '\n' '\0' >"$TMP" && mv -f "$TMP" "$FILELIST"
+fi
 
-TOTAL=$(awk -v RS='\0' 'END{print NR}' "$FILELIST")
+TOTAL=$(tr -cd '\000' <"$FILELIST" | wc -c | tr -d ' ')
 DISCOVERY_END=$(date +%s)
 log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
 log INFO "File list saved: $FILELIST"
@@ -312,18 +312,9 @@ PROCESSED=0
 FAILED=0
 LAST_PRINT=$START_TS
 
-log INFO "Starting hash: algo=$ALGO_NAME total_files=$TOTAL output=$OUTPUT"
+log INFO "Starting hash: algo=$ALGO total_files=$TOTAL output=$OUTPUT"
 
 trap 'log WARN "Interrupted. Processed ${PROCESSED}/${TOTAL}. Failed=${FAILED}. Partial CSV: ${OUTPUT}"' INT TERM
-
-percent_of() {
-  local p="$1" t="$2"
-  if (( t<=0 )); then echo 0; return; fi
-  local pct=$(( (p * 100) / t ))
-  (( pct<0 )) && pct=0
-  (( pct>100 )) && pct=100
-  echo "$pct"
-}
 
 progress_tick() {
   local now elapsed eta rem pct
@@ -339,29 +330,23 @@ progress_tick() {
 hash_one() {
   local f="$1"
   if [[ ! -r "$f" ]]; then
-    ((FAILED+=1))
-    log WARN "Skipped (missing/unreadable): $f"
-    return 1
+    ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1
   fi
   local sum
   if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"; then
-    ((FAILED+=1))
-    log WARN "Failed to hash: $f"
-    return 1
+    ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
   fi
   local bytes size_mb
   bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
   size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
   local row
-  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO_NAME"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
+  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
   printf '%s\n' "$row" >>"$OUTPUT"
   return 0
 }
 
 while IFS= read -r -d '' f; do
-  if hash_one "$f"; then
-    ((PROCESSED+=1))
-  fi
+  if hash_one "$f"; then ((PROCESSED+=1)); fi
   now=$(date +%s)
   if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
     progress_tick
