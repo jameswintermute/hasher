@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute <jameswinter@protonmail.ch>
+# Copyright (C) 2025 James Wintermute <jameswintermute@protonmail.ch>
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
@@ -403,27 +403,34 @@ FAIL=0
 start_progress() {
   T_START=$(date +%s)
   (
+    # derive TOTAL from file list once; DONE from CSV row count each tick
+    local total=0
+    if [[ -s "$FILES_LIST" ]]; then
+      total=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
+    fi
     while :; do
       sleep "$PROGRESS_INTERVAL" || break
-      local now elapsed eta pct
+      local now elapsed rows done eta pct
       now=$(date +%s)
       elapsed=$(( now - T_START ))
-      if (( DONE > 0 )); then
-        if (( DONE < TOTAL && TOTAL > 0 )); then
-          eta=$(( (elapsed * (TOTAL - DONE)) / DONE ))
+      if [[ -f "$OUTPUT" ]]; then
+        rows=$(wc -l < "$OUTPUT" | tr -d ' ')
+        if (( rows > 1 )); then done=$(( rows - 1 )); else done=0; fi
+      else
+        done=0
+      fi
+      if (( total > 0 )); then
+        pct=$(( done * 100 / total ))
+        if (( done > 0 && done < total )); then
+          eta=$(( elapsed * (total - done) / done ))
         else
           eta=0
         fi
       else
-        eta=0
-      fi
-      if (( TOTAL > 0 )); then
-        pct=$(( DONE * 100 / TOTAL ))
-      else
-        pct=0
+        pct=0; eta=0
       fi
       printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
-        "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$DONE" "$TOTAL" \
+        "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$done" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
         $((eta/3600)) $((eta%3600/60)) $((eta%60)) >> "$BACKGROUND_LOG"
     done
