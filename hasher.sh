@@ -30,6 +30,10 @@ XTRACE=false         # enable 'set -x' if true (override via config)
 
 PASSED_RUN_ID=""     # parent passes to child so IDs match
 
+# NEW: FTR defaults (overridable via [setup] in hasher.conf)
+SETUP_FIRST_RUN_HELP=true
+SETUP_PATHS_TEMPLATE="paths.example.txt"
+
 # ───────────────────── Built-in excludes ───────────────────
 read -r -d '' EXCLUDE_DEFAULTS <<'GLOBS' || true
 *@eaDir*
@@ -104,7 +108,7 @@ Flags:
   --pathfile FILE        File with one path per line (# comments ok)
   --algo NAME            sha256|sha1|sha512|md5|blake2 (default sha256)
   --nohup                Re-exec in background (live log: logs/background.log)
-  --config FILE          INI config ([logging] background-interval, level, xtrace; [exclusions] …)
+  --config FILE          INI config ([setup], [logging], [exclusions] …)
   --exclude-file FILE    Legacy extra globs (ignored if --config supplied)
   -h|--help              Show help
 
@@ -133,6 +137,25 @@ percent_of() {
   echo "$pct"
 }
 
+# NEW: helpers used by FTR
+is_first_run() { ls "$HASHES_DIR"/hasher-*.csv >/dev/null 2>&1 || return 0; return 1; }
+pathsfile_has_entries() { [[ -f "$1" ]] || return 1; awk 'NF && $1 !~ /^#/' "$1" | head -n1 >/dev/null 2>&1; }
+write_paths_template() {
+  local tmpl="${1:-paths.example.txt}"
+  cat >"$tmpl" <<'EOT'
+# paths.txt — one absolute path per line. Lines starting with # are comments.
+# Examples:
+# /volume1/Family
+# /volume1/Shared
+# /volume1/Work/Documents
+#
+# Tips:
+# - You can mix files and directories.
+# - Use full absolute paths.
+# - You can keep multiple files (paths.home.txt, paths.work.txt) and choose via --pathfile.
+EOT
+}
+
 # ─────────────────────── INI parser ────────────────────────
 parse_ini() {
   local file="$1"
@@ -144,6 +167,15 @@ parse_ini() {
     [[ -z "$raw" ]] && continue
     if [[ "$raw" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1],,}"; continue; fi
     case "$section" in
+      setup)  # NEW: read FTR toggles
+        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
+          case "$key" in
+            first_run_help) case "${val,,}" in true|1|yes) SETUP_FIRST_RUN_HELP=true ;; *) SETUP_FIRST_RUN_HELP=false ;; esac ;;
+            paths_template) [[ -n "$val" ]] && SETUP_PATHS_TEMPLATE="$val" ;;
+          esac
+        fi
+        ;;
       logging)
         if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
           key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
@@ -229,7 +261,8 @@ while (($#)); do
   esac
 done
 
-[[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
+# NOTE: we delay strict PATHFILE validation until after config is parsed,
+# so FTR can create a template and guide the user instead of hard-failing.
 
 # Initialize per-run paths
 BACKGROUND_LOG="$LOGS_DIR/background.log"
@@ -271,6 +304,23 @@ log INFO "Run-ID: $RUN_ID"
 log INFO "Config: ${CONFIG_FILE:-${HASHER_CONFIG:-<none>}} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES} | Level: ${LOG_LEVEL}"
 log INFO "Hasher initiated — please standby; initial file discovery may take some time."
 log INFO "Preparing file list..."
+
+# ─────────────────────── First-Time-Run guard ──────────────
+if $SETUP_FIRST_RUN_HELP 2>/dev/null && is_first_run; then
+  # If the paths file is missing or has no usable entries, guide the user.
+  if ! pathsfile_has_entries "${PATHFILE:-}"; then
+    write_paths_template "$SETUP_PATHS_TEMPLATE"
+    log INFO "First-time run detected."
+    log INFO "Your paths file appears missing/empty: '${PATHFILE:-<unset>}'"
+    log INFO "A starter has been written to: '$SETUP_PATHS_TEMPLATE'"
+    log INFO "Edit your paths file with absolute directories (one per line), then re-run:"
+    log INFO "  ./hasher.sh --pathfile paths.txt --algo sha256 --config hasher.conf --nohup"
+    exit 2
+  fi
+fi
+
+# If we get here and PATHFILE is still invalid, fail fast (keeps legacy behaviour).
+[[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
 
 # Ensure CSV header exists
 if [[ ! -s "$OUTPUT" ]]; then
