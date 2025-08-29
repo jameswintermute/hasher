@@ -18,423 +18,432 @@ ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
 PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
+LOG_LEVEL="info"     # info|warn|error
 
-# Config sources
-CONFIG_FILE=""       # INI config via --config
-EXCLUDE_FILE=""      # legacy plain excludes file
-: "${HASHER_CONFIG:=}"   # env fallback (parent exports to child)
+# Progress interval (seconds) for background.log
+PROGRESS_INTERVAL=15
 
-PROGRESS_INTERVAL=15 # seconds (override via config [logging] background-interval)
-LOG_LEVEL="info"     # debug|info|warn|error (override via config)
-XTRACE=false         # enable 'set -x' if true (override via config)
+# Default excludes (kept minimal; comment out if undesired)
+DEFAULT_EXCLUDES=( "#recycle" "@eaDir" ".DS_Store" "lost+found" )
 
-PASSED_RUN_ID=""     # parent passes to child so IDs match
+# ───────────────────────── Colors ──────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# NEW: FTR defaults (overridable via [setup] in hasher.conf)
-SETUP_FIRST_RUN_HELP=true
-SETUP_PATHS_TEMPLATE="paths.example.txt"
+# ───────────────────────── Setup ───────────────────────────
+mkdir -p "$HASHES_DIR" "$LOGS_DIR"
 
-# ───────────────────── Built-in excludes ───────────────────
-read -r -d '' EXCLUDE_DEFAULTS <<'GLOBS' || true
-*@eaDir*
-*/#recycle/*
-*/.Recycle.Bin/*
-*/.Trash*/**
-*/lost+found/*
-*/.Spotlight-V100/*
-*/.fseventsd/*
-*/.AppleDouble/*
-*/._*
-*.DS_Store
-Thumbs.db
-*.part
-*.tmp
-*/.synology*/**
-*@SynoResource*
-GLOBS
-INHERIT_DEFAULT_EXCLUDES=true
+# Run ID
+if command -v uuidgen >/dev/null 2>&1; then
+  RUN_ID="$(uuidgen)"
+elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+  RUN_ID="$(cat /proc/sys/kernel/random/uuid)"
+else
+  RUN_ID="$(date +%s)-$$"
+fi
 
-# ───────────────────────── Helpers ─────────────────────────
-ts() { date '+%Y-%m-%d %H:%M:%S'; }
+MAIN_LOG="$LOGS_DIR/hasher.log"
+RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
+FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
+BACKGROUND_LOG="$LOGS_DIR/background.log"
 
-gen_run_id() {
-  if [[ -n "${PASSED_RUN_ID:-}" ]]; then
-    printf '%s' "$PASSED_RUN_ID"
-  elif command -v uuidgen >/dev/null 2>&1; then
-    uuidgen
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    printf '%s-%s-%s' "$(date +'%Y%m%d-%H%M%S')" "$$" "$RANDOM"
-  fi
+# ───────────────────────── Logging ─────────────────────────
+_log() {
+  local lvl="$1"; shift
+  local msg="$*"
+  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
+  local line="[$ts] [RUN $RUN_ID] [$lvl] $msg"
+  # console
+  case "$lvl" in
+    INFO)  echo -e "${GREEN}$line${NC}";;
+    WARN)  echo -e "${YELLOW}$line${NC}";;
+    ERROR) echo -e "${RED}$line${NC}";;
+    *)     echo "$line";;
+  esac
+  # logs
+  printf '%s\n' "$line" >> "$MAIN_LOG"
+  printf '%s\n' "$line" >> "$RUN_LOG"
 }
 
-# Level filter
-lvl_rank() {
-  case "$1" in debug) echo 10 ;; info) echo 20 ;; warn) echo 30 ;; error) echo 40 ;; *) echo 20 ;; esac
-}
-LOG_RANK=$(lvl_rank "$LOG_LEVEL")
+info()  { _log "INFO"  "$*"; }
+warn()  { _log "WARN"  "$*"; }
+error() { _log "ERROR" "$*"; }
 
-RUN_ID="$(gen_run_id)"     # set early so errors include a Run-ID
-BACKGROUND_LOG=""          # symlink to per-run log (for tail -f)
-LOG_FILE=""                # per-run log: logs/hasher-$RUN_ID.log
-FILELIST=""                # per-run file list: logs/files-$RUN_ID.lst
-
-_log_core() {
-  local level="$1"; shift
-  local line; line=$(printf '[%s] [RUN %s] [%s] %s\n' "$(ts)" "$RUN_ID" "$level" "$*")
-  if $IS_CHILD; then
-    printf '%s\n' "$line" >&1
-  else
-    printf '%s\n' "$line" >&1
-    { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
-  fi
-}
-log() {
-  local level="$1"; shift || true
-  local want; want=$(lvl_rank "$level")
-  if (( want >= LOG_RANK )); then _log_core "$level" "$@"; fi
-}
-
-die() { _log_core ERROR "$*"; exit 1; }
-
+# ───────────────────────── Arg Parsing ─────────────────────
 usage() {
   cat <<EOF
-Usage:
-  $(basename "$0") --pathfile paths.txt [--algo sha256|sha1|sha512|md5|blake2]
-                   [--nohup] [--config hasher.conf] [--exclude-file excludes.txt]
+Usage: $0 [--pathfile FILE] [--algo sha256|sha1|sha512|md5|blake2] [--output CSV]
+          [--nohup] [--level info|warn|error] [--interval SECONDS]
+          [--exclude PATTERN ...] [--help]
 
-Flags:
-  --pathfile FILE        File with one path per line (# comments ok)
-  --algo NAME            sha256|sha1|sha512|md5|blake2 (default sha256)
-  --nohup                Re-exec in background (live log: logs/background.log)
-  --config FILE          INI config ([setup], [logging], [exclusions] …)
-  --exclude-file FILE    Legacy extra globs (ignored if --config supplied)
-  -h|--help              Show help
+Options:
+  --pathfile FILE    File containing one path (dir or file) per line. Required unless paths are piped.
+  --algo ALG         Hash algorithm (default: sha256).
+  --output CSV       Output CSV path (default: $OUTPUT).
+  --nohup            Re-exec under nohup (background) with logs to $BACKGROUND_LOG.
+  --level LEVEL      Log level threshold (info|warn|error). Default: info.
+  --interval N       Progress update interval seconds (default: $PROGRESS_INTERVAL).
+  --exclude P        Extra exclude pattern(s). Repeatable. (Literal substring match)
+  --help             Show this help.
 
-CSV columns: timestamp,path,algo,hash,size_mb
+Behavior:
+  * Writes CSV with header to: \$OUTPUT
+  * Logs: $MAIN_LOG (global), $RUN_LOG (per run), progress to $BACKGROUND_LOG
+  * Creates file list at: $FILES_LIST
 EOF
 }
 
-csv_quote() { local s=${1//\"/\"\"}; printf '"%s"' "$s"; }
+EXTRA_EXCLUDES=()
 
-portable_stat_size() {
-  local f="$1"
-  if stat -c%s "$f" >/dev/null 2>&1; then stat -c%s "$f"
-  elif stat -f%z "$f" >/dev/null 2>&1; then stat -f%z "$f"
-  else wc -c <"$f" | tr -d ' '
-  fi
-}
-
-format_secs() { local s=$1; (( s<0 )) && s=0; printf '%02d:%02d:%02d' "$((s/3600))" "$(((s%3600)/60))" "$((s%60))"; }
-
-percent_of() {
-  local p="$1" t="$2"
-  if (( t<=0 )); then echo 0; return; fi
-  local pct=$(( (p * 100) / t ))
-  (( pct<0 )) && pct=0
-  (( pct>100 )) && pct=100
-  echo "$pct"
-}
-
-# NEW: helpers used by FTR
-is_first_run() { ls "$HASHES_DIR"/hasher-*.csv >/dev/null 2>&1 || return 0; return 1; }
-pathsfile_has_entries() { [[ -f "$1" ]] || return 1; awk 'NF && $1 !~ /^#/' "$1" | head -n1 >/dev/null 2>&1; }
-write_paths_template() {
-  local tmpl="${1:-paths.example.txt}"
-  cat >"$tmpl" <<'EOT'
-# paths.txt — one absolute path per line. Lines starting with # are comments.
-# Examples:
-# /volume1/Family
-# /volume1/Shared
-# /volume1/Work/Documents
-#
-# Tips:
-# - You can mix files and directories.
-# - Use full absolute paths.
-# - You can keep multiple files (paths.home.txt, paths.work.txt) and choose via --pathfile.
-EOT
-}
-
-# ─────────────────────── INI parser ────────────────────────
-parse_ini() {
-  local file="$1"
-  [[ -f "$file" ]] || return 0
-  local section="" line key val raw
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    raw="${line%%[#;]*}"
-    raw="$(echo -n "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-    [[ -z "$raw" ]] && continue
-    if [[ "$raw" =~ ^\[(.+)\]$ ]]; then section="${BASH_REMATCH[1],,}"; continue; fi
-    case "$section" in
-      setup)  # NEW: read FTR toggles
-        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
-          case "$key" in
-            first_run_help) case "${val,,}" in true|1|yes) SETUP_FIRST_RUN_HELP=true ;; *) SETUP_FIRST_RUN_HELP=false ;; esac ;;
-            paths_template) [[ -n "$val" ]] && SETUP_PATHS_TEMPLATE="$val" ;;
-          esac
-        fi
-        ;;
-      logging)
-        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
-          case "$key" in
-            background-interval|progress-interval) [[ "$val" =~ ^[0-9]+$ ]] && PROGRESS_INTERVAL="$val" ;;
-            level) LOG_LEVEL="${val,,}"; LOG_RANK=$(lvl_rank "$LOG_LEVEL") ;;
-            xtrace) case "${val,,}" in true|1|yes) XTRACE=true ;; *) XTRACE=false ;; esac ;;
-          esac
-        fi
-        ;;
-      exclusions)
-        if [[ "$raw" =~ ^([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-          key="${BASH_REMATCH[1],,}"; val="${BASH_REMATCH[2]}"
-          case "$key" in
-            glob) EXCLUDE_GLOBS+=("$val") ;;
-            inherit-defaults)
-              case "${val,,}" in false|no|0) INHERIT_DEFAULT_EXCLUDES=false ;; true|yes|1) INHERIT_DEFAULT_EXCLUDES=true ;; esac
-              ;;
-          esac
-        else
-          EXCLUDE_GLOBS+=("$raw")
-        fi
-        ;;
-    esac
-  done <"$file"
-}
-
-# ───────────────────────── Excludes ────────────────────────
-declare -a EXCLUDE_GLOBS=()
-load_excludes() {
-  if [[ -n "$CONFIG_FILE" ]]; then parse_ini "$CONFIG_FILE"; fi
-  if [[ -z "$CONFIG_FILE" && -n "$HASHER_CONFIG" && -f "$HASHER_CONFIG" ]]; then
-    CONFIG_FILE="$HASHER_CONFIG"; parse_ini "$CONFIG_FILE"
-  fi
-  if [[ -z "$CONFIG_FILE" && -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
-    while IFS= read -r line; do
-      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-      EXCLUDE_GLOBS+=("$line")
-    done <"$EXCLUDE_FILE"
-  fi
-  if $INHERIT_DEFAULT_EXCLUDES; then
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      EXCLUDE_GLOBS+=("$line")
-    done <<<"$EXCLUDE_DEFAULTS"
-  fi
-  EXCLUDE_GLOBS+=("$HASHES_DIR/*")  # never hash our own outputs
-}
-
-is_excluded() {
-  local path="$1"
-  for pat in "${EXCLUDE_GLOBS[@]}"; do
-    [[ "$path" == $pat ]] && return 0
-  done
-  return 1
-}
-
-resolve_algo_cmd() {
-  case "$ALGO" in
-    sha256)  HASH_CMD="sha256sum"; ALGO_NAME="sha256" ;;
-    sha1)    HASH_CMD="sha1sum";   ALGO_NAME="sha1" ;;
-    sha512)  HASH_CMD="sha512sum"; ALGO_NAME="sha512" ;;
-    md5)     HASH_CMD="md5sum";    ALGO_NAME="md5" ;;
-    blake2)  HASH_CMD="b2sum";     ALGO_NAME="blake2" ;;
-    *) log WARN "Unknown --algo '$ALGO'. Defaulting to sha256."; HASH_CMD="sha256sum"; ALGO_NAME="sha256" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pathfile) PATHFILE="$2"; shift ;;
+    --algo)     ALGO="$2"; shift ;;
+    --output)   OUTPUT="$2"; shift ;;
+    --nohup)    RUN_IN_BACKGROUND=true ;;
+    --level)    LOG_LEVEL="$2"; shift ;;
+    --interval) PROGRESS_INTERVAL="$2"; shift ;;
+    --exclude)  EXTRA_EXCLUDES+=("$2"); shift ;;
+    --child)    IS_CHILD=true ;;          # internal
+    -h|--help)  usage; exit 0 ;;
+    *) error "Unknown arg: $1"; usage; exit 2 ;;
   esac
-  command -v "$HASH_CMD" >/dev/null 2>&1 || die "Required command '$HASH_CMD' not found."
-}
-
-# ───────────────────── Argument parsing ────────────────────
-while (($#)); do
-  case "${1:-}" in
-    --pathfile)      PATHFILE="${2:-}"; shift 2 ;;
-    --algo)          ALGO="${2:-}"; shift 2 ;;
-    --nohup)         RUN_IN_BACKGROUND=true; shift ;;
-    --headless)      IS_CHILD=true; shift ;;                 # internal
-    --run-id)        PASSED_RUN_ID="${2:-}"; RUN_ID="$PASSED_RUN_ID"; shift 2 ;;  # internal
-    --exclude-file)  EXCLUDE_FILE="${2:-}"; shift 2 ;;
-    --config)        CONFIG_FILE="${2:-}"; shift 2 ;;
-    -h|--help)       usage; exit 0 ;;
-    --*)             log WARN "Ignoring unknown flag: $1"; shift ;;
-    *)               log WARN "Ignoring unexpected arg: $1"; shift ;;
-  esac
+  shift
 done
 
-# NOTE: we delay strict PATHFILE validation until after config is parsed,
-# so FTR can create a template and guide the user instead of hard-failing.
-
-# Initialize per-run paths
-BACKGROUND_LOG="$LOGS_DIR/background.log"
-LOG_FILE="$LOGS_DIR/hasher-$RUN_ID.log"
-FILELIST="$LOGS_DIR/files-$RUN_ID.lst"
-
-mkdir -p "$HASHES_DIR" "$LOGS_DIR"
-: >"$LOG_FILE"
-ln -sfn "$(basename "$LOG_FILE")" "$LOGS_DIR/hasher.log" || true
-ln -sfn "$(basename "$LOG_FILE")" "$BACKGROUND_LOG"      || true
-
-# Optional shell tracing to the log (if enabled via config)
-if $XTRACE 2>/dev/null; then
-  exec {__xtrace_fd}>>"$LOG_FILE" || true
-  if [[ -n "${__xtrace_fd:-}" ]]; then
-    export BASH_XTRACEFD="$__xtrace_fd"
-    set -x
-  fi
-fi
-
-resolve_algo_cmd
-load_excludes
-
-# ─────────────────────── Background mode (robust) ──────────
+# ───────────────────────── Nohup Re-exec ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  export HASHER_CONFIG="${CONFIG_FILE}"
-  nohup bash "$0" \
-    --pathfile "$PATHFILE" --algo "$ALGO" \
-    ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
-    ${EXCLUDE_FILE:+--exclude-file "$EXCLUDE_FILE"} \
-    --run-id "$RUN_ID" --headless >>"$LOG_FILE" 2>&1 &
-  pid=$!
-  printf 'Hasher started with nohup (PID %s). Run-ID: %s. Output: %s\n' "$pid" "$RUN_ID" "$OUTPUT"
+  # Re-exec under nohup; keep environment + mark as child
+  export IS_CHILD=true
+  # shellcheck disable=SC2046
+  nohup "$0" --child \
+    ${PATHFILE:+--pathfile "$PATHFILE"} \
+    --algo "$ALGO" \
+    --output "$OUTPUT" \
+    --level "$LOG_LEVEL" \
+    --interval "$PROGRESS_INTERVAL" \
+    $(for ex in "${EXTRA_EXCLUDES[@]}"; do printf -- "--exclude %q " "$ex"; done) \
+    >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
+  bgpid=$!
+  echo "Hasher started with nohup (PID $bgpid). Output: $OUTPUT"
   exit 0
 fi
 
-# ─────────────────────── Startup log ───────────────────────
-log INFO "Run-ID: $RUN_ID"
-log INFO "Config: ${CONFIG_FILE:-${HASHER_CONFIG:-<none>}} | Progress interval: ${PROGRESS_INTERVAL}s | Inherit default excludes: ${INHERIT_DEFAULT_EXCLUDES} | Level: ${LOG_LEVEL}"
-log INFO "Hasher initiated — please standby; initial file discovery may take some time."
-log INFO "Preparing file list..."
-
-# ─────────────────────── First-Time-Run guard ──────────────
-if $SETUP_FIRST_RUN_HELP 2>/dev/null && is_first_run; then
-  # If the paths file is missing or has no usable entries, guide the user.
-  if ! pathsfile_has_entries "${PATHFILE:-}"; then
-    write_paths_template "$SETUP_PATHS_TEMPLATE"
-    log INFO "First-time run detected."
-    log INFO "Your paths file appears missing/empty: '${PATHFILE:-<unset>}'"
-    log INFO "A starter has been written to: '$SETUP_PATHS_TEMPLATE'"
-    log INFO "Edit your paths file with absolute directories (one per line), then re-run:"
-    log INFO "  ./hasher.sh --pathfile paths.txt --algo sha256 --config hasher.conf --nohup"
-    exit 2
-  fi
-fi
-
-# If we get here and PATHFILE is still invalid, fail fast (keeps legacy behaviour).
-[[ -n "$PATHFILE" && -f "$PATHFILE" ]] || die "Please provide --pathfile FILE (found: '$PATHFILE')."
-
-# Ensure CSV header exists
-if [[ ! -s "$OUTPUT" ]]; then
-  printf '"timestamp","path","algo","hash","size_mb"\n' >"$OUTPUT"
-fi
-
-# Load search paths
-declare -a SEARCH_PATHS=()
-while IFS= read -r line || [[ -n "$line" ]]; do
-  line="${line%%#*}"
-  line="$(echo -n "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-  [[ -z "$line" ]] && continue
-  SEARCH_PATHS+=("$line")
-done <"$PATHFILE"
-((${#SEARCH_PATHS[@]})) || die "No valid paths in $PATHFILE."
-
-# ───────────── Discovery (FIFO-based, BusyBox-safe) ────────
-DISCOVERY_START=$(date +%s)
-DISC_LAST_PRINT=$DISCOVERY_START
-DISCOVERED=0
-: >"$FILELIST"
-
-FIFO="$LOGS_DIR/.findfifo-$RUN_ID"
-cleanup_fifo() { [[ -p "$FIFO" ]] && rm -f "$FIFO" || true; }
-trap cleanup_fifo EXIT INT TERM
-mkfifo "$FIFO"
-
-# Start find in the background writing NUL-delimited paths to FIFO
-(
-  for p in "${SEARCH_PATHS[@]}"; do
-    if [[ -d "$p" || -f "$p" ]]; then
-      find "$p" -type f -print0 2>/dev/null || true
+# ───────────────────────── Hash Tool Map ───────────────────
+hash_cmd=""
+case "$ALGO" in
+  sha256) hash_cmd="sha256sum" ;;
+  sha1)   hash_cmd="sha1sum"   ;;
+  sha512) hash_cmd="sha512sum" ;;
+  md5)    hash_cmd="md5sum"    ;;
+  blake2)
+    if command -v b2sum >/dev/null 2>&1; then
+      hash_cmd="b2sum"
     else
-      # inject a WARN line for the reader to log
-      printf '[%s] [RUN %s] [WARN] Path does not exist or is not accessible: %s' "$(ts)" "$RUN_ID" "$p"
+      error "blake2 requested but 'b2sum' not found"; exit 1
     fi
-  done
-) >"$FIFO" &
+    ;;
+  *) error "Unsupported --algo '$ALGO'"; exit 1 ;;
+esac
 
-FIND_PID=$!
+command -v "$hash_cmd" >/dev/null 2>&1 || { error "Required tool '$hash_cmd' not found in PATH"; exit 1; }
 
-# Reader: consume from FIFO with ONE redirection (don’t reopen each loop!)
-while IFS= read -r -d '' f; do
-  if [[ "$f" == \[*WARN* ]]; then _log_core WARN "${f#*WARN] }"; continue; fi
-  if ! is_excluded "$f"; then
-    printf '%s\0' "$f" >>"$FILELIST"
-    ((DISCOVERED+=1))
+# ───────────────────────── Build File List ─────────────────
+# Accepts: PATHFILE with dirs/files; comments (#) and blanks ignored.
+build_file_list() {
+  : > "$FILES_LIST"
+  local had_input=false
+
+  if [[ -n "$PATHFILE" ]]; then
+    if [[ ! -r "$PATHFILE" ]]; then
+      error "Cannot read --pathfile '$PATHFILE'"; exit 1
+    fi
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+      # trim
+      local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
+      [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
+      if [[ -d "$path" ]]; then
+        find "$path" -type f -print0
+      elif [[ -f "$path" ]]; then
+        printf '%s\0' "$path"
+      else
+        warn "Path does not exist: $path"
+      fi
+    done < "$PATHFILE" >> "$FILES_LIST".tmp
+    had_input=true
   fi
-  now=$(date +%s)
-  if (( now - DISC_LAST_PRINT >= PROGRESS_INTERVAL )); then
-    log PROGRESS "Discovery: scanned=$DISCOVERED (last: $f)"
-    DISC_LAST_PRINT=$now
+
+  # If stdin is a pipe, also accept paths (null-terminated or newline)
+  if [ ! -t 0 ]; then
+    had_input=true
+    # Try to detect NULs; if none, convert newlines
+    if grep -qP '\x00' <(dd bs=1024 count=1 2>/dev/null); then
+      cat >> "$FILES_LIST".tmp
+    else
+      while IFS= read -r p || [[ -n "$p" ]]; do
+        [[ -z "$p" ]] && continue
+        printf '%s\0' "$p"
+      done >> "$FILES_LIST".tmp
+    fi
   fi
-done <"$FIFO"
 
-# Wait for find to finish and clean FIFO
-wait "$FIND_PID" 2>/dev/null || true
-cleanup_fifo
+  if ! $had_input; then
+    error "No input paths provided. Use --pathfile or pipe paths."; exit 2
+  fi
 
-TOTAL="$DISCOVERED"
-DISCOVERY_END=$(date +%s)
-log INFO "Discovery complete: total_files=$TOTAL took=$(format_secs $((DISCOVERY_END-DISCOVERY_START)))"
-log INFO "File list saved: $FILELIST"
-
-# ───────────────────────── Hashing ─────────────────────────
-START_TS=$(date +%s)
-PROCESSED=0
-FAILED=0
-LAST_PRINT=$START_TS
-
-log INFO "Starting hash: algo=$ALGO total_files=$TOTAL output=$OUTPUT"
-
-trap 'log WARN "Interrupted. Processed ${PROCESSED}/${TOTAL}. Failed=${FAILED}. Partial CSV: ${OUTPUT}"' INT TERM
-
-progress_tick() {
-  local now elapsed eta rem pct
-  now=$(date +%s)
-  elapsed=$((now - START_TS))
-  rem=$(( TOTAL - PROCESSED )); (( rem<0 )) && rem=0
-  eta=$(( PROCESSED>0 ? (elapsed * rem / PROCESSED) : 0 ))
-  pct=$(percent_of "$PROCESSED" "$TOTAL")
-  log PROGRESS "Hashing: [${pct}%] ${PROCESSED}/${TOTAL} | elapsed=$(format_secs "$elapsed") eta=$(format_secs "$eta")"
+  # Apply excludes (substring match)
+  # Merge default and extra patterns
+  local patterns=("${DEFAULT_EXCLUDES[@]}" "${EXTRA_EXCLUDES[@]}")
+  if (( ${#patterns[@]} > 0 )); then
+    # Read NUL list, filter lines that DO NOT contain any pattern
+    awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
+      BEGIN{
+        for(i=1;i<=N;i++) pat[i]=ARGV[i];
+        ARGC=1
+      }
+      {
+        keep=1
+        for(i=1;i<=N;i++){
+          if(index($0, pat[i])>0){ keep=0; break }
+        }
+        if(keep) printf "%s", $0
+      }
+    ' "${patterns[@]}" "$FILES_LIST".tmp > "$FILES_LIST"
+  else
+    mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
+  fi
+  rm -f -- "$FILES_LIST".tmp 2>/dev/null || true
 }
 
-hash_one() {
-  local f="$1"
-  if [[ ! -r "$f" ]]; then ((FAILED+=1)); log WARN "Skipped (missing/unreadable): $f"; return 1; fi
-  local sum
-  if ! sum="$("$HASH_CMD" -- "$f" 2>/dev/null | sed 's/[[:space:]].*$//')"; then
-    ((FAILED+=1)); log WARN "Failed to hash: $f"; return 1
-  fi
-  local bytes size_mb
-  bytes="$(portable_stat_size "$f" 2>/dev/null || echo 0)"
-  size_mb="$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1048576}')"
-  local row
-  row="$(csv_quote "$(ts)"),$(csv_quote "$f"),$(csv_quote "$ALGO"),$(csv_quote "$sum"),$(csv_quote "$size_mb")"
-  printf '%s\n' "$row" >>"$OUTPUT"
-  return 0
+# ───────────────────────── CSV Helpers ─────────────────────
+csv_escape() {
+  # Escape CSV field by double-quoting and doubling internal quotes
+  local s="$1"
+  s="${s//\"/\"\"}"
+  printf '"%s"' "$s"
 }
 
-if (( TOTAL == 0 )); then
-  log WARN "No files discovered. Nothing to hash."
-else
+write_csv_header() {
+  if [[ ! -s "$OUTPUT" ]]; then
+    printf 'path,size_bytes,mtime_epoch,algo,hash\n' > "$OUTPUT"
+  fi
+}
+
+append_csv_row() {
+  local path="$1" size="$2" mtime="$3" algo="$4" hash="$5"
+  printf '%s,%s,%s,%s,%s\n' \
+    "$(csv_escape "$path")" \
+    "$size" \
+    "$mtime" \
+    "$algo" \
+    "$hash" >> "$OUTPUT"
+}
+
+# ───────────────────────── Progress Ticker ─────────────────
+T_START=0
+hash_progress_pid=0
+TOTAL=0
+DONE=0
+FAIL=0
+
+start_progress() {
+  T_START=$(date +%s)
+  (
+    while :; do
+      sleep "$PROGRESS_INTERVAL" || break
+      local now elapsed eta pct
+      now=$(date +%s)
+      elapsed=$(( now - T_START ))
+      if (( DONE > 0 )); then
+        # ETA heuristic
+        if (( DONE < TOTAL && TOTAL > 0 )); then
+          eta=$(( (elapsed * (TOTAL - DONE)) / DONE ))
+        else
+          eta=0
+        fi
+      else
+        eta=0
+      fi
+      if (( TOTAL > 0 )); then
+        pct=$(( DONE * 100 / TOTAL ))
+      else
+        pct=0
+      fi
+      printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
+        "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$DONE" "$TOTAL" \
+        $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
+        $((eta/3600)) $((eta%3600/60)) $((eta%60)) >> "$BACKGROUND_LOG"
+    done
+  ) &
+  hash_progress_pid=$!
+}
+
+stop_progress() {
+  if [[ "$hash_progress_pid" -gt 0 ]] && kill -0 "$hash_progress_pid" 2>/dev/null; then
+    kill "$hash_progress_pid" 2>/dev/null || true
+    wait "$hash_progress_pid" 2>/dev/null || true
+  fi
+}
+
+# Clean shutdown
+cleanup() {
+  stop_progress
+}
+trap cleanup EXIT
+
+# ───────────────────────── Main Hashing ────────────────────
+main() {
+  info "Run-ID: $RUN_ID"
+  info "Config: ${PATHFILE:+pathfile=$PATHFILE} | Algo: $ALGO | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
+  info "Output CSV: $OUTPUT"
+
+  build_file_list
+
+  # Count total
+  if [[ -s "$FILES_LIST" ]]; then
+    TOTAL=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
+  else
+    TOTAL=0
+  fi
+  info "Discovered $TOTAL files to hash (post-exclude)."
+
+  write_csv_header
+  start_progress
+
+  # Iterate 0-terminated list to handle any filename safely
+  local start_ts
+  start_ts=$(date +%s)
+
+  # Read in chunks for portability
+  # shellcheck disable=SC2034
   while IFS= read -r -d '' f; do
-    if hash_one "$f"; then ((PROCESSED+=1)); fi
-    now=$(date +%s)
-    if (( now - LAST_PRINT >= PROGRESS_INTERVAL )) || (( PROCESSED == TOTAL )); then
-      progress_tick
-      LAST_PRINT=$now
-    fi
-  done <"$FILELIST"
-fi
+    # Stat size & mtime
+    local size mtime
+    size=$(stat -c%s -- "$f" 2>/dev/null || echo -1)
+    mtime=$(stat -c%Y -- "$f" 2>/dev/null || echo -1)
 
-# ───────────────────────── Summary ─────────────────────────
-END_TS=$(date +%s)
-ELAPSED=$((END_TS - START_TS))
-log INFO "Completed. Hashed ${PROCESSED}/${TOTAL} files (failures=${FAILED}) in $(format_secs "$ELAPSED"). CSV: $OUTPUT"
+    if [[ "$size" -lt 0 || "$mtime" -lt 0 ]]; then
+      warn "Stat failed: $f"
+      FAIL=$((FAIL+1))
+      DONE=$((DONE+1))
+      continue
+    fi
+
+    # Compute hash
+    local line hash
+    if ! line=$("$hash_cmd" -- "$f" 2>/dev/null); then
+      warn "Hash failed: $f"
+      FAIL=$((FAIL+1))
+      DONE=$((DONE+1))
+      continue
+    fi
+    hash="${line%% *}"  # first field up to first space
+
+    append_csv_row "$f" "$size" "$mtime" "$ALGO" "$hash"
+    DONE=$((DONE+1))
+  done < "$FILES_LIST"
+
+  local end_ts elapsed sH sM sS
+  end_ts=$(date +%s)
+  elapsed=$(( end_ts - start_ts ))
+  sH=$((elapsed/3600)); sM=$((elapsed%3600/60)); sS=$((elapsed%60))
+
+  stop_progress
+
+  info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
+
+  # ── Minimal addition: post-run reports + next steps ──────
+  post_run_reports "$OUTPUT" "$DATE_TAG"
+}
+
+# ───────────────────────── Post-run Reports ────────────────
+# Minimal, self-contained; header-agnostic; logs “next steps”.
+post_run_reports() {
+  local csv="$1"  # OUTPUT CSV
+  local date_tag="$2"
+
+  mkdir -p "$LOGS_DIR"
+
+  local zero_txt="$LOGS_DIR/zero-length-$date_tag.txt"
+  local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
+
+  # Zero-length list from CSV (detect size column)
+  if [[ -f "$csv" ]]; then
+    awk -F',' '
+      NR==1 {
+        for (i=1;i<=NF;i++) h[tolower($i)]=i
+        next
+      }
+      {
+        sizecol = (h["size_bytes"] ? h["size_bytes"] : (h["size"] ? h["size"] : 0))
+        pathcol = (h["path"] ? h["path"] : (h["filepath"] ? h["filepath"] : 1))
+        if (sizecol>0) {
+          if ($sizecol+0==0) print $pathcol
+        } else {
+          # fallback: last col is size? If 0, print first col
+          if ($(NF)+0==0) print $1
+        }
+      }
+    ' "$csv" | sed '/^\s*$/d' > "$zero_txt" || true
+  fi
+
+  # Duplicate report (group by a likely hash column)
+  awk -F',' '
+    BEGIN{ OFS="," }
+    NR==1 {
+      for (i=1;i<=NF;i++) { low=tolower($i); h[low]=i }
+      next
+    }
+    {
+      hashcol = (h["hash"] ? h["hash"] :
+                (h["sha256"] ? h["sha256"] :
+                (h["sha1"] ? h["sha1"] :
+                (h["sha512"] ? h["sha512"] :
+                (h["md5"] ? h["md5"] : 0)))))
+      pathcol = (h["path"] ? h["path"] : (h["filepath"] ? h["filepath"] : 1))
+      if (hashcol==0) next
+      hash=$hashcol; path=$pathcol
+      gsub(/^[ \t]+|[ \t]+$/,"",hash)
+      gsub(/^[ \t]+|[ \t]+$/,"",path)
+      if (hash!="") { count[hash]++; files[hash]=files[hash]"\n"path }
+    }
+    END{
+      for (k in count) if (count[k]>1) {
+        print "HASH " k " (" count[k] " files):"
+        s=files[k]; sub(/^\n/,"",s)
+        n=split(s,arr,"\n")
+        for (i=1;i<=n;i++) print "  " arr[i]
+        print ""
+      }
+    }
+  ' "$csv" > "$dupes_txt" || true
+
+  # Counts
+  local zero_count=0 dupe_groups=0 dupe_files=0
+  [[ -s "$zero_txt" ]] && zero_count=$(wc -l < "$zero_txt" | tr -d ' ')
+  if [[ -s "$dupes_txt" ]]; then
+    dupe_groups=$(grep -c '^HASH ' "$dupes_txt" || true)
+    dupe_files=$(grep -v '^$' "$dupes_txt" | grep -v '^HASH ' | sed 's/^[[:space:]]\+//' | sed '/^$/d' | wc -l | tr -d ' ' || true)
+  fi
+
+  echo
+  info "Run complete. Summary:"
+  info "  • CSV written to: $csv"
+  info "  • Zero-length files: $zero_count (see: $zero_txt)"
+  info "  • Duplicate groups: $dupe_groups (files involved: $dupe_files) (see: $dupes_txt)"
+  echo
+  echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
+  echo "  1) Review duplicates interactively:"
+  echo "       ./review-duplicates.sh"
+  echo "  2) Remove zero-length files (dry-run first):"
+  echo "       ./delete-zero-length.sh \"$zero_txt\"           # dry-run"
+  echo "       ./delete-zero-length.sh \"$zero_txt\" --force   # actually delete or move"
+  echo "  3) Deduplicate safely (move extras to quarantine; dry-run by default):"
+  echo "       ./deduplicate.sh --from-report \"$dupes_txt\" --keep newest --quarantine quarantine-$DATE_TAG"
+  echo
+}
+
+# ───────────────────────── Execute ─────────────────────────
+main
