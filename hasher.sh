@@ -28,6 +28,7 @@ PROGRESS_INTERVAL=15
 
 # Default excludes (kept minimal; comment out if undesired)
 DEFAULT_EXCLUDES=( "#recycle" "@eaDir" ".DS_Store" "lost+found" )
+EXTRA_EXCLUDES=()
 
 # ───────────────────────── Colors ──────────────────────────
 RED='\033[0;31m'
@@ -36,8 +37,6 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # ───────────────────────── Pre-scan for --config ───────────
-# We want config applied before CLI parsing and before paths/dirs init,
-# so that CLI flags can still override config and nohup can propagate it.
 if (( "$#" > 0 )); then
   i=1
   while (( i <= $# )); do
@@ -95,33 +94,98 @@ warn()  { _log "WARN"  "$*"; }
 error() { _log "ERROR" "$*"; }
 
 # ───────────────────────── Config loader ───────────────────
-# Supported keys (case-insensitive): algo, pathfile, output, level, interval,
-# exclude (repeatable), hashes_dir, logs_dir
+# INI-aware. Supported:
+#   [setup]    algo, pathfile, output, hashes_dir, logs_dir
+#   [logging]  level, background-interval, xtrace
+#   [exclusions]
+#              inherit-defaults=true|false
+#              exclude=PATTERN  (or bare line "PATTERN" with no '=')
+# Other sections/keys are ignored without warnings.
 load_config() {
   local f="$1"
   [[ -f "$f" ]] || { warn "Config not found: $f (ignoring)"; return; }
-  while IFS= read -r line || [[ -n "$line" ]]; do
+
+  local section=""
+  local inherit_defaults="true"
+
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
     # trim
-    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
-    key="${line%%=*}"; val="${line#*=}"
-    key="${key%"${key##*[![:space:]]}"}"; key="${key#"${key%%[![:space:]]*}"}"
-    val="${val%"${val##*[![:space:]]}"}"; val="${val#"${val%%[![:space:]]*}"}"
-    [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]] && val="${val:1:-1}"
-    [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]] && val="${val:1:-1}"
-    lk="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
-    case "$lk" in
-      algo)          ALGO="$val" ;;
-      pathfile)      PATHFILE="$val" ;;
-      output)        OUTPUT="$val" ;;
-      level)         LOG_LEVEL="$val" ;;
-      interval)      PROGRESS_INTERVAL="$val" ;;
-      exclude)       EXTRA_EXCLUDES+=("$val") ;;
-      hashes_dir)    HASHES_DIR="$val" ;;
-      logs_dir)      LOGS_DIR="$val" ;;
-      *)             warn "Unknown config key '$key' in $f" ;;
+    local line="${raw#"${raw%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "${line:0:1}" == "#" || "${line:0:1}" == ";" ]] && continue
+
+    # section?
+    if [[ "$line" =~ ^\[[^][]+\]$ ]]; then
+      section="${line:1:${#line}-2}"
+      section="$(printf '%s' "$section" | tr '[:upper:]' '[:lower:]')"
+      continue
+    fi
+
+    # key=value or bare value
+    local key val
+    if [[ "$line" == *"="* ]]; then
+      key="${line%%=*}"; val="${line#*=}"
+      key="${key%"${key##*[![:space:]]}"}"; key="${key#"${key%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"; val="${val#"${val%%[![:space:]]*}"}"
+      [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]] && val="${val:1:-1}"
+      [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]] && val="${val:1:-1}"
+      key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    else
+      key="__bare__"
+      val="$line"
+    fi
+
+    case "$section" in
+      ""|"setup")
+        case "$key" in
+          algo)          ALGO="$val" ;;
+          pathfile)      PATHFILE="$val" ;;
+          output)        OUTPUT="$val" ;;
+          hashes_dir)    HASHES_DIR="$val" ;;
+          logs_dir)      LOGS_DIR="$val" ;;
+          level)         LOG_LEVEL="$val" ;;              # allow in root
+          interval|background-interval) PROGRESS_INTERVAL="$val" ;;
+          exclude)       EXTRA_EXCLUDES+=("$val") ;;
+          __bare__)      : ;;                             # ignore bare in root/setup
+          *)             : ;;                             # ignore unknown, no warning
+        esac
+        ;;
+      "logging")
+        case "$key" in
+          level)         LOG_LEVEL="$val" ;;
+          background-interval|interval) PROGRESS_INTERVAL="$val" ;;
+          xtrace)
+            case "${val,,}" in
+              1|true|yes|on) set -x ;;
+            esac
+            ;;
+          *)             : ;;
+        esac
+        ;;
+      "exclusions")
+        case "$key" in
+          inherit-defaults)
+            case "${val,,}" in
+              0|false|no|off) inherit_defaults="false" ;;
+              *)              inherit_defaults="true" ;;
+            )
+            ;;
+          exclude)        EXTRA_EXCLUDES+=("$val") ;;
+          __bare__)       EXTRA_EXCLUDES+=("$val") ;;   # each bare line is a pattern
+          *)              : ;;
+        esac
+        ;;
+      # other sections accepted silently
+      *)
+        : 
+        ;;
     esac
   done < "$f"
+
+  # Handle inherit-defaults=false
+  if [[ "$inherit_defaults" == "false" ]]; then
+    DEFAULT_EXCLUDES=()
+  fi
 
   # reconcile paths after possible dir changes
   mkdir -p "$HASHES_DIR" "$LOGS_DIR"
@@ -164,8 +228,6 @@ Behavior:
 EOF
 }
 
-EXTRA_EXCLUDES=()
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pathfile) PATHFILE="$2"; shift ;;
@@ -175,7 +237,7 @@ while [[ $# -gt 0 ]]; do
     --level)    LOG_LEVEL="$2"; shift ;;
     --interval) PROGRESS_INTERVAL="$2"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("$2"); shift ;;
-    --config)   CONFIG_FILE="${2:-}"; shift ;;  # already loaded above; kept to allow nohup propagation
+    --config)   CONFIG_FILE="${2:-}"; shift ;;  # kept to allow nohup propagation
     --child)    IS_CHILD=true ;;          # internal
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
@@ -185,7 +247,6 @@ done
 
 # ───────────────────────── Nohup Re-exec ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
-  # Re-exec under nohup; keep environment + mark as child
   export IS_CHILD=true
   # shellcheck disable=SC2046
   nohup "$0" --child \
@@ -334,7 +395,6 @@ start_progress() {
       now=$(date +%s)
       elapsed=$(( now - T_START ))
       if (( DONE > 0 )); then
-        # ETA heuristic
         if (( DONE < TOTAL && TOTAL > 0 )); then
           eta=$(( (elapsed * (TOTAL - DONE)) / DONE ))
         else
@@ -394,7 +454,6 @@ main() {
   local start_ts
   start_ts=$(date +%s)
 
-  # Read in chunks for portability
   # shellcheck disable=SC2034
   while IFS= read -r -d '' f; do
     # Stat size & mtime
