@@ -89,7 +89,7 @@ _log() {
   printf '%s\n' "$line" >> "$RUN_LOG"
 }
 
-info()  { _log "INFO"  "$*"; }
+info()  { _log("INFO"  "$@"); }
 warn()  { _log "WARN"  "$*"; }
 error() { _log "ERROR" "$*"; }
 
@@ -297,7 +297,7 @@ build_file_list() {
       local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
       [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
       if [[ -d "$path" ]]; then
-        find "$path" -type f -print0
+        find "$path" -type f -print0 2>/dev/null
       elif [[ -f "$path" ]]; then
         printf '%s\0' "$path"
       else
@@ -331,18 +331,18 @@ build_file_list() {
     error "No input paths provided. Use --pathfile or pipe paths."; exit 2
   fi
 
-  # Apply excludes (substring match)
-  # Merge default and extra patterns
+  # Pre-filter count
+  local pre_count=0
+  [[ -s "$FILES_LIST".tmp ]] && pre_count=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
+
+  # Apply excludes (literal substring match)
   local patterns=("${DEFAULT_EXCLUDES[@]}" "${EXTRA_EXCLUDES[@]}")
   if (( ${#patterns[@]} > 0 )); then
-    # Read NUL list, filter lines that DO NOT contain any pattern
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
       BEGIN{
-        # Capture pattern args, then clear them from ARGV so remaining ARGV
-        # (the files list) is still read as input.
         for(i=1;i<=N;i++){
           pat[i]=ARGV[i]
-          ARGV[i]=""
+          ARGV[i]=""   # keep the files list (last arg) intact
         }
       }
       {
@@ -356,6 +356,16 @@ build_file_list() {
   else
     mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
   fi
+
+  # Post-filter count & guard
+  local post_count=0
+  [[ -s "$FILES_LIST" ]] && post_count=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
+  if (( pre_count > 0 && post_count == 0 && ${#patterns[@]} > 0 )); then
+    warn "Exclusion filter removed all $pre_count candidates; using unfiltered list this run. Review [exclusions] in hasher.conf."
+    mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
+    post_count="$pre_count"
+  fi
+
   rm -f -- "$FILES_LIST".tmp 2>/dev/null || true
 }
 
