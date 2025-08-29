@@ -564,3 +564,11 @@ fi
 
 echo "To execute planned deletions, run:"
 echo "  $PLAN"
+
+# ── Post-review tips (append near script exit) ─────────────────────────
+ts="$(date +'%Y-%m-%d %H:%M:%S')"
+echo "[${ts}] [INFO] Review session complete."
+echo "  • If you saved/exported a duplicates report, you can act on it:"
+echo "      ./deduplicate.sh --from-report logs/$(date +'%Y-%m-%d')-duplicate-hashes.txt"
+echo "  • Dry-run first (recommended), then add --force when satisfied."
+echo "  • Prefer quarantine moves (default) over delete for safety."
