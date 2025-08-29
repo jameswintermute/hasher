@@ -20,7 +20,7 @@ LOG_LEVEL="info"    # debug|info|warn|error
 XTRACE=false
 
 # [review] defaults (overridden by config) — shared semantics with review-duplicates.sh
-RV_INPUT="latest"             # latest|<filename>
+RV_INPUT="latest"             # latest|prompt|<filename>
 RV_SORT="count_desc"          # count_desc|size_desc|hash_asc
 RV_SKIP_ZERO=true             # skip_zero_size
 RV_MIN_MB="0.00"              # min_size_mb
@@ -28,6 +28,7 @@ RV_INCLUDE_REGEX=""           # include_regex (POSIX ERE)
 RV_EXCLUDE_REGEX=""           # exclude_regex (POSIX ERE)
 RV_REPORT_DIR="$DUP_DIR"      # report_dir
 RV_REPORT_PREFIX_DATE=true    # report_prefix_date
+RV_SUMMARY_LIMIT=0            # summary_limit_groups (0 = all)
 
 # runtime
 RUN_ID=""
@@ -101,6 +102,7 @@ parse_ini(){
             exclude_regex) RV_EXCLUDE_REGEX="$val" ;;
             report_dir) RV_REPORT_DIR="$val" ;;
             report_prefix_date) case "${val,,}" in true|1|yes) RV_REPORT_PREFIX_DATE=true ;; *) RV_REPORT_PREFIX_DATE=false ;; esac ;;
+            summary_limit_groups) RV_SUMMARY_LIMIT="${val:-0}"; [[ -z "$RV_SUMMARY_LIMIT" ]] && RV_SUMMARY_LIMIT=0 ;;
           esac
         fi
         ;;
@@ -167,24 +169,46 @@ fi
 
 log INFO "Run-ID: $RUN_ID"
 log INFO "Config: ${CONFIG_FILE:-<none>} | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
-log INFO "Filters: skip_zero=$RV_SKIP_ZERO min_mb=$RV_MIN_MB | Sort: $RV_SORT"
+log INFO "Filters: skip_zero=$RV_SKIP_ZERO min_mb=$RV_MIN_MB | Sort: $RV_SORT | Limit: $RV_SUMMARY_LIMIT"
 
 # ───────────────────────── Choose input CSV ─────────────────────────
 if [[ -z "$INPUT_FILE" ]]; then
-  if [[ "$RV_INPUT" = "latest" ]]; then
-    INPUT_FILE="$(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 1 || true)"
-    [[ -n "$INPUT_FILE" ]] || die "No hasher-*.csv files found in '$HASH_DIR'"
-    log INFO "Selected latest CSV: $(basename "$INPUT_FILE")"
-  else
-    if [[ -f "$HASH_DIR/$RV_INPUT" ]]; then
-      INPUT_FILE="$HASH_DIR/$RV_INPUT"
-    elif [[ -f "$RV_INPUT" ]]; then
-      INPUT_FILE="$RV_INPUT"
-    else
-      die "Configured input not found: $RV_INPUT"
-    fi
-    log INFO "Selected configured CSV: $(basename "$INPUT_FILE")"
-  fi
+  case "$RV_INPUT" in
+    latest)
+      INPUT_FILE="$(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 1 || true)"
+      [[ -n "$INPUT_FILE" ]] || die "No hasher-*.csv files found in '$HASH_DIR'"
+      log INFO "Selected latest CSV: $(basename "$INPUT_FILE")"
+      ;;
+    prompt)
+      mapfile -t FILES < <(ls -t "$HASH_DIR"/hasher-*.csv 2>/dev/null | head -n 10 || true)
+      (( ${#FILES[@]} )) || die "No hasher-*.csv files found in '$HASH_DIR'"
+      echo ""
+      echo "Select a CSV hash file to summarise:"
+      for i in "${!FILES[@]}"; do
+        printf "  [%d] %s\n" "$((i+1))" "$(basename "${FILES[$i]}")"
+      done
+      echo ""
+      read -r -p "Enter file number or filename: " selection
+      if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection>=1 && selection<=${#FILES[@]} )); then
+        INPUT_FILE="${FILES[$((selection-1))]}"
+      elif [[ -f "$HASH_DIR/$selection" ]]; then
+        INPUT_FILE="$HASH_DIR/$selection"
+      else
+        die "Invalid selection."
+      fi
+      log INFO "Selected CSV: $(basename "$INPUT_FILE")"
+      ;;
+    *)
+      if [[ -f "$HASH_DIR/$RV_INPUT" ]]; then
+        INPUT_FILE="$HASH_DIR/$RV_INPUT"
+      elif [[ -f "$RV_INPUT" ]]; then
+        INPUT_FILE="$RV_INPUT"
+      else
+        die "Configured input not found: $RV_INPUT"
+      fi
+      log INFO "Selected configured CSV: $(basename "$INPUT_FILE")"
+      ;;
+  esac
 else
   [[ -f "$INPUT_FILE" ]] || die "Input CSV not found: $INPUT_FILE"
   log INFO "Selected CLI CSV: $(basename "$INPUT_FILE")"
@@ -251,6 +275,11 @@ case "$RV_SORT" in
   *)          SORTED="$(cat "$META")";;
 esac
 
+# OPTIONAL LIMIT
+if (( RV_SUMMARY_LIMIT > 0 )); then
+  SORTED="$(echo "$SORTED" | head -n "$RV_SUMMARY_LIMIT")"
+fi
+
 # ───────────────────────── Write summary report ─────────────────────────
 {
   echo "# Duplicate Summary"
@@ -263,6 +292,9 @@ esac
   echo "# Files in groups       : $TOTAL_FILES"
   echo "# Total duplicated size : ${TOTAL_MB} MB"
   echo "# Sort                  : $RV_SORT"
+  if (( RV_SUMMARY_LIMIT > 0 )); then
+    echo "# Showing top           : $RV_SUMMARY_LIMIT groups"
+  fi
   echo
   printf "%-14s %-10s %-s\n" "COUNT" "SIZE(MB)" "HASH"
   printf "%-14s %-10s %-s\n" "-----" "--------" "----"
