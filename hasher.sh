@@ -20,6 +20,9 @@ RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
 LOG_LEVEL="info"     # info|warn|error
 
+# Optional config (CLI can override)
+CONFIG_FILE=""
+
 # Progress interval (seconds) for background.log
 PROGRESS_INTERVAL=15
 
@@ -32,10 +35,26 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# ───────────────────────── Setup ───────────────────────────
-mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+# ───────────────────────── Pre-scan for --config ───────────
+# We want config applied before CLI parsing and before paths/dirs init,
+# so that CLI flags can still override config and nohup can propagate it.
+if (( "$#" > 0 )); then
+  i=1
+  while (( i <= $# )); do
+    eval _arg="\${$i}"
+    if [[ "$_arg" == "--config" ]]; then
+      j=$((i+1)); eval CONFIG_FILE="\${$j}"
+      break
+    fi
+    i=$((i+1))
+  done
+fi
+# Auto-load ./hasher.conf if present and no --config provided
+if [[ -z "$CONFIG_FILE" && -f "./hasher.conf" ]]; then
+  CONFIG_FILE="./hasher.conf"
+fi
 
-# Run ID
+# ───────────────────────── Run ID ──────────────────────────
 if command -v uuidgen >/dev/null 2>&1; then
   RUN_ID="$(uuidgen)"
 elif [[ -r /proc/sys/kernel/random/uuid ]]; then
@@ -44,10 +63,14 @@ else
   RUN_ID="$(date +%s)-$$"
 fi
 
+# Derived paths (will be reconciled by load_config if config changes dirs)
 MAIN_LOG="$LOGS_DIR/hasher.log"
 RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
 FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
+
+# ───────────────────────── Setup dirs ──────────────────────
+mkdir -p "$HASHES_DIR" "$LOGS_DIR"
 
 # ───────────────────────── Logging ─────────────────────────
 _log() {
@@ -71,12 +94,57 @@ info()  { _log "INFO"  "$*"; }
 warn()  { _log "WARN"  "$*"; }
 error() { _log "ERROR" "$*"; }
 
+# ───────────────────────── Config loader ───────────────────
+# Supported keys (case-insensitive): algo, pathfile, output, level, interval,
+# exclude (repeatable), hashes_dir, logs_dir
+load_config() {
+  local f="$1"
+  [[ -f "$f" ]] || { warn "Config not found: $f (ignoring)"; return; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # trim
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"; key="${key#"${key%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"; val="${val#"${val%%[![:space:]]*}"}"
+    [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]] && val="${val:1:-1}"
+    [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]] && val="${val:1:-1}"
+    lk="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    case "$lk" in
+      algo)          ALGO="$val" ;;
+      pathfile)      PATHFILE="$val" ;;
+      output)        OUTPUT="$val" ;;
+      level)         LOG_LEVEL="$val" ;;
+      interval)      PROGRESS_INTERVAL="$val" ;;
+      exclude)       EXTRA_EXCLUDES+=("$val") ;;
+      hashes_dir)    HASHES_DIR="$val" ;;
+      logs_dir)      LOGS_DIR="$val" ;;
+      *)             warn "Unknown config key '$key' in $f" ;;
+    esac
+  done < "$f"
+
+  # reconcile paths after possible dir changes
+  mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+  MAIN_LOG="$LOGS_DIR/hasher.log"
+  RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
+  FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
+  BACKGROUND_LOG="$LOGS_DIR/background.log"
+
+  # re-derive default OUTPUT if still using default pattern or blank
+  if [[ "$OUTPUT" == "hashes/hasher-$DATE_TAG.csv" || -z "$OUTPUT" ]]; then
+    OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+  fi
+}
+
+# Apply config early (before arg parsing), if set
+[[ -n "$CONFIG_FILE" ]] && load_config "$CONFIG_FILE"
+
 # ───────────────────────── Arg Parsing ─────────────────────
 usage() {
   cat <<EOF
 Usage: $0 [--pathfile FILE] [--algo sha256|sha1|sha512|md5|blake2] [--output CSV]
           [--nohup] [--level info|warn|error] [--interval SECONDS]
-          [--exclude PATTERN ...] [--help]
+          [--exclude PATTERN ...] [--config FILE] [--help]
 
 Options:
   --pathfile FILE    File containing one path (dir or file) per line. Required unless paths are piped.
@@ -86,6 +154,7 @@ Options:
   --level LEVEL      Log level threshold (info|warn|error). Default: info.
   --interval N       Progress update interval seconds (default: $PROGRESS_INTERVAL).
   --exclude P        Extra exclude pattern(s). Repeatable. (Literal substring match)
+  --config FILE      Load settings from FILE (default: ./hasher.conf if present).
   --help             Show this help.
 
 Behavior:
@@ -106,6 +175,7 @@ while [[ $# -gt 0 ]]; do
     --level)    LOG_LEVEL="$2"; shift ;;
     --interval) PROGRESS_INTERVAL="$2"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("$2"); shift ;;
+    --config)   CONFIG_FILE="${2:-}"; shift ;;  # already loaded above; kept to allow nohup propagation
     --child)    IS_CHILD=true ;;          # internal
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
@@ -119,6 +189,7 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export IS_CHILD=true
   # shellcheck disable=SC2046
   nohup "$0" --child \
+    ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
     ${PATHFILE:+--pathfile "$PATHFILE"} \
     --algo "$ALGO" \
     --output "$OUTPUT" \
@@ -175,18 +246,24 @@ build_file_list() {
     had_input=true
   fi
 
-  # If stdin is a pipe, also accept paths (null-terminated or newline)
+  # If stdin is a pipe, also accept paths (NUL- or newline-delimited) — portable check
   if [ ! -t 0 ]; then
     had_input=true
-    # Try to detect NULs; if none, convert newlines
-    if grep -qP '\x00' <(dd bs=1024 count=1 2>/dev/null); then
-      cat >> "$FILES_LIST".tmp
+    local tmp_in="$FILES_LIST.stdin.tmp"
+    # Buffer stdin to a temp file so probing doesn't consume the stream
+    cat > "$tmp_in"
+    # Probe: read with -d '' (NUL delimiter); success ⇒ contains at least one NUL
+    if IFS= read -r -d '' _peek < "$tmp_in"; then
+      # NUL-delimited: append as-is
+      cat "$tmp_in" >> "$FILES_LIST".tmp
     else
+      # newline-delimited: convert to NUL-delimited
       while IFS= read -r p || [[ -n "$p" ]]; do
         [[ -z "$p" ]] && continue
         printf '%s\0' "$p"
-      done >> "$FILES_LIST".tmp
+      done < "$tmp_in" >> "$FILES_LIST".tmp
     fi
+    rm -f -- "$tmp_in" 2>/dev/null || true
   fi
 
   if ! $had_input; then
@@ -296,6 +373,7 @@ trap cleanup EXIT
 # ───────────────────────── Main Hashing ────────────────────
 main() {
   info "Run-ID: $RUN_ID"
+  [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
   info "Config: ${PATHFILE:+pathfile=$PATHFILE} | Algo: $ALGO | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
   info "Output CSV: $OUTPUT"
 
@@ -369,7 +447,7 @@ post_run_reports() {
   local zero_txt="$LOGS_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
-  # Zero-length list from CSV (detect size column)
+  # Zero-length list from CSV (detect size column) — POSIX-safe blank filtering
   if [[ -f "$csv" ]]; then
     awk -F',' '
       NR==1 {
@@ -386,7 +464,7 @@ post_run_reports() {
           if ($(NF)+0==0) print $1
         }
       }
-    ' "$csv" | sed '/^\s*$/d' > "$zero_txt" || true
+    ' "$csv" | grep -v '^[[:space:]]*$' > "$zero_txt" || true
   fi
 
   # Duplicate report (group by a likely hash column)
