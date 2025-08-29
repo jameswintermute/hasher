@@ -338,13 +338,17 @@ build_file_list() {
     # Read NUL list, filter lines that DO NOT contain any pattern
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
       BEGIN{
-        for(i=1;i<=N;i++) pat[i]=ARGV[i];
-        ARGC=1
+        # Capture pattern args, then clear them from ARGV so remaining ARGV
+        # (the files list) is still read as input.
+        for(i=1;i<=N;i++){
+          pat[i]=ARGV[i]
+          ARGV[i]=""
+        }
       }
       {
         keep=1
         for(i=1;i<=N;i++){
-          if(index($0, pat[i])>0){ keep=0; break }
+          if (pat[i] != "" && index($0, pat[i])>0) { keep=0; break }
         }
         if(keep) printf "%s", $0
       }
