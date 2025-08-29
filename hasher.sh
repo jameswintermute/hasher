@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute <jameswinter@protonmail.ch>
+# Copyright (C) 2025 James Wintermute <jameswintermute@protonmail.ch>
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
@@ -250,16 +250,14 @@ done
 # ───────────────────────── Nohup Re-exec ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export IS_CHILD=true
-  # shellcheck disable=SC2046
-  nohup "$0" --child \
-    ${CONFIG_FILE:+--config "$CONFIG_FILE"} \
-    ${PATHFILE:+--pathfile "$PATHFILE"} \
-    --algo "$ALGO" \
-    --output "$OUTPUT" \
-    --level "$LOG_LEVEL" \
-    --interval "$PROGRESS_INTERVAL" \
-    $(for ex in "${EXTRA_EXCLUDES[@]}"; do printf -- "--exclude %q " "$ex"; done) \
-    >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
+  # Build args safely with an array (IFS excludes spaces)
+  args=( "$0" --child )
+  [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
+  [[ -n "$PATHFILE" ]]    && args+=( --pathfile "$PATHFILE" )
+  args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" )
+  for ex in "${EXTRA_EXCLUDES[@]}"; do args+=( --exclude "$ex" ); done
+
+  nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
   bgpid=$!
   echo "Hasher started with nohup (PID $bgpid). Output: $OUTPUT"
   exit 0
