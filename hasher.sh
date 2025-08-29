@@ -155,7 +155,8 @@ load_config() {
           level)         LOG_LEVEL="$val" ;;
           background-interval|interval) PROGRESS_INTERVAL="$val" ;;
           xtrace)
-            case "${val,,}" in
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
               1|true|yes|on) set -x ;;
             esac
             ;;
@@ -165,10 +166,11 @@ load_config() {
       "exclusions")
         case "$key" in
           inherit-defaults)
-            case "${val,,}" in
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
               0|false|no|off) inherit_defaults="false" ;;
               *)              inherit_defaults="true" ;;
-            )
+            esac
             ;;
           exclude)        EXTRA_EXCLUDES+=("$val") ;;
           __bare__)       EXTRA_EXCLUDES+=("$val") ;;   # each bare line is a pattern
