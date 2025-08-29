@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute <jameswintermute@protonmail.ch>
+# Copyright (C) 2025 James Wintermute <jameswinter@protonmail.ch>
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
@@ -89,7 +89,7 @@ _log() {
   printf '%s\n' "$line" >> "$RUN_LOG"
 }
 
-info()  { _log("INFO"  "$@"); }
+info()  { _log "INFO"  "$*"; }
 warn()  { _log "WARN"  "$*"; }
 error() { _log "ERROR" "$*"; }
 
