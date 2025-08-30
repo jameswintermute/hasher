@@ -40,11 +40,6 @@ Options:
                        e.g. "$ZERO_DIR/quarantine-$DATE_TAG"
   -y, --yes            Assume "yes" to confirmations (useful for non-interactive)
   -h, --help           Show this help
-
-Examples:
-  $0
-  $0 "$ZERO_DIR/zero-length-$DATE_TAG.txt"
-  $0 -y --force --quarantine "$ZERO_DIR/quarantine-$DATE_TAG"
 EOF
 }
 
@@ -76,6 +71,25 @@ confirm() {
   fi
 }
 
+# ───────────────────────── Helpers ─────────────────────────
+count_entries() { awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$1" 2>/dev/null | wc -l | tr -d ' ' || echo 0; }
+
+short_label() {
+  # Pretty, non-wrapping label for menu: "verified • 2025-08-30 • zero-length • id=8e635fd6"
+  local p="$1" base dir date rid type
+  base="$(basename -- "$p")"
+  dir="$(basename -- "$(dirname -- "$p")")"
+  if [[ "$base" =~ ^verified-zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})-([A-Za-z0-9-]+)\.txt$ ]]; then
+    type="verified"; date="${BASH_REMATCH[1]}"; rid="${BASH_REMATCH[2]}"; rid="${rid:0:8}"
+  elif [[ "$base" =~ ^zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})\.txt$ ]]; then
+    type="raw"; date="${BASH_REMATCH[1]}"; rid=""
+  else
+    type="report"; date="unknown"; rid=""
+  fi
+  printf "%-9s • %s • %s" "$type" "$date" "$dir"
+  [[ -n "$rid" ]] && printf " • id=%s" "$rid"
+}
+
 # ───────────────────────── Parse args ──────────────────────
 while (( $# )); do
   case "$1" in
@@ -91,7 +105,6 @@ done
 # ───────────────────────── Auto-select input ───────────────
 pick_latest_report() {
   local raw=()
-  # Prefer ZERO_DIR, then LOGS_DIR; prefer verified-* then zero-length-* (newest first)
   for d in "$ZERO_DIR" "$LOGS_DIR"; do
     while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/verified-zero-length-*.txt 2>/dev/null || true)
     while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/zero-length-*.txt        2>/dev/null || true)
@@ -104,34 +117,24 @@ pick_latest_report() {
   done
 
   local total=${#cands[@]}
-  if (( total == 0 )); then
-    echo ""
-    return 0
-  fi
+  (( total )) || { echo ""; return 0; }
 
-  # If only one candidate, just return it
-  if (( total == 1 )); then
-    echo "${cands[0]}"
-    return 0
-  fi
+  # One candidate? return it.
+  if (( total == 1 )); then echo "${cands[0]}"; return 0; fi
 
-  # If stdin is non-interactive, pick first (log to stderr so it shows)
+  # Non-interactive? pick newest, but say which (stderr).
   if [ ! -t 0 ]; then
     >&2 echo "Auto-selecting latest (non-interactive): ${cands[0]}"
-    echo "${cands[0]}"
-    return 0
+    echo "${cands[0]}"; return 0
   fi
 
-  # Interactive: ALWAYS print the menu to stderr so it isn't swallowed by command substitution
-  local limit=$MAX_MENU
-  (( total < limit )) && limit=$total
-
+  # Interactive: ALWAYS show a compact menu to stderr
+  local limit=$MAX_MENU; (( total < limit )) && limit=$total
   >&2 echo "Select input report (showing $limit of $total most recent):"
   local i f cnt
   for (( i=0; i<limit; i++ )); do
-    f="${cands[$i]}"
-    cnt="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
-    >&2 printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$f" "$cnt"
+    f="${cands[$i]}"; cnt="$(count_entries "$f")"
+    >&2 printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$(short_label "$f")" "$cnt"
   done
   if (( total > limit )); then
     >&2 echo "  … (older reports not shown; pass a path explicitly if needed)"
@@ -139,7 +142,6 @@ pick_latest_report() {
 
   local pick
   while true; do
-    # read -p writes prompt to stderr by design — perfect for interactive menus
     read -r -p "Enter number [1-$limit] (default 1): " pick || true
     pick="${pick:-1}"
     if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=limit )); then
@@ -161,8 +163,10 @@ fi
 
 # ───────────────────────── Verified plan path ──────────────
 base="$(basename -- "$INPUT")"
-date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" || true)"
+# Extract ONLY the first date, then strip any stray newlines (prevents double-date & wrapping)
+date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" | head -n1 || true)"
 plan_date="${date_hint:-$DATE_TAG}"
+plan_date="$(printf '%s' "$plan_date" | tr -d '\r\n')"
 VERIFIED_LIST="$ZERO_DIR/verified-zero-length-$plan_date-$RUN_ID.txt"
 : > "$VERIFIED_LIST"
 
@@ -181,7 +185,7 @@ info "Summary log: $SUMMARY_LOG"
 info "Run-ID: $RUN_ID"
 
 # ───────────────────────── Pre-count for progress ─────────
-TOTAL_LINES="$(grep -v '^[[:space:]]*#' "$INPUT" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
+TOTAL_LINES="$(awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$INPUT" 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
 (( TOTAL_LINES < 0 )) && TOTAL_LINES=0
 STEP=$(( TOTAL_LINES / 100 )); (( STEP < 1 )) && STEP=1
 
