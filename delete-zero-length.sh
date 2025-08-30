@@ -14,7 +14,11 @@ RUN_ID="${RUN_ID:-$({ command -v uuidgen >/dev/null 2>&1 && uuidgen; } || \
                     { [ -r /proc/sys/kernel/random/uuid ] && cat /proc/sys/kernel/random/uuid; } || \
                     date +%s)}"
 SUMMARY_LOG="$LOGS_DIR/delete-zero-length-$DATE_TAG.log"
+
 mkdir -p "$LOGS_DIR" "$ZERO_DIR"
+
+# Colors
+RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'; NC=$'\033[0m'
 
 # ───────────────────────── Flags ───────────────────────────
 FORCE=false
@@ -26,22 +30,41 @@ usage() {
   cat <<EOF
 Usage: $0 [<pathlist.txt>] [--force] [--quarantine DIR] [--yes]
 
-If <pathlist.txt> is omitted, the script will auto-select the most recent report,
+If <pathlist.txt> is omitted, the script auto-selects the most recent report,
 preferring $ZERO_DIR/verified-*.txt, then $ZERO_DIR/zero-length-*.txt, then same in $LOGS_DIR.
 
 Options:
   --force              Actually delete/move verified files (otherwise dry-run)
-  --quarantine DIR     Move verified files into DIR (preserves path under DIR)
-                       (tip: use "$ZERO_DIR/quarantine-$DATE_TAG")
+  --quarantine DIR     Move verified files into DIR (preserve original path under DIR)
+                       e.g. "$ZERO_DIR/quarantine-$DATE_TAG"
   -y, --yes            Assume "yes" to confirmations (useful for non-interactive)
   -h, --help           Show this help
+
+Examples:
+  $0                                # auto-pick latest, dry-run
+  $0 "$ZERO_DIR/zero-length-$DATE_TAG.txt"        # explicit input, dry-run
+  $0 --force --quarantine "$ZERO_DIR/quarantine-$DATE_TAG"
 EOF
 }
 
-log_line() { local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"; echo "[$ts] [RUN $RUN_ID] [$1] ${*:2}" | tee -a "$SUMMARY_LOG" >/dev/null; }
-info()  { log_line INFO  "$*"; }
-warn()  { log_line WARN  "$*"; }
-error() { log_line ERROR "$*"; }
+# ───────────────────────── Logging ─────────────────────────
+_log_core() {
+  local lvl="$1"; shift
+  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
+  local line="[$ts] [RUN $RUN_ID] [$lvl] $*"
+  # console (color)
+  case "$lvl" in
+    INFO)  echo -e "${GREEN}$line${NC}" ;;
+    WARN)  echo -e "${YELLOW}$line${NC}" ;;
+    ERROR) echo -e "${RED}$line${NC}" ;;
+    *)     echo "$line" ;;
+  esac
+  # log file (plain)
+  printf '%s\n' "$line" >> "$SUMMARY_LOG"
+}
+info()  { _log_core INFO  "$*"; }
+warn()  { _log_core WARN  "$*"; }
+error() { _log_core ERROR "$*"; }
 
 confirm() {
   $YES && return 0
@@ -49,7 +72,7 @@ confirm() {
     read -r -p "$1 [Y/n] " ans || true
     case "${ans:-Y}" in Y|y|yes|YES) return 0 ;; *) return 1 ;; esac
   else
-    warn "Non-interactive mode and no --yes supplied; refusing."
+    warn "Non-interactive and no --yes supplied; refusing."
     return 1
   fi
 }
@@ -69,20 +92,20 @@ done
 # ───────────────────────── Auto-select input ───────────────
 pick_latest_report() {
   local cands=()
-  # prefer ZERO_DIR, then LOGS_DIR; prefer verified-*.txt then zero-length-*.txt
+  # Prefer ZERO_DIR, then LOGS_DIR; prefer verified-* then zero-length-*
   for d in "$ZERO_DIR" "$LOGS_DIR"; do
     while IFS= read -r f; do cands+=("$f"); done < <(ls -1t "$d"/verified-zero-length-*.txt 2>/dev/null || true)
     while IFS= read -r f; do cands+=("$f"); done < <(ls -1t "$d"/zero-length-*.txt        2>/dev/null || true)
   done
   (( ${#cands[@]} )) || { echo ""; return 0; }
 
-  # if non-interactive or single candidate, pick first
+  # If non-interactive or single candidate, pick first
   if (( ${#cands[@]} == 1 )) || [ ! -t 0 ]; then echo "${cands[0]}"; return 0; fi
 
   echo "Select input report:"
   local i=1
   for f in "${cands[@]}"; do
-    local cnt; cnt="$(grep -v '^[[:space:]]*#' "$f" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+    local cnt; cnt="$(grep -v '^[[:space:]]*#' "$f" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
     printf "  %2d) %s  (%s lines)\n" "$i" "$f" "$cnt"
     ((i++))
   done
@@ -103,9 +126,12 @@ fi
 
 [[ -r "$INPUT" ]] || { error "Input list not readable: $INPUT"; exit 3; }
 
-# ───────────────────────── Derive verified plan path ───────
+# ───────────────────────── Verified plan path ──────────────
+# Try to reuse a date already present in the filename; else use today's DATE_TAG
 base="$(basename -- "$INPUT")"
-VERIFIED_LIST="$ZERO_DIR/verified-${base%.*}-$DATE_TAG-$RUN_ID.txt"
+date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" || true)"
+plan_date="${date_hint:-$DATE_TAG}"
+VERIFIED_LIST="$ZERO_DIR/verified-zero-length-$plan_date-$RUN_ID.txt"
 : > "$VERIFIED_LIST"
 
 # ───────────────────────── Mode banner ─────────────────────
@@ -123,7 +149,7 @@ info "Summary log: $SUMMARY_LOG"
 info "Run-ID: $RUN_ID"
 
 # ───────────────────────── Pre-count for progress ─────────
-TOTAL_LINES="$(grep -v '^[[:space:]]*#' "$INPUT" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+TOTAL_LINES="$(grep -v '^[[:space:]]*#' "$INPUT" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
 (( TOTAL_LINES < 0 )) && TOTAL_LINES=0
 STEP=$(( TOTAL_LINES / 100 )); (( STEP < 1 )) && STEP=1
 
@@ -143,7 +169,7 @@ draw_progress() {
 finish_progress() { [ -t 1 ] && printf "\n"; }
 trap 'finish_progress' EXIT
 
-# ───────────────────────── Action helpers ──────────────────
+# ───────────────────────── Actions ─────────────────────────
 do_delete() { rm -f -- "$1" && ((deleted++)) || { ((delete_failed++)); warn "Failed to delete: $1"; }; }
 do_move() {
   local f="$1" dest="$QUARANTINE_DIR/$f" dest_dir
@@ -205,7 +231,7 @@ else
     echo "  ./delete-zero-length.sh \"$VERIFIED_LIST\" --force"
     echo
     echo "To quarantine instead of delete, run:"
-    echo "  ./delete-zero-length.sh \"$VERIFIED_LIST\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+    echo "  ./delete-zero-length.sh \"$VERIFIED_LIST\" --force --quarantine \"$ZERO_DIR/quarantine-$plan_date\""
     echo
   else
     info "No zero-length files remain to delete."
