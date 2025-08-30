@@ -5,11 +5,11 @@
 # This program comes with ABSOLUTELY NO WARRANTY.
 
 # review-duplicates.sh — Interactive review of duplicate groups (largest-first).
-# Fixes:
-#  - Robust TSV parsing (trims CR, validates fields)
-#  - Verifies .detail files exist before reading (prevents blocking on STDIN)
-#  - Uses while-read loops for group files (portable; no mapfile dependency)
-#  - Immediate progress feedback and folder “mirror” detection (ka/kb)
+# Synology/BusyBox-friendly; no mapfile; reads prompts from /dev/tty.
+# Key fixes:
+#  - Do NOT redirect stdin to the index file. Use FD 3 for file reads; keep stdin as TTY.
+#  - Trim stray CRs; validate fields; verify .detail exists before reading.
+#  - Live progress while indexing; mirror-folder helpers (ka/kb).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -30,7 +30,7 @@ ORDER="size"          # size|reclaim   (largest-first)
 LIMIT=100             # max groups to walk through interactively
 MIN_SIZE=0            # ignore dup groups where per-file size < MIN_SIZE
 FILTER_PREFIX=""      # only consider groups including any file under this prefix (optional)
-GROUP_DEPTH=2         # summary path depth
+GROUP_DEPTH=2         # summary path depth for final TSV
 TOP_N=10              # top-N summary after plan built
 SHOW_EACH_MAX=12      # show up to this many files per group in the UI
 FOLDER_DEPTH=3        # depth for folder summaries / mirror detection (/vol/Share/Sub=3)
@@ -81,12 +81,11 @@ mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$GROUPDIR"
 # ───────── Sanity ─────────
 [[ -n "$REPORT" && -r "$REPORT" ]] || { echo "ERROR: No readable duplicate report (run find-duplicates.sh)"; exit 1; }
 [[ -n "$CSV"    && -r "$CSV"    ]] || { echo "ERROR: No readable hasher CSV (run hasher.sh)"; exit 1; }
-
 TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
 
 # ───────── Helpers ─────────
 pp_size(){ b="$1"; u=(B KiB MiB GiB TiB PiB); i=0; while (( b>=1024 && i<${#u[@]}-1 )); do b=$(( (b+1023)/1024 )); i=$((i+1)); done; printf "%d %s" "$b" "${u[$i]}"; }
-fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
+fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
 folder_counts(){ # reads paths on stdin, prints "COUNT\tPREFIX" sorted by COUNT desc
   awk -v d="$FOLDER_DEPTH" -F'/' '
     function pref(a, n, d,   i,c,s){ s=""; c=0; for(i=1;i<=n;i++){ if(a[i]=="")continue; c++; if(c<=d){ s=s "/" a[i] } } if(s=="") s="/"; return s }
@@ -223,25 +222,28 @@ pp_line() { # args: size mtime path idx
 shown=0
 added_extras=0
 
-# Read index lines safely; trim CR; validate fields; verify detail exists
-while IFS= read -r line || [[ -n "$line" ]]; do
+# Open the index file on FD 3 so stdin stays connected to the TTY
+exec 3< "$INDEX_SORTED"
+
+# Read index lines from FD 3; read prompts from /dev/tty
+while true; do
+  line=""
+  IFS= read -r -u 3 line || { [[ -n "$line" ]] || break; }
   (( shown >= LIMIT )) && break
-  # Trim trailing CR if present (defensive)
+
+  # Trim trailing CR just in case
   [[ "${line: -1}" == $'\r' ]] && line="${line%$'\r'}"
-  # Split into 4 tab-separated fields
   IFS=$'\t' read -r first_sz reclaim cnt detail <<< "$line" || continue
-  # Field sanity
   [[ -n "${detail:-}" && -n "${first_sz:-}" && -n "${cnt:-}" ]] || continue
-  # Verify detail file exists; if not, skip (prevents reading from STDIN!)
+
   if [[ ! -f "$detail" ]]; then
     echo -e "${YELLOW}  ! Missing detail file: $detail (skipping)${NC}"
     continue
   fi
 
-  ((shown++))
-  echo -e "${CYAN}[$shown/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
+  echo -e "${CYAN}[$((shown+1))/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
 
-  # Load this group's items via while-read (portable, trims CR)
+  # Load this group's items
   paths=(); sizes=(); mtimes=()
   i=0
   while IFS=$'\t' read -r s t p || [[ -n "$s$t$p" ]]; do
@@ -261,22 +263,22 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   # Folder summary & mirror detection
   {
     for p in "${paths[@]}"; do echo "$p"; done | folder_counts
-  } > "$TMPROOT/group-$shown-folders.tsv"
+  } > "$TMPROOT/group-$((shown+1))-folders.tsv"
 
   echo "       Top folders (depth=$FOLDER_DEPTH):"
-  if [[ -s "$TMPROOT/group-$shown-folders.tsv" ]]; then
-    head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
+  if [[ -s "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
+    head -n 3 "$TMPROOT/group-$((shown+1))-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
   else
     echo "         (no folder summary)"
   fi
 
   mirror_hint=""
-  if [[ -s "$TMPROOT/group-$shown-folders.tsv" ]]; then
-    if (( $(wc -l < "$TMPROOT/group-$shown-folders.tsv" | tr -d ' ') == 2 )); then
-      a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$shown-folders.tsv")
-      b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$shown-folders.tsv")
-      a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$shown-folders.tsv")
-      b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+  if [[ -s "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
+    if (( $(wc -l < "$TMPROOT/group-$((shown+1))-folders.tsv" | tr -d ' ') == 2 )); then
+      a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$((shown+1))-folders.tsv")
+      b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$((shown+1))-folders.tsv")
+      a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
+      b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
       if (( a_count == b_count && a_count + b_count == total_in_group )); then
         mirror_hint="mirror"
         echo "       Mirror folders suspected:"
@@ -288,11 +290,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   fi
 
   echo
-  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice || choice=""
+  choice=""
+  # Read the user choice from the real terminal, not from FD 3
+  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice < /dev/tty || true
 
-  # Handle choice
   if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then
-    echo "  → Skipped."; echo; continue
+    echo "  → Skipped."; echo; shown=$((shown+1)); continue
   fi
   if [[ "$choice" =~ ^[qQ]$ ]]; then
     echo "  → Quitting early."; break
@@ -300,8 +303,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
   added_here=0
   if [[ "$choice" == "ka" || "$choice" == "kb" ]]; then
-    if [[ -f "$TMPROOT/group-$shown-folders.tsv" ]]; then
-      keep_pref=$(awk -F'\t' -v c="$choice" 'c=="ka"&&NR==1{print $2} c=="kb"&&NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+    if [[ -f "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
+      keep_pref=$(awk -F'\t' -v c="$choice" 'c=="ka"&&NR==1{print $2} c=="kb"&&NR==2{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
       if [[ -n "$keep_pref" ]]; then
         for p in "${paths[@]}"; do
           if [[ "${p:0:${#keep_pref}}" != "$keep_pref" ]]; then
@@ -317,12 +320,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     else
       echo -e "${YELLOW}  ! No folder summary; skipping.${NC}"
     fi
-    echo
-    continue
+    echo; shown=$((shown+1)); continue
   fi
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > total_in_group )); then
-    echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; continue
+    echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; shown=$((shown+1)); continue
   fi
 
   keep_idx="$choice"
@@ -334,7 +336,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   ((added_extras+=added_here))
   echo "  → Keeping #$keep_idx; added $added_here extras to plan."
   echo
-done < "$INDEX_SORTED"
+  shown=$((shown+1))
+done
+
+# Close FD 3
+exec 3<&-
 
 # ───────── Summary of the plan ─────────
 if [[ -s "$PLAN" ]]; then
