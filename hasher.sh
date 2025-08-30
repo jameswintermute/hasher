@@ -20,6 +20,7 @@ PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
 LOG_LEVEL="info"     # info|warn|error
+ZERO_LENGTH_ONLY=false
 
 # Optional config (CLI can override)
 CONFIG_FILE=""
@@ -211,7 +212,7 @@ usage() {
   cat <<EOF
 Usage: $0 [--pathfile FILE] [--algo sha256|sha1|sha512|md5|blake2] [--output CSV]
           [--nohup] [--level info|warn|error] [--interval SECONDS]
-          [--exclude PATTERN ...] [--config FILE] [--help]
+          [--exclude PATTERN ...] [--zero-length-only] [--config FILE] [--help]
 
 Options:
   --pathfile FILE    File containing one path (dir or file) per line. Required unless paths are piped.
@@ -221,11 +222,12 @@ Options:
   --level LEVEL      Log level threshold (info|warn|error). Default: info.
   --interval N       Progress update interval seconds (default: $PROGRESS_INTERVAL).
   --exclude P        Extra exclude pattern(s). Repeatable. (Literal substring match)
+  --zero-length-only Scan and output zero-length file list only, then exit (no hashing).
   --config FILE      Load settings from FILE (default: ./hasher.conf if present).
   --help             Show this help.
 
 Behavior:
-  * Writes CSV with header to: \$OUTPUT
+  * Writes CSV with header to: \$OUTPUT (unless --zero-length-only)
   * Logs: $MAIN_LOG (global), $RUN_LOG (per run), progress to $BACKGROUND_LOG
   * Creates file list at: $FILES_LIST
 EOF
@@ -233,15 +235,16 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pathfile) PATHFILE="$2"; shift ;;
-    --algo)     ALGO="$2"; shift ;;
-    --output)   OUTPUT="$2"; shift ;;
+    --pathfile) PATHFILE="${2:-}"; shift ;;
+    --algo)     ALGO="${2:-}"; shift ;;
+    --output)   OUTPUT="${2:-}"; shift ;;
     --nohup)    RUN_IN_BACKGROUND=true ;;
-    --level)    LOG_LEVEL="$2"; shift ;;
-    --interval) PROGRESS_INTERVAL="$2"; shift ;;
-    --exclude)  EXTRA_EXCLUDES+=("$2"); shift ;;
+    --level)    LOG_LEVEL="${2:-}"; shift ;;
+    --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
+    --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
+    --zero-length-only) ZERO_LENGTH_ONLY=true ;;
     --config)   CONFIG_FILE="${2:-}"; shift ;;  # kept to allow nohup propagation
-    --child)    IS_CHILD=true ;;          # internal
+    --child)    IS_CHILD=true ;;                # internal
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -254,13 +257,14 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   # Build args safely with an array (IFS excludes spaces)
   args=( "$0" --child )
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
-  [[ -n "$PATHFILE" ]]    && args+=( --pathfile "$PATHFILE" )
+  [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
   args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" )
   for ex in "${EXTRA_EXCLUDES[@]}"; do args+=( --exclude "$ex" ); done
+  $ZERO_LENGTH_ONLY && args+=( --zero-length-only )
 
   nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
   bgpid=$!
-  echo "Hasher started with nohup (PID $bgpid). Output: $OUTPUT"
+  echo "Hasher started with nohup (PID $bgpid). Output: ${ZERO_LENGTH_ONLY:+(zero-length-only mode)} $OUTPUT"
   exit 0
 fi
 
@@ -458,6 +462,7 @@ main() {
   [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
   info "Config: ${PATHFILE:+pathfile=$PATHFILE} | Algo: $ALGO | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
   info "Output CSV: $OUTPUT"
+  $ZERO_LENGTH_ONLY && info "Mode: ZERO-LENGTH-ONLY (no hashing)"
 
   build_file_list
 
@@ -467,12 +472,38 @@ main() {
   else
     TOTAL=0
   fi
-  info "Discovered $TOTAL files to hash (post-exclude)."
+  info "Discovered $TOTAL files to scan (post-exclude)."
 
+  # ───── Fast path: zero-length-only (no hashing) ──────────
+  if $ZERO_LENGTH_ONLY; then
+    local out="$ZERO_DIR/zero-length-$DATE_TAG.txt"
+    : > "$out"
+    local n=0 m=0 nr=0
+    # shellcheck disable=SC2034
+    while IFS= read -r -d '' f; do
+      if [[ ! -e "$f" ]]; then
+        ((m++))
+      elif [[ ! -f "$f" ]]; then
+        ((nr++))
+      elif [[ ! -s "$f" ]]; then
+        echo "$f" >> "$out"
+        ((n++))
+      fi
+    done < "$FILES_LIST"
+    info "Zero-length-only scan complete: $n zero-length files (missing=$m, not-regular=$nr)."
+    info "Report: $out"
+    echo
+    echo -e "${GREEN}[NEXT]${NC} Review or delete:"
+    echo "  ./delete-zero-length.sh \"$out\"           # dry-run"
+    echo "  ./delete-zero-length.sh \"$out\" --force   # delete (or add --quarantine DIR)"
+    echo
+    return
+  fi
+
+  # ───── Normal hashing path ───────────────────────────────
   write_csv_header
   start_progress
 
-  # Iterate 0-terminated list to handle any filename safely
   local start_ts
   start_ts=$(date +%s)
 
@@ -513,7 +544,7 @@ main() {
 
   info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
-  # ── Minimal addition: post-run reports + next steps ──────
+  # ── Post-run reports + next steps ────────────────────────
   post_run_reports "$OUTPUT" "$DATE_TAG"
 }
 
