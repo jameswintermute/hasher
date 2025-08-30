@@ -85,6 +85,13 @@ fi
 [[ -r "$REPORT" ]] || { echo "ERROR: Cannot read report: $REPORT" >&2; exit 1; }
 [[ -r "$CSV"    ]] || { echo "ERROR: Cannot read CSV: $CSV" >&2; exit 1; }
 
+# Pre-create/clear outputs safely (avoid weird awk shell calls)
+: > "$PLAN"
+: > "$SUMMARY_TSV"
+
+# Count total groups to show progress
+TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
+
 echo -e "${GREEN}Reviewing duplicates (dry-run)…${NC}"
 echo "  • Report:       $REPORT"
 echo "  • CSV:          $CSV"
@@ -96,15 +103,15 @@ echo
 
 # AWK does the heavy lifting: loads CSV (path->size,mtime), parses report groups,
 # applies policy to choose keep, writes plan (extras; optionally filtered by prefix),
-# and writes a summary TSV grouped by path prefix (depth).
+# and writes a summary TSV grouped by path prefix (depth). Also prints periodic progress.
 awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" \
     -v keep="$KEEP" -v minsize="$MIN_SIZE" -v wantprefix="$FILTER_PREFIX" \
-    -v depth="$GROUP_DEPTH" -v topn="$TOP_N" '
+    -v depth="$GROUP_DEPTH" -v topn="$TOP_N" -v total="$TOTAL_GROUPS" -v every=250 '
   function ltrim(s){ sub(/^[ \t\r\n]+/, "", s); return s }
   function rtrim(s){ sub(/[ \t\r\n]+$/, "", s); return s }
   function unquote_csv(s){ gsub(/""/,"\"",s); return s }
 
-  function parse_csv_line(line,   path, rest, c, endq, size_str, mtime_str, algo, hash) {
+  function parse_csv_line(line,   path, rest, c, endq, size_str, mtime_str, hash) {
     if (substr(line,1,1)=="\"") {
       endq=0
       for (i=2;i<=length(line);i++) {
@@ -126,11 +133,11 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
     c=index(rest,","); if (c==0) return 0
     mtime_str=substr(rest,1,c-1); mtime_str=ltrim(rtrim(mtime_str)); rest=substr(rest,c+1)
     c=index(rest,","); if (c==0) return 0
-    # algo=substr(rest,1,c-1) ; not used
-    hash=substr(rest,c+1)
-    PATH=path; SIZE=size_str+0; MTIME=mtime_str+0; HASH=ltrim(rtrim(hash))
+    hash=substr(rest,c+1); hash=ltrim(rtrim(hash))
+    PATH=path; SIZE=size_str+0; MTIME=mtime_str+0; HASH=hash
     return 1
   }
+
   function prefix_of(p, depth,   i,n,part,count,acc) {
     n = split(p, a, "/")
     acc=""; count=0
@@ -143,6 +150,7 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
     if (acc=="") acc="/"
     return acc
   }
+
   function load_csv(file) {
     while ((getline line < file) > 0) {
       if (NRcsv==0) { NRcsv++; continue }  # skip header
@@ -154,28 +162,38 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
     }
     close(file)
   }
+
   function cmp(a,b,policy) {
-    # returns 1 if a > b for the policy, -1 if a < b, 0 equal
-    if (policy=="newest")     { if (mtime[a]>mtime[b]) return 1; if (mtime[a]<mtime[b]) return -1; }
-    else if (policy=="oldest"){ if (mtime[a]<mtime[b]) return 1; if (mtime[a]>mtime[b]) return -1; }
+    if (policy=="newest")      { if (mtime[a]>mtime[b]) return 1; if (mtime[a]<mtime[b]) return -1; }
+    else if (policy=="oldest") { if (mtime[a]<mtime[b]) return 1; if (mtime[a]>mtime[b]) return -1; }
     else if (policy=="largest"){ if (size[a]>size[b])  return 1; if (size[a]<size[b])  return -1; }
     else if (policy=="smallest"){if (size[a]<size[b])  return 1; if (size[a]>size[b])  return -1; }
-    else if (policy=="first") { if (a<b) return 1; if (a>b) return -1; }
-    else if (policy=="last")  { if (a>b) return 1; if (a<b) return -1; }
+    else if (policy=="first")  { if (a<b) return 1; if (a>b) return -1; }
+    else if (policy=="last")   { if (a>b) return 1; if (a<b) return -1; }
     return 0
   }
+
   function choose_keep(arr, n, policy,   i, best) {
     best=arr[1]
     for (i=2;i<=n;i++){ if (cmp(arr[i], best, policy)>0) best=arr[i] }
     return best
   }
-  function flush_group(   i, keepfile, pre, c, extra_count_in_group) {
+
+  function progress_tick() {
+    if (total>0 && (grp_seen%every==0 || grp_seen==total)) {
+      pct = int(grp_seen*100/total)
+      printf("[PROGRESS] Groups: %d/%d (%d%%)\n", grp_seen, total, pct) > "/dev/stderr"
+    } else if (total==0 && grp_seen%every==0) {
+      printf("[PROGRESS] Groups processed: %d\n", grp_seen) > "/dev/stderr"
+    }
+  }
+
+  function flush_group(   i, keepfile, pre, extra_count_in_group) {
     if (gcount<2) { gcount=0; return }
     if (gsize<minsize) { gcount=0; return }
 
     keepfile = choose_keep(gfiles, gcount, keep)
 
-    # extras = all but keepfile; if wantprefix set, only include extras under that prefix
     extra_count_in_group = 0
     for (i=1;i<=gcount;i++) if (gfiles[i]!=keepfile) {
       if (wantprefix=="" || index(gfiles[i], wantprefix)==1) {
@@ -183,7 +201,6 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
         extras_total++
         reclaim_total += (gfiles[i] in size ? size[gfiles[i]] : 0)
         extra_count_in_group++
-        # summary by prefix
         pre = prefix_of(gfiles[i], depth)
         grpcount[pre]++
       }
@@ -197,24 +214,25 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
   }
 
   BEGIN{
-    # truncate outputs
-    system("bash -c \">\\\"\" plan \"\\\"\"")
-    system("bash -c \">\\\"\" summary \"\\\"\"")
     load_csv(csv)
     gcount=0; gsize=0
     groups_considered=0; files_in_dup_groups=0
     extras_total=0; reclaim_total=0
+    grp_seen=0
   }
 
-  # Parse report: groups shaped like:
+  # Parse report:
   # HASH <hash> (<N> files):
   #   /path/one
   #   /path/two
   /^HASH[ ]/ {
     flush_group()
+    grp_seen++
+    progress_tick()
     gcount=0; gsize=0
     next
   }
+
   /^[ ]{2}/ {
     f=$0; sub(/^[ ]+/, "", f)
     if (f=="") next
@@ -222,11 +240,11 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
     if (gcount==1) gsize = (f in size ? size[f] : 0)
     next
   }
+
   /^$/ { next }
 
   END{
     flush_group()
-
     # write summary TSV (prefix \t count_of_extras)
     for (k in grpcount) print k "\t" grpcount[k] > summary
     close(summary)
@@ -244,7 +262,6 @@ awk -v csv="$CSV" -v report="$REPORT" -v plan="$PLAN" -v summary="$SUMMARY_TSV" 
 
 # Print Top-N groups from the summary TSV (sorted by count desc)
 if [[ -s "$SUMMARY_TSV" ]]; then
-  # Ensure sorted
   sort -k2,2nr "$SUMMARY_TSV" -o "$SUMMARY_TSV" || true
   echo
   echo "Top $TOP_N groups (depth=$GROUP_DEPTH):"
@@ -254,7 +271,6 @@ if [[ -s "$SUMMARY_TSV" ]]; then
     ((rank++))
     pct=0
     if [[ "${total_extras:-0}" -gt 0 ]]; then
-      # integer percent
       pct=$(( (cnt * 100) / total_extras ))
     fi
     printf "  %2d) %-50s %6d extras  (%3d%%)\n" "$rank" "$pref" "$cnt" "$pct"
