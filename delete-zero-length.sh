@@ -1,287 +1,311 @@
 #!/usr/bin/env bash
-# delete-zero-length.sh — verify & (optionally) delete/move zero-length files from a list
-# Dry-run by default. With no arguments, auto-selects the most recent report and asks for confirmation.
-
+# delete-zero-length.sh — verify & delete/move zero-length files
+# Dry-run by default. Can quarantine instead of deleting.
+# Adds summary-by-path (top groups) for context.
 set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
 
-# ───────────────────────── Constants ───────────────────────
+# ────────────── Defaults ──────────────
 LOGS_DIR="logs"
 ZERO_DIR="zero-length"
 DATE_TAG="$(date +'%Y-%m-%d')"
-RUN_ID="${RUN_ID:-$({ command -v uuidgen >/dev/null 2>&1 && uuidgen; } || \
-                    { [ -r /proc/sys/kernel/random/uuid ] && cat /proc/sys/kernel/random/uuid; } || \
-                    date +%s)}"
 SUMMARY_LOG="$LOGS_DIR/delete-zero-length-$DATE_TAG.log"
-MAX_MENU=10
+RUN_ID="$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-$$" )"
 
-mkdir -p "$LOGS_DIR" "$ZERO_DIR"
-
-# Colors
-RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'; NC=$'\033[0m'
-
-# ───────────────────────── Flags ───────────────────────────
 FORCE=false
+ASSUME_YES=false
 QUARANTINE_DIR=""
-YES=false
-INPUT=""
+GROUP_DEPTH=2     # how many leading path components to group by (e.g. /vol/share = 2)
+TOP_N=10          # how many top groups to print in console
+SHOW_PATH_SUMMARY=true
+
+# ────────────── Colors ──────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+log() {
+  local lvl="$1"; shift; local msg="$*"
+  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
+  printf '[%s] [RUN %s] [%s] %s\n' "$ts" "$RUN_ID" "$lvl" "$msg" | tee -a "$SUMMARY_LOG" >&2
+}
 
 usage() {
-  cat <<EOF
+cat <<EOF
 Usage: $0 [<pathlist.txt>] [--force] [--quarantine DIR] [--yes]
+          [--group-depth N] [--top N] [--no-path-summary] [-h|--help]
 
-If <pathlist.txt> is omitted, the script auto-selects the most recent report,
-preferring $ZERO_DIR/verified-*.txt, then $ZERO_DIR/zero-length-*.txt, then same in $LOGS_DIR.
+Behavior:
+  • Dry-run by default. Verifies input list, writes a verified plan, shows a
+    summary (including top directories by count), and prints a ready-to-run cmd.
+  • With --force, acts immediately on the newly generated verified plan.
+  • Use --quarantine DIR with --force to move files under DIR (preserves path)
+    instead of deleting.
+
+Examples:
+  # Auto-pick latest report (prefers verified-*.txt, else zero-length-*.txt, else logs/zero-length-*.txt)
+  $0
+
+  # Use explicit input (dry-run):
+  $0 "zero-length/zero-length-$DATE_TAG.txt"
+
+  # Act now (delete) using auto-picked input:
+  $0 --force
+
+  # Act now (quarantine) preserving path under the given directory:
+  $0 "zero-length/zero-length-$DATE_TAG.txt" --force --quarantine "zero-length/quarantine-$DATE_TAG"
 
 Options:
-  --force              Actually delete/move verified files (otherwise dry-run)
-  --quarantine DIR     Move verified files into DIR (preserve original path under DIR)
-                       e.g. "$ZERO_DIR/quarantine-$DATE_TAG"
-  -y, --yes            Assume "yes" to confirmations (useful for non-interactive)
-  -h, --help           Show this help
+  --force                 Actually delete/move verified files (otherwise dry-run)
+  --quarantine DIR        Move verified files into DIR (preserve absolute path under DIR)
+  -y, --yes               Assume "yes" to confirmations (useful for non-interactive)
+  --group-depth N         Group summary by first N path components (default: $GROUP_DEPTH)
+  --top N                 Show top N groups in console (default: $TOP_N)
+  --no-path-summary       Skip path grouping summary
+  -h, --help              Show this help
 EOF
 }
 
-# ───────────────────────── Logging ─────────────────────────
-_log_core() {
-  local lvl="$1"; shift
-  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
-  local line="[$ts] [RUN $RUN_ID] [$lvl] $*"
-  case "$lvl" in
-    INFO)  echo -e "${GREEN}$line${NC}" ;;
-    WARN)  echo -e "${YELLOW}$line${NC}" ;;
-    ERROR) echo -e "${RED}$line${NC}" ;;
-    *)     echo "$line" ;;
-  esac
-  printf '%s\n' "$line" >> "$SUMMARY_LOG"
-}
-info()  { _log_core INFO  "$*"; }
-warn()  { _log_core WARN  "$*"; }
-error() { _log_core ERROR "$*"; }
+# ────────────── Arg parsing ──────────────
+INPUT_FILE="${1:-}"
+if [[ "${INPUT_FILE:-}" == "--"* || "${INPUT_FILE:-}" == "-h" || -z "${INPUT_FILE:-}" ]]; then
+  INPUT_FILE=""
+fi
+if [[ -n "${INPUT_FILE:-}" ]]; then shift || true; fi
 
-confirm() {
-  $YES && return 0
-  if [ -t 0 ]; then
-    read -r -p "$1 [Y/n] " ans || true
-    case "${ans:-Y}" in Y|y|yes|YES) return 0 ;; *) return 1 ;; esac
-  else
-    warn "Non-interactive and no --yes supplied; refusing."
-    return 1
-  fi
-}
-
-# ───────────────────────── Helpers ─────────────────────────
-count_entries() {
-  local f="$1" n
-  if [[ -r "$f" ]]; then
-    # Avoid pipefail double-zero: capture, then sanitize to digits only
-    n="$(awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$f" 2>/dev/null | wc -l)"
-    n="${n//[!0-9]/}"
-    [[ -z "$n" ]] && n=0
-  else
-    n=0
-  fi
-  printf '%s' "$n"
-}
-
-short_label() {
-  # Compact, non-wrapping label: "verified • 2025-08-30 • zero-length • id=837142be"
-  local p="$1" base dir date type rid tail last
-  base="$(basename -- "$p")"
-  dir="$(basename -- "$(dirname -- "$p")")"
-  if [[ "$base" =~ ^verified-zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})- ]]; then
-    type="verified"; date="${BASH_REMATCH[1]}"
-    tail="${base%.txt}"; last="${tail##*-}"; [[ ${#last} -ge 8 ]] && rid="${last:0:8}" || rid=""
-  elif [[ "$base" =~ ^zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})\.txt$ ]]; then
-    type="raw"; date="${BASH_REMATCH[1]}"; rid=""
-  else
-    type="report"; date="unknown"; rid=""
-  fi
-  printf "%-9s • %s • %s" "$type" "$date" "$dir"
-  [[ -n "$rid" ]] && printf " • id=%s" "$rid"
-}
-
-# ───────────────────────── Parse args ──────────────────────
-while (( $# )); do
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
     --force) FORCE=true ;;
-    --quarantine) shift; QUARANTINE_DIR="${1:-}"; [[ -n "$QUARANTINE_DIR" ]] || { error "Missing DIR for --quarantine"; exit 2; } ;;
-    -y|--yes) YES=true ;;
-    *) [[ -z "$INPUT" ]] && INPUT="$1" || { error "Unexpected argument: $1"; usage; exit 2; } ;;
+    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
+    -y|--yes) ASSUME_YES=true ;;
+    --group-depth) GROUP_DEPTH="${2:-2}"; shift ;;
+    --top) TOP_N="${2:-10}"; shift ;;
+    --no-path-summary) SHOW_PATH_SUMMARY=false ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo -e "${YELLOW}Unknown option: $1${NC}" >&2; usage; exit 2 ;;
   esac
-  shift || true
+  shift
 done
 
-# ───────────────────────── Auto-select input ───────────────
-pick_latest_report() {
-  local raw=()
-  for d in "$ZERO_DIR" "$LOGS_DIR"; do
-    while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/verified-zero-length-*.txt 2>/dev/null || true)
-    while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/zero-length-*.txt        2>/dev/null || true)
-  done
-  # De-duplicate while preserving order
-  local cands=() seen=""
-  for f in "${raw[@]}"; do
-    [[ -e "$f" ]] || continue
-    if [[ ":$seen:" != *":$f:"* ]]; then cands+=("$f"); seen="$seen:$f"; fi
-  done
+mkdir -p "$LOGS_DIR" "$ZERO_DIR"
 
-  local total=${#cands[@]}
-  (( total )) || { echo ""; return 0; }
+# ────────────── Helpers ──────────────
+count_lines() { [[ -f "$1" ]] && wc -l <"$1" | tr -d ' ' || echo 0; }
+short_id() { local s="$1"; s="${s%.txt}"; s="${s##*-}"; printf '%s' "${s:0:8}"; }
+first_date_in_name() { printf '%s' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1 || true; }
 
-  # One candidate? return it.
-  if (( total == 1 )); then echo "${cands[0]}"; return 0; fi
-
-  # Non-interactive? pick newest, but say which (stderr).
-  if [ ! -t 0 ]; then
-    >&2 echo "Auto-selecting latest (non-interactive): ${cands[0]}"
-    echo "${cands[0]}"; return 0
+pick_reports() {
+  # newest first; limit 10
+  local list=()
+  mapfile -t list < <(ls -1t zero-length/verified-zero-length-*.txt 2>/dev/null | head -n 10 || true)
+  if (( ${#list[@]} == 0 )); then
+    mapfile -t list < <(ls -1t zero-length/zero-length-*.txt 2>/dev/null | head -n 10 || true)
+  else
+    # also include raw zero-length and logs if room (helpful if verified empty)
+    local raw; mapfile -t raw < <(ls -1t zero-length/zero-length-*.txt 2>/dev/null | head -n 10 || true)
+    list+=("${raw[@]}")
+  fi
+  if (( ${#list[@]} == 0 )); then
+    mapfile -t list < <(ls -1t logs/zero-length-*.txt 2>/dev/null | head -n 10 || true)
+  else
+    local zlog; mapfile -t zlog < <(ls -1t logs/zero-length-*.txt 2>/dev/null | head -n 10 || true)
+    list+=("${zlog[@]}")
   fi
 
-  # Interactive: ALWAYS show a compact menu to stderr
-  local limit=$MAX_MENU; (( total < limit )) && limit=$total
-  >&2 echo "Select input report (showing $limit of $total most recent):"
-  local i f cnt
-  for (( i=0; i<limit; i++ )); do
-    f="${cands[$i]}"; cnt="$(count_entries "$f")"
-    >&2 printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$(short_label "$f")" "$cnt"
-  done
-  if (( total > limit )); then
-    >&2 echo "  … (older reports not shown; pass a path explicitly if needed)"
+  # unique + cap at 10
+  awk 'BEGIN{FS="\n"}{print}' <<<"${list[*]}" | awk '!seen[$0]++' | head -n 10
+}
+
+# ────────────── Input selection ──────────────
+if [[ -z "${INPUT_FILE:-}" ]]; then
+  mapfile -t CANDIDATES < <(pick_reports)
+  if (( ${#CANDIDATES[@]} == 0 )); then
+    log ERROR "No report files found (expected zero-length/verified-*.txt or zero-length-*.txt or logs/zero-length-*.txt)."
+    exit 1
   fi
 
-  local pick
-  while true; do
-    read -r -p "Enter number [1-$limit] (default 1): " pick || true
-    pick="${pick:-1}"
-    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=limit )); then
-      echo "${cands[$((pick-1))]}"
-      return 0
+  echo "Select input report (showing ${#CANDIDATES[@]} of ${#CANDIDATES[@]} most recent):"
+  i=1
+  for f in "${CANDIDATES[@]}"; do
+    typ="raw"; src="zero-length"
+    base="$(basename "$f")"
+    date="$(first_date_in_name "$base")"
+    cnt="$(count_lines "$f")"
+    if [[ "$base" == verified-zero-length-* ]]; then typ="verified"; src="zero-length"; sid="$(short_id "$base")"; printf "  %2d) %-9s • %s • zero-length • id=%s  (%d entries)\n" "$i" "$typ" "$date" "$sid" "$cnt"
+    elif [[ "$f" == logs/* ]]; then typ="raw"; src="logs"; printf "  %2d) %-9s • %s • logs         (%d entries)\n" "$i" "$typ" "$date" "$cnt"
+    else printf "  %2d) %-9s • %s • zero-length  (%d entries)\n" "$i" "$typ" "$date" "$cnt"
     fi
-    >&2 echo "Invalid selection."
+    i=$((i+1))
   done
-}
 
-if [[ -z "$INPUT" ]]; then
-  INPUT="$(pick_latest_report)"
-  [[ -n "$INPUT" ]] || { error "No report files found (looked in $ZERO_DIR and $LOGS_DIR for zero-length-*.txt or verified-zero-length-*.txt)."; usage; exit 1; }
-  info "Auto-selected input: $INPUT"
-  confirm "Use \"$INPUT\"?" || { info "Aborted by user."; exit 0; }
+  if $ASSUME_YES; then sel=1
+  else
+    read -r -p "Enter number [1-${#CANDIDATES[@]}] (default 1): " sel || true
+    sel="${sel:-1}"
+  fi
+
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#CANDIDATES[@]} )); then
+    log ERROR "Invalid selection."; exit 2
+  fi
+  INPUT_FILE="${CANDIDATES[$((sel-1))]}"
+  log INFO "Auto-selected input: $INPUT_FILE"
+  if ! $ASSUME_YES; then
+    read -r -p "Use \"$INPUT_FILE\"? [Y/n] " yn || true
+    case "${yn,,}" in n|no) echo "Aborted."; exit 0;; esac
+  fi
 fi
 
-[[ -r "$INPUT" ]] || { error "Input list not readable: $INPUT"; exit 3; }
-
-# ───────────────────────── Verified plan path ──────────────
-base="$(basename -- "$INPUT")"
-date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" | head -n1 || true)"
-plan_date="${date_hint:-$DATE_TAG}"
-plan_date="$(printf '%s' "$plan_date" | tr -d '\r\n')"
-VERIFIED_LIST="$ZERO_DIR/verified-zero-length-$plan_date-$RUN_ID.txt"
-: > "$VERIFIED_LIST"
-
-# ───────────────────────── Mode banner ─────────────────────
-if $FORCE; then
-  if [[ -n "$QUARANTINE_DIR" ]]; then info "Mode: FORCE (quarantine to \"$QUARANTINE_DIR\")"
-  else info "Mode: FORCE (delete)"; fi
-  confirm "Proceed with FORCE action?" || { info "Aborted by user."; exit 0; }
-else
-  info "Mode: DRY-RUN (no changes will be made)"
+if [[ ! -r "$INPUT_FILE" ]]; then
+  log ERROR "Cannot read input list: $INPUT_FILE"
+  exit 1
 fi
 
-info "Verifying zero-length files…"
-info "Input list: $INPUT"
-info "Summary log: $SUMMARY_LOG"
-info "Run-ID: $RUN_ID"
+# ────────────── Verify input → write verified plan ──────────────
+MODE="DRY-RUN"; $FORCE && MODE="EXECUTE"
+log INFO "Mode: $MODE ${FORCE:+(will ${QUARANTINE_DIR:+move to quarantine}${QUARANTINE_DIR:+" "}"$QUARANTINE_DIR"${QUARANTINE_DIR:+" "}||delete)}"
+log INFO "Verifying zero-length files…"
+log INFO "Input list: $INPUT_FILE"
+log INFO "Summary log: $SUMMARY_LOG"
+log INFO "Run-ID: $RUN_ID"
 
-# ───────────────────────── Pre-count for progress ─────────
-TOTAL_LINES="$(count_entries "$INPUT")"
-# integer-guard
-TOTAL_LINES="${TOTAL_LINES//[!0-9]/}"; [[ -z "$TOTAL_LINES" ]] && TOTAL_LINES=0
-STEP=$(( TOTAL_LINES / 100 )); (( STEP < 1 )) && STEP=1
+VERIFIED="$ZERO_DIR/verified-zero-length-$DATE_TAG-$RUN_ID.txt"
+: > "$VERIFIED"
 
-# ───────────────────────── Counters ────────────────────────
-seen=0; processed=0; still_zero=0; missing=0; nonzero=0; not_regular=0
-deleted=0; moved=0; delete_failed=0; move_failed=0
+total_in=0
+missing=0
+notreg=0
+notzero=0
+verified_now=0
 
-# ───────────────────────── Progress UI ─────────────────────
-draw_progress() {
-  local p="$1" t="$2"; (( t == 0 )) && t=1
-  local pc=$(( p * 100 / t )); (( pc > 100 )) && pc=100
-  local width=30; local fill=$(( pc * width / 100 ))
-  local bar; bar="$(printf '%*s' "$fill" '' | tr ' ' '#')"; bar="$bar$(printf '%*s' "$((width-fill))" '' | tr ' ' '.')"
-  if [ -t 1 ]; then printf "\r[%-30s] %3d%% (%d/%d)" "$bar" "$pc" "$p" "$t"
-  else (( p % STEP == 0 )) && echo "Progress: $pc%% ($p/$t)"; fi
-}
-finish_progress() { [ -t 1 ] && printf "\n"; }
-trap 'finish_progress' EXIT
+# progress printing cadence
+STEP=200
 
-# ───────────────────────── Actions ─────────────────────────
-do_delete() { rm -f -- "$1" && ((deleted++)) || { ((delete_failed++)); warn "Failed to delete: $1"; }; }
-do_move() {
-  local f="$1" dest="$QUARANTINE_DIR/$f" dest_dir
-  dest_dir="$(dirname -- "$dest")"
-  if mkdir -p -- "$dest_dir"; then
-    mv -n -- "$f" "$dest" 2>/dev/null && ((moved++)) || {
-      local alt="${dest}.${RUN_ID}"
-      mv -- "$f" "$alt" && ((moved++)) || { ((move_failed++)); warn "Failed to move: $f -> $dest"; }
+while IFS= read -r f || [[ -n "$f" ]]; do
+  [[ -z "$f" ]] && continue
+  total_in=$((total_in+1))
+  if (( total_in % STEP == 0 )); then
+    printf '\rVerifying… %d checked' "$total_in" >&2
+  fi
+
+  if [[ ! -e "$f" ]]; then
+    missing=$((missing+1))
+    continue
+  fi
+  if [[ ! -f "$f" ]]; then
+    notreg=$((notreg+1))
+    continue
+  fi
+  if [[ -s "$f" ]]; then
+    notzero=$((notzero+1))
+    continue
+  fi
+  printf '%s\n' "$f" >> "$VERIFIED"
+  verified_now=$((verified_now+1))
+done < "$INPUT_FILE"
+printf '\r' >&2 || true
+
+log INFO "Verification complete."
+log INFO "  • Input entries considered: $total_in"
+log INFO "  • Missing paths: $missing"
+log INFO "  • Not regular files: $notreg"
+log INFO "  • No longer zero-length: $notzero"
+log INFO "  • Verified zero-length now: $verified_now"
+log INFO "Verified plan file: $VERIFIED"
+
+# ────────────── Summary by path (top groups) ──────────────
+if $SHOW_PATH_SUMMARY && (( verified_now > 0 )); then
+  SUMMARY_TSV="$LOGS_DIR/delete-zero-length-summary-$DATE_TAG-$RUN_ID.tsv"
+  awk -v d="$GROUP_DEPTH" -F'/' '
+    BEGIN{OFS="/"}
+    {
+      if ($0=="") next
+      k=""; c=0
+      for (i=1;i<=NF;i++){
+        if($i=="") continue
+        c++
+        if (c<=d) { k=k "/" $i } else { break }
+      }
+      count[k]++
     }
+    END{
+      for (k in count) printf "%s\t%d\n", k, count[k]
+    }
+  ' "$VERIFIED" | sort -k2,2nr > "$SUMMARY_TSV" || true
+
+  log INFO "Summary by path (depth=$GROUP_DEPTH) written to: $SUMMARY_TSV"
+
+  echo -e "${GREEN}Top $TOP_N groups (depth=$GROUP_DEPTH):${NC}"
+  i=0
+  while IFS=$'\t' read -r path cnt; do
+    i=$((i+1))
+    pct=$(( cnt * 100 / verified_now ))
+    printf "  %2d) %-50s  %6d files  (%3d%%)\n" "$i" "$path" "$cnt" "$pct"
+    (( i>=TOP_N )) && break || true
+  done < "$SUMMARY_TSV"
+  echo
+fi
+
+# If dry-run, print ready-to-run
+if ! $FORCE; then
+  echo -e "${GREEN}[DRY-RUN SUMMARY]${NC}"
+  echo "  Verified zero-length files: $verified_now"
+  echo "  Ready to act using the verified plan:"
+  echo "    Delete:"
+  echo "      $0 \"$VERIFIED\" --force"
+  echo "    Quarantine:"
+  echo "      $0 \"$VERIFIED\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+  exit 0
+fi
+
+# ────────────── Execute (delete or quarantine) ──────────────
+act_delete=0
+act_move=0
+act_fail=0
+
+if [[ -n "$QUARANTINE_DIR" ]]; then
+  mkdir -p "$QUARANTINE_DIR"
+fi
+
+if ! $ASSUME_YES; then
+  echo
+  if [[ -n "$QUARANTINE_DIR" ]]; then
+    read -r -p "Move $verified_now files to quarantine \"$QUARANTINE_DIR\"? [y/N] " yn || true
   else
-    ((move_failed++)); warn "Failed to create quarantine dir: $dest_dir"
+    read -r -p "Permanently delete $verified_now files? [y/N] " yn || true
   fi
-}
+  case "${yn,,}" in y|yes) : ;; *) echo "Aborted."; exit 0;; esac
+fi
 
-# ───────────────────────── Verify pass (+optional act) ─────
-start_ts=$(date +%s)
-while IFS= read -r line || [[ -n "$line" ]]; do
-  file="${line%$'\r'}"
-  [[ -z "${file//[[:space:]]/}" ]] && continue
-  [[ "$file" =~ ^[[:space:]]*# ]] && continue
-
-  (( seen++ ))
-  if [[ ! -e "$file" ]]; then (( missing++ ))
-  elif [[ ! -f "$file" ]]; then (( not_regular++ ))
-  elif [[ ! -s "$file" ]]; then
-    echo "$file" >> "$VERIFIED_LIST"; (( still_zero++ ))
-    if $FORCE; then
-      if [[ -n "$QUARANTINE_DIR" ]]; then do_move "$file"; else do_delete "$file"; fi
+while IFS= read -r f || [[ -n "$f" ]]; do
+  [[ -z "$f" ]] && continue
+  if [[ -n "$QUARANTINE_DIR" ]]; then
+    rel="${f#/}"                    # strip leading slash
+    dest="$QUARANTINE_DIR/$rel"
+    mkdir -p "$(dirname "$dest")" || { act_fail=$((act_fail+1)); continue; }
+    if mv -n -- "$f" "$dest" 2>/dev/null; then
+      act_move=$((act_move+1))
+    else
+      act_fail=$((act_fail+1))
     fi
   else
-    (( nonzero++ ))
+    if rm -f -- "$f" 2>/dev/null; then
+      act_delete=$((act_delete+1))
+    else
+      act_fail=$((act_fail+1))
+    fi
   fi
+done < "$VERIFIED"
 
-  (( processed++ )); draw_progress "$processed" "$TOTAL_LINES"
-done < "$INPUT"
-finish_progress
-elapsed=$(( $(date +%s) - start_ts ))
-
-# ───────────────────────── Summary ─────────────────────────
-info "Verification complete in ${elapsed}s"
-info "Input entries considered: $TOTAL_LINES"
-info " • Missing paths: $missing"
-info " • Not regular files: $not_regular"
-info " • No longer zero-length: $nonzero"
-info " • Verified zero-length now: $still_zero"
-info "Verified plan file: $VERIFIED_LIST"
-
-if $FORCE; then
-  if [[ -n "$QUARANTINE_DIR" ]]; then
-    info "ACTION: Moved (quarantined): $moved  | Move failures: $move_failed | Quarantine root: $QUARANTINE_DIR"
-  else
-    info "ACTION: Deleted: $deleted | Delete failures: $delete_failed"
-  fi
+echo
+log INFO "Execution complete."
+if [[ -n "$QUARANTINE_DIR" ]]; then
+  log INFO "  • Moved to quarantine: $act_move"
 else
-  if (( still_zero > 0 )); then
-    echo
-    info "SAFE TO DELETE: $still_zero files (verified zero-length)."
-    echo "To execute deletion safely, run:"
-    echo "  ./delete-zero-length.sh \"$VERIFIED_LIST\" --force"
-    echo
-    echo "To quarantine instead of delete, run:"
-    echo "  ./delete-zero-length.sh \"$VERIFIED_LIST\" --force --quarantine \"$ZERO_DIR/quarantine-$plan_date\""
-    echo
-  else
-    info "No zero-length files remain to delete."
-  fi
+  log INFO "  • Deleted: $act_delete"
 fi
+log INFO "  • Failed actions: $act_fail"
+log INFO "  • Verified plan was: $VERIFIED"
+if [[ -n "$QUARANTINE_DIR" ]]; then
+  log INFO "Quarantine root: $QUARANTINE_DIR"
+fi
+
+echo -e "${GREEN}Done.${NC}"
