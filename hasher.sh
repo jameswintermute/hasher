@@ -422,7 +422,7 @@ stop_hash_progress() {
 start_zero_progress() {
   T_START=$(date +%s)
   ZERO_PROGRESS_FILE="$LOGS_DIR/zero-scan-$RUN_ID.count"
-  printf '0\n' > "$ZERO_PROGRESS_FILE"
+  echo 0 > "$ZERO_PROGRESS_FILE"
   (
     local total=0 count=0 now elapsed eta pct
     if [[ -s "$FILES_LIST" ]]; then
@@ -430,15 +430,7 @@ start_zero_progress() {
     fi
     while :; do
       sleep "$PROGRESS_INTERVAL" || break
-
-      if [[ -f "$ZERO_PROGRESS_FILE" ]]; then
-        # robust read: digits only (avoids partial/truncated reads)
-        count="$(tr -cd '0-9' < "$ZERO_PROGRESS_FILE")"
-        [[ -z "$count" ]] && count=0
-      else
-        count=0
-      fi
-
+      [[ -f "$ZERO_PROGRESS_FILE" ]] && count="$(cat "$ZERO_PROGRESS_FILE" 2>/dev/null || echo 0)" || count=0
       now=$(date +%s)
       elapsed=$(( now - T_START ))
       if (( total > 0 )); then
@@ -451,7 +443,6 @@ start_zero_progress() {
       else
         pct=0; eta=0
       fi
-
       printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
         "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$count" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
@@ -505,16 +496,11 @@ main() {
     local n=0 m=0 nr=0
     local scanned=0
 
-    # Start message to background.log
     bglog INFO "Zero-length-only scan starting: total=$TOTAL, report=$out"
 
     start_zero_progress
-    # shellcheck disable=SC2034
     while IFS= read -r -d '' f; do
-      scanned=$((scanned+1))
-      printf '%d\n' "$scanned" > "$ZERO_PROGRESS_FILE.tmp"
-      mv -f "$ZERO_PROGRESS_FILE.tmp" "$ZERO_PROGRESS_FILE"
-
+      scanned=$((scanned+1)); echo "$scanned" > "$ZERO_PROGRESS_FILE"
       if [[ ! -e "$f" ]]; then
         m=$((m+1))
       elif [[ ! -f "$f" ]]; then
@@ -526,13 +512,11 @@ main() {
     done < "$FILES_LIST"
     stop_zero_progress
 
-    # Human-friendly summary (console + per-run log)
     info  "Zero-length-only scan complete."
     info  "  • Zero-length files now: $n"
     info  "  • Missing paths: $m | Not regular files: $nr"
     info  "  • Report: $out"
 
-    # Mirror to background.log so you see it in tail -f
     bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
     bglog INFO "NEXT: Review (dry-run): ./delete-zero-length.sh \"$out\""
     bglog INFO "NEXT: Delete: ./delete-zero-length.sh \"$out\" --force  |  Quarantine: ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
@@ -555,9 +539,7 @@ main() {
   local start_ts
   start_ts=$(date +%s)
 
-  # shellcheck disable=SC2034
   while IFS= read -r -d '' f; do
-    # Stat size & mtime
     local size mtime
     size=$(stat -c%s -- "$f" 2>/dev/null || echo -1)
     mtime=$(stat -c%Y -- "$f" 2>/dev/null || echo -1)
@@ -569,7 +551,6 @@ main() {
       continue
     fi
 
-    # Compute hash
     local line hash
     if ! line=$("$hash_cmd" -- "$f" 2>/dev/null); then
       warn "Hash failed: $f"
@@ -577,7 +558,7 @@ main() {
       DONE=$((DONE+1))
       continue
     fi
-    hash="${line%% *}"  # first field up to first space
+    hash="${line%% *}"
 
     append_csv_row "$f" "$size" "$mtime" "$ALGO" "$hash"
     DONE=$((DONE+1))
@@ -592,13 +573,12 @@ main() {
 
   info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
-  # ── Post-run reports + next steps ────────────────────────
   post_run_reports "$OUTPUT" "$DATE_TAG"
 }
 
 # ───────────────────────── Post-run Reports ────────────────
 post_run_reports() {
-  local csv="$1"  # OUTPUT CSV
+  local csv="$1"
   local date_tag="$2"
 
   mkdir -p "$LOGS_DIR" "$ZERO_DIR"
@@ -606,7 +586,6 @@ post_run_reports() {
   local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
-  # Zero-length list from CSV
   if [[ -f "$csv" ]]; then
     awk -F',' '
       NR==1 { for (i=1;i<=NF;i++) h[tolower($i)]=i; next }
@@ -619,7 +598,6 @@ post_run_reports() {
     ' "$csv" | grep -v '^[[:space:]]*$' > "$zero_txt" || true
   fi
 
-  # Duplicate report (group by hash column)
   awk -F',' '
     BEGIN{ OFS="," }
     NR==1 { for (i=1;i<=NF;i++){ low=tolower($i); h[low]=i } next }
@@ -647,7 +625,6 @@ post_run_reports() {
     }
   ' "$csv" > "$dupes_txt" || true
 
-  # Counts
   local zero_count=0 dupe_groups=0 dupe_files=0
   [[ -s "$zero_txt" ]] && zero_count=$(wc -l < "$zero_txt" | tr -d ' ')
   if [[ -s "$dupes_txt" ]]; then
@@ -663,12 +640,18 @@ post_run_reports() {
   echo
   echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
   echo "  1) Review duplicates interactively:"
-  echo "       ./review-duplicates.sh"
+  echo "       ./review-duplicates.sh --from-report \"$dupes_txt\" --keep newest"
   echo "  2) Remove zero-length files (dry-run first):"
   echo "       ./delete-zero-length.sh \"$zero_txt\"           # dry-run"
   echo "       ./delete-zero-length.sh \"$zero_txt\" --force   # actually delete or move"
-  echo "  3) Deduplicate safely (move extras to quarantine; dry-run by default):"
-  echo "       ./deduplicate.sh --from-report \"$dupes_txt\" --keep newest --quarantine quarantine-$DATE_TAG"
+  echo "  3) Duplicates (review then act):"
+  echo "       ./find-duplicates.sh"
+  echo "       ./review-duplicates.sh --from-report \"$dupes_txt\" --keep newest"
+  echo "       # Dry-run action on your latest reviewed plan:"
+  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\""
+  echo "       # Execute (move to quarantine or delete):"
+  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force --quarantine \"quarantine-$DATE_TAG\""
+  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force"
   echo
 }
 
