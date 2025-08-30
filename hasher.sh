@@ -1,6 +1,6 @@
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute <jameswintermute@protonmail.ch>
+# Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
@@ -145,11 +145,11 @@ load_config() {
           output)        OUTPUT="$val" ;;
           hashes_dir)    HASHES_DIR="$val" ;;
           logs_dir)      LOGS_DIR="$val" ;;
-          level)         LOG_LEVEL="$val" ;;              # allow in root
+          level)         LOG_LEVEL="$val" ;;
           interval|background-interval) PROGRESS_INTERVAL="$val" ;;
           exclude)       EXTRA_EXCLUDES+=("$val") ;;
-          __bare__)      : ;;                             # ignore bare in root/setup
-          *)             : ;;                             # ignore unknown, no warning
+          __bare__)      : ;;
+          *)             : ;;
         esac
         ;;
       "logging")
@@ -175,13 +175,12 @@ load_config() {
             esac
             ;;
           exclude)        EXTRA_EXCLUDES+=("$val") ;;
-          __bare__)       EXTRA_EXCLUDES+=("$val") ;;   # each bare line is a pattern
+          __bare__)       EXTRA_EXCLUDES+=("$val") ;;
           *)              : ;;
         esac
         ;;
-      # other sections accepted silently
       *)
-        : 
+        :
         ;;
     esac
   done < "$f"
@@ -243,8 +242,8 @@ while [[ $# -gt 0 ]]; do
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
-    --config)   CONFIG_FILE="${2:-}"; shift ;;  # kept to allow nohup propagation
-    --child)    IS_CHILD=true ;;                # internal
+    --config)   CONFIG_FILE="${2:-}"; shift ;;
+    --child)    IS_CHILD=true ;;
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -254,7 +253,6 @@ done
 # ───────────────────────── Nohup Re-exec ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export IS_CHILD=true
-  # Build args safely with an array (IFS excludes spaces)
   args=( "$0" --child )
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
@@ -264,7 +262,7 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
 
   nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
   bgpid=$!
-  echo "Hasher started with nohup (PID $bgpid). Output: ${ZERO_LENGTH_ONLY:+(zero-length-only mode)} $OUTPUT"
+  echo "Hasher started with nohup (PID $bgpid). Output: ${ZERO_LENGTH_ONLY:+(zero-length-only mode) }$OUTPUT"
   exit 0
 fi
 
@@ -284,11 +282,9 @@ case "$ALGO" in
     ;;
   *) error "Unsupported --algo '$ALGO'"; exit 1 ;;
 esac
-
 command -v "$hash_cmd" >/dev/null 2>&1 || { error "Required tool '$hash_cmd' not found in PATH"; exit 1; }
 
 # ───────────────────────── Build File List ─────────────────
-# Accepts: PATHFILE with dirs/files; comments (#) and blanks ignored.
 build_file_list() {
   : > "$FILES_LIST"
   local had_input=false
@@ -298,7 +294,6 @@ build_file_list() {
       error "Cannot read --pathfile '$PATHFILE'"; exit 1
     fi
     while IFS= read -r raw || [[ -n "$raw" ]]; do
-      # trim
       local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
       [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
       if [[ -d "$path" ]]; then
@@ -312,18 +307,14 @@ build_file_list() {
     had_input=true
   fi
 
-  # If stdin is a pipe, also accept paths (NUL- or newline-delimited) — portable check
+  # If stdin is a pipe, accept paths (NUL- or newline-delimited)
   if [ ! -t 0 ]; then
     had_input=true
     local tmp_in="$FILES_LIST.stdin.tmp"
-    # Buffer stdin to a temp file so probing doesn't consume the stream
     cat > "$tmp_in"
-    # Probe: read with -d '' (NUL delimiter); success ⇒ contains at least one NUL
     if IFS= read -r -d '' _peek < "$tmp_in"; then
-      # NUL-delimited: append as-is
       cat "$tmp_in" >> "$FILES_LIST".tmp
     else
-      # newline-delimited: convert to NUL-delimited
       while IFS= read -r p || [[ -n "$p" ]]; do
         [[ -z "$p" ]] && continue
         printf '%s\0' "$p"
@@ -336,7 +327,6 @@ build_file_list() {
     error "No input paths provided. Use --pathfile or pipe paths."; exit 2
   fi
 
-  # Pre-filter count
   local pre_count=0
   [[ -s "$FILES_LIST".tmp ]] && pre_count=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
 
@@ -344,25 +334,14 @@ build_file_list() {
   local patterns=("${DEFAULT_EXCLUDES[@]}" "${EXTRA_EXCLUDES[@]}")
   if (( ${#patterns[@]} > 0 )); then
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
-      BEGIN{
-        for(i=1;i<=N;i++){
-          pat[i]=ARGV[i]
-          ARGV[i]=""   # keep the files list (last arg) intact
-        }
-      }
-      {
-        keep=1
-        for(i=1;i<=N;i++){
-          if (pat[i] != "" && index($0, pat[i])>0) { keep=0; break }
-        }
-        if(keep) printf "%s", $0
-      }
+      BEGIN{ for(i=1;i<=N;i++){ pat[i]=ARGV[i]; ARGV[i]="" } }
+      { keep=1; for(i=1;i<=N;i++){ if (pat[i] != "" && index($0, pat[i])>0) { keep=0; break } }
+        if(keep) printf "%s", $0 }
     ' "${patterns[@]}" "$FILES_LIST".tmp > "$FILES_LIST"
   else
     mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
   fi
 
-  # Post-filter count & guard
   local post_count=0
   [[ -s "$FILES_LIST" ]] && post_count=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
   if (( pre_count > 0 && post_count == 0 && ${#patterns[@]} > 0 )); then
@@ -375,12 +354,7 @@ build_file_list() {
 }
 
 # ───────────────────────── CSV Helpers ─────────────────────
-csv_escape() {
-  # Escape CSV field by double-quoting and doubling internal quotes
-  local s="$1"
-  s="${s//\"/\"\"}"
-  printf '"%s"' "$s"
-}
+csv_escape() { local s="$1"; s="${s//\"/\"\"}"; printf '"%s"' "$s"; }
 
 write_csv_header() {
   if [[ ! -s "$OUTPUT" ]]; then
@@ -391,24 +365,18 @@ write_csv_header() {
 append_csv_row() {
   local path="$1" size="$2" mtime="$3" algo="$4" hash="$5"
   printf '%s,%s,%s,%s,%s\n' \
-    "$(csv_escape "$path")" \
-    "$size" \
-    "$mtime" \
-    "$algo" \
-    "$hash" >> "$OUTPUT"
+    "$(csv_escape "$path")" "$size" "$mtime" "$ALGO" "$hash" >> "$OUTPUT"
 }
 
-# ───────────────────────── Progress Ticker ─────────────────
+# ───────────────────────── Progress Tickers ────────────────
 T_START=0
 hash_progress_pid=0
-TOTAL=0
-DONE=0
-FAIL=0
+zero_progress_pid=0
+ZERO_PROGRESS_FILE=""
 
-start_progress() {
+start_hash_progress() {
   T_START=$(date +%s)
   (
-    # derive TOTAL from file list once; DONE from CSV row count each tick
     local total=0
     if [[ -s "$FILES_LIST" ]]; then
       total=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
@@ -443,20 +411,66 @@ start_progress() {
   hash_progress_pid=$!
 }
 
-stop_progress() {
+stop_hash_progress() {
   if [[ "$hash_progress_pid" -gt 0 ]] && kill -0 "$hash_progress_pid" 2>/dev/null; then
     kill "$hash_progress_pid" 2>/dev/null || true
     wait "$hash_progress_pid" 2>/dev/null || true
   fi
 }
 
+start_zero_progress() {
+  T_START=$(date +%s)
+  ZERO_PROGRESS_FILE="$LOGS_DIR/zero-scan-$RUN_ID.count"
+  echo 0 > "$ZERO_PROGRESS_FILE"
+  (
+    local total=0 count=0 now elapsed eta pct
+    if [[ -s "$FILES_LIST" ]]; then
+      total=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
+    fi
+    while :; do
+      sleep "$PROGRESS_INTERVAL" || break
+      [[ -f "$ZERO_PROGRESS_FILE" ]] && count="$(cat "$ZERO_PROGRESS_FILE" 2>/dev/null || echo 0)" || count=0
+      now=$(date +%s)
+      elapsed=$(( now - T_START ))
+      if (( total > 0 )); then
+        pct=$(( count * 100 / total ))
+        if (( count > 0 && count < total )); then
+          eta=$(( elapsed * (total - count) / count ))
+        else
+          eta=0
+        fi
+      else
+        pct=0; eta=0
+      fi
+      printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
+        "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$count" "$total" \
+        $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
+        $((eta/3600)) $((eta%3600/60)) $((eta%60)) >> "$BACKGROUND_LOG"
+    done
+  ) &
+  zero_progress_pid=$!
+}
+
+stop_zero_progress() {
+  if [[ "$zero_progress_pid" -gt 0 ]] && kill -0 "$zero_progress_pid" 2>/dev/null; then
+    kill "$zero_progress_pid" 2>/dev/null || true
+    wait "$zero_progress_pid" 2>/dev/null || true
+  fi
+  [[ -n "$ZERO_PROGRESS_FILE" ]] && rm -f -- "$ZERO_PROGRESS_FILE" 2>/dev/null || true
+}
+
 # Clean shutdown
 cleanup() {
-  stop_progress
+  stop_hash_progress
+  stop_zero_progress
 }
 trap cleanup EXIT
 
 # ───────────────────────── Main Hashing ────────────────────
+TOTAL=0
+DONE=0
+FAIL=0
+
 main() {
   info "Run-ID: $RUN_ID"
   [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
@@ -479,8 +493,12 @@ main() {
     local out="$ZERO_DIR/zero-length-$DATE_TAG.txt"
     : > "$out"
     local n=0 m=0 nr=0
+    local scanned=0
+
+    start_zero_progress
     # shellcheck disable=SC2034
     while IFS= read -r -d '' f; do
+      ((scanned++)); echo "$scanned" > "$ZERO_PROGRESS_FILE"
       if [[ ! -e "$f" ]]; then
         ((m++))
       elif [[ ! -f "$f" ]]; then
@@ -490,19 +508,27 @@ main() {
         ((n++))
       fi
     done < "$FILES_LIST"
-    info "Zero-length-only scan complete: $n zero-length files (missing=$m, not-regular=$nr)."
-    info "Report: $out"
+    stop_zero_progress
+
+    info "Zero-length-only scan complete."
+    info "  • Zero-length files now: $n"
+    info "  • Missing paths: $m | Not regular files: $nr"
+    info "  • Report: $out"
+
     echo
-    echo -e "${GREEN}[NEXT]${NC} Review or delete:"
-    echo "  ./delete-zero-length.sh \"$out\"           # dry-run"
-    echo "  ./delete-zero-length.sh \"$out\" --force   # delete (or add --quarantine DIR)"
+    echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
+    echo "  1) Review or delete zero-length files (dry-run first):"
+    echo "       ./delete-zero-length.sh \"$out\""
+    echo "  2) Execute deletion safely (or move to quarantine):"
+    echo "       ./delete-zero-length.sh \"$out\" --force"
+    echo "       ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
     echo
     return
   fi
 
   # ───── Normal hashing path ───────────────────────────────
   write_csv_header
-  start_progress
+  start_hash_progress
 
   local start_ts
   start_ts=$(date +%s)
@@ -540,7 +566,7 @@ main() {
   elapsed=$(( end_ts - start_ts ))
   sH=$((elapsed/3600)); sM=$((elapsed%3600/60)); sS=$((elapsed%60))
 
-  stop_progress
+  stop_hash_progress
 
   info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
@@ -549,7 +575,6 @@ main() {
 }
 
 # ───────────────────────── Post-run Reports ────────────────
-# Minimal, self-contained; header-agnostic; logs “next steps”.
 post_run_reports() {
   local csv="$1"  # OUTPUT CSV
   local date_tag="$2"
@@ -559,33 +584,23 @@ post_run_reports() {
   local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
-  # Zero-length list from CSV (detect size column) — POSIX-safe blank filtering
+  # Zero-length list from CSV
   if [[ -f "$csv" ]]; then
     awk -F',' '
-      NR==1 {
-        for (i=1;i<=NF;i++) h[tolower($i)]=i
-        next
-      }
+      NR==1 { for (i=1;i<=NF;i++) h[tolower($i)]=i; next }
       {
         sizecol = (h["size_bytes"] ? h["size_bytes"] : (h["size"] ? h["size"] : 0))
         pathcol = (h["path"] ? h["path"] : (h["filepath"] ? h["filepath"] : 1))
-        if (sizecol>0) {
-          if ($sizecol+0==0) print $pathcol
-        } else {
-          # fallback: last col is size? If 0, print first col
-          if ($(NF)+0==0) print $1
-        }
+        if (sizecol>0) { if ($sizecol+0==0) print $pathcol }
+        else { if ($(NF)+0==0) print $1 }
       }
     ' "$csv" | grep -v '^[[:space:]]*$' > "$zero_txt" || true
   fi
 
-  # Duplicate report (group by a likely hash column)
+  # Duplicate report (group by hash column)
   awk -F',' '
     BEGIN{ OFS="," }
-    NR==1 {
-      for (i=1;i<=NF;i++) { low=tolower($i); h[low]=i }
-      next
-    }
+    NR==1 { for (i=1;i<=NF;i++){ low=tolower($i); h[low]=i } next }
     {
       hashcol = (h["hash"] ? h["hash"] :
                 (h["sha256"] ? h["sha256"] :
