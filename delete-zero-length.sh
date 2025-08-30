@@ -42,8 +42,8 @@ Options:
   -h, --help           Show this help
 
 Examples:
-  $0                                # auto-pick latest, dry-run
-  $0 "$ZERO_DIR/zero-length-$DATE_TAG.txt"        # explicit input, dry-run
+  $0
+  $0 "$ZERO_DIR/zero-length-$DATE_TAG.txt"
   $0 -y --force --quarantine "$ZERO_DIR/quarantine-$DATE_TAG"
 EOF
 }
@@ -109,13 +109,20 @@ pick_latest_report() {
     return 0
   fi
 
-  # If only one candidate or non-interactive stdin, pick first silently
-  if (( total == 1 )) || [ ! -t 0 ]; then
+  # If only one candidate, pick it immediately
+  if (( total == 1 )); then
     echo "${cands[0]}"
     return 0
   fi
 
-  # Show up to MAX_MENU choices
+  # If non-interactive stdin, pick first but log what we picked
+  if [ ! -t 0 ]; then
+    info "Non-interactive input; auto-selecting latest: ${cands[0]}"
+    echo "${cands[0]}"
+    return 0
+  fi
+
+  # Show up to MAX_MENU choices (ALWAYS print the menu in interactive)
   local limit=$MAX_MENU
   (( total < limit )) && limit=$total
 
