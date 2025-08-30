@@ -271,4 +271,28 @@ if [[ -s "$PLAN" ]]; then
   ' "$PLAN" | sort -k2,2nr > "$SUMMARY_TSV"
 
   total_extras=$(awk -F'\t' '{s+=$2} END{print s+0}' "$SUMMARY_TSV")
-  echo "Top $TOP_N groups (dept_
+  echo "Top $TOP_N groups (depth=$GROUP_DEPTH):"
+  rank=0
+  while IFS=$'\t' read -r pref cnt; do
+    ((rank++))
+    pct=0
+    if [[ "${total_extras:-0}" -gt 0 ]]; then pct=$(( (cnt * 100) / total_extras )); fi
+    printf "  %2d) %-50s %6d extras  (%3d%%)\n" "$rank" "$pref" "$cnt" "$pct"
+    (( rank >= TOP_N )) && break || true
+  done < "$SUMMARY_TSV"
+fi
+
+echo
+echo -e "${GREEN}Interactive review complete.${NC}"
+echo "  • Groups reviewed:       $shown (limit=$LIMIT)"
+echo "  • Plan entries (extras): ${added_extras:-0}"
+echo "  • Plan file:             $PLAN"
+echo "  • Summary TSV:           $SUMMARY_TSV"
+echo
+echo -e "${GREEN}[NEXT STEPS]${NC}"
+echo "  1) Review the plan:"
+echo "       less \"$PLAN\""
+echo "  2) Move extras to quarantine (safe):"
+echo "       while IFS= read -r p; do mkdir -p \"quarantine-$DATE_TAG\$(dirname \"\$p\")\"; mv -n -- \"\$p\" \"quarantine-$DATE_TAG\$p\"; done < \"$PLAN\""
+echo "  3) Or delete extras (dangerous):"
+echo "       xargs -0 rm -f -- < <(tr '\\n' '\\0' < \"$PLAN\")"
