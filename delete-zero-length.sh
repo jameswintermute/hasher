@@ -72,15 +72,27 @@ confirm() {
 }
 
 # ───────────────────────── Helpers ─────────────────────────
-count_entries() { awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$1" 2>/dev/null | wc -l | tr -d ' ' || echo 0; }
+count_entries() {
+  local f="$1" n
+  if [[ -r "$f" ]]; then
+    # Avoid pipefail double-zero: capture, then sanitize to digits only
+    n="$(awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$f" 2>/dev/null | wc -l)"
+    n="${n//[!0-9]/}"
+    [[ -z "$n" ]] && n=0
+  else
+    n=0
+  fi
+  printf '%s' "$n"
+}
 
 short_label() {
-  # Pretty, non-wrapping label for menu: "verified • 2025-08-30 • zero-length • id=8e635fd6"
-  local p="$1" base dir date rid type
+  # Compact, non-wrapping label: "verified • 2025-08-30 • zero-length • id=837142be"
+  local p="$1" base dir date type rid tail last
   base="$(basename -- "$p")"
   dir="$(basename -- "$(dirname -- "$p")")"
-  if [[ "$base" =~ ^verified-zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})-([A-Za-z0-9-]+)\.txt$ ]]; then
-    type="verified"; date="${BASH_REMATCH[1]}"; rid="${BASH_REMATCH[2]}"; rid="${rid:0:8}"
+  if [[ "$base" =~ ^verified-zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})- ]]; then
+    type="verified"; date="${BASH_REMATCH[1]}"
+    tail="${base%.txt}"; last="${tail##*-}"; [[ ${#last} -ge 8 ]] && rid="${last:0:8}" || rid=""
   elif [[ "$base" =~ ^zero-length-([0-9]{4}-[0-9]{2}-[0-9]{2})\.txt$ ]]; then
     type="raw"; date="${BASH_REMATCH[1]}"; rid=""
   else
@@ -163,7 +175,6 @@ fi
 
 # ───────────────────────── Verified plan path ──────────────
 base="$(basename -- "$INPUT")"
-# Extract ONLY the first date, then strip any stray newlines (prevents double-date & wrapping)
 date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" | head -n1 || true)"
 plan_date="${date_hint:-$DATE_TAG}"
 plan_date="$(printf '%s' "$plan_date" | tr -d '\r\n')"
@@ -185,8 +196,9 @@ info "Summary log: $SUMMARY_LOG"
 info "Run-ID: $RUN_ID"
 
 # ───────────────────────── Pre-count for progress ─────────
-TOTAL_LINES="$(awk 'NF && $0 !~ /^[[:space:]]*#/' -- "$INPUT" 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
-(( TOTAL_LINES < 0 )) && TOTAL_LINES=0
+TOTAL_LINES="$(count_entries "$INPUT")"
+# integer-guard
+TOTAL_LINES="${TOTAL_LINES//[!0-9]/}"; [[ -z "$TOTAL_LINES" ]] && TOTAL_LINES=0
 STEP=$(( TOTAL_LINES / 100 )); (( STEP < 1 )) && STEP=1
 
 # ───────────────────────── Counters ────────────────────────
