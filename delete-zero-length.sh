@@ -109,43 +109,44 @@ pick_latest_report() {
     return 0
   fi
 
-  # If only one candidate, pick it immediately
+  # If only one candidate, just return it
   if (( total == 1 )); then
     echo "${cands[0]}"
     return 0
   fi
 
-  # If non-interactive stdin, pick first but log what we picked
+  # If stdin is non-interactive, pick first (log to stderr so it shows)
   if [ ! -t 0 ]; then
-    info "Non-interactive input; auto-selecting latest: ${cands[0]}"
+    >&2 echo "Auto-selecting latest (non-interactive): ${cands[0]}"
     echo "${cands[0]}"
     return 0
   fi
 
-  # Show up to MAX_MENU choices (ALWAYS print the menu in interactive)
+  # Interactive: ALWAYS print the menu to stderr so it isn't swallowed by command substitution
   local limit=$MAX_MENU
   (( total < limit )) && limit=$total
 
-  echo "Select input report (showing $limit of $total most recent):"
+  >&2 echo "Select input report (showing $limit of $total most recent):"
   local i f cnt
   for (( i=0; i<limit; i++ )); do
     f="${cands[$i]}"
     cnt="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
-    printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$f" "$cnt"
+    >&2 printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$f" "$cnt"
   done
   if (( total > limit )); then
-    echo "  … (older reports not shown; pass a path explicitly if needed)"
+    >&2 echo "  … (older reports not shown; pass a path explicitly if needed)"
   fi
 
   local pick
   while true; do
+    # read -p writes prompt to stderr by design — perfect for interactive menus
     read -r -p "Enter number [1-$limit] (default 1): " pick || true
     pick="${pick:-1}"
     if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=limit )); then
       echo "${cands[$((pick-1))]}"
       return 0
     fi
-    echo "Invalid selection."
+    >&2 echo "Invalid selection."
   done
 }
 
