@@ -84,9 +84,6 @@ TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
 # ───────── Helpers ─────────
 pp_size(){ b="$1"; u=(B KiB MiB GiB TiB PiB); i=0; while (( b>=1024 && i<${#u[@]}-1 )); do b=$(( (b+1023)/1024 )); i=$((i+1)); done; printf "%d %s" "$b" "${u[$i]}"; }
 fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
-prefix_of(){ # prefix_of PATH DEPTH -> echoes prefix
-  awk -v p="$1" -v d="$2" -F'/' 'BEGIN{c=0;s=""} { for(i=1;i<=NF;i++){ if($i=="") continue; c++; if(c<=d){ s=s "/" $i } } } END{ if(s=="") s="/"; print s }'
-}
 folder_counts(){ # reads paths on stdin, prints "COUNT\tPREFIX" sorted by COUNT desc
   awk -v d="$FOLDER_DEPTH" -F'/' '
     function pref(a, n, d,   i,c,s){ s=""; c=0; for(i=1;i<=n;i++){ if(a[i]=="")continue; c++; if(c<=d){ s=s "/" a[i] } } if(s=="") s="/"; return s }
@@ -207,7 +204,7 @@ echo "  • Groups:       $INDEX_COUNT total"
 echo "  • Plan:         $PLAN"
 echo
 
-# If stdin isn't a TTY, warn (we rely on it for prompts now)
+# Require a real TTY on stdin for prompts
 if [[ ! -t 0 ]]; then
   echo -e "${YELLOW}No interactive TTY on stdin; run from an interactive terminal to make selections.${NC}"
   exit 1
@@ -267,7 +264,9 @@ for line in "${INDEX_LINES[@]}"; do
   } > "$TMPROOT/group-$shown-folders.tsv"
 
   echo "       Top folders (depth=$FOLDER_DEPTH):"
-  head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
+  head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -f - <<'AWK'
+    BEGIN{FS="\t"} {printf "         - %s  (%s files)\n", $2, $1}
+AWK
 
   mirror_hint=""
   if (( $(wc -l < "$TMPROOT/group-$shown-folders.tsv" | tr -d ' ') == 2 )); then
@@ -285,7 +284,7 @@ for line in "${INDEX_LINES[@]}"; do
   fi
 
   echo
-  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice
+  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice || choice=""
 
   # Handle choice
   if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then
