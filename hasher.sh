@@ -91,6 +91,14 @@ _log() {
   printf '%s\n' "$line" >> "$RUN_LOG"
 }
 
+# extra: write directly to background.log (no color)
+bglog() {
+  local lvl="$1"; shift
+  local msg="$*"
+  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
+  printf '[%s] [RUN %s] [%s] %s\n' "$ts" "$RUN_ID" "$lvl" "$msg" >> "$BACKGROUND_LOG"
+}
+
 info()  { _log "INFO"  "$*"; }
 warn()  { _log "WARN"  "$*"; }
 error() { _log "ERROR" "$*"; }
@@ -170,8 +178,8 @@ load_config() {
           inherit-defaults)
             v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
             case "$v" in
-              0|false|no|off) inherit_defaults="false" ;;
-              *)              inherit_defaults="true" ;;
+              0|false|no|off) DEFAULT_EXCLUDES=() ;;
+              *)              : ;;
             esac
             ;;
           exclude)        EXTRA_EXCLUDES+=("$val") ;;
@@ -179,16 +187,9 @@ load_config() {
           *)              : ;;
         esac
         ;;
-      *)
-        :
-        ;;
+      *) : ;;
     esac
   done < "$f"
-
-  # Handle inherit-defaults=false
-  if [[ "$inherit_defaults" == "false" ]]; then
-    DEFAULT_EXCLUDES=()
-  fi
 
   # reconcile paths after possible dir changes
   mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$ZERO_DIR"
@@ -242,8 +243,8 @@ while [[ $# -gt 0 ]]; do
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
-    --config)   CONFIG_FILE="${2:-}"; shift ;;
-    --child)    IS_CHILD=true ;;
+    --config)   CONFIG_FILE="${2:-}"; shift ;;  # kept to allow nohup propagation
+    --child)    IS_CHILD=true ;;                # internal
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -495,6 +496,9 @@ main() {
     local n=0 m=0 nr=0
     local scanned=0
 
+    # Immediate positive feedback to background.log
+    bglog INFO "Zero-length-only scan starting: total=$TOTAL, report=$out"
+
     start_zero_progress
     # shellcheck disable=SC2034
     while IFS= read -r -d '' f; do
@@ -510,10 +514,15 @@ main() {
     done < "$FILES_LIST"
     stop_zero_progress
 
-    info "Zero-length-only scan complete."
-    info "  • Zero-length files now: $n"
-    info "  • Missing paths: $m | Not regular files: $nr"
-    info "  • Report: $out"
+    info  "Zero-length-only scan complete."
+    info  "  • Zero-length files now: $n"
+    info  "  • Missing paths: $m | Not regular files: $nr"
+    info  "  • Report: $out"
+
+    # Mirror the summary & next steps straight into background.log
+    bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
+    bglog INFO "NEXT: Review or delete zero-length files (dry-run): ./delete-zero-length.sh \"$out\""
+    bglog INFO "NEXT: Delete: ./delete-zero-length.sh \"$out\" --force  |  Quarantine: ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
 
     echo
     echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
