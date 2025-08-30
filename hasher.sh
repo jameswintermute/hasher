@@ -11,6 +11,7 @@ LC_ALL=C
 # ───────────────────────── Constants ───────────────────────
 HASHES_DIR="hashes"
 LOGS_DIR="logs"
+ZERO_DIR="zero-length"
 DATE_TAG="$(date +'%Y-%m-%d')"
 OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
 
@@ -69,7 +70,7 @@ FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 
 # ───────────────────────── Setup dirs ──────────────────────
-mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$ZERO_DIR"
 
 # ───────────────────────── Logging ─────────────────────────
 _log() {
@@ -190,7 +191,7 @@ load_config() {
   fi
 
   # reconcile paths after possible dir changes
-  mkdir -p "$HASHES_DIR" "$LOGS_DIR"
+  mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$ZERO_DIR"
   MAIN_LOG="$LOGS_DIR/hasher.log"
   RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
   FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
@@ -522,9 +523,9 @@ post_run_reports() {
   local csv="$1"  # OUTPUT CSV
   local date_tag="$2"
 
-  mkdir -p "$LOGS_DIR"
+  mkdir -p "$LOGS_DIR" "$ZERO_DIR"
 
-  local zero_txt="$LOGS_DIR/zero-length-$date_tag.txt"
+  local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
   # Zero-length list from CSV (detect size column) — POSIX-safe blank filtering
