@@ -490,50 +490,51 @@ main() {
   info "Discovered $TOTAL files to scan (post-exclude)."
 
   # ───── Fast path: zero-length-only (no hashing) ──────────
-  if $ZERO_LENGTH_ONLY; then
-    local out="$ZERO_DIR/zero-length-$DATE_TAG.txt"
-    : > "$out"
-    local n=0 m=0 nr=0
-    local scanned=0
+ if $ZERO_LENGTH_ONLY; then
+  local out="$ZERO_DIR/zero-length-$DATE_TAG.txt"
+  : > "$out"
+  local n=0 m=0 nr=0
+  local scanned=0
 
-    # Immediate positive feedback to background.log
-    bglog INFO "Zero-length-only scan starting: total=$TOTAL, report=$out"
+  # Start message to background.log
+  bglog INFO "Zero-length-only scan starting: total=$TOTAL, report=$out"
 
-    start_zero_progress
-    # shellcheck disable=SC2034
-    while IFS= read -r -d '' f; do
-      ((scanned++)); echo "$scanned" > "$ZERO_PROGRESS_FILE"
-      if [[ ! -e "$f" ]]; then
-        ((m++))
-      elif [[ ! -f "$f" ]]; then
-        ((nr++))
-      elif [[ ! -s "$f" ]]; then
-        echo "$f" >> "$out"
-        ((n++))
-      fi
-    done < "$FILES_LIST"
-    stop_zero_progress
+  start_zero_progress
+  # shellcheck disable=SC2034
+  while IFS= read -r -d '' f; do
+    scanned=$((scanned+1)); echo "$scanned" > "$ZERO_PROGRESS_FILE"
+    if [[ ! -e "$f" ]]; then
+      m=$((m+1))
+    elif [[ ! -f "$f" ]]; then
+      nr=$((nr+1))
+    elif [[ ! -s "$f" ]]; then
+      echo "$f" >> "$out"
+      n=$((n+1))
+    fi
+  done < "$FILES_LIST"
+  stop_zero_progress
 
-    info  "Zero-length-only scan complete."
-    info  "  • Zero-length files now: $n"
-    info  "  • Missing paths: $m | Not regular files: $nr"
-    info  "  • Report: $out"
+  # Human-friendly summary (console + per-run log)
+  info  "Zero-length-only scan complete."
+  info  "  • Zero-length files now: $n"
+  info  "  • Missing paths: $m | Not regular files: $nr"
+  info  "  • Report: $out"
 
-    # Mirror the summary & next steps straight into background.log
-    bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
-    bglog INFO "NEXT: Review or delete zero-length files (dry-run): ./delete-zero-length.sh \"$out\""
-    bglog INFO "NEXT: Delete: ./delete-zero-length.sh \"$out\" --force  |  Quarantine: ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+  # Mirror to background.log so you see it in tail -f
+  bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
+  bglog INFO "NEXT: Review (dry-run): ./delete-zero-length.sh \"$out\""
+  bglog INFO "NEXT: Delete: ./delete-zero-length.sh \"$out\" --force  |  Quarantine: ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
 
-    echo
-    echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
-    echo "  1) Review or delete zero-length files (dry-run first):"
-    echo "       ./delete-zero-length.sh \"$out\""
-    echo "  2) Execute deletion safely (or move to quarantine):"
-    echo "       ./delete-zero-length.sh \"$out\" --force"
-    echo "       ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
-    echo
-    return
-  fi
+  echo
+  echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
+  echo "  1) Review or delete zero-length files (dry-run first):"
+  echo "       ./delete-zero-length.sh \"$out\""
+  echo "  2) Execute deletion safely (or move to quarantine):"
+  echo "       ./delete-zero-length.sh \"$out\" --force"
+  echo "       ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+  echo
+  return
+fi
 
   # ───── Normal hashing path ───────────────────────────────
   write_csv_header
