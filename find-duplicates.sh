@@ -1,7 +1,12 @@
-#!/usr/bin/env bash
-# find-duplicates.sh — Generate duplicate report from hasher CSV
-# Dry-run style: only analyzes and writes reports; does not delete/move.
-# Output format matches hasher.sh's post_run_reports for compatibility with deduplicate.sh.
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
+# find-duplicates.sh — Generate duplicate report from hasher CSV.
+# Analyzes only; writes reports; does not delete/move.
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
@@ -10,14 +15,18 @@ LC_ALL=C
 HASHES_DIR="hashes"
 LOGS_DIR="logs"
 DATE_TAG="$(date +'%Y-%m-%d')"
-RUN_ID="$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-$$" )"
+RUN_ID="$(
+  (command -v uuidgen >/dev/null 2>&1 && uuidgen) \
+  || cat /proc/sys/kernel/random/uuid 2>/dev/null \
+  || echo "$(date +%s)-$$"
+)"
 
 REPORT="$LOGS_DIR/$DATE_TAG-duplicate-hashes.txt"
 SUMMARY_TSV="$LOGS_DIR/duplicate-summary-$DATE_TAG-$RUN_ID.tsv"
-TOP_N=10               # how many top groups to print
-GROUP_DEPTH=2          # path grouping depth for summary (/volume1/Share = 2)
+TOP_N=10               # console: top N path groups
+GROUP_DEPTH=2          # grouping depth (/volume1/Share = 2)
 FROM_CSV=""            # override input CSV
-MIN_SIZE=0             # bytes; filter out dup groups below this size (0=all)
+MIN_SIZE=0             # bytes; only consider groups where per-file size >= MIN_SIZE
 
 # ───────── Colors ─────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -42,11 +51,11 @@ Options:
   --top N             Show top N path groups in console (default: $TOP_N)
   -h, --help          Show this help
 
-Example:
-  $0                               # use latest hashes/hasher-*.csv
+Examples:
+  $0
   $0 --min-size 1048576            # only 1MB+ dup groups
-  $0 --group-depth 3 --top 20      # deeper summary
-  $0 --from-csv hashes/hasher-2025-08-30.csv
+  $0 --group-depth 3 --top 20      # deeper path summary
+  $0 --from-csv hashes/hasher-$DATE_TAG.csv
 EOF
 }
 
@@ -79,22 +88,20 @@ log INFO "Report will be written to: $REPORT"
 log INFO "Summary TSV will be written to: $SUMMARY_TSV"
 log INFO "Filters: min_size=${MIN_SIZE}B, group_depth=$GROUP_DEPTH"
 
+# Truncate outputs up front
+: > "$REPORT"
+: > "$SUMMARY_TSV".tmp
+
 # ───────── Build duplicate report ─────────
-# We assume header: path,size_bytes,mtime_epoch,algo,hash (as produced by hasher.sh).
-# We parse the first (possibly quoted) CSV field by hand to be robust to commas in paths.
-# Output format:
-#   HASH <hash> (<N> files):
-#     /path/one
-#     /path/two
-#   [blank line between groups]
-awk -v minsize="$MIN_SIZE" -v report="$REPORT" -v summary="$SUMMARY_TSV" -v depth="$GROUP_DEPTH" -v topn="$TOP_N" '
+# POSIX-awk only. Robust CSV first-field parsing for quoted paths.
+awk -v minsize="$MIN_SIZE" -v report="$REPORT" -v summarytmp="$SUMMARY_TSV.tmp" -v depth="$GROUP_DEPTH" '
   function ltrim(s){ sub(/^[ \t\r\n]+/, "", s); return s }
   function rtrim(s){ sub(/[ \t\r\n]+$/, "", s); return s }
   function unquote_csv(s){ gsub(/""/,"\"",s); return s }
-  # Parse our known schema line into path,size,hash quickly and robustly.
-  function parse_line(line,   path, rest, c, endq, size, mtime, algo, hash) {
+
+  # Parse one CSV line from hasher: path,size_bytes,mtime_epoch,algo,hash
+  function parse_line(line,   path, rest, c, endq, size_str, hash) {
     if (substr(line,1,1)=="\"") {
-      # quoted path
       endq=0
       for (i=2;i<=length(line);i++) {
         ch=substr(line,i,1)
@@ -104,138 +111,114 @@ awk -v minsize="$MIN_SIZE" -v report="$REPORT" -v summary="$SUMMARY_TSV" -v dept
         }
       }
       if (endq==0) return 0
-      path=substr(line,2,endq-2)
-      path=unquote_csv(path)
-      rest=substr(line,endq+2)  # skip closing quote and following comma
+      path=substr(line,2,endq-2); path=unquote_csv(path)
+      rest=substr(line,endq+2) # skip closing quote + comma
     } else {
-      c=index(line,",")
-      if (c==0) return 0
-      path=substr(line,1,c-1)
-      rest=substr(line,c+1)
+      c=index(line,","); if (c==0) return 0
+      path=substr(line,1,c-1); rest=substr(line,c+1)
     }
     # size
     c=index(rest,","); if (c==0) return 0
-    size_str=substr(rest,1,c-1); size_str=ltrim(rtrim(size_str))
-    rest=substr(rest,c+1)
-    # mtime
+    size_str=substr(rest,1,c-1); size_str=ltrim(rtrim(size_str)); rest=substr(rest,c+1)
+    # mtime (skip)
     c=index(rest,","); if (c==0) return 0
-    # mtime_str=substr(rest,1,c-1) ; not used
     rest=substr(rest,c+1)
-    # algo
+    # algo (skip)
     c=index(rest,","); if (c==0) return 0
-    # algo=substr(rest,1,c-1) ; not used
-    hash=substr(rest,c+1)
-    size = size_str + 0
-    PATH=path; SIZE=size; HASH=hash
+    hash=substr(rest,c+1); hash=ltrim(rtrim(hash))
+
+    PATH=path; SIZE=size_str+0; HASH=hash
     return 1
   }
+
   function prefix(p, depth,   i,n,part,count,acc) {
     n = split(p, a, "/")
     acc=""; count=0
     for (i=1; i<=n; i++) {
-      part=a[i]
-      if (part=="") continue
+      part=a[i]; if (part=="") continue
       count++
       if (count<=depth) acc=acc "/" part; else break
     }
     if (acc=="") acc="/"
     return acc
   }
+
   BEGIN{
-    OFS="\t"
     groups=0; dup_files=0; reclaim=0
+    # make sure outputs start empty
+    print "" > report; close(report)
+    print "" > summarytmp; close(summarytmp)
   }
-  NR==1 { next } # skip header
+
+  NR==1 { next }  # skip header
+
   {
-    line=$0
-    if (!parse_line(line)) next
-    # accumulate by hash
-    if (!(HASH in count)) {
-      count[HASH]=0
-      size_by_hash[HASH]=SIZE
-      files[HASH]=""
-    }
+    if (!parse_line($0)) next
+    if (!(HASH in count)) { count[HASH]=0; size_by_hash[HASH]=SIZE; files[HASH]="" }
     count[HASH]++
     files[HASH]=files[HASH] "\n" PATH
   }
+
   END{
-    # Write report
-    out = report
-    if ((f = fopen(out, "w")) == 0) {
-      print "ERROR: cannot write report: " out > "/dev/stderr"
-      exit 1
-    }
     for (h in count) {
-      c=count[h]
-      s=size_by_hash[h]+0
+      c=count[h]; s=size_by_hash[h]+0
       if (c>1 && s>=minsize) {
         groups++
         dup_files += c
         reclaim += (c-1)*s
-        printf("HASH %s (%d files):\n", h, c) > out
-        # list files
-        split(files[h], arr, "\n")
-        for (i=1; i<=length(arr); i++) {
-          p=arr[i]
-          if (p=="") continue
-          printf("  %s\n", p) > out
-          # build path summary
+        printf("HASH %s (%d files):\n", h, c) >> report
+        n=split(files[h], arr, "\n")
+        for (i=1; i<=n; i++) {
+          p=arr[i]; if (p=="") continue
+          printf("  %s\n", p) >> report
           pre = prefix(p, depth)
           groupcount[pre]++
         }
-        printf("\n") > out
+        printf("\n") >> report
       }
     }
-    close(out)
+    # write summary tmp
+    for (k in groupcount) printf("%s\t%d\n", k, groupcount[k]) >> summarytmp
 
-    # Write summary TSV sorted by count desc
-    # Format: <path_prefix>\t<count>
-    # We will post-sort outside awk using sort for portability.
-    tmp = summary ".tmp"
-    if ((f2 = fopen(tmp, "w")) == 0) {
-      print "ERROR: cannot write summary tmp: " tmp > "/dev/stderr"
-      exit 1
-    }
-    for (k in groupcount) {
-      printf("%s\t%d\n", k, groupcount[k]) > tmp
-    }
-    close(tmp)
-    # Sort numerically desc by 2nd field
-    cmd = "sort -k2,2nr " tmp " > " summary
-    system(cmd)
-    system("rm -f " tmp)
-
-    # Print console summary
-    printf("%sDuplicate analysis complete.%s\n", "\033[0;32m", "\033[0m") > "/dev/stderr"
-    printf("  • Duplicate groups: %d\n", groups) > "/dev/stderr"
-    printf("  • Files in dup groups: %d\n", dup_files) > "/dev/stderr"
-    printf("  • Potential reclaim: %d bytes\n", reclaim) > "/dev/stderr"
-    printf("  • Report: %s\n", report) > "/dev/stderr"
-    printf("  • Summary TSV: %s\n", summary) > "/dev/stderr"
-
-    # Print top N groups
-    printf("\nTop %d groups (depth=%d):\n", topn, depth) > "/dev/stderr"
-    # read back the sorted summary
-    cmd2 = "head -n " topn " " summary
-    while ((cmd2 | getline line2) > 0) {
-      # split line2 by tab
-      split(line2, flds, "\t")
-      pref=flds[1]; cnt=flds[2]+0
-      if (dup_files>0) pct = int(cnt*100/dup_files); else pct=0
-      printf("  %2d) %-50s %6d files (%3d%%)\n", ++rank, pref, cnt, pct) > "/dev/stderr"
-    }
-    close(cmd2)
+    # emit totals for the shell to read if needed
+    printf("DUP_GROUPS=%d\nDUP_FILES=%d\nRECLAIM=%d\n", groups, dup_files, reclaim) > "/dev/stderr"
   }
 ' "$FROM_CSV"
 
-# Friendly next step
+# Sort summary and show top-N
+sort -k2,2nr "$SUMMARY_TSV".tmp -o "$SUMMARY_TSV" || true
+
+# Compute total files across groups for percentages (sum of 2nd col)
+total_in_groups=$(awk -F'\t' '{s+=$2} END{print s+0}' "$SUMMARY_TSV")
+
+echo
+echo -e "${GREEN}Duplicate analysis complete.${NC}"
+echo "  • Report:           $REPORT"
+echo "  • Summary TSV:      $SUMMARY_TSV"
+echo "  • Total files in groups: $total_in_groups"
+echo
+
+if [[ -s "$SUMMARY_TSV" ]]; then
+  echo "Top $TOP_N groups (depth=$GROUP_DEPTH):"
+  rank=0
+  while IFS=$'\t' read -r pref cnt; do
+    ((rank++))
+    pct=0
+    if [[ "${total_in_groups:-0}" -gt 0 ]]; then
+      pct=$(( (cnt * 100) / total_in_groups ))
+    fi
+    printf "  %2d) %-50s %6d files  (%3d%%)\n" "$rank" "$pref" "$cnt" "$pct"
+    (( rank >= TOP_N )) && break || true
+  done < "$SUMMARY_TSV"
+fi
+
 echo
 echo -e "${GREEN}[NEXT STEPS]${NC}"
 echo "  1) Review the duplicate report:"
 echo "       less \"$REPORT\""
-echo "  2) Dry-run dedupe interactively (if your tool supports it):"
-echo "       ./review-duplicates.sh"
-echo "  3) Move extras to quarantine (safe):"
+echo "  2) Preview actions & create a plan:"
+echo "       ./review-duplicates.sh --from-report \"$REPORT\""
+echo "  3) Safer dedupe (quarantine extras):"
 echo "       ./deduplicate.sh --from-report \"$REPORT\" --keep newest --quarantine \"quarantine-$DATE_TAG\""
 echo "  4) Or delete extras (dangerous):"
 echo "       ./deduplicate.sh --from-report \"$REPORT\" --keep newest --force"
