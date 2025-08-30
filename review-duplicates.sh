@@ -5,8 +5,11 @@
 # This program comes with ABSOLUTELY NO WARRANTY.
 
 # review-duplicates.sh — Interactive review of duplicate groups (largest-first).
-# Fast indexing (single CSV + report pass). Prompts with standard `read -rp`.
-# Adds mirrored-folder detection and per-group folder summaries.
+# Fixes:
+#  - Robust TSV parsing (trims CR, validates fields)
+#  - Verifies .detail files exist before reading (prevents blocking on STDIN)
+#  - Uses while-read loops for group files (portable; no mapfile dependency)
+#  - Immediate progress feedback and folder “mirror” detection (ka/kb)
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -217,43 +220,40 @@ pp_line() { # args: size mtime path idx
   printf "       modified: %s\n" "$when"
 }
 
-# Read the whole index into memory; fallback if `mapfile` missing
-INDEX_LINES=()
-if command -v mapfile >/dev/null 2>&1; then
-  mapfile -t INDEX_LINES < "$INDEX_SORTED"
-else
-  while IFS= read -r _ln; do INDEX_LINES+=("$_ln"); done < "$INDEX_SORTED"
-fi
-
 shown=0
 added_extras=0
 
-for line in "${INDEX_LINES[@]}"; do
+# Read index lines safely; trim CR; validate fields; verify detail exists
+while IFS= read -r line || [[ -n "$line" ]]; do
   (( shown >= LIMIT )) && break
+  # Trim trailing CR if present (defensive)
+  [[ "${line: -1}" == $'\r' ]] && line="${line%$'\r'}"
+  # Split into 4 tab-separated fields
   IFS=$'\t' read -r first_sz reclaim cnt detail <<< "$line" || continue
+  # Field sanity
+  [[ -n "${detail:-}" && -n "${first_sz:-}" && -n "${cnt:-}" ]] || continue
+  # Verify detail file exists; if not, skip (prevents reading from STDIN!)
+  if [[ ! -f "$detail" ]]; then
+    echo -e "${YELLOW}  ! Missing detail file: $detail (skipping)${NC}"
+    continue
+  fi
 
   ((shown++))
   echo -e "${CYAN}[$shown/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
 
-  # Load this group's items into arrays (so we can display + compute folder stats)
-  GROUP_LINES=()
-  if command -v mapfile >/dev/null 2>&1; then
-    mapfile -t GROUP_LINES < "$detail"
-  else
-    while IFS= read -r gl; do GROUP_LINES+=("$gl"); done < "$detail"
-  fi
-
+  # Load this group's items via while-read (portable, trims CR)
   paths=(); sizes=(); mtimes=()
-  for gl in "${GROUP_LINES[@]}"; do
-    IFS=$'\t' read -r s t p <<< "$gl"
-    sizes+=("$s"); mtimes+=("$t"); paths+=("$p")
-  done
+  i=0
+  while IFS=$'\t' read -r s t p || [[ -n "$s$t$p" ]]; do
+    [[ "${p: -1}" == $'\r' ]] && p="${p%$'\r'}"
+    sizes[i]="$s"; mtimes[i]="$t"; paths[i]="$p"
+    i=$((i+1))
+  done < "$detail"
 
-  # Display up to SHOW_EACH_MAX items
   total_in_group=${#paths[@]}
   to_show=$(( total_in_group < SHOW_EACH_MAX ? total_in_group : SHOW_EACH_MAX ))
-  for ((i=0;i<to_show;i++)); do
-    pp_line "${sizes[$i]}" "${mtimes[$i]}" "${paths[$i]}" "$((i+1))"
+  for ((k=0;k<to_show;k++)); do
+    pp_line "${sizes[$k]}" "${mtimes[$k]}" "${paths[$k]}" "$((k+1))"
   done
   hidden=$(( total_in_group - to_show ))
   (( hidden > 0 )) && echo "       … and $hidden more not shown"
@@ -264,22 +264,26 @@ for line in "${INDEX_LINES[@]}"; do
   } > "$TMPROOT/group-$shown-folders.tsv"
 
   echo "       Top folders (depth=$FOLDER_DEPTH):"
-  head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -f - <<'AWK'
-    BEGIN{FS="\t"} {printf "         - %s  (%s files)\n", $2, $1}
-AWK
+  if [[ -s "$TMPROOT/group-$shown-folders.tsv" ]]; then
+    head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
+  else
+    echo "         (no folder summary)"
+  fi
 
   mirror_hint=""
-  if (( $(wc -l < "$TMPROOT/group-$shown-folders.tsv" | tr -d ' ') == 2 )); then
-    a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$shown-folders.tsv")
-    b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$shown-folders.tsv")
-    a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$shown-folders.tsv")
-    b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
-    if (( a_count == b_count && a_count + b_count == total_in_group )); then
-      mirror_hint="mirror"
-      echo "       Mirror folders suspected:"
-      echo "         [A] $a_pref  ($a_count files)"
-      echo "         [B] $b_pref  ($b_count files)"
-      echo "       Tip: type 'ka' to keep A (drop B-side), or 'kb' to keep B (drop A-side)."
+  if [[ -s "$TMPROOT/group-$shown-folders.tsv" ]]; then
+    if (( $(wc -l < "$TMPROOT/group-$shown-folders.tsv" | tr -d ' ') == 2 )); then
+      a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$shown-folders.tsv")
+      b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$shown-folders.tsv")
+      a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+      b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+      if (( a_count == b_count && a_count + b_count == total_in_group )); then
+        mirror_hint="mirror"
+        echo "       Mirror folders suspected:"
+        echo "         [A] $a_pref  ($a_count files)"
+        echo "         [B] $b_pref  ($b_count files)"
+        echo "       Tip: type 'ka' to keep A (drop B-side), or 'kb' to keep B (drop A-side)."
+      fi
     fi
   fi
 
@@ -330,7 +334,7 @@ AWK
   ((added_extras+=added_here))
   echo "  → Keeping #$keep_idx; added $added_here extras to plan."
   echo
-done
+done < "$INDEX_SORTED"
 
 # ───────── Summary of the plan ─────────
 if [[ -s "$PLAN" ]]; then
