@@ -5,8 +5,8 @@
 # This program comes with ABSOLUTELY NO WARRANTY.
 
 # review-duplicates.sh — Interactive review of duplicate groups (largest-first).
-# Fast indexing: loads CSV once, parses the report once, writes per-group detail files.
-# Interactive prompts read from /dev/tty (so they work even inside a while-read loop).
+# Fast indexing (single CSV + report pass). Interactive prompts from /dev/tty.
+# Index is read into memory (mapfile) to avoid stdin conflicts.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -77,7 +77,6 @@ mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$GROUPDIR"
 [[ -n "$REPORT" && -r "$REPORT" ]] || { echo "ERROR: No readable duplicate report (run find-duplicates.sh)"; exit 1; }
 [[ -n "$CSV"    && -r "$CSV"    ]] || { echo "ERROR: No readable hasher CSV (run hasher.sh)"; exit 1; }
 
-# Count total groups for nicer progress later (optional)
 TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
 
 # ───────── Helpers ─────────
@@ -187,20 +186,20 @@ case "$ORDER" in
   *) echo -e "${YELLOW}Unknown --order '$ORDER' (use size|reclaim).${NC}"; exit 2 ;;
 esac
 
+INDEX_COUNT=$(wc -l < "$INDEX_SORTED" | tr -d ' ' || echo 0)
+
 echo
 echo -e "${GREEN}Index ready. Starting interactive review…${NC}"
 echo "  • Ordering:     $ORDER (largest first)"
 echo "  • Limit:        $LIMIT"
+echo "  • Groups:       $INDEX_COUNT total"
 echo "  • Plan:         $PLAN"
 echo
 
-# ───────── Interactive review (read prompts from /dev/tty) ─────────
-# Open a TTY fd for prompts even though stdin is redirected by the while-read loop.
+# ───────── Interactive review (array, prompts from /dev/tty) ─────────
 TTY_FD=3
 if ! exec 3</dev/tty 2>/dev/null; then
-  # Fallback: if no TTY available, bail into non-interactive summary mode.
-  echo -e "${YELLOW}No /dev/tty available; running non-interactive. No choices will be recorded.${NC}"
-  echo "Run this script from an interactive terminal (ssh/tty) to select files."
+  echo -e "${YELLOW}No /dev/tty available; run from a terminal to make selections.${NC}"
   exit 1
 fi
 
@@ -211,11 +210,17 @@ pp_line() { # args: size mtime path idx
   printf "       modified: %s\n" "$when"
 }
 
+# Read the whole index into memory to avoid stdin conflicts
+mapfile -t INDEX_LINES < "$INDEX_SORTED"
+
 shown=0
 added_extras=0
 
-while IFS=$'\t' read -r first_sz reclaim cnt detail; do
-  ((shown++)); (( shown > LIMIT )) && break
+for line in "${INDEX_LINES[@]}"; do
+  (( shown >= LIMIT )) && break
+  IFS=$'\t' read -r first_sz reclaim cnt detail <<< "$line" || continue
+
+  ((shown++))
   echo -e "${CYAN}[$shown/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
 
   # Display up to SHOW_EACH_MAX items
@@ -229,15 +234,13 @@ while IFS=$'\t' read -r first_sz reclaim cnt detail; do
       ((hidden++))
     fi
   done < "$detail"
-  if (( hidden > 0 )); then
-    echo "       … and $hidden more not shown"
-  fi
+  (( hidden > 0 )) && echo "       … and $hidden more not shown"
 
   echo
   printf "Select the file ID to KEEP [1-%d], 's' to skip, or 'q' to quit: " "$cnt" >&$TTY_FD
   read -r choice <&$TTY_FD || choice=""
-  if [[ -z "${choice:-}" || "$choice" == "s" || "$choice" == "S" ]]; then echo "  → Skipped."; echo; continue; fi
-  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then echo "  → Quitting early."; break; fi
+  if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then echo "  → Skipped."; echo; continue; fi
+  if [[ "$choice" =~ ^[qQ]$ ]]; then echo "  → Quitting early."; break; fi
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > cnt )); then echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; continue; fi
 
   keep_idx="$choice"
@@ -245,7 +248,7 @@ while IFS=$'\t' read -r first_sz reclaim cnt detail; do
   j=0
   while IFS=$'\t' read -r s t p; do
     ((j++))
-    if (( j == keep_idx )); then continue; fi
+    (( j == keep_idx )) && continue
     printf '%s\n' "$p" >> "$PLAN"
     ((added_here++))
   done < "$detail"
@@ -253,7 +256,7 @@ while IFS=$'\t' read -r first_sz reclaim cnt detail; do
   ((added_extras+=added_here))
   echo "  → Keeping #$keep_idx; added $added_here extras to plan."
   echo
-done < "$INDEX_SORTED"
+done
 
 # ───────── Summary of the plan ─────────
 if [[ -s "$PLAN" ]]; then
@@ -268,28 +271,4 @@ if [[ -s "$PLAN" ]]; then
   ' "$PLAN" | sort -k2,2nr > "$SUMMARY_TSV"
 
   total_extras=$(awk -F'\t' '{s+=$2} END{print s+0}' "$SUMMARY_TSV")
-  echo "Top $TOP_N groups (depth=$GROUP_DEPTH):"
-  rank=0
-  while IFS=$'\t' read -r pref cnt; do
-    ((rank++))
-    pct=0
-    if [[ "${total_extras:-0}" -gt 0 ]]; then pct=$(( (cnt * 100) / total_extras )); fi
-    printf "  %2d) %-50s %6d extras  (%3d%%)\n" "$rank" "$pref" "$cnt" "$pct"
-    (( rank >= TOP_N )) && break || true
-  done < "$SUMMARY_TSV"
-fi
-
-echo
-echo -e "${GREEN}Interactive review complete.${NC}"
-echo "  • Groups reviewed:       $shown (limit=$LIMIT)"
-echo "  • Plan entries (extras): ${added_extras:-0}"
-echo "  • Plan file:             $PLAN"
-echo "  • Summary TSV:           $SUMMARY_TSV"
-echo
-echo -e "${GREEN}[NEXT STEPS]${NC}"
-echo "  1) Review the plan:"
-echo "       less \"$PLAN\""
-echo "  2) Move extras to quarantine (safe):"
-echo "       while IFS= read -r p; do mkdir -p \"quarantine-$DATE_TAG\$(dirname \"\$p\")\"; mv -n -- \"\$p\" \"quarantine-$DATE_TAG\$p\"; done < \"$PLAN\""
-echo "  3) Or delete extras (dangerous):"
-echo "       xargs -0 rm -f -- < <(tr '\\n' '\\0' < \"$PLAN\")"
+  echo "Top $TOP_N groups (dept_
