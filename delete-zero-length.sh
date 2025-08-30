@@ -14,6 +14,7 @@ RUN_ID="${RUN_ID:-$({ command -v uuidgen >/dev/null 2>&1 && uuidgen; } || \
                     { [ -r /proc/sys/kernel/random/uuid ] && cat /proc/sys/kernel/random/uuid; } || \
                     date +%s)}"
 SUMMARY_LOG="$LOGS_DIR/delete-zero-length-$DATE_TAG.log"
+MAX_MENU=10
 
 mkdir -p "$LOGS_DIR" "$ZERO_DIR"
 
@@ -43,7 +44,7 @@ Options:
 Examples:
   $0                                # auto-pick latest, dry-run
   $0 "$ZERO_DIR/zero-length-$DATE_TAG.txt"        # explicit input, dry-run
-  $0 --force --quarantine "$ZERO_DIR/quarantine-$DATE_TAG"
+  $0 -y --force --quarantine "$ZERO_DIR/quarantine-$DATE_TAG"
 EOF
 }
 
@@ -52,14 +53,12 @@ _log_core() {
   local lvl="$1"; shift
   local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
   local line="[$ts] [RUN $RUN_ID] [$lvl] $*"
-  # console (color)
   case "$lvl" in
     INFO)  echo -e "${GREEN}$line${NC}" ;;
     WARN)  echo -e "${YELLOW}$line${NC}" ;;
     ERROR) echo -e "${RED}$line${NC}" ;;
     *)     echo "$line" ;;
   esac
-  # log file (plain)
   printf '%s\n' "$line" >> "$SUMMARY_LOG"
 }
 info()  { _log_core INFO  "$*"; }
@@ -91,28 +90,54 @@ done
 
 # ───────────────────────── Auto-select input ───────────────
 pick_latest_report() {
-  local cands=()
-  # Prefer ZERO_DIR, then LOGS_DIR; prefer verified-* then zero-length-*
+  local raw=()
+  # Prefer ZERO_DIR, then LOGS_DIR; prefer verified-* then zero-length-* (newest first)
   for d in "$ZERO_DIR" "$LOGS_DIR"; do
-    while IFS= read -r f; do cands+=("$f"); done < <(ls -1t "$d"/verified-zero-length-*.txt 2>/dev/null || true)
-    while IFS= read -r f; do cands+=("$f"); done < <(ls -1t "$d"/zero-length-*.txt        2>/dev/null || true)
+    while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/verified-zero-length-*.txt 2>/dev/null || true)
+    while IFS= read -r f; do raw+=("$f"); done < <(ls -1t "$d"/zero-length-*.txt        2>/dev/null || true)
   done
-  (( ${#cands[@]} )) || { echo ""; return 0; }
-
-  # If non-interactive or single candidate, pick first
-  if (( ${#cands[@]} == 1 )) || [ ! -t 0 ]; then echo "${cands[0]}"; return 0; fi
-
-  echo "Select input report:"
-  local i=1
-  for f in "${cands[@]}"; do
-    local cnt; cnt="$(grep -v '^[[:space:]]*#' "$f" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
-    printf "  %2d) %s  (%s lines)\n" "$i" "$f" "$cnt"
-    ((i++))
+  # De-duplicate while preserving order
+  local cands=() seen=""
+  for f in "${raw[@]}"; do
+    [[ -e "$f" ]] || continue
+    if [[ ":$seen:" != *":$f:"* ]]; then cands+=("$f"); seen="$seen:$f"; fi
   done
+
+  local total=${#cands[@]}
+  if (( total == 0 )); then
+    echo ""
+    return 0
+  fi
+
+  # If only one candidate or non-interactive stdin, pick first silently
+  if (( total == 1 )) || [ ! -t 0 ]; then
+    echo "${cands[0]}"
+    return 0
+  fi
+
+  # Show up to MAX_MENU choices
+  local limit=$MAX_MENU
+  (( total < limit )) && limit=$total
+
+  echo "Select input report (showing $limit of $total most recent):"
+  local i f cnt
+  for (( i=0; i<limit; i++ )); do
+    f="${cands[$i]}"
+    cnt="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ' || echo 0)"
+    printf "  %2d) %s  (%s entries)\n" "$((i+1))" "$f" "$cnt"
+  done
+  if (( total > limit )); then
+    echo "  … (older reports not shown; pass a path explicitly if needed)"
+  fi
+
+  local pick
   while true; do
-    read -r -p "Enter number [1-${#cands[@]}] (default 1): " pick || true
+    read -r -p "Enter number [1-$limit] (default 1): " pick || true
     pick="${pick:-1}"
-    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#cands[@]} )) && { echo "${cands[$((pick-1))]}"; return 0; }
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=limit )); then
+      echo "${cands[$((pick-1))]}"
+      return 0
+    fi
     echo "Invalid selection."
   done
 }
@@ -127,7 +152,6 @@ fi
 [[ -r "$INPUT" ]] || { error "Input list not readable: $INPUT"; exit 3; }
 
 # ───────────────────────── Verified plan path ──────────────
-# Try to reuse a date already present in the filename; else use today's DATE_TAG
 base="$(basename -- "$INPUT")"
 date_hint="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" || true)"
 plan_date="${date_hint:-$DATE_TAG}"
