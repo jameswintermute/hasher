@@ -6,7 +6,7 @@
 
 # review-duplicates.sh — Interactive review of duplicate groups (largest-first).
 # Fast indexing: loads CSV once, parses the report once, writes per-group detail files.
-# Safe: writes a plan only; never deletes.
+# Interactive prompts read from /dev/tty (so they work even inside a while-read loop).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -26,9 +26,10 @@ CSV="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
 ORDER="size"          # size|reclaim   (largest-first)
 LIMIT=100             # max groups to walk through interactively
 MIN_SIZE=0            # ignore dup groups where per-file size < MIN_SIZE
-FILTER_PREFIX=""      # if set, only consider groups that include any file under this prefix
+FILTER_PREFIX=""      # only consider groups including any file under this prefix (optional)
 GROUP_DEPTH=2         # summary path depth
 TOP_N=10              # top-N summary after plan built
+SHOW_EACH_MAX=12      # show up to this many files per group in the UI
 
 # Outputs
 PLAN="$LOGS_DIR/review-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
@@ -76,6 +77,9 @@ mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$GROUPDIR"
 [[ -n "$REPORT" && -r "$REPORT" ]] || { echo "ERROR: No readable duplicate report (run find-duplicates.sh)"; exit 1; }
 [[ -n "$CSV"    && -r "$CSV"    ]] || { echo "ERROR: No readable hasher CSV (run hasher.sh)"; exit 1; }
 
+# Count total groups for nicer progress later (optional)
+TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
+
 # ───────── Helpers ─────────
 pp_size(){ b="$1"; u=(B KiB MiB GiB TiB PiB); i=0; while (( b>=1024 && i<${#u[@]}-1 )); do b=$(( (b+1023)/1024 )); i=$((i+1)); done; printf "%d %s" "$b" "${u[$i]}"; }
 fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
@@ -88,40 +92,31 @@ echo "  • Temp:    $TMPROOT"
 echo
 
 # ───────── One-pass index build (FAST) ─────────
-# Loads CSV once (path -> size,mtime). Parses report once.
-# Writes:
-#   - $GROUPDIR/group-XXXXXX.detail  (lines: <size>\t<mtime>\t<path>)
-#   - $INDEX_RAW (TSV: first_size  reclaim  count  detail_file)
 awk -v csv="$CSV" -v report="$REPORT" -v outdir="$GROUPDIR" -v indexout="$INDEX_RAW" \
-    -v minsize="$MIN_SIZE" -v wantprefix="$FILTER_PREFIX" '
+    -v minsize="$MIN_SIZE" -v wantprefix="$FILTER_PREFIX" -v total="$TOTAL_GROUPS" '
   function ltrim(s){ sub(/^[ \t\r\n]+/,"",s); return s }
   function rtrim(s){ sub(/[ \t\r\n]+$/,"",s); return s }
   function unquote_csv(s){ gsub(/""/,"\"",s); return s }
+  function hhmmss(sec,  h,m,s){ if (sec<0) sec=0; h=int(sec/3600); m=int((sec%3600)/60); s=int(sec%60); return sprintf("%02d:%02d:%02d",h,m,s) }
 
-  function parse_csv_line(line,   path, rest, c, endq, size_str, mtime_str, hash) {
+  function parse_csv_line(line,   path, rest, c, endq, size_str, mtime_str) {
     if (substr(line,1,1)=="\"") {
       endq=0
       for (i=2;i<=length(line);i++) {
         ch=substr(line,i,1)
-        if (ch=="\"") {
-          nxt=substr(line,i+1,1)
-          if (nxt=="\"") { i++; continue } else { endq=i; break }
-        }
+        if (ch=="\"") { nxt=substr(line,i+1,1); if (nxt=="\"") { i++; continue } else { endq=i; break } }
       }
       if (endq==0) return 0
-      path=substr(line,2,endq-2)
-      path=unquote_csv(path)
+      path=substr(line,2,endq-2); path=unquote_csv(path)
       rest=substr(line,endq+2)
     } else {
       c=index(line,","); if (c==0) return 0
-      path=substr(line,1,c-1)
-      rest=substr(line,c+1)
+      path=substr(line,1,c-1); rest=substr(line,c+1)
     }
     c=index(rest,","); if (c==0) return 0
     size_str=substr(rest,1,c-1); size_str=ltrim(rtrim(size_str)); rest=substr(rest,c+1)
     c=index(rest,","); if (c==0) return 0
     mtime_str=substr(rest,1,c-1); mtime_str=ltrim(rtrim(mtime_str)); rest=substr(rest,c+1)
-    # skip algo, keep hash (not needed here)
     PATH=path; SIZE=size_str+0; MTIME=mtime_str+0
     return 1
   }
@@ -129,71 +124,63 @@ awk -v csv="$CSV" -v report="$REPORT" -v outdir="$GROUPDIR" -v indexout="$INDEX_
   function flush_group(   detail, reclaim) {
     if (gcount<2) { gcount=0; return }
     if (first_size<minsize) { gcount=0; return }
-    if (wantprefix!="") {
-      if (hasprefix==0) { gcount=0; return }
-    }
+    if (wantprefix!="" && hasprefix==0) { gcount=0; return }
     detail = outdir "/group-" sprintf("%06d", gidx) ".detail"
-    # write index line: first_size, reclaim, count, path_to_detail
     reclaim = first_size * (gcount - 1)
     printf("%d\t%d\t%d\t%s\n", first_size, reclaim, gcount, detail) >> indexout
     groups_emitted++
     gcount=0; first_size=0; hasprefix=0
   }
 
-  BEGIN{
-    FS=","; OFS="\t"
-    # Load CSV
-    total_csv=0
-  }
+  BEGIN{ FS=","; OFS="\t"; total_csv=0; t0=systime() }
+
   FILENAME==csv {
-    if (NRcsv==0) { NRcsv++; next }     # skip header
+    if (NRcsv==0) { NRcsv++; next }
     if (parse_csv_line($0)) { size[PATH]=SIZE; mtime[PATH]=MTIME; total_csv++ }
-    if (total_csv % 20000 == 0) {
-      printf("... CSV loaded: %d rows\n", total_csv) > "/dev/stderr"
-    }
-    NRcsv++
-    next
+    if (total_csv % 20000 == 0) { printf("... CSV loaded: %d rows\n", total_csv) > "/dev/stderr"; fflush("/dev/stderr") }
+    NRcsv++; next
   }
+
   FILENAME==report {
     if ($0 ~ /^HASH[ ]/) {
-      # new group begin
       if (gidx>0) flush_group()
-      gidx++
-      gcount=0; first_size=0; hasprefix=0
+      gidx++; gcount=0; first_size=0; hasprefix=0
       if (gidx % 500 == 0) {
-        printf("... Report groups parsed: %d (files seen: %d)\n", gidx, files_seen) > "/dev/stderr"
+        elapsed = systime()-t0
+        pct = (total>0 ? int(gidx*100/total) : 0)
+        rate = (elapsed>0 ? gidx/elapsed : 0)
+        eta = (rate>0 && total>0 ? int((total-gidx)/rate) : 0)
+        printf("... Report groups parsed: %d/%d (%d%%) (files seen: %d) | elapsed=%s eta=%s\n",
+               gidx, total, pct, files_seen, hhmmss(elapsed), hhmmss(eta)) > "/dev/stderr"; fflush("/dev/stderr")
       }
       next
     }
     if ($0 ~ /^[ ]{2}/) {
-      f=$0; sub(/^[ ]+/, "", f)
-      if (f=="") next
+      f=$0; sub(/^[ ]+/, "", f); if (f=="") next
       s = (f in size ? size[f] : 0)
       t = (f in mtime ? mtime[f] : 0)
       detail = outdir "/group-" sprintf("%06d", gidx) ".detail"
       printf("%d\t%d\t%s\n", s, t, f) >> detail
-      gcount++
-      files_seen++
-      if (gcount==1) first_size=s
+      gcount++; files_seen++; if (gcount==1) first_size=s
       if (wantprefix!="" && index(f, wantprefix)==1) hasprefix=1
       next
     }
     next
   }
+
   END{
     if (gidx>0) flush_group()
-    printf("Loaded CSV rows: %d\n", total_csv) > "/dev/stderr"
-    printf("Parsed report groups: %d | Emitted indexed groups: %d | Files seen: %d\n", gidx, groups_emitted, files_seen) > "/dev/stderr"
+    printf("Loaded CSV rows: %d\n", total_csv) > "/dev/stderr"; fflush("/dev/stderr")
+    printf("Parsed report groups: %d/%d | Emitted indexed groups: %d | Files seen: %d\n",
+           gidx, total, groups_emitted, files_seen) > "/dev/stderr"; fflush("/dev/stderr")
   }
 ' "$CSV" "$REPORT"
 
-# Immediate feedback from the index step gets printed above.
-# Now sort index according to requested order.
+# Sort index by requested order
 if [[ ! -s "$INDEX_RAW" ]]; then
   echo "No duplicate groups match filters."
   exit 0
 fi
-
 case "$ORDER" in
   size)    sort -k1,1nr -k3,3nr "$INDEX_RAW" -o "$INDEX_SORTED" ;;
   reclaim) sort -k2,2nr -k1,1nr "$INDEX_RAW" -o "$INDEX_SORTED" ;;
@@ -207,32 +194,48 @@ echo "  • Limit:        $LIMIT"
 echo "  • Plan:         $PLAN"
 echo
 
-# ───────── Interactive review ─────────
-reviewed=0
-added_extras=0
-shown=0
+# ───────── Interactive review (read prompts from /dev/tty) ─────────
+# Open a TTY fd for prompts even though stdin is redirected by the while-read loop.
+TTY_FD=3
+if ! exec 3</dev/tty 2>/dev/null; then
+  # Fallback: if no TTY available, bail into non-interactive summary mode.
+  echo -e "${YELLOW}No /dev/tty available; running non-interactive. No choices will be recorded.${NC}"
+  echo "Run this script from an interactive terminal (ssh/tty) to select files."
+  exit 1
+fi
 
-pp_line() {
-  # args: size mtime path index width
+pp_line() { # args: size mtime path idx
   local s="$1" t="$2" p="$3" idx="$4"
   local when; when="$(fmt_epoch "$t")"
   printf "   %2d) %-19s  %s\n" "$idx" "$(pp_size "$s")" "$p"
   printf "       modified: %s\n" "$when"
 }
 
+shown=0
+added_extras=0
+
 while IFS=$'\t' read -r first_sz reclaim cnt detail; do
   ((shown++)); (( shown > LIMIT )) && break
   echo -e "${CYAN}[$shown/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
 
-  # Display group entries
+  # Display up to SHOW_EACH_MAX items
   i=0
+  hidden=0
   while IFS=$'\t' read -r s t p; do
     ((i++))
-    pp_line "$s" "$t" "$p" "$i"
+    if (( i <= SHOW_EACH_MAX )); then
+      pp_line "$s" "$t" "$p" "$i"
+    else
+      ((hidden++))
+    fi
   done < "$detail"
+  if (( hidden > 0 )); then
+    echo "       … and $hidden more not shown"
+  fi
 
   echo
-  read -r -p "Select the file ID to KEEP [1-$cnt], or 's' to skip, or 'q' to quit: " choice
+  printf "Select the file ID to KEEP [1-%d], 's' to skip, or 'q' to quit: " "$cnt" >&$TTY_FD
+  read -r choice <&$TTY_FD || choice=""
   if [[ -z "${choice:-}" || "$choice" == "s" || "$choice" == "S" ]]; then echo "  → Skipped."; echo; continue; fi
   if [[ "$choice" == "q" || "$choice" == "Q" ]]; then echo "  → Quitting early."; break; fi
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > cnt )); then echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; continue; fi
@@ -240,7 +243,6 @@ while IFS=$'\t' read -r first_sz reclaim cnt detail; do
   keep_idx="$choice"
   added_here=0
   j=0
-  # Re-read detail to write all extras (not the chosen keep)
   while IFS=$'\t' read -r s t p; do
     ((j++))
     if (( j == keep_idx )); then continue; fi
@@ -287,7 +289,7 @@ echo
 echo -e "${GREEN}[NEXT STEPS]${NC}"
 echo "  1) Review the plan:"
 echo "       less \"$PLAN\""
-echo "  2) Safer action — move extras to quarantine (preserve tree):"
-echo "       ./delete-duplicates.sh --from-plan \"$PLAN\" --force --quarantine \"quarantine-$DATE_TAG\""
+echo "  2) Move extras to quarantine (safe):"
+echo "       while IFS= read -r p; do mkdir -p \"quarantine-$DATE_TAG\$(dirname \"\$p\")\"; mv -n -- \"\$p\" \"quarantine-$DATE_TAG\$p\"; done < \"$PLAN\""
 echo "  3) Or delete extras (dangerous):"
-echo "       ./delete-duplicates.sh --from-plan \"$PLAN\" --force"
+echo "       xargs -0 rm -f -- < <(tr '\\n' '\\0' < \"$PLAN\")"
