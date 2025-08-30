@@ -5,8 +5,8 @@
 # This program comes with ABSOLUTELY NO WARRANTY.
 
 # review-duplicates.sh — Interactive review of duplicate groups (largest-first).
-# Fast indexing (single CSV + report pass). Interactive prompts from /dev/tty.
-# Index is read into memory (mapfile) to avoid stdin conflicts.
+# Fast indexing (single CSV + report pass). Prompts with standard `read -rp`.
+# Adds mirrored-folder detection and per-group folder summaries.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -30,6 +30,7 @@ FILTER_PREFIX=""      # only consider groups including any file under this prefi
 GROUP_DEPTH=2         # summary path depth
 TOP_N=10              # top-N summary after plan built
 SHOW_EACH_MAX=12      # show up to this many files per group in the UI
+FOLDER_DEPTH=3        # depth for folder summaries / mirror detection (/vol/Share/Sub=3)
 
 # Outputs
 PLAN="$LOGS_DIR/review-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
@@ -47,7 +48,7 @@ cat <<EOF
 Usage: $0 [--from-report FILE] [--from-csv FILE]
           [--order size|reclaim] [--limit N]
           [--min-size BYTES] [--filter-prefix PATH]
-          [--group-depth N] [--top N]
+          [--group-depth N] [--top N] [--folder-depth N]
           [-h|--help]
 EOF
 }
@@ -63,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --filter-prefix) FILTER_PREFIX="${2:-}"; shift ;;
     --group-depth)   GROUP_DEPTH="${2:-2}"; shift ;;
     --top)           TOP_N="${2:-10}"; shift ;;
+    --folder-depth)  FOLDER_DEPTH="${2:-3}"; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) echo -e "${YELLOW}Unknown option: $1${NC}"; usage; exit 2 ;;
   esac
@@ -82,6 +84,15 @@ TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
 # ───────── Helpers ─────────
 pp_size(){ b="$1"; u=(B KiB MiB GiB TiB PiB); i=0; while (( b>=1024 && i<${#u[@]}-1 )); do b=$(( (b+1023)/1024 )); i=$((i+1)); done; printf "%d %s" "$b" "${u[$i]}"; }
 fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
+prefix_of(){ # prefix_of PATH DEPTH -> echoes prefix
+  awk -v p="$1" -v d="$2" -F'/' 'BEGIN{c=0;s=""} { for(i=1;i<=NF;i++){ if($i=="") continue; c++; if(c<=d){ s=s "/" $i } } } END{ if(s=="") s="/"; print s }'
+}
+folder_counts(){ # reads paths on stdin, prints "COUNT\tPREFIX" sorted by COUNT desc
+  awk -v d="$FOLDER_DEPTH" -F'/' '
+    function pref(a, n, d,   i,c,s){ s=""; c=0; for(i=1;i<=n;i++){ if(a[i]=="")continue; c++; if(c<=d){ s=s "/" a[i] } } if(s=="") s="/"; return s }
+    { n=split($0,a,"/"); p=pref(a,n,d); g[p]++ } END{ for(k in g) printf("%d\t%s\n", g[k], k) }
+  ' | sort -k1,1nr
+}
 
 echo -e "${GREEN}Indexing CSV and duplicate report…${NC}"
 echo "  • CSV:     $CSV"
@@ -196,10 +207,9 @@ echo "  • Groups:       $INDEX_COUNT total"
 echo "  • Plan:         $PLAN"
 echo
 
-# ───────── Interactive review (array, prompts from /dev/tty) ─────────
-TTY_FD=3
-if ! exec 3</dev/tty 2>/dev/null; then
-  echo -e "${YELLOW}No /dev/tty available; run from a terminal to make selections.${NC}"
+# If stdin isn't a TTY, warn (we rely on it for prompts now)
+if [[ ! -t 0 ]]; then
+  echo -e "${YELLOW}No interactive TTY on stdin; run from an interactive terminal to make selections.${NC}"
   exit 1
 fi
 
@@ -210,8 +220,13 @@ pp_line() { # args: size mtime path idx
   printf "       modified: %s\n" "$when"
 }
 
-# Read the whole index into memory to avoid stdin conflicts
-mapfile -t INDEX_LINES < "$INDEX_SORTED"
+# Read the whole index into memory; fallback if `mapfile` missing
+INDEX_LINES=()
+if command -v mapfile >/dev/null 2>&1; then
+  mapfile -t INDEX_LINES < "$INDEX_SORTED"
+else
+  while IFS= read -r _ln; do INDEX_LINES+=("$_ln"); done < "$INDEX_SORTED"
+fi
 
 shown=0
 added_extras=0
@@ -223,36 +238,96 @@ for line in "${INDEX_LINES[@]}"; do
   ((shown++))
   echo -e "${CYAN}[$shown/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
 
+  # Load this group's items into arrays (so we can display + compute folder stats)
+  GROUP_LINES=()
+  if command -v mapfile >/dev/null 2>&1; then
+    mapfile -t GROUP_LINES < "$detail"
+  else
+    while IFS= read -r gl; do GROUP_LINES+=("$gl"); done < "$detail"
+  fi
+
+  paths=(); sizes=(); mtimes=()
+  for gl in "${GROUP_LINES[@]}"; do
+    IFS=$'\t' read -r s t p <<< "$gl"
+    sizes+=("$s"); mtimes+=("$t"); paths+=("$p")
+  done
+
   # Display up to SHOW_EACH_MAX items
-  i=0
-  hidden=0
-  while IFS=$'\t' read -r s t p; do
-    ((i++))
-    if (( i <= SHOW_EACH_MAX )); then
-      pp_line "$s" "$t" "$p" "$i"
-    else
-      ((hidden++))
-    fi
-  done < "$detail"
+  total_in_group=${#paths[@]}
+  to_show=$(( total_in_group < SHOW_EACH_MAX ? total_in_group : SHOW_EACH_MAX ))
+  for ((i=0;i<to_show;i++)); do
+    pp_line "${sizes[$i]}" "${mtimes[$i]}" "${paths[$i]}" "$((i+1))"
+  done
+  hidden=$(( total_in_group - to_show ))
   (( hidden > 0 )) && echo "       … and $hidden more not shown"
 
+  # Folder summary & mirror detection
+  {
+    for p in "${paths[@]}"; do echo "$p"; done | folder_counts
+  } > "$TMPROOT/group-$shown-folders.tsv"
+
+  echo "       Top folders (depth=$FOLDER_DEPTH):"
+  head -n 3 "$TMPROOT/group-$shown-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
+
+  mirror_hint=""
+  if (( $(wc -l < "$TMPROOT/group-$shown-folders.tsv" | tr -d ' ') == 2 )); then
+    a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$shown-folders.tsv")
+    b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$shown-folders.tsv")
+    a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+    b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+    if (( a_count == b_count && a_count + b_count == total_in_group )); then
+      mirror_hint="mirror"
+      echo "       Mirror folders suspected:"
+      echo "         [A] $a_pref  ($a_count files)"
+      echo "         [B] $b_pref  ($b_count files)"
+      echo "       Tip: type 'ka' to keep A (drop B-side), or 'kb' to keep B (drop A-side)."
+    fi
+  fi
+
   echo
-  printf "Select the file ID to KEEP [1-%d], 's' to skip, or 'q' to quit: " "$cnt" >&$TTY_FD
-  read -r choice <&$TTY_FD || choice=""
-  if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then echo "  → Skipped."; echo; continue; fi
-  if [[ "$choice" =~ ^[qQ]$ ]]; then echo "  → Quitting early."; break; fi
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > cnt )); then echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; continue; fi
+  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice
+
+  # Handle choice
+  if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then
+    echo "  → Skipped."; echo; continue
+  fi
+  if [[ "$choice" =~ ^[qQ]$ ]]; then
+    echo "  → Quitting early."; break
+  fi
+
+  added_here=0
+  if [[ "$choice" == "ka" || "$choice" == "kb" ]]; then
+    if [[ -f "$TMPROOT/group-$shown-folders.tsv" ]]; then
+      keep_pref=$(awk -F'\t' -v c="$choice" 'c=="ka"&&NR==1{print $2} c=="kb"&&NR==2{print $2}' "$TMPROOT/group-$shown-folders.tsv")
+      if [[ -n "$keep_pref" ]]; then
+        for p in "${paths[@]}"; do
+          if [[ "${p:0:${#keep_pref}}" != "$keep_pref" ]]; then
+            printf '%s\n' "$p" >> "$PLAN"
+            ((added_here++))
+          fi
+        done
+        ((added_extras+=added_here))
+        echo "  → Keeping folder '${keep_pref}'; added $added_here extras to plan."
+      else
+        echo -e "${YELLOW}  ! Could not resolve folder choice; skipping.${NC}"
+      fi
+    else
+      echo -e "${YELLOW}  ! No folder summary; skipping.${NC}"
+    fi
+    echo
+    continue
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > total_in_group )); then
+    echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; continue
+  fi
 
   keep_idx="$choice"
-  added_here=0
-  j=0
-  while IFS=$'\t' read -r s t p; do
-    ((j++))
-    (( j == keep_idx )) && continue
-    printf '%s\n' "$p" >> "$PLAN"
+  for ((j=0;j<total_in_group;j++)); do
+    (( j+1 == keep_idx )) && continue
+    printf '%s\n' "${paths[$j]}" >> "$PLAN"
     ((added_here++))
-  done < "$detail"
-
+  done
   ((added_extras+=added_here))
   echo "  → Keeping #$keep_idx; added $added_here extras to plan."
   echo
