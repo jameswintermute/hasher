@@ -1,311 +1,331 @@
-#!/usr/bin/env bash
-# delete-zero-length.sh — verify & delete/move zero-length files
-# Dry-run by default. Can quarantine instead of deleting.
-# Adds summary-by-path (top groups) for context.
+#!/bin/bash
+# delete-zero-length.sh — verify and delete/quarantine zero-length files from a list
+# Now supports hasher.conf-driven exclusions (optional) matching delete-low-value.sh:
+#   - Built-in excludes (always available; applied only if enabled): Thumbs.db, .DS_Store, Desktop.ini,
+#     and directories #recycle, @eaDir, .snapshot, .AppleDouble (case-insensitive).
+#   - Reads ZERO_APPLY_EXCLUDES from hasher.conf (default: false). CLI can override:
+#       --apply-excludes  (force enable)
+#       --no-excludes     (force disable)
+#   - Also reads EXCLUDES_FILE / EXCLUDE_BASENAMES / EXCLUDE_DIRS / EXCLUDE_GLOBS from hasher.conf.
+#   - CLI extras: --excludes-file FILE, --exclude PATTERN (repeatable), --list-excludes
+#
+# Usage:
+#   ./delete-zero-length.sh <listfile> [--verify-only] [--force] [--quarantine DIR]
+#                           [--apply-excludes|--no-excludes]
+#                           [--excludes-file FILE] [--exclude PATTERN] [--list-excludes]
+#
 set -Eeuo pipefail
-IFS=$'\n\t'
-LC_ALL=C
+IFS=$'\n\t'; LC_ALL=C
 
-# ────────────── Defaults ──────────────
-LOGS_DIR="logs"
+# ── Setup ──────────────────────────────────────────────────────────────────────
+LOG_DIR="logs"
 ZERO_DIR="zero-length"
-DATE_TAG="$(date +'%Y-%m-%d')"
-SUMMARY_LOG="$LOGS_DIR/delete-zero-length-$DATE_TAG.log"
-RUN_ID="$( (command -v uuidgen >/dev/null 2>&1 && uuidgen) || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s)-$$" )"
+mkdir -p "$LOG_DIR" "$ZERO_DIR"
 
-FORCE=false
-ASSUME_YES=false
-QUARANTINE_DIR=""
-GROUP_DEPTH=2     # how many leading path components to group by (e.g. /vol/share = 2)
-TOP_N=10          # how many top groups to print in console
-SHOW_PATH_SUMMARY=true
+# Run ID (no uuidgen dependency)
+if [ -r /proc/sys/kernel/random/uuid ]; then
+  RUN_ID="$(cat /proc/sys/kernel/random/uuid)"
+else
+  RUN_ID="$(date +%s)-$$-$RANDOM"
+fi
 
-# ────────────── Colors ──────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+# ── Logging ───────────────────────────────────────────────────────────────────
+ts() { date +"%Y-%m-%d %H:%M:%S"; }
+log() { printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
+log_info(){ log "INFO"  "$*"; }
+log_warn(){ log "WARN"  "$*"; }
+log_error(){ log "ERROR" "$*"; }
 
-log() {
-  local lvl="$1"; shift; local msg="$*"
-  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
-  printf '[%s] [RUN %s] [%s] %s\n' "$ts" "$RUN_ID" "$lvl" "$msg" | tee -a "$SUMMARY_LOG" >&2
+# ── Exclusion engine (shared style with delete-low-value.sh) ───────────────────
+# Built-in case-insensitive basename excludes
+declare -a EX_BASENAMES=( "thumbs.db" ".ds_store" "desktop.ini" )
+# Built-in case-insensitive directory substrings to avoid (match anywhere in path)
+declare -a EX_SUBSTRINGS=( "/#recycle/" "/@eadir/" "/.snapshot/" "/.appledouble/" )
+# User-specified glob patterns (case-insensitive against full paths)
+declare -a EX_GLOBS=()
+
+# Lowercase helper
+to_lc(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+has_glob_meta(){ case "$1" in *'*'*|*'?'*|*'['*']'* ) return 0 ;; * ) return 1 ;; esac; }
+add_ex_glob(){
+  local p_lc="$(to_lc "$1")"
+  if has_glob_meta "$p_lc"; then EX_GLOBS+=( "$p_lc" ); else EX_GLOBS+=( "*${p_lc}*" ); fi
 }
 
-usage() {
-cat <<EOF
-Usage: $0 [<pathlist.txt>] [--force] [--quarantine DIR] [--yes]
-          [--group-depth N] [--top N] [--no-path-summary] [-h|--help]
+load_excludes_file(){
+  local file="$1"; [ -r "$file" ] || return 1
+  local count=0
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="${raw%$'\r'}"
+    case "$line" in ""|\#*) continue ;; esac
+    add_ex_glob "$line"; count=$((count+1))
+  done < "$file"
+  log_info "Loaded $count exclude pattern(s) from: $file"
+  return 0
+}
 
-Behavior:
-  • Dry-run by default. Verifies input list, writes a verified plan, shows a
-    summary (including top directories by count), and prints a ready-to-run cmd.
-  • With --force, acts immediately on the newly generated verified plan.
-  • Use --quarantine DIR with --force to move files under DIR (preserves path)
-    instead of deleting.
+discover_hasher_excludes(){
+  for cand in "excludes.txt" "exclude-paths.txt" "exclude-globs.txt"; do
+    if [ -r "$cand" ]; then load_excludes_file "$cand" && return 0; fi
+  done
+  if [ -r "hasher.conf" ]; then
+    local hint=""
+    hint="$(awk -F= '/^(EXCLUDES_FILE|EXCLUDE_FILE|EXCLUDE_LIST)[ \t]*=/{print $2; exit }' hasher.conf | sed 's/^[ \t"'\'' ]*//; s/[ \t"'\'' ]*$//')"
+    if [ -n "$hint" ] && [ -r "$hint" ]; then load_excludes_file "$hint" && return 0; fi
+  fi
+  return 1
+}
 
-Examples:
-  # Auto-pick latest report (prefers verified-*.txt, else zero-length-*.txt, else logs/zero-length-*.txt)
-  $0
+is_excluded(){
+  # $1: path
+  local p="$1"; local p_lc; p_lc="$(to_lc "$p")"
+  local base; base="$(basename -- "$p")"; local base_lc; base_lc="$(to_lc "$base")"
 
-  # Use explicit input (dry-run):
-  $0 "zero-length/zero-length-$DATE_TAG.txt"
+  # Basename exacts
+  for b in "${EX_BASENAMES[@]}"; do [ "$base_lc" = "$b" ] && return 0; done
+  # Path substrings
+  for s in "${EX_SUBSTRINGS[@]}"; do case "$p_lc" in *"$s"*) return 0 ;; esac; done
+  # User globs
+  for g in "${EX_GLOBS[@]:-}"; do case "$p_lc" in $g) return 0 ;; esac; done
 
-  # Act now (delete) using auto-picked input:
-  $0 --force
+  return 1
+}
 
-  # Act now (quarantine) preserving path under the given directory:
-  $0 "zero-length/zero-length-$DATE_TAG.txt" --force --quarantine "zero-length/quarantine-$DATE_TAG"
+# ── Args ──────────────────────────────────────────────────────────────────────
+INPUT_LIST=""
+FORCE=false
+VERIFY_ONLY=false
+QUARANTINE_DIR=""
+APPLY_EXCLUDES=""   # tri-state: "", true, false
+EXCLUDES_FILE_OPT=""
+EXTRA_EXCLUDES=()
+LIST_EXCLUDES=false
+
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --force) FORCE=true ;;
+    --verify-only) VERIFY_ONLY=true ;;
+    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
+    --apply-excludes) APPLY_EXCLUDES=true ;;
+    --no-excludes) APPLY_EXCLUDES=false ;;
+    --excludes-file) EXCLUDES_FILE_OPT="${2:-}"; shift ;;
+    --exclude) EXTRA_EXCLUDES+=( "${2:-}" ); shift ;;
+    --list-excludes) LIST_EXCLUDES=true ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: delete-zero-length.sh <listfile> [options]
 
 Options:
-  --force                 Actually delete/move verified files (otherwise dry-run)
-  --quarantine DIR        Move verified files into DIR (preserve absolute path under DIR)
-  -y, --yes               Assume "yes" to confirmations (useful for non-interactive)
-  --group-depth N         Group summary by first N path components (default: $GROUP_DEPTH)
-  --top N                 Show top N groups in console (default: $TOP_N)
-  --no-path-summary       Skip path grouping summary
-  -h, --help              Show this help
+  --verify-only            Only verify and build a plan; do not delete or move
+  --force                  Execute deletions/quarantine using the verified plan
+  --quarantine DIR         Move files to DIR instead of deleting
+
+  # Exclusions (optional; off by default unless enabled via hasher.conf or --apply-excludes)
+  --apply-excludes         Apply hasher/external excludes to zero-length processing
+  --no-excludes            Do not apply excludes (overrides config)
+  --excludes-file FILE     Load additional case-insensitive glob patterns (one per line)
+  --exclude PATTERN        Add an inline exclude glob (may repeat). Matches FULL path, case-insensitive.
+  --list-excludes          Print the active exclusion rules and exit
+
+Notes:
+  - Exclusion matching is case-insensitive. Plain tokens without *,?,[ are wrapped as *token*.
+  - ZERO_APPLY_EXCLUDES in hasher.conf can enable excludes by default for zero-length processing.
 EOF
-}
-
-# ────────────── Arg parsing ──────────────
-INPUT_FILE="${1:-}"
-if [[ "${INPUT_FILE:-}" == "--"* || "${INPUT_FILE:-}" == "-h" || -z "${INPUT_FILE:-}" ]]; then
-  INPUT_FILE=""
-fi
-if [[ -n "${INPUT_FILE:-}" ]]; then shift || true; fi
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --force) FORCE=true ;;
-    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
-    -y|--yes) ASSUME_YES=true ;;
-    --group-depth) GROUP_DEPTH="${2:-2}"; shift ;;
-    --top) TOP_N="${2:-10}"; shift ;;
-    --no-path-summary) SHOW_PATH_SUMMARY=false ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo -e "${YELLOW}Unknown option: $1${NC}" >&2; usage; exit 2 ;;
+      exit 0 ;;
+    *)
+      if [ -z "$INPUT_LIST" ]; then INPUT_LIST="${1:-}"; else log_error "Unexpected argument: $1"; exit 2; fi
+      ;;
   esac
-  shift
+  shift || true
 done
 
-mkdir -p "$LOGS_DIR" "$ZERO_DIR"
+[ -n "$INPUT_LIST" ] || { log_error "No input list provided."; exit 2; }
+[ -r "$INPUT_LIST" ]  || { log_error "Input list not readable: $INPUT_LIST"; exit 2; }
 
-# ────────────── Helpers ──────────────
-count_lines() { [[ -f "$1" ]] && wc -l <"$1" | tr -d ' ' || echo 0; }
-short_id() { local s="$1"; s="${s%.txt}"; s="${s##*-}"; printf '%s' "${s:0:8}"; }
-first_date_in_name() { printf '%s' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1 || true; }
+SUMMARY_LOG="${LOG_DIR}/delete-zero-length-$(date +'%Y-%m-%d').log"
+VERIFIED_PLAN="${ZERO_DIR}/verified-zero-length-$(date +'%Y-%m-%d')-${RUN_ID}.txt"
+: > "$VERIFIED_PLAN"
 
-pick_reports() {
-  # newest first; limit 10
-  local list=()
-  mapfile -t list < <(ls -1t zero-length/verified-zero-length-*.txt 2>/dev/null | head -n 10 || true)
-  if (( ${#list[@]} == 0 )); then
-    mapfile -t list < <(ls -1t zero-length/zero-length-*.txt 2>/dev/null | head -n 10 || true)
-  else
-    # also include raw zero-length and logs if room (helpful if verified empty)
-    local raw; mapfile -t raw < <(ls -1t zero-length/zero-length-*.txt 2>/dev/null | head -n 10 || true)
-    list+=("${raw[@]}")
-  fi
-  if (( ${#list[@]} == 0 )); then
-    mapfile -t list < <(ls -1t logs/zero-length-*.txt 2>/dev/null | head -n 10 || true)
-  else
-    local zlog; mapfile -t zlog < <(ls -1t logs/zero-length-*.txt 2>/dev/null | head -n 10 || true)
-    list+=("${zlog[@]}")
-  fi
+# ── Read config from hasher.conf ──────────────────────────────────────────────
+ZERO_APPLY_EXCLUDES=false
+if [ -r "hasher.conf" ]; then
+  z="$(awk -F= '/^[[:space:]]*ZERO_APPLY_EXCLUDES[[:space:]]*=/{print $2; exit}' hasher.conf | tr -d '\r\n"'\''[:space:]' | tr '[:upper:]' '[:lower:]')"
+  case "$z" in (true|1|yes|y|on) ZERO_APPLY_EXCLUDES=true ;; esac
 
-  # unique + cap at 10
-  awk 'BEGIN{FS="\n"}{print}' <<<"${list[*]}" | awk '!seen[$0]++' | head -n 10
-}
+  # Excludes file
+  cf="$(awk -F= '/^[[:space:]]*(EXCLUDES_FILE|EXCLUDE_FILE|EXCLUDE_LIST)[[:space:]]*=/{print $2; exit}' hasher.conf | sed 's/^[[:space:]"'\'' ]*//; s/[[:space:]"'\'' ]*$//')"
+  [ -z "$EXCLUDES_FILE_OPT" ] && EXCLUDES_FILE_OPT="$cf"
 
-# ────────────── Input selection ──────────────
-if [[ -z "${INPUT_FILE:-}" ]]; then
-  mapfile -t CANDIDATES < <(pick_reports)
-  if (( ${#CANDIDATES[@]} == 0 )); then
-    log ERROR "No report files found (expected zero-length/verified-*.txt or zero-length-*.txt or logs/zero-length-*.txt)."
-    exit 1
+  # Extra basenames
+  bline="$(awk -F= '/^[[:space:]]*EXCLUDE_BASENAMES[[:space:]]*=/{print $2; exit}' hasher.conf)"
+  if [ -n "$bline" ]; then
+    bclean="$(echo "$bline" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"
+    IFS=',' read -r -a extra_b <<< "$bclean"
+    for x in "${extra_b[@]:-}"; do
+      xlc="$(echo "$x" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$xlc" ] && EX_BASENAMES+=( "$xlc" )
+    done
   fi
 
-  echo "Select input report (showing ${#CANDIDATES[@]} of ${#CANDIDATES[@]} most recent):"
-  i=1
-  for f in "${CANDIDATES[@]}"; do
-    typ="raw"; src="zero-length"
-    base="$(basename "$f")"
-    date="$(first_date_in_name "$base")"
-    cnt="$(count_lines "$f")"
-    if [[ "$base" == verified-zero-length-* ]]; then typ="verified"; src="zero-length"; sid="$(short_id "$base")"; printf "  %2d) %-9s • %s • zero-length • id=%s  (%d entries)\n" "$i" "$typ" "$date" "$sid" "$cnt"
-    elif [[ "$f" == logs/* ]]; then typ="raw"; src="logs"; printf "  %2d) %-9s • %s • logs         (%d entries)\n" "$i" "$typ" "$date" "$cnt"
-    else printf "  %2d) %-9s • %s • zero-length  (%d entries)\n" "$i" "$typ" "$date" "$cnt"
-    fi
-    i=$((i+1))
-  done
-
-  if $ASSUME_YES; then sel=1
-  else
-    read -r -p "Enter number [1-${#CANDIDATES[@]}] (default 1): " sel || true
-    sel="${sel:-1}"
+  # Extra directory substrings
+  dline="$(awk -F= '/^[[:space:]]*EXCLUDE_DIRS[[:space:]]*=/{print $2; exit}' hasher.conf)"
+  if [ -n "$dline" ]; then
+    dclean="$(echo "$dline" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"
+    IFS=',' read -r -a extra_d <<< "$dclean"
+    for x in "${extra_d[@]:-}"; do
+      xlc="$(echo "$x" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$xlc" ] && EX_SUBSTRINGS+=( "/${xlc}/" )
+    done
   fi
 
-  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#CANDIDATES[@]} )); then
-    log ERROR "Invalid selection."; exit 2
-  fi
-  INPUT_FILE="${CANDIDATES[$((sel-1))]}"
-  log INFO "Auto-selected input: $INPUT_FILE"
-  if ! $ASSUME_YES; then
-    read -r -p "Use \"$INPUT_FILE\"? [Y/n] " yn || true
-    case "${yn,,}" in n|no) echo "Aborted."; exit 0;; esac
+  # Extra globs
+  gline="$(awk -F= '/^[[:space:]]*EXCLUDE_GLOBS[[:space:]]*=/{print $2; exit}' hasher.conf)"
+  if [ -n "$gline" ]; then
+    gclean="$(echo "$gline" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"
+    IFS=',' read -r -a extra_g <<< "$gclean"
+    for x in "${extra_g[@]:-}"; do
+      xtrim="$(echo "$x" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$xtrim" ] && add_ex_glob "$xtrim"
+    done
   fi
 fi
 
-if [[ ! -r "$INPUT_FILE" ]]; then
-  log ERROR "Cannot read input list: $INPUT_FILE"
-  exit 1
+# Decide whether to apply excludes (CLI overrides config)
+if [ -z "$APPLY_EXCLUDES" ]; then
+  $ZERO_APPLY_EXCLUDES && APPLY_EXCLUDES=true || APPLY_EXCLUDES=false
 fi
 
-# ────────────── Verify input → write verified plan ──────────────
-MODE="DRY-RUN"; $FORCE && MODE="EXECUTE"
-log INFO "Mode: $MODE ${FORCE:+(will ${QUARANTINE_DIR:+move to quarantine}${QUARANTINE_DIR:+" "}"$QUARANTINE_DIR"${QUARANTINE_DIR:+" "}||delete)}"
-log INFO "Verifying zero-length files…"
-log INFO "Input list: $INPUT_FILE"
-log INFO "Summary log: $SUMMARY_LOG"
-log INFO "Run-ID: $RUN_ID"
-
-VERIFIED="$ZERO_DIR/verified-zero-length-$DATE_TAG-$RUN_ID.txt"
-: > "$VERIFIED"
-
-total_in=0
-missing=0
-notreg=0
-notzero=0
-verified_now=0
-
-# progress printing cadence
-STEP=200
-
-while IFS= read -r f || [[ -n "$f" ]]; do
-  [[ -z "$f" ]] && continue
-  total_in=$((total_in+1))
-  if (( total_in % STEP == 0 )); then
-    printf '\rVerifying… %d checked' "$total_in" >&2
-  fi
-
-  if [[ ! -e "$f" ]]; then
-    missing=$((missing+1))
-    continue
-  fi
-  if [[ ! -f "$f" ]]; then
-    notreg=$((notreg+1))
-    continue
-  fi
-  if [[ -s "$f" ]]; then
-    notzero=$((notzero+1))
-    continue
-  fi
-  printf '%s\n' "$f" >> "$VERIFIED"
-  verified_now=$((verified_now+1))
-done < "$INPUT_FILE"
-printf '\r' >&2 || true
-
-log INFO "Verification complete."
-log INFO "  • Input entries considered: $total_in"
-log INFO "  • Missing paths: $missing"
-log INFO "  • Not regular files: $notreg"
-log INFO "  • No longer zero-length: $notzero"
-log INFO "  • Verified zero-length now: $verified_now"
-log INFO "Verified plan file: $VERIFIED"
-
-# ────────────── Summary by path (top groups) ──────────────
-if $SHOW_PATH_SUMMARY && (( verified_now > 0 )); then
-  SUMMARY_TSV="$LOGS_DIR/delete-zero-length-summary-$DATE_TAG-$RUN_ID.tsv"
-  awk -v d="$GROUP_DEPTH" -F'/' '
-    BEGIN{OFS="/"}
-    {
-      if ($0=="") next
-      k=""; c=0
-      for (i=1;i<=NF;i++){
-        if($i=="") continue
-        c++
-        if (c<=d) { k=k "/" $i } else { break }
-      }
-      count[k]++
-    }
-    END{
-      for (k in count) printf "%s\t%d\n", k, count[k]
-    }
-  ' "$VERIFIED" | sort -k2,2nr > "$SUMMARY_TSV" || true
-
-  log INFO "Summary by path (depth=$GROUP_DEPTH) written to: $SUMMARY_TSV"
-
-  echo -e "${GREEN}Top $TOP_N groups (depth=$GROUP_DEPTH):${NC}"
-  i=0
-  while IFS=$'\t' read -r path cnt; do
-    i=$((i+1))
-    pct=$(( cnt * 100 / verified_now ))
-    printf "  %2d) %-50s  %6d files  (%3d%%)\n" "$i" "$path" "$cnt" "$pct"
-    (( i>=TOP_N )) && break || true
-  done < "$SUMMARY_TSV"
-  echo
+# Load excludes from files if requested / available
+if [ -n "$EXCLUDES_FILE_OPT" ]; then
+  load_excludes_file "$EXCLUDES_FILE_OPT" || log_warn "Could not read excludes file: $EXCLUDES_FILE_OPT"
+else
+  discover_hasher_excludes || true
 fi
+for pat in "${EXTRA_EXCLUDES[@]:-}"; do add_ex_glob "$pat"; done
 
-# If dry-run, print ready-to-run
-if ! $FORCE; then
-  echo -e "${GREEN}[DRY-RUN SUMMARY]${NC}"
-  echo "  Verified zero-length files: $verified_now"
-  echo "  Ready to act using the verified plan:"
-  echo "    Delete:"
-  echo "      $0 \"$VERIFIED\" --force"
-  echo "    Quarantine:"
-  echo "      $0 \"$VERIFIED\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+if $LIST_EXCLUDES; then
+  echo "Active excludes (apply=${APPLY_EXCLUDES}):"
+  echo "  Basenames:"; for b in "${EX_BASENAMES[@]}"; do echo "    - $b"; done
+  echo "  Dir substrings:"; for s in "${EX_SUBSTRINGS[@]}"; do echo "    - $s"; done
+  echo "  Glob patterns:"; for g in "${EX_GLOBS[@]:-}"; do echo "    - $g"; done
   exit 0
 fi
 
-# ────────────── Execute (delete or quarantine) ──────────────
-act_delete=0
-act_move=0
-act_fail=0
-
-if [[ -n "$QUARANTINE_DIR" ]]; then
-  mkdir -p "$QUARANTINE_DIR"
-fi
-
-if ! $ASSUME_YES; then
-  echo
-  if [[ -n "$QUARANTINE_DIR" ]]; then
-    read -r -p "Move $verified_now files to quarantine \"$QUARANTINE_DIR\"? [y/N] " yn || true
-  else
-    read -r -p "Permanently delete $verified_now files? [y/N] " yn || true
-  fi
-  case "${yn,,}" in y|yes) : ;; *) echo "Aborted."; exit 0;; esac
-fi
-
-while IFS= read -r f || [[ -n "$f" ]]; do
-  [[ -z "$f" ]] && continue
-  if [[ -n "$QUARANTINE_DIR" ]]; then
-    rel="${f#/}"                    # strip leading slash
-    dest="$QUARANTINE_DIR/$rel"
-    mkdir -p "$(dirname "$dest")" || { act_fail=$((act_fail+1)); continue; }
-    if mv -n -- "$f" "$dest" 2>/dev/null; then
-      act_move=$((act_move+1))
-    else
-      act_fail=$((act_fail+1))
-    fi
-  else
-    if rm -f -- "$f" 2>/dev/null; then
-      act_delete=$((act_delete+1))
-    else
-      act_fail=$((act_fail+1))
-    fi
-  fi
-done < "$VERIFIED"
-
-echo
-log INFO "Execution complete."
-if [[ -n "$QUARANTINE_DIR" ]]; then
-  log INFO "  • Moved to quarantine: $act_move"
+# ── Mode banner ───────────────────────────────────────────────────────────────
+if $VERIFY_ONLY; then
+  log_info "Mode: VERIFY-ONLY (no deletes or moves will occur)"
+elif ! $FORCE; then
+  hint="delete"; [ -n "$QUARANTINE_DIR" ] && hint="quarantine to '$QUARANTINE_DIR'"
+  log_info "Mode: DRY-RUN (will $hint)"
 else
-  log INFO "  • Deleted: $act_delete"
-fi
-log INFO "  • Failed actions: $act_fail"
-log INFO "  • Verified plan was: $VERIFIED"
-if [[ -n "$QUARANTINE_DIR" ]]; then
-  log INFO "Quarantine root: $QUARANTINE_DIR"
+  hint="delete"; [ -n "$QUARANTINE_DIR" ] && hint="quarantine to '$QUARANTINE_DIR'"
+  log_info "Mode: EXECUTE (will $hint)"
 fi
 
-echo -e "${GREEN}Done.${NC}"
+$APPLY_EXCLUDES && log_info "Exclusions: ENABLED (per CLI/config)" || log_info "Exclusions: DISABLED"
+
+log_info "Verifying zero-length files…"
+log_info "Input list: $INPUT_LIST"
+log_info "Summary log: $SUMMARY_LOG"
+log_info "Run-ID: $RUN_ID"
+
+# ── CRLF detection ────────────────────────────────────────────────────────────
+has_crlf=false; grep -q $'\r' "$INPUT_LIST" && has_crlf=true
+
+# ── Verification pass ─────────────────────────────────────────────────────────
+considered=0; excluded=0; missing=0; not_regular=0; not_zero_now=0; verified=0
+: > "$VERIFIED_PLAN"
+
+# Read lines safely (trim trailing CR, skip blanks/comments)
+while IFS= read -r rawline || [ -n "$rawline" ]; do
+  line=${rawline%$'\r'}
+  [ -z "$line" ] && continue
+  case "$line" in \#*) continue ;; esac
+
+  considered=$((considered+1))
+
+  if $APPLY_EXCLUDES && is_excluded "$line"; then
+    excluded=$((excluded+1))
+    continue
+  fi
+
+  if [ ! -e "$line" ]; then
+    missing=$((missing+1)); continue
+  fi
+
+  if [ ! -f "$line" ]; then
+    not_regular=$((not_regular+1)); continue
+  fi
+
+  if [ ! -s "$line" ]; then
+    printf '%s\n' "$line" >> "$VERIFIED_PLAN"
+    verified=$((verified+1))
+  else
+    not_zero_now=$((not_zero_now+1))
+  fi
+done < "$INPUT_LIST"
+
+if $has_crlf; then
+  log_warn "Input list has Windows (CRLF) line endings; handled safely during read."
+  log_warn "To normalise on disk: sed -i 's/\\r$//' \"$INPUT_LIST\""
+fi
+
+if [ "$missing" -gt 0 ] && [ "$missing" -eq "$considered" ]; then
+  log_warn "All entries appear missing. Common causes:"
+  log_warn "  • CRLF endings in the list (run: sed -i 's/\\r$//' \"$INPUT_LIST\")"
+  log_warn "  • Paths moved/renamed after the scan"
+fi
+
+log_info "Verification complete."
+log_info "  • Input entries considered: $considered"
+$APPLY_EXCLUDES && log_info "  • Excluded by rules: $excluded"
+log_info "  • Missing paths: $missing"
+log_info "  • Not regular files: $not_regular"
+log_info "  • No longer zero-length: $not_zero_now"
+log_info "  • Verified zero-length now: $verified"
+log_info "Verified plan file: $VERIFIED_PLAN"
+
+if $VERIFY_ONLY; then
+  printf "[VERIFY-ONLY SUMMARY]\n"
+  printf "  Verified zero-length files: %s\n" "$verified"
+  printf "  Next: ./delete-zero-length.sh \"%s\"\n" "$INPUT_LIST"
+  exit 0
+fi
+
+# ── DRY-RUN OR EXECUTE ────────────────────────────────────────────────────────
+if ! $FORCE; then
+  printf "[DRY-RUN SUMMARY]\n"
+  printf "  Verified zero-length files: %s\n" "$verified"
+  printf "  Ready to act using the verified plan:\n"
+  printf "    Delete:\n"
+  printf "      ./delete-zero-length.sh \"%s\" --force%s\n" "$INPUT_LIST" $($APPLY_EXCLUDES && echo " --apply-excludes" || echo "")
+  printf "    Quarantine:\n"
+  printf "      ./delete-zero-length.sh \"%s\" --force --quarantine \"zero-length/quarantine-$(date +%F)\"%s\n" "$INPUT_LIST" $($APPLY_EXCLUDES && echo " --apply-excludes" || echo "")
+  exit 0
+fi
+
+# ── Ensure quarantine dir if set ──────────────────────────────────────────────
+[ -n "$QUARANTINE_DIR" ] && mkdir -p "$QUARANTINE_DIR"
+
+# ── Execute actions ───────────────────────────────────────────────────────────
+acted=0; errs=0
+while IFS= read -r path || [ -n "$path" ]; do
+  [ -z "$path" ] && continue
+  if [ -n "$QUARANTINE_DIR" ]; then
+    dest="${QUARANTINE_DIR%/}/$(basename "$path")"
+    if mv -f -- "$path" "$dest" 2>>"$SUMMARY_LOG"; then
+      log_info "Quarantined: $path -> $dest"; acted=$((acted+1))
+    else
+      log_error "Failed to quarantine: $path"; errs=$((errs+1))
+    fi
+  else
+    if rm -f -- "$path" 2>>"$SUMMARY_LOG"; then
+      log_info "Deleted: $path"; acted=$((acted+1))
+    else
+      log_error "Failed to delete: $path"; errs=$((errs+1))
+    fi
+  fi
+done < "$VERIFIED_PLAN"
+
+log_info "Execution complete. Acted on: $acted, errors: $errs"
+exit 0
