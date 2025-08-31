@@ -1,382 +1,277 @@
 #!/bin/bash
-# Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
-# This program comes with ABSOLUTELY NO WARRANTY.
-
-# review-duplicates.sh — Interactive review of duplicate groups (largest-first).
-# Synology/BusyBox-friendly; no mapfile; reads prompts from /dev/tty.
-# Key fixes:
-#  - Do NOT redirect stdin to the index file. Use FD 3 for file reads; keep stdin as TTY.
-#  - Trim stray CRs; validate fields; verify .detail exists before reading.
-#  - Live progress while indexing; mirror-folder helpers (ka/kb).
-
+# review-duplicates.sh — build a deletion PLAN for duplicate files
+# - Reads a duplicates report (CSV: hash,size,path OR whitespace: hash size path)
+# - Prefilters "low-value" groups (size <= LOW_VALUE_THRESHOLD_BYTES from hasher.conf, default 0)
+#     → diverted to low-value/low-value-candidates-<date>-<RUN_ID>.txt
+# - Presents remaining groups for review (interactive by default), or auto-keep by policy
+# - Emits a plan file: logs/review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt (one path per line to delete)
+#
+# Example:
+#   ./review-duplicates.sh --from-report logs/2025-08-30-duplicate-hashes.txt --keep newest --limit 100
+#
 set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
 
-# ───────── Config ─────────
-HASHES_DIR="hashes"
-LOGS_DIR="logs"
-DATE_TAG="$(date +'%Y-%m-%d')"
-RUN_ID="$(( (RANDOM<<16) ^ (RANDOM<<1) ^ $$ ))"
+# ── Logging ───────────────────────────────────────────────────────────────────
+ts() { date +"%Y-%m-%d %H:%M:%S"; }
+if [ -r /proc/sys/kernel/random/uuid ]; then
+  RUN_ID="$(cat /proc/sys/kernel/random/uuid)"
+else
+  RUN_ID="$(date +%s)-$$-$RANDOM"
+fi
+log() { printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
+log_info(){ log "INFO"  "$*"; }
+log_warn(){ log "WARN"  "$*"; }
+log_error(){ log "ERROR" "$*"; }
 
-# Inputs (auto-picked if not provided)
-REPORT="$(ls -1t "$LOGS_DIR"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
-CSV="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+# ── Args ──────────────────────────────────────────────────────────────────────
+REPORT_FILE=""
+KEEP_POLICY="none"   # none|newest|oldest|path-prefer=REGEX
+LIMIT=100
+ORDER="size-desc"    # size-desc|size-asc
+NON_INTERACTIVE=false
 
-# Review parameters
-ORDER="size"          # size|reclaim   (largest-first)
-LIMIT=100             # max groups to walk through interactively
-MIN_SIZE=0            # ignore dup groups where per-file size < MIN_SIZE
-FILTER_PREFIX=""      # only consider groups including any file under this prefix (optional)
-GROUP_DEPTH=2         # summary path depth for final TSV
-TOP_N=10              # top-N summary after plan built
-SHOW_EACH_MAX=12      # show up to this many files per group in the UI
-FOLDER_DEPTH=3        # depth for folder summaries / mirror detection (/vol/Share/Sub=3)
+usage(){
+cat <<'EOF'
+Usage: review-duplicates.sh --from-report <file> [options]
 
-# Outputs
-PLAN="$LOGS_DIR/review-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
-SUMMARY_TSV="$LOGS_DIR/review-duplicates-summary-$DATE_TAG-$RUN_ID.tsv"
-TMPROOT="$LOGS_DIR/review-groups-$DATE_TAG-$RUN_ID"
-GROUPDIR="$TMPROOT/groups"
-INDEX_RAW="$TMPROOT/groups-index-raw.tsv"
-INDEX_SORTED="$TMPROOT/groups-sorted.tsv"
+Options:
+  --keep newest|oldest|path-prefer=REGEX|none
+  --limit N                 Review at most N groups (default: 100)
+  --order size-desc|size-asc
+  --non-interactive         Apply --keep policy across all groups without prompting
+  --plan-out FILE           Override default plan path
+  -h, --help                Show this help
 
-# Colors
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-
-usage() {
-cat <<EOF
-Usage: $0 [--from-report FILE] [--from-csv FILE]
-          [--order size|reclaim] [--limit N]
-          [--min-size BYTES] [--filter-prefix PATH]
-          [--group-depth N] [--top N] [--folder-depth N]
-          [-h|--help]
+Notes:
+  • "Low-value" groups (size <= LOW_VALUE_THRESHOLD_BYTES in hasher.conf) are diverted
+    to low-value/low-value-candidates-<date>-<RUN_ID>.txt and NOT shown in the review UI.
+  • The plan file contains paths to DELETE. No deletions happen in this script.
 EOF
 }
 
-# ───────── Args ─────────
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --from-report)   REPORT="${2:-}"; shift ;;
-    --from-csv)      CSV="${2:-}"; shift ;;
-    --order)         ORDER="${2:-size}"; shift ;;
-    --limit)         LIMIT="${2:-100}"; shift ;;
-    --min-size)      MIN_SIZE="${2:-0}"; shift ;;
-    --filter-prefix) FILTER_PREFIX="${2:-}"; shift ;;
-    --group-depth)   GROUP_DEPTH="${2:-2}"; shift ;;
-    --top)           TOP_N="${2:-10}"; shift ;;
-    --folder-depth)  FOLDER_DEPTH="${2:-3}"; shift ;;
-    -h|--help)       usage; exit 0 ;;
-    *) echo -e "${YELLOW}Unknown option: $1${NC}"; usage; exit 2 ;;
+PLAN_OUT=""
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --from-report) REPORT_FILE="${2:-}"; shift ;;
+    --keep) KEEP_POLICY="${2:-}"; shift ;;
+    --limit) LIMIT="${2:-100}"; shift ;;
+    --order) ORDER="${2:-size-desc}"; shift ;;
+    --non-interactive) NON_INTERACTIVE=true ;;
+    --plan-out) PLAN_OUT="${2:-}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) log_error "Unknown argument: $1"; usage; exit 2 ;;
   esac
-  shift
+  shift || true
 done
 
-mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$GROUPDIR"
-: > "$PLAN"
-: > "$SUMMARY_TSV"
+[ -n "$REPORT_FILE" ] || { log_error "Missing --from-report"; exit 2; }
+[ -r "$REPORT_FILE" ] || { log_error "Report not readable: $REPORT_FILE"; exit 2; }
 
-# ───────── Sanity ─────────
-[[ -n "$REPORT" && -r "$REPORT" ]] || { echo "ERROR: No readable duplicate report (run find-duplicates.sh)"; exit 1; }
-[[ -n "$CSV"    && -r "$CSV"    ]] || { echo "ERROR: No readable hasher CSV (run hasher.sh)"; exit 1; }
-TOTAL_GROUPS=$(grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0)
+mkdir -p logs low-value
 
-# ───────── Helpers ─────────
-pp_size(){ b="$1"; u=(B KiB MiB GiB TiB PiB); i=0; while (( b>=1024 && i<${#u[@]}-1 )); do b=$(( (b+1023)/1024 )); i=$((i+1)); done; printf "%d %s" "$b" "${u[$i]}"; }
-fmt_epoch(){ ts="$1"; date -d "@$ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"; }
-folder_counts(){ # reads paths on stdin, prints "COUNT\tPREFIX" sorted by COUNT desc
-  awk -v d="$FOLDER_DEPTH" -F'/' '
-    function pref(a, n, d,   i,c,s){ s=""; c=0; for(i=1;i<=n;i++){ if(a[i]=="")continue; c++; if(c<=d){ s=s "/" a[i] } } if(s=="") s="/"; return s }
-    { n=split($0,a,"/"); p=pref(a,n,d); g[p]++ } END{ for(k in g) printf("%d\t%s\n", g[k], k) }
-  ' | sort -k1,1nr
-}
-
-echo -e "${GREEN}Indexing CSV and duplicate report…${NC}"
-echo "  • CSV:     $CSV"
-echo "  • Report:  $REPORT"
-echo "  • Filters: min_size=${MIN_SIZE}B${FILTER_PREFIX:+, prefix=$FILTER_PREFIX}"
-echo "  • Temp:    $TMPROOT"
-echo
-
-# ───────── One-pass index build (FAST) ─────────
-awk -v csv="$CSV" -v report="$REPORT" -v outdir="$GROUPDIR" -v indexout="$INDEX_RAW" \
-    -v minsize="$MIN_SIZE" -v wantprefix="$FILTER_PREFIX" -v total="$TOTAL_GROUPS" '
-  function ltrim(s){ sub(/^[ \t\r\n]+/,"",s); return s }
-  function rtrim(s){ sub(/[ \t\r\n]+$/,"",s); return s }
-  function unquote_csv(s){ gsub(/""/,"\"",s); return s }
-  function hhmmss(sec,  h,m,s){ if (sec<0) sec=0; h=int(sec/3600); m=int((sec%3600)/60); s=int(sec%60); return sprintf("%02d:%02d:%02d",h,m,s) }
-
-  function parse_csv_line(line,   path, rest, c, endq, size_str, mtime_str) {
-    if (substr(line,1,1)=="\"") {
-      endq=0
-      for (i=2;i<=length(line);i++) {
-        ch=substr(line,i,1)
-        if (ch=="\"") { nxt=substr(line,i+1,1); if (nxt=="\"") { i++; continue } else { endq=i; break } }
-      }
-      if (endq==0) return 0
-      path=substr(line,2,endq-2); path=unquote_csv(path)
-      rest=substr(line,endq+2)
-    } else {
-      c=index(line,","); if (c==0) return 0
-      path=substr(line,1,c-1); rest=substr(line,c+1)
-    }
-    c=index(rest,","); if (c==0) return 0
-    size_str=substr(rest,1,c-1); size_str=ltrim(rtrim(size_str)); rest=substr(rest,c+1)
-    c=index(rest,","); if (c==0) return 0
-    mtime_str=substr(rest,1,c-1); mtime_str=ltrim(rtrim(mtime_str)); rest=substr(rest,c+1)
-    PATH=path; SIZE=size_str+0; MTIME=mtime_str+0
-    return 1
-  }
-
-  function flush_group(   detail, reclaim) {
-    if (gcount<2) { gcount=0; return }
-    if (first_size<minsize) { gcount=0; return }
-    if (wantprefix!="" && hasprefix==0) { gcount=0; return }
-    detail = outdir "/group-" sprintf("%06d", gidx) ".detail"
-    reclaim = first_size * (gcount - 1)
-    printf("%d\t%d\t%d\t%s\n", first_size, reclaim, gcount, detail) >> indexout
-    groups_emitted++
-    gcount=0; first_size=0; hasprefix=0
-  }
-
-  BEGIN{ FS=","; OFS="\t"; total_csv=0; t0=systime() }
-
-  FILENAME==csv {
-    if (NRcsv==0) { NRcsv++; next }
-    if (parse_csv_line($0)) { size[PATH]=SIZE; mtime[PATH]=MTIME; total_csv++ }
-    if (total_csv % 20000 == 0) { printf("... CSV loaded: %d rows\n", total_csv) > "/dev/stderr"; fflush("/dev/stderr") }
-    NRcsv++; next
-  }
-
-  FILENAME==report {
-    if ($0 ~ /^HASH[ ]/) {
-      if (gidx>0) flush_group()
-      gidx++; gcount=0; first_size=0; hasprefix=0
-      if (gidx % 500 == 0) {
-        elapsed = systime()-t0
-        pct = (total>0 ? int(gidx*100/total) : 0)
-        rate = (elapsed>0 ? gidx/elapsed : 0)
-        eta = (rate>0 && total>0 ? int((total-gidx)/rate) : 0)
-        printf("... Report groups parsed: %d/%d (%d%%) (files seen: %d) | elapsed=%s eta=%s\n",
-               gidx, total, pct, files_seen, hhmmss(elapsed), hhmmss(eta)) > "/dev/stderr"; fflush("/dev/stderr")
-      }
-      next
-    }
-    if ($0 ~ /^[ ]{2}/) {
-      f=$0; sub(/^[ ]+/, "", f); if (f=="") next
-      s = (f in size ? size[f] : 0)
-      t = (f in mtime ? mtime[f] : 0)
-      detail = outdir "/group-" sprintf("%06d", gidx) ".detail"
-      printf("%d\t%d\t%s\n", s, t, f) >> detail
-      gcount++; files_seen++; if (gcount==1) first_size=s
-      if (wantprefix!="" && index(f, wantprefix)==1) hasprefix=1
-      next
-    }
-    next
-  }
-
-  END{
-    if (gidx>0) flush_group()
-    printf("Loaded CSV rows: %d\n", total_csv) > "/dev/stderr"; fflush("/dev/stderr")
-    printf("Parsed report groups: %d/%d | Emitted indexed groups: %d | Files seen: %d\n",
-           gidx, total, groups_emitted, files_seen) > "/dev/stderr"; fflush("/dev/stderr")
-  }
-' "$CSV" "$REPORT"
-
-# Sort index by requested order
-if [[ ! -s "$INDEX_RAW" ]]; then
-  echo "No duplicate groups match filters."
-  exit 0
+# ── Load LOW_VALUE_THRESHOLD_BYTES from hasher.conf ───────────────────────────
+LOW_VALUE_THRESHOLD_BYTES="0"
+if [ -r "hasher.conf" ]; then
+  val="$(awk -F= '/^[[:space:]]*LOW_VALUE_THRESHOLD_BYTES[[:space:]]*=/{print $2; exit}' hasher.conf | tr -d '\r\n"'\''[:space:]')"
+  case "$val" in (''|*[!0-9]*) ;; (*) LOW_VALUE_THRESHOLD_BYTES="$val" ;; esac
 fi
+
+# ── Prefilter low-value groups into a side list ───────────────────────────────
+PREFILTERED_REPORT="logs/$(date +%F)-duplicate-hashes-nonlow-${RUN_ID}.txt"
+LOW_VALUE_DUMP="low-value/low-value-candidates-$(date +%F)-${RUN_ID}.txt"
+
+# Detect CSV vs whitespace per line and re-emit only non-low-value rows to PREFILTERED_REPORT
+awk -v dump="$LOW_VALUE_DUMP" -v out="$PREFILTERED_REPORT" -v thr="$LOW_VALUE_THRESHOLD_BYTES" '
+  function isnum(x){ return (x ~ /^[0-9]+$/) }
+  BEGIN{ FS="," }
+  {
+    # Try CSV first
+    h=$1; s=$2; p=$3
+    if(!isnum(s)){
+      # Fallback: whitespace
+      n=split($0,a,/[ \t]+/); h=a[1]; s=a[2]; p=""
+      if(n>=3){
+        # rebuild original path with spaces
+        for(i=3;i<=n;i++){ p = (p? p " " : "") a[i] }
+      }
+    }
+    if(isnum(s) && s <= thr){
+      print p >> dump
+      next
+    }
+    print $0 >> out
+  }
+' "$REPORT_FILE"
+
+if [ -s "$LOW_VALUE_DUMP" ]; then
+  log_info "Low-value duplicate entries diverted (<= ${LOW_VALUE_THRESHOLD_BYTES} bytes): $(wc -l < "$LOW_VALUE_DUMP")"
+  log_info "  • Saved to: $LOW_VALUE_DUMP"
+  log_info "  • Next steps: ./delete-low-value.sh --from-list \"$LOW_VALUE_DUMP\" --verify-only"
+fi
+
+# Use filtered report from here on
+REPORT_FILE="$PREFILTERED_REPORT"
+
+# ── Index groups (hash -> paths, size) ────────────────────────────────────────
+# We normalise to "hash|size|path" lines to ease bash parsing.
+INDEX_FILE="logs/dups-index-${RUN_ID}.txt"
+: > "$INDEX_FILE"
+awk '
+  function isnum(x){ return (x ~ /^[0-9]+$/) }
+  BEGIN{ FS="," }
+  {
+    h=$1; s=$2; p=$3
+    if(!(s ~ /^[0-9]+$/)){
+      # Fallback whitespace
+      n=split($0,a,/[ \t]+/); h=a[1]; s=a[2]; p=""
+      if(n>=3){
+        for(i=3;i<=n;i++){ p = (p? p " " : "") a[i] }
+      }
+    }
+    if(h=="" || !(s ~ /^[0-9]+$/) || p=="") next
+    printf "%s|%s|%s\n", h, s, p
+  }
+' "$REPORT_FILE" >> "$INDEX_FILE"
+
+TOTAL_ROWS=$(wc -l < "$INDEX_FILE" | tr -d ' ')
+[ "$TOTAL_ROWS" -gt 0 ] || { log_warn "No duplicate rows after filtering; nothing to review."; exit 0; }
+
+# Build group list: hash -> size,count
+GROUP_LIST="logs/dups-groups-${RUN_ID}.txt"
+: > "$GROUP_LIST"
+awk -F'|' '{ c[$1]++; sz[$1]=$2 } END{ for(h in c){ printf "%s %s %s\n", sz[h], c[h], h } }' "$INDEX_FILE" \
+  > "$GROUP_LIST"
+
+TOTAL_GROUPS=$(wc -l < "$GROUP_LIST" | tr -d ' ')
+
+# Sort groups by size
 case "$ORDER" in
-  size)    sort -k1,1nr -k3,3nr "$INDEX_RAW" -o "$INDEX_SORTED" ;;
-  reclaim) sort -k2,2nr -k1,1nr "$INDEX_RAW" -o "$INDEX_SORTED" ;;
-  *) echo -e "${YELLOW}Unknown --order '$ORDER' (use size|reclaim).${NC}"; exit 2 ;;
+  size-asc)  SORTED_GROUPS="logs/dups-groups-sorted-${RUN_ID}.txt"; sort -n  "$GROUP_LIST" > "$SORTED_GROUPS" ;;
+  *)         SORTED_GROUPS="logs/dups-groups-sorted-${RUN_ID}.txt"; sort -nr "$GROUP_LIST" > "$SORTED_GROUPS" ;;
 esac
 
-INDEX_COUNT=$(wc -l < "$INDEX_SORTED" | tr -d ' ' || echo 0)
+# Plan path
+[ -n "$PLAN_OUT" ] || PLAN_OUT="logs/review-dedupe-plan-$(date +'%Y-%m-%d')-$(date +%s).txt"
+: > "$PLAN_OUT"
 
-echo
-echo -e "${GREEN}Index ready. Starting interactive review…${NC}"
-echo "  • Ordering:     $ORDER (largest first)"
-echo "  • Limit:        $LIMIT"
-echo "  • Groups:       $INDEX_COUNT total"
-echo "  • Plan:         $PLAN"
-echo
+# ── Helpers ───────────────────────────────────────────────────────────────────
+# human size
+hsize(){
+  awk -v b="$1" 'BEGIN{
+    split("B KB MB GB TB PB",u); s=1; while (b>=1024 && s<6){ b/=1024; s++ } printf("%.0f %s", b, u[s])
+  }'
+}
+mtime_epoch(){
+  # stat -c %Y works on BusyBox/GNU on Synology typically; fallback to 0 if not available
+  stat -c %Y -- "$1" 2>/dev/null || stat --format=%Y -- "$1" 2>/dev/null || echo 0
+}
+mtime_iso(){
+  local e; e="$(mtime_epoch "$1")"
+  date -d "@$e" +"%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "1970-01-01 00:00:00"
+}
+choose_keep_by_policy(){
+  local policy="$1"; local hash="$2"; shift 2
+  local paths=("$@")
+  local keep_idx=0
 
-# Require a real TTY on stdin for prompts
-if [[ ! -t 0 ]]; then
-  echo -e "${YELLOW}No interactive TTY on stdin; run from an interactive terminal to make selections.${NC}"
-  exit 1
-fi
-
-pp_line() { # args: size mtime path idx
-  local s="$1" t="$2" p="$3" idx="$4"
-  local when; when="$(fmt_epoch "$t")"
-  printf "   %2d) %-19s  %s\n" "$idx" "$(pp_size "$s")" "$p"
-  printf "       modified: %s\n" "$when"
+  case "$policy" in
+    newest)
+      local best_ts=0 ts i=0
+      for p in "${paths[@]}"; do
+        ts="$(mtime_epoch "$p")"; ts="${ts:-0}"
+        if [ "$ts" -ge "$best_ts" ]; then best_ts="$ts"; keep_idx="$i"; fi
+        i=$((i+1))
+      done
+      ;;
+    oldest)
+      local best_ts=9999999999 ts i=0
+      for p in "${paths[@]}"; do
+        ts="$(mtime_epoch "$p")"; ts="${ts:-0}"
+        if [ "$ts" -le "$best_ts" ]; then best_ts="$ts"; keep_idx="$i"; fi
+        i=$((i+1))
+      done
+      ;;
+    path-prefer=*)
+      local rx="${policy#path-prefer=}"
+      local i=0
+      for p in "${paths[@]}"; do
+        echo "$p" | grep -Eiq -- "$rx" && { keep_idx="$i"; break; }
+        i=$((i+1))
+      done
+      ;;
+    *) keep_idx=0 ;;
+  esac
+  echo "$keep_idx"
 }
 
+# ── Review loop ───────────────────────────────────────────────────────────────
+log_info "Index ready. Starting review…"
+log_info "  • Ordering:     ${ORDER/size-/size }"
+log_info "  • Limit:        $LIMIT"
+log_info "  • Groups:       $TOTAL_GROUPS total"
+log_info "  • Plan:         $PLAN_OUT"
+[ "$KEEP_POLICY" != "none" ] && log_info "  • Keep policy:  $KEEP_POLICY"
+$NON_INTERACTIVE && log_info "  • Mode:         non-interactive (auto-keep by policy)"
+
 shown=0
-added_extras=0
+while IFS=' ' read -r gsize gcount ghash; do
+  [ "$shown" -ge "$LIMIT" ] && break
 
-# Open the index file on FD 3 so stdin stays connected to the TTY
-exec 3< "$INDEX_SORTED"
+  # Collect paths for this hash
+  mapfile -t paths < <(awk -F'|' -v h="$ghash" '$1==h{print $3}' "$INDEX_FILE")
+  # Defensive: ensure count matches
+  [ "${#paths[@]}" -lt 2 ] && continue
 
-# Read index lines from FD 3; read prompts from /dev/tty
-while true; do
-  line=""
-  IFS= read -r -u 3 line || { [[ -n "$line" ]] || break; }
-  (( shown >= LIMIT )) && break
+  # Display header
+  sz_human="$(hsize "$gsize")"
+  reclaim=$(( (gcount-1) * gsize ))
+  reclaim_h="$(hsize "$reclaim")"
+  idx=$((shown+1))
+  printf "[%d/%d] Size: %s  |  Files: %s  |  Potential reclaim: %s\n" "$idx" "$LIMIT" "$sz_human" "$gcount" "$reclaim_h"
 
-  # Trim trailing CR just in case
-  [[ "${line: -1}" == $'\r' ]] && line="${line%$'\r'}"
-  IFS=$'\t' read -r first_sz reclaim cnt detail <<< "$line" || continue
-  [[ -n "${detail:-}" && -n "${first_sz:-}" && -n "${cnt:-}" ]] || continue
-
-  if [[ ! -f "$detail" ]]; then
-    echo -e "${YELLOW}  ! Missing detail file: $detail (skipping)${NC}"
-    continue
-  fi
-
-  echo -e "${CYAN}[$((shown+1))/$LIMIT] Size: $(pp_size "$first_sz")  |  Files: $cnt  |  Potential reclaim: $(pp_size "$reclaim")${NC}"
-
-  # Load this group's items
-  paths=(); sizes=(); mtimes=()
-  i=0
-  while IFS=$'\t' read -r s t p || [[ -n "$s$t$p" ]]; do
-    [[ "${p: -1}" == $'\r' ]] && p="${p%$'\r'}"
-    sizes[i]="$s"; mtimes[i]="$t"; paths[i]="$p"
+  # Display first 12 entries with mtimes
+  i=1
+  for p in "${paths[@]}"; do
+    [ $i -le 12 ] || { echo "       … and $((gcount-12)) more not shown"; break; }
+    printf "    %d) %s  \"%s\"\n" "$i" "$sz_human" "$p"
+    printf "       modified: %s\n" "$(mtime_iso "$p")"
     i=$((i+1))
-  done < "$detail"
-
-  total_in_group=${#paths[@]}
-  to_show=$(( total_in_group < SHOW_EACH_MAX ? total_in_group : SHOW_EACH_MAX ))
-  for ((k=0;k<to_show;k++)); do
-    pp_line "${sizes[$k]}" "${mtimes[$k]}" "${paths[$k]}" "$((k+1))"
   done
-  hidden=$(( total_in_group - to_show ))
-  (( hidden > 0 )) && echo "       … and $hidden more not shown"
 
-  # Folder summary & mirror detection
-  {
-    for p in "${paths[@]}"; do echo "$p"; done | folder_counts
-  } > "$TMPROOT/group-$((shown+1))-folders.tsv"
-
-  echo "       Top folders (depth=$FOLDER_DEPTH):"
-  if [[ -s "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
-    head -n 3 "$TMPROOT/group-$((shown+1))-folders.tsv" | awk -F'\t' '{printf "         - %s  (%s files)\n", $2, $1}'
+  # Decide keep
+  if $NON_INTERACTIVE && [ "$KEEP_POLICY" != "none" ]; then
+    sel="$(choose_keep_by_policy "$KEEP_POLICY" "$ghash" "${paths[@]}")"
   else
-    echo "         (no folder summary)"
+    # Prompt
+    read -r -p "Select the file ID to KEEP [1-${#paths[@]}], 's' to skip, 'q' to quit: " ans || ans="s"
+    case "$ans" in
+      q|Q) echo "  → Quit."; break ;;
+      s|S|"") echo "  → Skipped."; shown=$((shown+1)); continue ;;
+      *)
+        if echo "$ans" | grep -Eq '^[0-9]+$' && [ "$ans" -ge 1 ] && [ "$ans" -le "${#paths[@]}" ]; then
+          sel=$((ans-1))
+        else
+          echo "  → Invalid; skipped."; shown=$((shown+1)); continue
+        fi
+        ;;
+    esac
   fi
 
-  mirror_hint=""
-  if [[ -s "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
-    if (( $(wc -l < "$TMPROOT/group-$((shown+1))-folders.tsv" | tr -d ' ') == 2 )); then
-      a_count=$(awk 'NR==1{print $1}' "$TMPROOT/group-$((shown+1))-folders.tsv")
-      b_count=$(awk 'NR==2{print $1}' "$TMPROOT/group-$((shown+1))-folders.tsv")
-      a_pref=$(awk -F'\t' 'NR==1{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
-      b_pref=$(awk -F'\t' 'NR==2{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
-      if (( a_count == b_count && a_count + b_count == total_in_group )); then
-        mirror_hint="mirror"
-        echo "       Mirror folders suspected:"
-        echo "         [A] $a_pref  ($a_count files)"
-        echo "         [B] $b_pref  ($b_count files)"
-        echo "       Tip: type 'ka' to keep A (drop B-side), or 'kb' to keep B (drop A-side)."
-      fi
-    fi
-  fi
-
-  echo
-  choice=""
-  # Read the user choice from the real terminal, not from FD 3
-  read -rp "Select the file ID to KEEP [1-$total_in_group], ${mirror_hint:+or 'ka'/'kb', }'s' to skip, 'q' to quit: " choice < /dev/tty || true
-
-  if [[ -z "${choice:-}" || "$choice" =~ ^[sS]$ ]]; then
-    echo "  → Skipped."; echo; shown=$((shown+1)); continue
-  fi
-  if [[ "$choice" =~ ^[qQ]$ ]]; then
-    echo "  → Quitting early."; break
-  fi
-
-  added_here=0
-  if [[ "$choice" == "ka" || "$choice" == "kb" ]]; then
-    if [[ -f "$TMPROOT/group-$((shown+1))-folders.tsv" ]]; then
-      keep_pref=$(awk -F'\t' -v c="$choice" 'c=="ka"&&NR==1{print $2} c=="kb"&&NR==2{print $2}' "$TMPROOT/group-$((shown+1))-folders.tsv")
-      if [[ -n "$keep_pref" ]]; then
-        for p in "${paths[@]}"; do
-          if [[ "${p:0:${#keep_pref}}" != "$keep_pref" ]]; then
-            printf '%s\n' "$p" >> "$PLAN"
-            ((added_here++))
-          fi
-        done
-        ((added_extras+=added_here))
-        echo "  → Keeping folder '${keep_pref}'; added $added_here extras to plan."
-      else
-        echo -e "${YELLOW}  ! Could not resolve folder choice; skipping.${NC}"
-      fi
-    else
-      echo -e "${YELLOW}  ! No folder summary; skipping.${NC}"
-    fi
-    echo; shown=$((shown+1)); continue
-  fi
-
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > total_in_group )); then
-    echo -e "${YELLOW}Invalid choice. Skipping.${NC}"; echo; shown=$((shown+1)); continue
-  fi
-
-  keep_idx="$choice"
-  for ((j=0;j<total_in_group;j++)); do
-    (( j+1 == keep_idx )) && continue
-    printf '%s\n' "${paths[$j]}" >> "$PLAN"
-    ((added_here++))
+  # Write deletions (all except selected)
+  keep_path="${paths[$sel]}"
+  for j in "${!paths[@]}"; do
+    [ "$j" -eq "$sel" ] && continue
+    printf "%s\n" "${paths[$j]}" >> "$PLAN_OUT"
   done
-  ((added_extras+=added_here))
-  echo "  → Keeping #$keep_idx; added $added_here extras to plan."
-  echo
+  echo "  → Keeping: \"$keep_path\"; marked $((gcount-1)) for deletion."
   shown=$((shown+1))
-done
+done < "$SORTED_GROUPS"
 
-# Close FD 3
-exec 3<&-
-
-# ───────── Summary of the plan ─────────
-if [[ -s "$PLAN" ]]; then
-  awk -v depth="$GROUP_DEPTH" '
-    function pref(p, depth,   i,n,part,count,acc){
-      n = split(p, a, "/"); acc=""; count=0
-      for (i=1;i<=n;i++){ part=a[i]; if (part=="") continue; count++; if (count<=depth) acc=acc "/" part; else break }
-      if (acc=="") acc="/"; return acc
-    }
-    { g[pref($0, depth)]++ }
-    END{ for(k in g) printf("%s\t%d\n", k, g[k]) }
-  ' "$PLAN" | sort -k2,2nr > "$SUMMARY_TSV"
-
-  total_extras=$(awk -F'\t' '{s+=$2} END{print s+0}' "$SUMMARY_TSV")
-  echo "Top $TOP_N groups (depth=$GROUP_DEPTH):"
-  rank=0
-  while IFS=$'\t' read -r pref cnt; do
-    ((rank++))
-    pct=0
-    if [[ "${total_extras:-0}" -gt 0 ]]; then pct=$(( (cnt * 100) / total_extras )); fi
-    printf "  %2d) %-50s %6d extras  (%3d%%)\n" "$rank" "$pref" "$cnt" "$pct"
-    (( rank >= TOP_N )) && break || true
-  done < "$SUMMARY_TSV"
-fi
-
-echo
-echo -e "${GREEN}Interactive review complete.${NC}"
-echo "  • Groups reviewed:       $shown (limit=$LIMIT)"
-echo "  • Plan entries (extras): ${added_extras:-0}"
-echo "  • Plan file:             $PLAN"
-echo "  • Summary TSV:           $SUMMARY_TSV"
-echo
-echo -e "${GREEN}[NEXT STEPS]${NC}"
-echo "  1) Review the plan:"
-echo "       less \"$PLAN\""
-echo "  2) Move extras to quarantine (safe):"
-echo "       while IFS= read -r p; do mkdir -p \"quarantine-$DATE_TAG\$(dirname \"\$p\")\"; mv -n -- \"\$p\" \"quarantine-$DATE_TAG\$p\"; done < \"$PLAN\""
-echo "  3) Or delete extras (dangerous):"
-echo "       xargs -0 rm -f -- < <(tr '\\n' '\\0' < \"$PLAN\")"
+log_info "Plan written: $PLAN_OUT"
+log_info "Next steps:"
+log_info "  • Dry-run: ./delete-duplicates.sh --from-plan \"$PLAN_OUT\""
+log_info "  • Execute: ./delete-duplicates.sh --from-plan \"$PLAN_OUT\" --force [--quarantine DIR]"
+log_info "  • Low-value candidates, if any, saved to: $LOW_VALUE_DUMP"
+exit 0
