@@ -1,3 +1,0 @@
-# Paths to include should be placed below
-# Example: /volume1/<folder>
-# Note: One path per line
