@@ -6,7 +6,7 @@ Robust hashing + duplicate discovery + safe cleanup tooling for NAS environments
 
 ---
 
-## Quickstart
+## 🚀 Quickstart (recommended)
 
 ```bash
 # Clone the repo
@@ -14,18 +14,20 @@ git clone https://github.com/yourusername/hasher.git
 cd hasher
 
 # Make scripts executable
-chmod +x hasher.sh find-duplicates.sh review-duplicates.sh delete-duplicates.sh            delete-zero-length.sh delete-low-value.sh
+chmod +x launcher.sh
+chmod +x bin/*.sh
 
-# Create config (edit as needed)
-cp hasher.conf hasher.conf.backup 2>/dev/null || true
-# or create from scratch; see the "Configuration" section below
+# Add the directories you want to scan (one per line)
+nano local/paths.txt     # or use your editor of choice
 
-# Run hasher (foreground example)
-./hasher.sh --pathfile paths.txt --algo sha256
+# Launch (runs hasher in nohup mode using local/paths.txt + sha256)
+./launcher.sh
 
-# Run duplicate discovery (summary only)
-./find-duplicates.sh
+# Foreground mode (stay attached to console)
+./launcher.sh --foreground
 ```
+
+The launcher prints exactly what it runs and where to tail logs.
 
 ---
 
@@ -56,34 +58,38 @@ This project helps protect NAS-stored data by:
 * Uses common POSIX tooling: `bash`, `awk`, `sort`, `uniq`, `stat`, `mv`, `rm`.
 * No `pv` or `less` required.
 * Ensure the repo directory (e.g., `hasher/`) lives on the NAS volume where you’re scanning.
-* For long runs on DSM, prefer `--nohup` to survive SSH disconnects.
+* For long runs on DSM, prefer background mode to survive SSH disconnects.
 
 ---
 
 ## Usage Overview (Happy Path)
 
-### 1) Hash the files
+### 1) Start hashing (easiest: the launcher)
 
 ```bash
-# Background (recommended on Synology DSM)
-./hasher.sh --pathfile paths.txt --algo sha256 --nohup
-# Foreground
-./hasher.sh --pathfile paths.txt --algo sha256
+./launcher.sh                          # nohup; uses local/paths.txt + sha256
+# or explicitly:
+./launcher.sh --pathfile local/paths.txt --algo sha256 --foreground
 ```
 
 **Outputs:**
 * `hashes/hasher-YYYY-MM-DD.csv` – main digest table
 * `logs/background.log` – progress + end-of-run summary
-* `zero-length/zero-length-YYYY-MM-DD.txt` – **candidates detected at scan time**
+* `var/zero-length/zero-length-YYYY-MM-DD.txt` – **candidates detected at scan time**
 
 > ⚠️ **Important:** “candidates detected at scan time” ≠ “safe to delete now”. Always verify right before acting.
+
+**Manual alternative (if you don’t want the launcher):**
+```bash
+bin/hasher.sh --pathfile local/paths.txt --algo sha256 --nohup
+```
 
 ---
 
 ### 2) Find duplicate groups
 
 ```bash
-./find-duplicates.sh
+bin/find-duplicates.sh
 ```
 **Outputs:**
 * `logs/YYYY-MM-DD-duplicate-hashes.txt` – report for review
@@ -94,16 +100,16 @@ This project helps protect NAS-stored data by:
 
 ```bash
 # Interactive (default), prefer keeping the newest copy:
-./review-duplicates.sh --from-report "logs/2025-08-30-duplicate-hashes.txt" --keep newest --limit 100
+bin/review-duplicates.sh --from-report "logs/2025-08-30-duplicate-hashes.txt" --keep newest --limit 100
 
 # Or non-interactive (auto policy across all groups):
-./review-duplicates.sh --from-report "logs/2025-08-30-duplicate-hashes.txt"   --keep newest --non-interactive
+bin/review-duplicates.sh --from-report "logs/2025-08-30-duplicate-hashes.txt" --keep newest --non-interactive
 ```
 
 **What it does now:**
 * **Prefilters “low-value” groups** out of the UI per `LOW_VALUE_THRESHOLD_BYTES` in `hasher.conf`
   (default `0`, i.e. only zero‑byte files). Those are written to:
-  `low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt`.
+  `var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt`.
 * Builds a deletion plan for real space reclaim:
   `logs/review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt` (each line is a path to delete).
 
@@ -113,13 +119,13 @@ This project helps protect NAS-stored data by:
 
 ```bash
 # Dry-run (recommended)
-./delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)"
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)"
 
 # Execute (delete)
-./delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)" --force
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)" --force
 
 # Execute to quarantine instead of delete
-./delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)"   --force --quarantine "quarantine-$(date +%F)"
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)"   --force --quarantine "var/quarantine/$(date +%F)"
 ```
 
 ---
@@ -128,16 +134,16 @@ This project helps protect NAS-stored data by:
 
 ```bash
 # Verify current state and write a verified plan (no actions taken)
-./delete-zero-length.sh "zero-length/zero-length-YYYY-MM-DD.txt" --verify-only
+bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --verify-only
 
 # Dry-run (uses the verified plan)
-./delete-zero-length.sh "zero-length/zero-length-YYYY-MM-DD.txt"
+bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt"
 
 # Execute (delete)
-./delete-zero-length.sh "zero-length/zero-length-YYYY-MM-DD.txt" --force
+bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force
 
 # Execute to quarantine
-./delete-zero-length.sh "zero-length/zero-length-YYYY-MM-DD.txt" --force   --quarantine "zero-length/quarantine-$(date +%F)"
+bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force   --quarantine "var/quarantine/$(date +%F)"
 ```
 
 **Extras:**
@@ -153,16 +159,16 @@ This project helps protect NAS-stored data by:
 
 ```bash
 # Inspect active excludes
-./delete-low-value.sh --from-list "low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --list-excludes
+bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --list-excludes
 
 # Verify-only
-./delete-low-value.sh --from-list "low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --verify-only
+bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --verify-only
 
 # Execute (delete)
-./delete-low-value.sh --from-list "low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --force
+bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --force
 
 # Execute to quarantine
-./delete-low-value.sh --from-list "low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt"   --force --quarantine "low-value/quarantine-$(date +%F)"
+bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt"   --force --quarantine "var/quarantine/$(date +%F)"
 ```
 
 **Threshold & Exclusions**
@@ -174,51 +180,68 @@ This project helps protect NAS-stored data by:
 
 ## Configuration (`hasher.conf`)
 
-Simple `key=value` file (no code is executed). A ready-to-use `hasher.conf` is included.
+We follow a Splunk‑style **default/local overlay**:
+
+```
+default/hasher.conf   # shipped defaults
+local/hasher.conf     # (optional) site overrides
+local/paths.txt       # directories to scan (one per line)
+local/excludes.txt    # one glob per line, case‑insensitive
+```
+
+Minimal keys the cleanup/review helpers read:
 
 ```ini
 # Low-value threshold (bytes). 0 = only zero-byte files.
 LOW_VALUE_THRESHOLD_BYTES=0
 
 # If true, zero-length deletion will apply excludes below by default.
-#ZERO_APPLY_EXCLUDES=false
+ZERO_APPLY_EXCLUDES=false
 
 # Exclude patterns
-#EXCLUDES_FILE=excludes.txt
+EXCLUDES_FILE=local/excludes.txt
 #EXCLUDE_GLOBS=*.tmp,*/.cache/*,*/node_modules/*
 #EXCLUDE_BASENAMES=Thumbs.db,.DS_Store,Desktop.ini
 #EXCLUDE_DIRS=#recycle,@eaDir,.snapshot,.AppleDouble
 ```
 
-> **Precedence:** CLI flags > `hasher.conf` > auto-discovered exclude files > built-ins.
+> **Precedence:** CLI flags > `local/hasher.conf` > `default/hasher.conf` > `local/excludes.txt` > built‑ins.
 
 ---
 
 ## Recommended Directory Structure
 
 ```
+├── bin/
+│   ├── hasher.sh
+│   ├── find-duplicates.sh
+│   ├── review-duplicates.sh
+│   ├── delete-duplicates.sh
+│   ├── delete-zero-length.sh
+│   ├── delete-low-value.sh
+│   └── lib_paths.sh
+├── default/
+│   └── hasher.conf
+├── local/
+│   ├── hasher.conf          # optional overrides
+│   ├── paths.txt
+│   └── excludes.txt
 ├── hashes/
 │   └── hasher-YYYY-MM-DD.csv
 ├── logs/
 │   ├── background.log
 │   ├── YYYY-MM-DD-duplicate-hashes.txt
-│   ├── review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt
-│   └── dups-index/… (ephemeral indexes may live here)
-├── zero-length/
-│   ├── zero-length-YYYY-MM-DD.txt
-│   ├── verified-zero-length-YYYY-MM-DD-<RUN_ID>.txt
-│   └── quarantine-YYYY-MM-DD/  (if used)
-├── low-value/
-│   ├── low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt
-│   ├── verified-low-value-YYYY-MM-DD-<RUN_ID>.txt
-│   └── quarantine-YYYY-MM-DD/  (if used)
-├── hasher.sh
-├── find-duplicates.sh
-├── review-duplicates.sh
-├── delete-duplicates.sh
-├── delete-zero-length.sh
-├── delete-low-value.sh
-└── hasher.conf
+│   └── review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt
+├── var/
+│   ├── zero-length/
+│   │   ├── zero-length-YYYY-MM-DD.txt
+│   │   └── verified-zero-length-YYYY-MM-DD-<RUN_ID>.txt
+│   ├── low-value/
+│   │   ├── low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt
+│   │   └── verified-low-value-YYYY-MM-DD-<RUN_ID>.txt
+│   └── quarantine/
+├── launcher.sh
+└── LICENSE
 ```
 
 ---
@@ -234,26 +257,28 @@ LOW_VALUE_THRESHOLD_BYTES=0
 
 ## Troubleshooting
 
-**All entries show as “missing” during verify**
-* Likely **CRLF** endings in your list file. Fix with:
-  ```bash
-  sed -i 's/\r$//' <listfile>
-  ```
-  All list readers trim `\r` automatically, but cleaning the file is good hygiene.
+**All entries show as “missing” during verify**  
+Likely **CRLF** endings in your list file. Fix with:
+```bash
+sed -i 's/
+$//' <listfile>
+```
+Readers trim `
+` automatically, but cleaning the file is good hygiene.
 
-**Zero-byte groups appear in duplicate review UI**
-* This is now **expected to be filtered out** per `LOW_VALUE_THRESHOLD_BYTES`. Ensure your `hasher.conf` is present (default `0` filters only zero‑byte).
+**Zero-byte groups appear in duplicate review UI**  
+This is now filtered out per `LOW_VALUE_THRESHOLD_BYTES`. Ensure your config is present (default `0` filters only zero‑byte).
 
-**Slow indexing with massive reports**
-* Reduce `--limit` during review or use `--non-interactive` with a keep policy (e.g., `--keep newest`).
+**Slow indexing with massive reports**  
+Reduce `--limit` during review or use `--non-interactive` with a keep policy (e.g., `--keep newest`).
 
 ---
 
 ## Best Practice on Synology
 
-* Prefer `--nohup` on long runs to survive SSH disconnects.
-* Set the repo on the same volume you’re scanning to minimise cross-volume I/O.
-* Keep `logs/` under version control ignore (`.gitignore`) if noisy.
+* Prefer background mode to survive SSH disconnects (`./launcher.sh` does this by default).
+* Put the repo on the same volume you’re scanning to minimise cross‑volume I/O.
+* Keep `logs/` under version control ignore if they’re noisy.
 
 ---
 
