@@ -1,13 +1,6 @@
-# Exclusions for hasher
-# Lines starting with # are comments
-
-# Common recycle / Synology folders
-\#recycle
-@SynoEAStream
-
-# Development artifacts
-node_modules
-.git
-
-# macOS system file
-.DS_Store
+# local/excludes.txt — one glob per line (case-insensitive)
+*.tmp
+*.part
+*.bak
+*/Cache/*
+*/.Trash*/**
