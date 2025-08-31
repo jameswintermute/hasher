@@ -4,241 +4,121 @@
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
-# delete-duplicates.sh — Execute a dedupe plan (extras-only) or build it from a report.
-# Safe by default (DRY-RUN). Use --force to actually delete or move to quarantine.
-#
-# Primary workflow:
-#   hasher.sh → find-duplicates.sh → review-duplicates.sh → delete-duplicates.sh
-#
-# Modes:
-#   • --from-plan FILE      Use the extras-only plan created by review-duplicates.sh
-#   • --from-report FILE    Derive extras on-the-fly from a duplicate report; requires a CSV
-#       [--keep newest|oldest|largest|smallest|first|last]  (default: newest)
-#       [--from-csv FILE]   (auto-picks newest hashes/hasher-*.csv if omitted)
-#
-# Actions (dry-run unless --force):
-#   • delete (default when --force and no --quarantine)
-#   • move to quarantine DIR (when --quarantine DIR and --force)
-#
-# Outputs:
-#   • Verified plan of actions: logs/verified-dedupe-plan-<DATE>-<RUN>.txt
-#   • Summary TSV by path:     logs/delete-duplicates-summary-<DATE>-<RUN>.tsv
-#   • Execution log:           logs/delete-duplicates-<DATE>.log
-
+# delete-duplicates.sh — act on a review PLAN (delete or quarantine duplicate files)
+# - Reads a plan file (one absolute path per line) created by review-duplicates.sh
+# - Defaults to DRY-RUN; use --force to actually delete or move
+# - CRLF-safe, skips blanks and comments
+# - Layout-aware via bin/lib_paths.sh
 set -Eeuo pipefail
-IFS=$'\n\t'
-LC_ALL=C
+IFS=$'\n\t'; LC_ALL=C
 
-# ───────── Config ─────────
-HASHES_DIR="hashes"
-LOGS_DIR="logs"
-DATE_TAG="$(date +'%Y-%m-%d')"
-RUN_ID="$(
-  (command -v uuidgen >/dev/null 2>&1 && uuidgen) \
-  || cat /proc/sys/kernel/random/uuid 2>/dev/null \
-  || echo "$(date +%s)-$$"
-)"
+# Path/layout discovery
+. "$(dirname "$0")/lib_paths.sh" 2>/dev/null || true
 
-FROM_PLAN=""          # --from-plan FILE (extras list; one path per line)
-FROM_REPORT=""        # --from-report FILE
-CSV=""                # --from-csv FILE (needed if using --from-report)
-KEEP="newest"         # keep policy when deriving from report
-FORCE=false           # --force to actually mutate
-QUARANTINE=""         # --quarantine DIR (requires --force)
-YES=false             # --yes to auto-confirm
-GROUP_DEPTH=2         # for summary TSV
-TOP_N=10              # how many groups to print at end
+ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+if [ -r /proc/sys/kernel/random/uuid ]; then RUN_ID="$(cat /proc/sys/kernel/random/uuid)"; else RUN_ID="$(date +%s)-$$-$RANDOM"; fi
+log(){ printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
+log_info(){ log "INFO" "$*"; }; log_warn(){ log "WARN" "$*"; }; log_error(){ log "ERROR" "$*"; }
 
-VERIFIED="$LOGS_DIR/verified-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
-SUMMARY_TSV="$LOGS_DIR/delete-duplicates-summary-$DATE_TAG-$RUN_ID.tsv"
-EXEC_LOG="$LOGS_DIR/delete-duplicates-$DATE_TAG.log"
+PLAN_FILE=""; FORCE=false; QUARANTINE_DIR=""
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+usage(){
+  cat <<'EOF'
+Usage: delete-duplicates.sh --from-plan <file> [--force] [--quarantine DIR]
 
-usage() {
-cat <<EOF
-Usage: $0 [--from-plan FILE] | [--from-report FILE [--keep POLICY] [--from-csv FILE]]
-          [--force] [--quarantine DIR] [--yes]
-          [--group-depth N] [--top N] [-h|--help]
+Options:
+  --from-plan FILE     Path to plan file with one filesystem path per line
+  --force              Execute actions (delete/quarantine). Default is dry-run
+  --quarantine DIR     Move files to DIR instead of deleting (tree is preserved below DIR)
 
-Actions:
-  Dry-run always. Add --force to execute.
-  If --quarantine DIR is set with --force, files are MOVED to DIR (tree preserved).
-  Otherwise, files are DELETED with --force.
-
-Examples:
-  # Execute a reviewed plan (recommended path):
-  $0 --from-plan "logs/review-dedupe-plan-*.txt"        # dry-run (auto-picks newest)
-  $0 --from-plan "logs/review-dedupe-plan-2025-08-30-*.txt" --force
-  $0 --from-plan "logs/review-dedupe-plan-*.txt" --force --quarantine "quarantine-$(date +%F)"
-
-  # Derive from report (skip the interactive review step):
-  $0 --from-report "logs/$(date +%F)-duplicate-hashes.txt" --keep newest --force --quarantine "quarantine-$(date +%F)"
+Notes:
+  - Plan lines that are blank or start with # are ignored.
+  - On quarantine, the original directory structure is preserved under DIR.
+  - All actions/errors are logged to logs/delete-duplicates-YYYY-MM-DD.log
 EOF
 }
 
-# ───────── Args ─────────
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --from-plan)   FROM_PLAN="${2:-}"; shift ;;
-    --from-report) FROM_REPORT="${2:-}"; shift ;;
-    --from-csv)    CSV="${2:-}"; shift ;;
-    --keep)        KEEP="${2:-newest}"; shift ;;
-    --force)       FORCE=true ;;
-    --quarantine)  QUARANTINE="${2:-}"; shift ;;
-    --yes|-y)      YES=true ;;
-    --group-depth) GROUP_DEPTH="${2:-2}"; shift ;;
-    --top)         TOP_N="${2:-10}"; shift ;;
-    -h|--help)     usage; exit 0 ;;
-    *) echo -e "${YELLOW}Unknown option: $1${NC}"; usage; exit 2 ;;
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --from-plan) PLAN_FILE="${2:-}"; shift ;;
+    --force) FORCE=true ;;
+    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) log_error "Unknown argument: $1"; usage; exit 2 ;;
   esac
-  shift
+  shift || true
 done
 
-mkdir -p "$LOGS_DIR"
+[ -n "$PLAN_FILE" ] || { log_error "Missing --from-plan"; exit 2; }
+[ -r "$PLAN_FILE" ] || { log_error "Plan file not readable: $PLAN_FILE"; exit 2; }
 
-log() {
-  local lvl="$1"; shift
-  local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
-  printf '[%s] [RUN %s] [%s] %s\n' "$ts" "$RUN_ID" "$lvl" "$*" | tee -a "$EXEC_LOG" >&2
-}
+mkdir -p "$LOG_DIR"
+SUMMARY_LOG="$LOG_DIR/delete-duplicates-$(date +'%Y-%m-%d').log"
+VERIFIED_PLAN="$LOG_DIR/verified-duplicates-$(date +'%Y-%m-%d')-${RUN_ID}.txt"
+: > "$VERIFIED_PLAN"
 
-# ───────── Input resolution ─────────
+log_info "Plan: $PLAN_FILE"
+log_info "Summary log: $SUMMARY_LOG"
+[ -n "$QUARANTINE_DIR" ] && log_info "Quarantine dir: $QUARANTINE_DIR"
 
-# Prefer --from-plan; if omitted, auto-pick newest review plan.
-if [[ -z "$FROM_PLAN" && -z "$FROM_REPORT" ]]; then
-  # try most recent review plan
-  FROM_PLAN="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+# Verification pass
+has_crlf=false; grep -q $'\r' "$PLAN_FILE" && has_crlf=true
+considered=0; missing=0; not_regular=0; verified=0
+
+while IFS= read -r raw || [ -n "$raw" ]; do
+  line="${raw%$'\r'}"
+  [ -z "$line" ] && continue
+  case "$line" in \#*) continue ;; esac
+  considered=$((considered+1))
+  if [ ! -e "$line" ]; then missing=$((missing+1)); continue; fi
+  if [ ! -f "$line" ]; then not_regular=$((not_regular+1)); continue; fi
+  printf '%s\n' "$line" >> "$VERIFIED_PLAN"
+  verified=$((verified+1))
+done < "$PLAN_FILE"
+
+$has_crlf && log_warn "Plan has CRLF line endings; handled during read. To normalise: sed -i 's/\r$//' "$PLAN_FILE""
+
+log_info "Verification complete."
+log_info "  • Considered: $considered"
+log_info "  • Missing: $missing"
+log_info "  • Not regular files: $not_regular"
+log_info "  • Verified (will act on): $verified"
+log_info "Verified plan file: $VERIFIED_PLAN"
+
+if ! $FORCE; then
+  printf "[DRY-RUN SUMMARY]\n"
+  printf "  Files that would be acted on: %s\n" "$verified"
+  printf "  To execute delete:    ./bin/delete-duplicates.sh --from-plan "%s" --force\n" "$PLAN_FILE"
+  printf "  To quarantine to dir: ./bin/delete-duplicates.sh --from-plan "%s" --force --quarantine "var/quarantine/$(date +%F)"\n" "$PLAN_FILE"
+  exit 0
 fi
 
-if [[ -n "$FROM_PLAN" ]]; then
-  # expand globs safely
-  set +f
-  arr=( $FROM_PLAN )
-  set -f
-  if (( ${#arr[@]} > 1 )); then
-    # pick newest
-    FROM_PLAN="$(ls -1t "${arr[@]}" 2>/dev/null | head -n1 || true)"
+# Ensure quarantine dir if used
+if [ -n "$QUARANTINE_DIR" ]; then mkdir -p "$QUARANTINE_DIR"; fi
+
+# Execute
+acted=0; errs=0
+while IFS= read -r path || [ -n "$path" ]; do
+  [ -z "$path" ] && continue
+  if [ -n "$QUARANTINE_DIR" ]; then
+    # Preserve tree under quarantine dir
+    clean="${path#/}"                             # strip leading slashes
+    dest="${QUARANTINE_DIR%/}/$clean"
+    dest_dir="$(dirname -- "$dest")"
+    mkdir -p -- "$dest_dir"
+    if mv -f -- "$path" "$dest" 2>>"$SUMMARY_LOG"; then
+      log_info "Quarantined: $path -> $dest"; acted=$((acted+1))
+    else
+      log_error "Failed to quarantine: $path"; errs=$((errs+1))
+    fi
+  else
+    if rm -f -- "$path" 2>>"$SUMMARY_LOG"; then
+      log_info "Deleted: $path"; acted=$((acted+1))
+    else
+      log_error "Failed to delete: $path"; errs=$((errs+1))
+    fi
   fi
-  [[ -n "$FROM_PLAN" && -r "$FROM_PLAN" ]] || { echo -e "${RED}ERROR:${NC} Plan not found/readable."; exit 1; }
-  MODE="plan"
-else
-  [[ -r "$FROM_REPORT" ]] || { echo -e "${RED}ERROR:${NC} Report not found/readable."; exit 1; }
-  # CSV for policy decisions (mtime/size). Auto-pick newest if missing.
-  if [[ -z "$CSV" ]]; then
-    CSV="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
-  fi
-  [[ -n "$CSV" && -r "$CSV" ]] || { echo -e "${RED}ERROR:${NC} CSV not found/readable (needed with --from-report)."; exit 1; }
-  MODE="report"
-fi
+done < "$VERIFIED_PLAN"
 
-# ───────── If deriving from report, build a temp plan of EXTRAS ─────────
-TMPPLAN=""
-if [[ "$MODE" == "report" ]]; then
-  TMPPLAN="$LOGS_DIR/tmp-plan-$DATE_TAG-$RUN_ID.txt"
-  : > "$TMPPLAN"
-  log INFO "Deriving extras from report using keep=$KEEP …"
-  # Build extras-only plan from the report with help from CSV (mtime/size)
-  awk -v report="$FROM_REPORT" -v csv="$CSV" -v keep="$KEEP" -v out="$TMPPLAN" '
-    function ltrim(s){ sub(/^[ \t\r\n]+/,"",s); return s }
-    function rtrim(s){ sub(/[ \t\r\n]+$/,"",s); return s }
-    function uq(s){ gsub(/""/,"\"",s); return s }
-    function parse_csv(line,  path,rest,c,endq,size_str,mtime_str,hash){
-      if (substr(line,1,1)=="\"") {
-        endq=0
-        for(i=2;i<=length(line);i++){
-          ch=substr(line,i,1)
-          if(ch=="\""){ nxt=substr(line,i+1,1); if(nxt=="\""){i++} else {endq=i; break} }
-        }
-        if(endq==0) return 0
-        path=substr(line,2,endq-2); path=uq(path); rest=substr(line,endq+2)
-      } else {
-        c=index(line,","); if(c==0) return 0
-        path=substr(line,1,c-1); rest=substr(line,c+1)
-      }
-      c=index(rest,","); if(c==0) return 0
-      size_str=substr(rest,1,c-1); rest=substr(rest,c+1)
-      c=index(rest,","); if(c==0) return 0
-      mtime_str=substr(rest,1,c-1); rest=substr(rest,c+1)
-      c=index(rest,","); if(c==0) return 0
-      hash=substr(rest,c+1); hash=ltrim(rtrim(hash))
-      SIZE[path]=size_str+0; MTIME[path]=mtime_str+0
-      return 1
-    }
-    function cmp(a,b){
-      if (keep=="newest")     { if (MTIME[a]>MTIME[b]) return 1; if (MTIME[a]<MTIME[b]) return -1; }
-      else if (keep=="oldest"){ if (MTIME[a]<MTIME[b]) return 1; if (MTIME[a]>MTIME[b]) return -1; }
-      else if (keep=="largest"){ if (SIZE[a]>SIZE[b])  return 1; if (SIZE[a]<SIZE[b])  return -1; }
-      else if (keep=="smallest"){if (SIZE[a]<SIZE[b])  return 1; if (SIZE[a]>SIZE[b])  return -1; }
-      else if (keep=="first") { if (a<b) return 1; if (a>b) return -1; }
-      else if (keep=="last")  { if (a>b) return 1; if (a<b) return -1; }
-      return 0
-    }
-    function choose_keep(arr,n,  i,b){ b=arr[1]; for(i=2;i<=n;i++){ if(cmp(arr[i],b)>0) b=arr[i] } return b }
-    BEGIN{
-      while ((getline cl < csv) > 0) { if (NRc==0){NRc++; continue}; parse_csv(cl); NRc++ } close(csv)
-    }
-    /^HASH[ ]/ { flush(); gcount=0; next }
-    /^[ ]{2}/  { f=$0; sub(/^[ ]+/,"",f); if(f!=""){ g[++gcount]=f } next }
-    { next } # ignore
-    function flush(  i,keepf){
-      if (gcount<2) return
-      keepf=choose_keep(g,gcount)
-      for(i=1;i<=gcount;i++) if (g[i]!=keepf) print g[i] >> out
-    }
-    END{ flush() }
-  ' "$FROM_REPORT"
-  FROM_PLAN="$TMPPLAN"
-fi
-
-# ───────── Verify plan (existence, regular file) and compute basic stats ─────────
-: > "$VERIFIED"
-: > "$SUMMARY_TSV"
-
-total_in=0
-verified=0
-missing=0
-notreg=0
-bytes_total=0
-
-# verify loop
-while IFS= read -r p || [[ -n "$p" ]]; do
-  ((total_in++))
-  if [[ ! -e "$p" ]]; then
-    ((missing++))
-    continue
-  fi
-  if [[ ! -f "$p" ]]; then
-    ((notreg++))
-    continue
-  fi
-  printf '%s\n' "$p" >> "$VERIFIED"
-  # stat size (best-effort)
-  sz="$(stat -c%s -- "$p" 2>/dev/null || echo 0)"
-  bytes_total=$(( bytes_total + sz ))
-done < "$FROM_PLAN"
-
-# Build summary TSV by path prefix
-if [[ -s "$VERIFIED" ]]; then
-  awk -v depth="$GROUP_DEPTH" '
-    function pref(p,depth,   i,n,part,count,acc){
-      n=split(p,a,"/"); acc=""; count=0
-      for(i=1;i<=n;i++){ part=a[i]; if(part=="") continue; count++; if(count<=depth) acc=acc "/" part; else break }
-      if(acc=="") acc="/"; return acc
-    }
-    { g[pref($0,depth)]++ }
-    END{ for(k in g) printf("%s\t%d\n",k,g[k]) }
-  ' "$VERIFIED" | sort -k2,2nr > "$SUMMARY_TSV"
-fi
-
-pp_bytes() {  # simple pretty bytes (binary units)
-  local b="${1:-0}" u=(B KiB MiB GiB TiB PiB) i=0
-  while (( b >= 1024 && i < ${#u[@]}-1 )); do b=$(( (b + 1023) / 1024 )); i=$((i+1)); done
-  printf "%d %s" "$b" "${u[$i]}"
-}
-
-log INFO "Mode: ${MODE^^}"
-log INFO "Input: ${MODE^^} file: ${MODE=="plan" ? FROM_PLAN : FROM_REPORT}"
-[[ "$MODE" == "report" ]] && log INFO "CSV: $CSV | keep=$KEEP"
-log INFO "Verified plan: $VERIFIED"
-log INFO "S
+log_info "Execution complete. Acted on: $acted, errors: $errs"
+exit 0
