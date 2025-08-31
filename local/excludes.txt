@@ -1,0 +1,6 @@
+# local/excludes.txt — one glob per line (case-insensitive)
+*.tmp
+*.part
+*.bak
+*/Cache/*
+*/.Trash*/**
