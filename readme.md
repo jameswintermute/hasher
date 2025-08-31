@@ -31,7 +31,7 @@ cp hasher.conf hasher.conf.backup 2>/dev/null || true
 
 ## About
 
-A project by James Wintermute ([jameswinter@protonmail.ch](mailto:jameswinter@protonmail.ch)).  
+A project by James Wintermute ([jameswintermute@protonmail.ch](mailto:jameswintermute@protonmail.ch)).  
 Originally started in December 2022.  
 Overhauled in Summer 2025 with assistance from ChatGPT.
 
