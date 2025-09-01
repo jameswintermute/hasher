@@ -1,174 +1,356 @@
+\
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
-#!/bin/bash
-# review-duplicates.sh — build a deletion PLAN for duplicate files
-# - Reads a duplicates report (CSV: hash,size,path OR whitespace: hash size path)
-# - Prefilters "low-value" groups (size <= LOW_VALUE_THRESHOLD_BYTES from hasher.conf, default 0)
-#     → diverted to $LOW_DIR/low-value-candidates-<date>-<RUN_ID>.txt
-# - Presents remaining groups for review (interactive by default), or auto-keep by policy
-# - Emits a plan file: $LOG_DIR/review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt
+
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
-# Path/layout discovery
-. "$(dirname "$0")/lib_paths.sh" 2>/dev/null || true
+# ───────────────────────── Layout discovery ─────────────────────────
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Assume this file lives in .../bin/
+APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+BIN_DIR="$APP_HOME/bin"
+LOG_DIR="$APP_HOME/logs"
+HASHES_DIR="$APP_HOME/hashes"
+VAR_DIR="$APP_HOME/var"
+LOW_DIR="$VAR_DIR/low-value"
 
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
-if [ -r /proc/sys/kernel/random/uuid ]; then RUN_ID="$(cat /proc/sys/kernel/random/uuid)"; else RUN_ID="$(date +%s)-$$-$RANDOM"; fi
-log(){ printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
-log_info(){ log "INFO" "$*"; }; log_warn(){ log "WARN" "$*"; }; log_error(){ log "ERROR" "$*"; }
+mkdir -p "$LOG_DIR" "$HASHES_DIR" "$VAR_DIR" "$LOW_DIR"
 
-REPORT_FILE=""; KEEP_POLICY="none"; LIMIT=100; ORDER="size-desc"; NON_INTERACTIVE=false; PLAN_OUT=""
-usage(){ cat <<'EOF'
-Usage: review-duplicates.sh --from-report <file> [options]
-  --keep newest|oldest|path-prefer=REGEX|none
-  --limit N                 Review at most N groups (default: 100)
-  --order size-desc|size-asc
-  --non-interactive         Apply --keep policy across all groups without prompting
-  --plan-out FILE           Override default plan path
+# Optional shared path helpers
+if [ -r "$BIN_DIR/lib_paths.sh" ]; then
+  . "$BIN_DIR/lib_paths.sh" 2>/dev/null || true
+fi
+
+# ───────────────────────── Defaults & args ─────────────────────────
+ORDER="size"             # size|count
+LIMIT=100                # number of groups to review (interactive)
+KEEP_POLICY="newest"     # newest|oldest|largest|smallest|first|last
+NON_INTERACTIVE=false
+REPORT=""                # logs/YYYY-MM-DD-duplicate-hashes.txt
+CONFIG_FILE=""
+LOW_VALUE_THRESHOLD_BYTES=0
+
+ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+say(){ printf "[%s] %s\n" "$(ts)" "$*"; }
+
+usage(){
+  cat <<EOF
+Usage: $0 --from-report FILE [options]
+
+Options:
+  --from-report FILE     Path to canonical duplicate report (logs/YYYY-MM-DD-duplicate-hashes.txt)
+  --order size|count     Sort groups by total size (default) or by file count
+  --limit N              Max groups to review interactively (default: 100). Ignored in --non-interactive
+  --keep POLICY          Keep policy in non-interactive mode or default selection (newest|oldest|largest|smallest|first|last)
+  --non-interactive      Do not prompt; apply --keep POLICY across all groups
+  --config FILE          Load thresholds (LOW_VALUE_THRESHOLD_BYTES=...)
+
+Examples:
+  $0 --from-report "logs/2025-09-01-duplicate-hashes.txt" --keep newest
+  $0 --from-report "logs/2025-09-01-duplicate-hashes.txt" --non-interactive --keep newest
 EOF
 }
-while [ $# -gt 0 ]; do
+
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    --from-report) REPORT_FILE="${2:-}"; shift ;;
+    --from-report) REPORT="${2:-}"; shift ;;
+    --order) ORDER="${2:-}"; shift ;;
+    --limit) LIMIT="${2:-}"; shift ;;
     --keep) KEEP_POLICY="${2:-}"; shift ;;
-    --limit) LIMIT="${2:-100}"; shift ;;
-    --order) ORDER="${2:-size-desc}"; shift ;;
     --non-interactive) NON_INTERACTIVE=true ;;
-    --plan-out) PLAN_OUT="${2:-}"; shift ;;
+    --config) CONFIG_FILE="${2:-}"; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) log_error "Unknown arg: $1"; usage; exit 2 ;;
-  esac; shift || true
+    *) echo "Unknown arg: $1"; usage; exit 2 ;;
+  esac
+  shift
 done
-[ -n "$REPORT_FILE" ] || { log_error "Missing --from-report"; exit 2; }
-[ -r "$REPORT_FILE" ] || { log_error "Report not readable: $REPORT_FILE"; exit 2; }
 
-mkdir -p "$LOG_DIR" "$LOW_DIR"
+[ -n "$REPORT" ] || { echo "[ERROR] Missing --from-report"; usage; exit 2; }
+[ -r "$REPORT" ] || { echo "[ERROR] Cannot read report: $REPORT"; exit 2; }
 
-LOW_VALUE_THRESHOLD_BYTES="0"
-if [ -r "$CONF_FILE" ]; then
-  val="$(awk -F= '/^[[:space:]]*LOW_VALUE_THRESHOLD_BYTES[[:space:]]*=/{print $2; exit}' "$CONF_FILE" | tr -d '\r\n"'\''[:space:]')"
-  case "$val" in (''|*[!0-9]*) ;; (*) LOW_VALUE_THRESHOLD_BYTES="$val" ;; esac
+# ───────────────────────── Load config (simple k=v) ─────────────────
+load_conf(){
+  local f="$1"
+  [ -r "$f" ] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+    case "$line" in
+      *=*)
+        key="${line%%=*}"; val="${line#*=}"
+        key="$(echo "$key" | tr -d '[:space:]')"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+        case "$key" in
+          LOW_VALUE_THRESHOLD_BYTES) LOW_VALUE_THRESHOLD_BYTES="$val" ;;
+        esac
+        ;;
+    esac
+  done < "$f"
+}
+# Prefer local override then default
+[ -z "$CONFIG_FILE" ] && [ -r "$APP_HOME/local/hasher.conf" ] && CONFIG_FILE="$APP_HOME/local/hasher.conf"
+[ -z "$CONFIG_FILE" ] && [ -r "$APP_HOME/default/hasher.conf" ] && CONFIG_FILE="$APP_HOME/default/hasher.conf"
+[ -n "$CONFIG_FILE" ] && load_conf "$CONFIG_FILE"
+
+# ───────────────────────── Canonical report guard ───────────────────
+# Expect lines like:  HASH <digest> (<N> files):
+if ! grep -Eq '^HASH[[:space:]][^[:space:]]+[[:space:]]+\([0-9]+[[:space:]]+files\):' "$REPORT"; then
+  echo "[ERROR] '$REPORT' doesn't look like a canonical duplicate-hashes report."
+  case "$REPORT" in
+    *-nonlow-*.txt|*-low-*.txt)
+      echo "[HINT] This appears to be a filtered summary (nonlow/low). Use the full report named like:"
+      echo "       logs/YYYY-MM-DD-duplicate-hashes.txt"
+      ;;
+  esac
+  _cand="$(ls -1t "$(dirname "$REPORT")"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
+  if [ -n "$_cand" ]; then
+    echo "[SUGGEST] Try: $0 --from-report \"$_cand\""
+  fi
+  exit 2
 fi
 
-PREFILTERED_REPORT="$LOG_DIR/$(date +%F)-duplicate-hashes-nonlow-${RUN_ID}.txt"
-LOW_VALUE_DUMP="$LOW_DIR/low-value-candidates-$(date +%F)-${RUN_ID}.txt"
-awk -v dump="$LOW_VALUE_DUMP" -v out="$PREFILTERED_REPORT" -v thr="$LOW_VALUE_THRESHOLD_BYTES" '
-  function isnum(x){ return (x ~ /^[0-9]+$/) }
-  BEGIN{ FS="," }
-  {
-    h=$1; s=$2; p=$3
-    if(!isnum(s)){
-      n=split($0,a,/[ \t]+/); h=a[1]; s=a[2]; p="";
-      if(n>=3){ for(i=3;i<=n;i++){ p = (p? p " " : "") a[i] } }
-    }
-    if(isnum(s) && s<=thr){ print p >> dump; next }
-    print $0 >> out
-  }
-' "$REPORT_FILE"
-
-if [ -s "$LOW_VALUE_DUMP" ]; then
-  log_info "Low-value duplicate entries diverted (<= ${LOW_VALUE_THRESHOLD_BYTES} bytes): $(wc -l < "$LOW_VALUE_DUMP")"
-  log_info "  • Saved to: $LOW_VALUE_DUMP"
-  log_info "  • Next steps: ./bin/delete-low-value.sh --from-list \"$LOW_VALUE_DUMP\" --verify-only"
-fi
-REPORT_FILE="$PREFILTERED_REPORT"
-
-INDEX_FILE="$LOG_DIR/dups-index-${RUN_ID}.txt"; : > "$INDEX_FILE"
-awk '
-  function isnum(x){ return (x ~ /^[0-9]+$/) }
-  BEGIN{ FS="," }
-  {
-    h=$1; s=$2; p=$3
-    if(!(s ~ /^[0-9]+$/)){
-      n=split($0,a,/[ \t]+/); h=a[1]; s=a[2]; p="";
-      if(n>=3){ for(i=3;i<=n;i++){ p = (p? p " " : "") a[i] } }
-    }
-    if(h=="" || !(s ~ /^[0-9]+$/) || p=="") next
-    printf "%s|%s|%s\n", h, s, p
-  }
-' "$REPORT_FILE" >> "$INDEX_FILE"
-
-TOTAL_ROWS=$(wc -l < "$INDEX_FILE" | tr -d ' ')
-[ "$TOTAL_ROWS" -gt 0 ] || { log_warn "No duplicate rows after filtering; nothing to review."; exit 0; }
-
-GROUP_LIST="$LOG_DIR/dups-groups-${RUN_ID}.txt"; : > "$GROUP_LIST"
-awk -F'|' '{ c[$1]++; sz[$1]=$2 } END{ for(h in c){ printf "%s %s %s\n", sz[h], c[h], h } }' "$INDEX_FILE" > "$GROUP_LIST"
-TOTAL_GROUPS=$(wc -l < "$GROUP_LIST" | tr -d ' ')
-
-case "$ORDER" in
-  size-asc)  SORTED_GROUPS="$LOG_DIR/dups-groups-sorted-${RUN_ID}.txt"; sort -n  "$GROUP_LIST" > "$SORTED_GROUPS" ;;
-  *)         SORTED_GROUPS="$LOG_DIR/dups-groups-sorted-${RUN_ID}.txt"; sort -nr "$GROUP_LIST" > "$SORTED_GROUPS" ;;
-esac
-
-[ -n "$PLAN_OUT" ] || PLAN_OUT="$LOG_DIR/review-dedupe-plan-$(date +'%Y-%m-%d')-$(date +%s).txt"; : > "$PLAN_OUT"
-
-hsize(){ awk -v b="$1" 'BEGIN{ split("B KB MB GB TB PB",u); s=1; while (b>=1024 && s<6){ b/=1024; s++ } printf("%.0f %s", b, u[s]) }'; }
-mtime_epoch(){ stat -c %Y -- "$1" 2>/dev/null || stat --format=%Y -- "$1" 2>/dev/null || echo 0; }
-mtime_iso(){ local e; e="$(mtime_epoch "$1")"; date -d "@$e" +"%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "1970-01-01 00:00:00"; }
-choose_keep_by_policy(){
-  local policy="$1"; shift; local hash="$1"; shift; local paths=("$@"); local keep_idx=0
-  case "$policy" in
-    newest) local best=0 ts i=0; for p in "${paths[@]}"; do ts="$(mtime_epoch "$p")"; [ "$ts" -ge "$best" ] && { best="$ts"; keep_idx="$i"; }; i=$((i+1)); done ;;
-    oldest) local best=9999999999 ts i=0; for p in "${paths[@]}"; do ts="$(mtime_epoch "$p")"; [ "$ts" -le "$best" ] && { best="$ts"; keep_idx="$i"; }; i=$((i+1)); done ;;
-    path-prefer=*) local rx="${policy#path-prefer=}"; local i=0; for p in "${paths[@]}"; do echo "$p" | grep -Eiq -- "$rx" && { keep_idx="$i"; break; }; i=$((i+1)); done ;;
-    *) keep_idx=0 ;;
-  esac; echo "$keep_idx"
+# ───────────────────────── Utilities ────────────────────────────────
+human(){
+  # bytes → human
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B,KB,MB,GB,TB,PB",u,","); s=0;
+    while (b>=1024 && s<5){b/=1024;s++}
+    printf (s? "%.1f %s":"%d %s"), b, u[s+1];
+  }'
 }
 
-log_info "Index ready. Starting review…"
-log_info "  • Ordering:     ${ORDER/size-/size }"
-log_info "  • Limit:        $LIMIT"
-log_info "  • Groups:       $TOTAL_GROUPS total"
-log_info "  • Plan:         $PLAN_OUT"
-[ "$KEEP_POLICY" != "none" ] && log_info "  • Keep policy:  $KEEP_POLICY"
-$NON_INTERACTIVE && log_info "  • Mode:         non-interactive (auto-keep by policy)"
+mtime_of(){
+  stat -c %Y -- "$1" 2>/dev/null || echo 0
+}
 
-shown=0
-while IFS=' ' read -r gsize gcount ghash; do
-  [ "$shown" -ge "$LIMIT" ] && break
-  mapfile -t paths < <(awk -F'|' -v h="$ghash" '$1==h{print $3}' "$INDEX_FILE")
-  [ "${#paths[@]}" -lt 2 ] && continue
+size_of(){
+  stat -c %s -- "$1" 2>/dev/null || echo 0
+}
 
-  sz_human="$(hsize "$gsize")"; reclaim=$(( (gcount-1) * gsize )); reclaim_h="$(hsize "$reclaim")"; idx=$((shown+1))
-  printf "[%d/%d] Size: %s  |  Files: %s  |  Potential reclaim: %s\n" "$idx" "$LIMIT" "$sz_human" "$gcount" "$reclaim_h"
+basename_safe(){
+  # prints base path (without quotes issues)
+  local p="$1"; p="${p%\"}"; p="${p#\"}"; printf '%s\n' "$p"
+}
 
-  i=1
-  for p in "${paths[@]}"; do
-    [ $i -le 12 ] || { echo "       … and $((gcount-12)) more not shown"; break; }
-    printf "    %d) %s  \"%s\"\n" "$i" "$sz_human" "$p"
-    printf "       modified: %s\n" "$(mtime_iso "$p")"; i=$((i+1))
+# ───────────────────────── Parse report into groups ─────────────────
+# We need: groups[]=hash, files for each; compute size (from filesystem) and mtimes
+declare -a GROUP_HASHES=()
+declare -a GROUP_FILES_COUNTS=()
+declare -a GROUP_TOTAL_SIZES=()
+declare -A GROUP_FILES_MAP=()   # key = index, value = NUL-separated files
+declare -a GROUP_FILE_SIZE=()   # per-group representative file size (assume duplicates same size)
+
+current_hash=""
+current_files=()
+
+flush_group(){
+  if [ -n "$current_hash" ] && [ "${#current_files[@]}" -gt 1 ]; then
+    local idx="${#GROUP_HASHES[@]}"
+    GROUP_HASHES+=("$current_hash")
+    # Compute representative size as size of first file
+    local first="${current_files[0]}"
+    first="$(basename_safe "$first")"
+    local rep_size; rep_size="$(size_of "$first")"
+    local total_size=$(( rep_size * ${#current_files[@]} ))
+    GROUP_FILES_COUNTS+=("${#current_files[@]}")
+    GROUP_TOTAL_SIZES+=("$total_size")
+    GROUP_FILE_SIZE+=("$rep_size")
+    # Store NUL-separated paths
+    local joined=""
+    for f in "${current_files[@]}"; do
+      f="$(basename_safe "$f")"
+      joined+="$f"$'\0'
+    done
+    GROUP_FILES_MAP["$idx"]="$joined"
+  fi
+  current_hash=""
+  current_files=()
+}
+
+# Read report
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
+    flush_group
+    current_hash="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
+    # indented file path line
+    current_files+=("${BASH_REMATCH[1]}")
+  else
+    # empty separator lines ignored
+    :
+  fi
+done < "$REPORT"
+flush_group
+
+TOTAL_GROUPS="${#GROUP_HASHES[@]}"
+[ "$TOTAL_GROUPS" -gt 0 ] || { echo "[INFO] No duplicate groups found in: $REPORT"; exit 0; }
+
+# ───────────────────────── Sort groups per ORDER ────────────────────
+# We'll build an index ORDER_IDX[] of group indices in desired order
+declare -a ORDER_IDX=()
+for ((i=0;i<TOTAL_GROUPS;i++)); do ORDER_IDX+=("$i"); done
+
+if [ "$ORDER" = "count" ]; then
+  # sort by files count desc
+  IFS=$'\n' ORDER_IDX=($(for i in "${ORDER_IDX[@]}"; do echo "$i ${GROUP_FILES_COUNTS[$i]}"; done | sort -k2,2nr | awk '{print $1}'))
+else
+  # default: sort by total size desc
+  IFS=$'\n' ORDER_IDX=($(for i in "${ORDER_IDX[@]}"; do echo "$i ${GROUP_TOTAL_SIZES[$i]}"; done | sort -k2,2nr | awk '{print $1}'))
+fi
+unset IFS
+
+# ───────────────────────── Low-value diversion ──────────────────────
+RUN_ID="$(date +%s)-$$"
+DATE_TAG="$(date +%F)"
+PLAN_FILE="$LOG_DIR/review-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
+LOW_LIST="$LOW_DIR/low-value-candidates-$DATE_TAG-$RUN_ID.txt"
+: > "$PLAN_FILE"
+: > "$LOW_LIST"
+
+say "[RUN $RUN_ID] [INFO] Index ready. Starting review…"
+say "[RUN $RUN_ID] [INFO]   • Ordering:     $ORDER desc"
+say "[RUN $RUN_ID] [INFO]   • Limit:        $LIMIT"
+say "[RUN $RUN_ID] [INFO]   • Groups:       $TOTAL_GROUPS total"
+say "[RUN $RUN_ID] [INFO]   • Plan:         $PLAN_FILE"
+
+diverted_low=0
+kept_count=0
+skipped_count=0
+
+prompt_keep(){
+  local group_idx="$1"
+  local files_joined="${GROUP_FILES_MAP[$group_idx]}"
+  IFS=$'\0' read -r -d '' -a files <<< "${files_joined}"$'\0'
+
+  local n="${#files[@]}"
+  local rep_size="${GROUP_FILE_SIZE[$group_idx]}"
+  local size_human; size_human="$(human "$rep_size")"
+  local reclaim=$(( (n-1) * rep_size ))
+  local reclaim_h; reclaim_h="$(human "$reclaim")"
+
+  echo "[${REVIEW_POS}/${REVIEW_MAX}] Size: ${size_human}  |  Files: ${n}  |  Potential reclaim: ${reclaim_h}"
+
+  # Compute mtimes for policy decisions
+  declare -a mtimes=()
+  for ((k=0;k<n;k++)); do
+    mtimes+=("$(mtime_of "${files[$k]}")")
   done
 
-  if $NON_INTERACTIVE && [ "$KEEP_POLICY" != "none" ]; then
-    sel="$(choose_keep_by_policy "$KEEP_POLICY" "$ghash" "${paths[@]}")"
+  # Decide default keep candidate based on policy
+  local def_keep=0
+  case "$KEEP_POLICY" in
+    newest)   # keep highest mtime
+      local max=0 idx=0
+      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -gt "$max" ]; then max="${mtimes[$k]}"; idx="$k"; fi; done
+      def_keep="$idx" ;;
+    oldest)   # keep lowest mtime
+      local min=9999999999 idx=0
+      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -lt "$min" ]; then min="${mtimes[$k]}"; idx="$k"; fi; done
+      def_keep="$idx" ;;
+    largest)  # same size by definition; fallback to newest
+      local max=0 idx=0
+      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -gt "$max" ]; then max="${mtimes[$k]}"; idx="$k"; fi; done
+      def_keep="$idx" ;;
+    smallest) # same size; fallback to oldest
+      local min=9999999999 idx=0
+      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -lt "$min" ]; then min="${mtimes[$k]}"; idx="$k"; fi; done
+      def_keep="$idx" ;;
+    last) def_keep=$((n-1)) ;;
+    first|*) def_keep=0 ;;
+  esac
+
+  # Show choices (up to 12 paths to avoid massive spam)
+  local show=12
+  for ((k=0;k<n && k<show;k++)); do
+    local ts="${mtimes[$k]}"
+    [ "$ts" -gt 0 ] && ts_fmt="$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$ts")" || ts_fmt="unknown"
+    printf "    %2d) %-10s  \"%s\"\n" "$(($k+1))" "$size_human" "${files[$k]}"
+    printf "        modified: %s\n" "$ts_fmt"
+  done
+  if [ "$n" -gt "$show" ]; then
+    echo "        … and $((n-show)) more not shown"
+  fi
+
+  if $NON_INTERACTIVE; then
+    keep="$((def_keep+1))"
   else
-    read -r -p "Select the file ID to KEEP [1-${#paths[@]}], 's' to skip, 'q' to quit: " ans || ans="s"
-    case "$ans" in
-      q|Q) echo "  → Quit."; break ;;
-      s|S|"") echo "  → Skipped."; shown=$((shown+1)); continue ;;
-      *)
-        if echo "$ans" | grep -Eq '^[0-9]+$' && [ "$ans" -ge 1 ] && [ "$ans" -le "${#paths[@]}" ]; then
-          sel=$((ans-1))
-        else
-          echo "  → Invalid; skipped."; shown=$((shown+1)); continue
-        fi
-        ;;
+    read -rp "Select the file ID to KEEP [1-$n], 's' to skip, 'q' to quit (default: $((def_keep+1))): " ans
+    case "${ans:-$((def_keep+1))}" in
+      q|Q) echo "Quitting."; exit 0 ;;
+      s|S) echo "  → Skipped."; return 2 ;;
+      ''|*[!0-9]*) keep="$((def_keep+1))" ;;
+      *) keep="$ans" ;;
     esac
   fi
 
-  keep_path="${paths[$sel]}"
-  for j in "${!paths[@]}"; do [ "$j" -eq "$sel" ] && continue; printf "%s\n" "${paths[$j]}" >> "$PLAN_OUT"; done
-  echo "  → Keeping: \"$keep_path\"; marked $((gcount-1)) for deletion."
-  shown=$((shown+1))
-done < "$SORTED_GROUPS"
+  # Validate keep
+  if [ "$keep" -lt 1 ] || [ "$keep" -gt "$n" ]; then
+    echo "Invalid selection. Skipping group."
+    return 2
+  fi
 
-log_info "Plan written: $PLAN_OUT"
-log_info "Next steps:"
-log_info "  • Dry-run: ./bin/delete-duplicates.sh --from-plan \"$PLAN_OUT\""
-log_info "  • Execute: ./bin/delete-duplicates.sh --from-plan \"$PLAN_OUT\" --force [--quarantine DIR]"
-log_info "  • Low-value candidates, if any, saved to: $LOW_VALUE_DUMP"
+  # Emit plan (delete all except the kept one)
+  local kept_path="${files[$((keep-1))]}"
+  for ((k=0;k<n;k++)); do
+    if [ "$k" -ne $((keep-1)) ]; then
+      printf '%s\n' "${files[$k]}" >> "$PLAN_FILE"
+    fi
+  done
+  echo "  → Keep: \"$kept_path\""
+  return 0
+}
+
+# ───────────────────────── Review loop ──────────────────────────────
+REVIEW_MAX="$LIMIT"
+if $NON_INTERACTIVE; then REVIEW_MAX="$TOTAL_GROUPS"; fi
+
+reviewed=0
+for i in "${ORDER_IDX[@]}"; do
+  # Enforce limit
+  if [ "$reviewed" -ge "$REVIEW_MAX" ]; then break; fi
+
+  files_joined="${GROUP_FILES_MAP[$i]}"
+  IFS=$'\0' read -r -d '' -a files <<< "${files_joined}"$'\0'
+  n="${#files[@]}"
+  rep_size="${GROUP_FILE_SIZE[$i]}"
+
+  # Divert low-value groups (all files <= threshold) to LOW_LIST
+  lv_divert=true
+  if [ "$LOW_VALUE_THRESHOLD_BYTES" -le 0 ]; then
+    # threshold 0 => only zero-byte groups are "low"
+    for f in "${files[@]}"; do
+      sz="$(size_of "$f")"
+      if [ "$sz" -gt 0 ]; then lv_divert=false; break; fi
+    done
+  else
+    for f in "${files[@]}"; do
+      sz="$(size_of "$f")"
+      if [ "$sz" -gt "$LOW_VALUE_THRESHOLD_BYTES" ]; then lv_divert=false; break; fi
+    done
+  fi
+
+  if $lv_divert; then
+    for f in "${files[@]}"; do printf '%s\n' "$f" >> "$LOW_LIST"; done
+    diverted_low=$((diverted_low+1))
+    continue
+  fi
+
+  reviewed=$((reviewed+1))
+  REVIEW_POS="$reviewed"
+  prompt_keep "$i" || { skipped_count=$((skipped_count+1)); continue; }
+  kept_count=$((kept_count+1))
+done
+
+# ───────────────────────── Summary & next steps ─────────────────────
+say "[RUN $RUN_ID] [INFO] Plan written: $PLAN_FILE"
+say "[RUN $RUN_ID] [INFO] Next steps:"
+say "[RUN $RUN_ID] [INFO]   • Dry-run: ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\""
+say "[RUN $RUN_ID] [INFO]   • Execute: ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\" --force [--quarantine DIR]"
+say "[RUN $RUN_ID] [INFO]   • Low-value candidates, if any, saved to: $LOW_LIST"
+
 exit 0
