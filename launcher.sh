@@ -1,4 +1,3 @@
-\
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
@@ -30,10 +29,10 @@ cat <<'EOF'
 EOF
 }
 
-press_any(){ read -rp "Press Enter to continue..." _ || true; }
+press_any(){ read -r -p "Press Enter to continue..." _ || true; }
 
 latest_csv(){ ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true; }
-latest_report(){ ls -1t "$LOGS_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true; }
+latest_report(){ ls -1t "$LOGS_DIR"/*duplicate-hashes*.txt 2>/dev/null | head -n1 || true; }
 latest_zero(){ ls -1t "$ZERO_DIR"/zero-length-*.txt 2>/dev/null | head -n1 || true; }
 latest_plan(){ ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true; }
 
@@ -48,7 +47,7 @@ status(){
     echo "Row count (including header): $rows"
   fi
 
-  local last; last="$(tac "$LOGS_DIR/background.log" 2>/dev/null | grep -m1 '\[PROGRESS\]' || true)"
+  local last; last="$(grep '\[PROGRESS\]' "$LOGS_DIR/background.log" 2>/dev/null | tail -n 1 || true)"
   if [ -n "$last" ]; then
     eta_hms="$(echo "$last" | sed -n 's/.* eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
     pct="$(echo "$last" | sed -n 's/.* Hashing: \[\([0-9]\+\)%\].*/\1/p')"
@@ -62,7 +61,13 @@ status(){
   fi
 
   if [ -s "$LOGS_DIR/background.log" ]; then
-    echo; echo "[STATUS] $(tail -n 1 "$LOGS_DIR/background.log")"
+    # If a completed line exists in last 50 lines, show it
+    comp="$(tail -n 50 "$LOGS_DIR/background.log" 2>/dev/null | grep -m1 'Completed\. Hashed' || true)"
+    if [ -n "$comp" ]; then
+      echo; echo "[STATUS] $comp"
+    else
+      echo; echo "[STATUS] $(tail -n 1 "$LOGS_DIR/background.log")"
+    fi
   fi
   press_any
 }
@@ -75,6 +80,26 @@ start_hashing(){
   ( cd "$APP_HOME" && "$BIN_DIR/hasher.sh" --pathfile "$LOCAL_DIR/paths.txt" --algo sha256 --nohup )
   echo; echo "Tail logs with:"
   echo "  tail -f \"$LOGS_DIR/background.log\" \"$LOGS_DIR/hasher.log\""
+  press_any
+}
+
+# ───── Option 9: advanced/custom hashing ─────
+advanced_hashing(){
+  echo "Advanced / Custom hashing"
+  read -r -p "Pathfile [default: $LOCAL_DIR/paths.txt]: " pf || pf=""
+  [ -z "$pf" ] && pf="$LOCAL_DIR/paths.txt"
+  read -r -p "Algorithm sha256|sha1|sha512|md5|blake2 [default: sha256]: " algo || algo=""
+  [ -z "$algo" ] && algo="sha256"
+  read -r -p "Zero-length-only mode? (y/N): " z || z=""
+  zlc="$(printf "%s" "$z" | tr '[:upper:]' '[:lower:]')"
+  read -r -p "Run in background with nohup? (Y/n): " nh || nh=""
+  nhc="$(printf "%s" "$nh" | tr '[:upper:]' '[:lower:]')"
+  cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" )
+  if [ "$zlc" = "y" ] || [ "$zlc" = "yes" ]; then cmd+=( --zero-length-only ); fi
+  if [ -z "$nhc" ] || [ "$nhc" = "y" ] || [ "$nhc" = "yes" ]; then cmd+=( --nohup ); fi
+  echo "Command:"
+  echo "  ${cmd[*]}"
+  ( cd "$APP_HOME" && "${cmd[@]}" )
   press_any
 }
 
@@ -109,7 +134,8 @@ delete_zero_len(){
   echo "Zero-length list: $z"
   echo "Choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
   read -r -p "> " mode || mode=""
-  case "${mode,,}" in
+  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
+  case "$mode_lc" in
     d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" ) ;;
     f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force ) ;;
     q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force --quarantine "$ZERO_DIR/quarantine-$(date +%F)" ) ;;
@@ -122,7 +148,8 @@ delete_zero_len(){
 delete_junk(){
   echo "Junk cleaner — choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
   read -r -p "> " mode || mode=""
-  case "${mode,,}" in
+  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
+  case "$mode_lc" in
     d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --dry-run ) ;;
     f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --force ) ;;
     q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --quarantine "$APP_HOME/var/junk/quarantine-$(date +%F)" ) ;;
@@ -133,7 +160,7 @@ delete_junk(){
 
 # ───── Option 6: act on a duplicate delete PLAN ─────
 act_on_plan(){
-  local candidates; IFS=$'\n' read -r -d '' -a candidates < <(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n 20; printf '\0')
+  mapfile -t candidates < <(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n 20)
   if [ "${#candidates[@]}" -eq 0 ]; then
     echo "[INFO] No review-dedupe plan files found in $LOGS_DIR."
     echo "Run option 3 (Review duplicate hashes) to build a plan first."
@@ -143,10 +170,14 @@ act_on_plan(){
   local i=0
   for f in "${candidates[@]}"; do
     i=$((i+1))
-    local n ts
-    n="$(wc -l < "$f" | tr -d ' ')" || n="?"
-    ts="$(date -r "$f" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$f" 2>/dev/null || echo "?")"
-    printf "  %2d) %-60s  (%s lines)  [%s]\n" "$i" "$(basename "$f")" "$n" "$ts"
+    local n ts ts_h
+    n="$(wc -l < "$f" | tr -d ' ' 2>/dev/null || echo '?')"
+    if ts=$(stat -c %Y "$f" 2>/dev/null); then
+      ts_h="$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")"
+    else
+      ts_h="$(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+    printf "  %2d) %-60s  (%s lines)  [%s]\n" "$i" "$(basename "$f")" "$n" "$ts_h"
   done
   echo
   read -r -p "Select a plan [1-${#candidates[@]}] (default 1): " sel || sel=""
@@ -158,7 +189,8 @@ act_on_plan(){
   echo "Chosen: $plan"
   echo "Choose mode: [d]ry-run (default), [f]orce, [q]uarantine"
   read -r -p "> " mode || mode=""
-  case "${mode,,}" in
+  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
+  case "$mode_lc" in
     f|force)
       ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" --force )
       ;;
@@ -172,11 +204,11 @@ act_on_plan(){
     *|d|dry|dry-run)
       ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" )
       ;;
-  end
+  esac
   press_any
 }
 
-# ───── Option 6/7/8 helpers ─────
+# ───── Helpers ─────
 populate_paths(){
   local f="$LOCAL_DIR/paths.txt"
   if [ -s "$f" ]; then
@@ -215,7 +247,7 @@ main_menu(){
 ### Stage 1 - Hash ###
   0) Check hashing status
   1) Start Hashing (NAS-safe defaults)
-  8) Advanced / Custom hashing
+  9) Advanced / Custom hashing
 
 ### Stage 2 - Identify ###
   2) Find duplicate hashes
@@ -243,6 +275,7 @@ EOF
       6) act_on_plan ;;
       7) populate_paths ;;
       8) edit_conf ;;
+      9) advanced_hashing ;;
       q|Q) exit 0 ;;
       *) echo "Unknown option"; press_any ;;
     esac
