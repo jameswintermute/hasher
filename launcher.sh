@@ -46,7 +46,7 @@ say(){ printf "[%s] %s\n" "$(ts)" "$*"; }
 pause(){ read -rp "Press Enter to continue..." _; }
 
 pick_latest(){
-  # $1 = glob pattern
+  # $1 = glob pattern (unquoted to allow expansion)
   ls -1t $1 2>/dev/null | head -n1 || true
 }
 
@@ -120,9 +120,13 @@ is_hashing_active(){
   local bg="$LOG_DIR/background.log"
   [ -s "$bg" ] || return 1
   local line ts_str pct
+  # last progress line
   line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
   [ -n "$line" ] || return 1
+
+  # extract timestamp inside first [..]
   ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
+  # Try to compute age; if unavailable, assume active
   if date -d "$ts_str" +%s >/dev/null 2>&1; then
     local ts now age
     ts="$(date -d "$ts_str" +%s)"
@@ -132,11 +136,18 @@ is_hashing_active(){
       return 1
     fi
   fi
+
+  # if progress shows 100%, treat as not active
   pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
   if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
     return 1
   fi
   return 0
+}
+
+# Return 0 if GNU date supports -d "@EPOCH"
+gnu_date_epoch_ok(){
+  date -d "@0" +%s >/dev/null 2>&1
 }
 
 show_hash_status(){
@@ -148,31 +159,36 @@ show_hash_status(){
   fi
 
   # Extract most recent progress line and derive friendly ETA
-  local line ts_str pct eta_h eta_m eta_s eta_abs eta_day now_day tomorrow_day
+  local line ts_str pct eta_str eta_h eta_m eta_s friendly_eta
   line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
   ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
   pct="$(printf '%s\n' "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p')"
-  read -r eta_h eta_m eta_s <<EOF
-$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]\):\([0-9][0-9]\):\([0-9][0-9]\).*/\1 \2 \3/p')
+  eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
+
+  if [ -n "$eta_str" ]; then
+    IFS=':' read -r eta_h eta_m eta_s <<EOF
+$eta_str
 EOF
-  if [ -n "$eta_h" ] && [ -n "$eta_m" ] && [ -n "$eta_s" ]; then
-    local eta_sec=$((10#$eta_h*3600 + 10#$eta_m*60 + 10#$eta_s))
-    if date -d "$ts_str + $eta_sec seconds" +%F\ %T >/dev/null 2>&1; then
-      eta_abs="$(date -d "$ts_str + $eta_sec seconds" +%F\ %T)"
-      now_day="$(date +%F)"
-      tomorrow_day="$(date -d "tomorrow" +%F 2>/dev/null || date -d "$now_day + 1 day" +%F)"
-      eta_day="${eta_abs%% *}"
-      eta_time="${eta_abs#* }"
-      if [ "$eta_day" = "$now_day" ]; then
-        eta_label="today"
-      elif [ "$eta_day" = "$tomorrow_day" ]; then
-        eta_label="tomorrow"
-      else
-        eta_label="$eta_day"
-      fi
-      friendly_eta="~${eta_h}h ${eta_m}m (around ${eta_time} ${eta_label})"
-    else
-      friendly_eta="~${eta_h}h ${eta_m}m ${eta_s}s"
+    # Strip leading zeros for readability
+    [ "${eta_h#0}" = "" ] && eta_h="0" || eta_h="${eta_h#0}"
+    [ "${eta_m#0}" = "" ] && eta_m="0" || eta_m="${eta_m#0}"
+    [ "${eta_s#0}" = "" ] && eta_s="0" || eta_s="${eta_s#0}"
+    friendly_eta="~${eta_h}h ${eta_m}m"
+
+    # Optional absolute time if GNU date is available
+    if gnu_date_epoch_ok; then
+      local now epoch abs_day abs_time label today tomorrow add
+      epoch="$(date +%s)"
+      now="$epoch"
+      add=$((10#$eta_h*3600 + 10#$eta_m*60 + 10#$eta_s))
+      abs_day="$(date -d "@$((now + add))" +%F)"
+      abs_time="$(date -d "@$((now + add))" +%T)"
+      today="$(date +%F)"
+      tomorrow="$(date -d "@$((now + 86400))" +%F)"
+      if [ "$abs_day" = "$today" ]; then label="today"
+      elif [ "$abs_day" = "$tomorrow" ]; then label="tomorrow"
+      else label="$abs_day"; fi
+      friendly_eta="$friendly_eta (around $abs_time $label)"
     fi
   else
     friendly_eta="(ETA unavailable)"
