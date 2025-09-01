@@ -121,11 +121,11 @@ is_hashing_active(){
   [ -s "$bg" ] || return 1
   local line ts_str pct
   # last progress line
-  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  line="$(awk '/\\[PROGRESS\\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
   [ -n "$line" ] || return 1
 
   # extract timestamp inside first [..]
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')"
   # Try to compute age; if unavailable, assume active
   if date -d "$ts_str" +%s >/dev/null 2>&1; then
     local ts now age
@@ -138,7 +138,7 @@ is_hashing_active(){
   fi
 
   # if progress shows 100%, treat as not active
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \\[\\([0-9]\\+\\)%\\].*/\\1/p')"
   if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
     return 1
   fi
@@ -160,10 +160,15 @@ show_hash_status(){
 
   # Extract most recent progress line and derive friendly ETA
   local line ts_str pct eta_str eta_h eta_m eta_s friendly_eta
-  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p')"
-  eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
+  line="$(awk '/\\[PROGRESS\\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')"
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*\\[\\([0-9]\\+\\)%\\].*/\\1/p')"
+
+  # Robust ETA extraction: first try awk split on 'eta=' token, then sed fallback
+  eta_str="$(printf '%s\n' "$line" | awk -F'eta=' '{print $2}' | awk '{print $1}' )"
+  if [[ ! "$eta_str" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\).*/\\1/p')"
+  fi
 
   if [ -n "$eta_str" ]; then
     IFS=':' read -r eta_h eta_m eta_s <<EOF
@@ -195,16 +200,52 @@ EOF
   fi
 
   echo "— Latest progress —"
-  awk '/\[PROGRESS\]/{print}' "$bg" | tail -n 10
+  awk '/\\[PROGRESS\\]/{print}' "$bg" | tail -n 10
 
   if [ -n "$pct" ]; then
     echo
     echo "Summary: ${pct}% complete • ETA ${friendly_eta}"
   fi
 
-  # Show latest RUN ID & related log if present
+  # Determine latest RUN ID seen in background.log
   local last_run_id run_log
-  last_run_id="$(awk '/\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\[RUN //;s/\]//')"
+  last_run_id="$(awk '/\\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\\[RUN //;s/\\]//')"
+
+  # If a Completed line exists for the last run, show it prominently
+  local completed_line completed_ts completed_csv completed_elapsed completed_fail completed_counts
+  if [ -n "$last_run_id" ]; then
+    completed_line="$(grep -F \"[RUN $last_run_id]\" \"$bg\" | grep -F \"] [INFO] Completed.\" | tail -n 1 || true)"
+    if [ -n \"$completed_line\" ]; then
+      completed_ts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')\"
+      completed_csv=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* CSV: \\([^ ]\\+\\).*/\\1/p')\"
+      completed_elapsed=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* in \\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\)\\. .*/\\1/p')\"
+      completed_counts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* Hashed \\([0-9]\\+\\/[^ ]\\+\\) files.*/\\1/p')\"
+
+      echo
+      echo \"*** COMPLETED ***\"
+      [ -n \"$completed_ts\" ] && echo \"Finished at: $completed_ts\"
+      [ -n \"$completed_counts\" ] && echo \"Files hashed: $completed_counts\"
+      [ -n \"$completed_elapsed\" ] && echo \"Duration: $completed_elapsed\"
+      if [ -n \"$completed_csv\" ]; then
+        # If path is relative, show absolute
+        case \"$completed_csv\" in
+          /*) echo \"CSV: $completed_csv\" ;;
+          *)  echo \"CSV: $APP_HOME/$completed_csv\" ;;
+        esac
+      fi
+    fi
+  fi
+
+  # Show latest CSV (still useful if no Completed line parsed)
+  local latest_csv
+  latest_csv="$(pick_latest "$HASHES_DIR/hasher-*.csv")"
+  if [ -n "$latest_csv" ]; then
+    echo
+    echo "Latest CSV: $latest_csv"
+    echo "Row count (including header): $(wc -l < "$latest_csv" 2>/dev/null || echo 0)"
+  fi
+
+  # Show tail of the per-run log if present
   if [ -n "$last_run_id" ]; then
     run_log="$LOG_DIR/hasher-$last_run_id.log"
     if [ -f "$run_log" ]; then
@@ -214,23 +255,20 @@ EOF
     fi
   fi
 
-  # Show latest CSV
-  local latest_csv
-  latest_csv="$(pick_latest "$HASHES_DIR/hasher-*.csv")"
-  if [ -n "$latest_csv" ]; then
-    echo
-    echo "Latest CSV: $latest_csv"
-    echo "Row count (including header): $(wc -l < "$latest_csv" 2>/dev/null || echo 0)"
-  fi
-
-  # Give a simple 'active?' hint
+  # Active/idle hint
   if is_hashing_active; then
     echo
     echo "[STATUS] Hashing appears ACTIVE (recent progress in $bg)."
     echo "Tip: avoid launching a second run until this completes."
   else
-    echo
-    echo "[STATUS] No recent progress detected — hashing may be idle or complete."
+    # If we showed a completed line, be explicit; otherwise generic
+    if [ -n \"$completed_line\" ]; then
+      echo
+      echo "[STATUS] Hashing is COMPLETE for the latest run."
+    else
+      echo
+      echo "[STATUS] No recent progress detected — hashing may be idle or complete."
+    fi
   fi
   pause
 }
