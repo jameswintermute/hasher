@@ -10,7 +10,6 @@ IFS=$'\n\t'; LC_ALL=C
 
 # ───────────────────────── Layout discovery ─────────────────────────
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# Assume this file lives in .../bin/
 APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 BIN_DIR="$APP_HOME/bin"
 LOG_DIR="$APP_HOME/logs"
@@ -92,13 +91,11 @@ load_conf(){
     esac
   done < "$f"
 }
-# Prefer local override then default
 [ -z "$CONFIG_FILE" ] && [ -r "$APP_HOME/local/hasher.conf" ] && CONFIG_FILE="$APP_HOME/local/hasher.conf"
 [ -z "$CONFIG_FILE" ] && [ -r "$APP_HOME/default/hasher.conf" ] && CONFIG_FILE="$APP_HOME/default/hasher.conf"
 [ -n "$CONFIG_FILE" ] && load_conf "$CONFIG_FILE"
 
 # ───────────────────────── Canonical report guard ───────────────────
-# Expect lines like:  HASH <digest> (<N> files):
 if ! grep -Eq '^HASH[[:space:]][^[:space:]]+[[:space:]]+\([0-9]+[[:space:]]+files\):' "$REPORT"; then
   echo "[ERROR] '$REPORT' doesn't look like a canonical duplicate-hashes report."
   case "$REPORT" in
@@ -116,7 +113,6 @@ fi
 
 # ───────────────────────── Utilities ────────────────────────────────
 human(){
-  # bytes → human
   awk -v b="${1:-0}" 'BEGIN{
     split("B,KB,MB,GB,TB,PB",u,","); s=0;
     while (b>=1024 && s<5){b/=1024;s++}
@@ -124,82 +120,101 @@ human(){
   }'
 }
 
-mtime_of(){
-  stat -c %Y -- "$1" 2>/dev/null || echo 0
-}
+mtime_of(){ stat -c %Y -- "$1" 2>/dev/null || echo 0; }
+size_of(){  stat -c %s -- "$1" 2>/dev/null || echo 0; }
 
-size_of(){
-  stat -c %s -- "$1" 2>/dev/null || echo 0
-}
+strip_quotes(){ local p="$1"; p="${p%\"}"; p="${p#\"}"; printf '%s\n' "$p"; }
 
-basename_safe(){
-  # prints base path (without quotes issues)
-  local p="$1"; p="${p%\"}"; p="${p#\"}"; printf '%s\n' "$p"
-}
-
-# ───────────────────────── Parse report into groups ─────────────────
-# We need: groups[]=hash, files for each; compute size (from filesystem) and mtimes
+# ───────────────────────── Parse report into groups (with progress) ─
 declare -a GROUP_HASHES=()
 declare -a GROUP_FILES_COUNTS=()
 declare -a GROUP_TOTAL_SIZES=()
-declare -A GROUP_FILES_MAP=()   # key = index, value = NUL-separated files
-declare -a GROUP_FILE_SIZE=()   # per-group representative file size (assume duplicates same size)
+declare -A GROUP_FILES_MAP=()
+declare -a GROUP_FILE_SIZE=()
+
+TOTAL_DECLARED_GROUPS="$(grep -c '^HASH ' "$REPORT" || echo 0)"
+say "[INFO] Parsing report… groups declared: $TOTAL_DECLARED_GROUPS"
+PARSED_GROUPS=0
+FILES_SEEN=0
+PARSE_START="$(date +%s)"
+PROG_STEP=200   # print a progress line every N groups
 
 current_hash=""
 current_files=()
+
+progress_line(){
+  local now elapsed eta pct
+  now="$(date +%s)"; elapsed=$(( now - PARSE_START ))
+  if [ "$PARSED_GROUPS" -gt 0 ] && [ "$TOTAL_DECLARED_GROUPS" -gt 0 ]; then
+    pct=$(( PARSED_GROUPS * 100 / TOTAL_DECLARED_GROUPS ))
+    eta=$(( elapsed * (TOTAL_DECLARED_GROUPS - PARSED_GROUPS) / PARSED_GROUPS ))
+  else
+    pct=0; eta=0
+  fi
+  printf "... Report groups parsed: %d/%d (%d%%) (files seen: %d) | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n" \
+    "$PARSED_GROUPS" "$TOTAL_DECLARED_GROUPS" "$pct" "$FILES_SEEN" \
+    $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
+    $((eta/3600)) $((eta%3600/60)) $((eta%60))
+}
 
 flush_group(){
   if [ -n "$current_hash" ] && [ "${#current_files[@]}" -gt 1 ]; then
     local idx="${#GROUP_HASHES[@]}"
     GROUP_HASHES+=("$current_hash")
-    # Compute representative size as size of first file
-    local first="${current_files[0]}"
-    first="$(basename_safe "$first")"
+    local first="$(strip_quotes "${current_files[0]}")"
     local rep_size; rep_size="$(size_of "$first")"
     local total_size=$(( rep_size * ${#current_files[@]} ))
     GROUP_FILES_COUNTS+=("${#current_files[@]}")
     GROUP_TOTAL_SIZES+=("$total_size")
     GROUP_FILE_SIZE+=("$rep_size")
-    # Store NUL-separated paths
+    # store NUL-joined
     local joined=""
     for f in "${current_files[@]}"; do
-      f="$(basename_safe "$f")"
-      joined+="$f"$'\0'
+      joined+="$(strip_quotes "$f")"$'\0'
     done
     GROUP_FILES_MAP["$idx"]="$joined"
+  fi
+  if [ -n "$current_hash" ]; then
+    PARSED_GROUPS=$((PARSED_GROUPS+1))
+    FILES_SEEN=$((FILES_SEEN + ${#current_files[@]}))
+    # periodic progress
+    if [ $(( PARSED_GROUPS % PROG_STEP )) -eq 0 ]; then
+      progress_line
+    fi
   fi
   current_hash=""
   current_files=()
 }
 
-# Read report
+# Read & parse
 while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
     flush_group
     current_hash="${BASH_REMATCH[1]}"
+    # (we could optionally compare declared count ${BASH_REMATCH[2]})
   elif [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
-    # indented file path line
     current_files+=("${BASH_REMATCH[1]}")
   else
-    # empty separator lines ignored
     :
   fi
 done < "$REPORT"
 flush_group
+# Final progress line
+progress_line
 
 TOTAL_GROUPS="${#GROUP_HASHES[@]}"
-[ "$TOTAL_GROUPS" -gt 0 ] || { echo "[INFO] No duplicate groups found in: $REPORT"; exit 0; }
+if [ "$TOTAL_GROUPS" -le 0 ]; then
+  echo "[INFO] No duplicate groups found in: $REPORT"
+  exit 0
+fi
 
 # ───────────────────────── Sort groups per ORDER ────────────────────
-# We'll build an index ORDER_IDX[] of group indices in desired order
 declare -a ORDER_IDX=()
 for ((i=0;i<TOTAL_GROUPS;i++)); do ORDER_IDX+=("$i"); done
 
 if [ "$ORDER" = "count" ]; then
-  # sort by files count desc
   IFS=$'\n' ORDER_IDX=($(for i in "${ORDER_IDX[@]}"; do echo "$i ${GROUP_FILES_COUNTS[$i]}"; done | sort -k2,2nr | awk '{print $1}'))
 else
-  # default: sort by total size desc
   IFS=$'\n' ORDER_IDX=($(for i in "${ORDER_IDX[@]}"; do echo "$i ${GROUP_TOTAL_SIZES[$i]}"; done | sort -k2,2nr | awk '{print $1}'))
 fi
 unset IFS
@@ -222,6 +237,10 @@ diverted_low=0
 kept_count=0
 skipped_count=0
 
+human_size_of_file(){
+  local f="$1"; local sz; sz="$(size_of "$f")"; human "$sz"
+}
+
 prompt_keep(){
   local group_idx="$1"
   local files_joined="${GROUP_FILES_MAP[$group_idx]}"
@@ -235,40 +254,27 @@ prompt_keep(){
 
   echo "[${REVIEW_POS}/${REVIEW_MAX}] Size: ${size_human}  |  Files: ${n}  |  Potential reclaim: ${reclaim_h}"
 
-  # Compute mtimes for policy decisions
   declare -a mtimes=()
-  for ((k=0;k<n;k++)); do
-    mtimes+=("$(mtime_of "${files[$k]}")")
-  done
+  for ((k=0;k<n;k++)); do mtimes+=("$(mtime_of "${files[$k]}")"); done
 
-  # Decide default keep candidate based on policy
   local def_keep=0
   case "$KEEP_POLICY" in
-    newest)   # keep highest mtime
-      local max=0 idx=0
-      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -gt "$max" ]; then max="${mtimes[$k]}"; idx="$k"; fi; done
-      def_keep="$idx" ;;
-    oldest)   # keep lowest mtime
-      local min=9999999999 idx=0
-      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -lt "$min" ]; then min="${mtimes[$k]}"; idx="$k"; fi; done
-      def_keep="$idx" ;;
-    largest)  # same size by definition; fallback to newest
-      local max=0 idx=0
-      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -gt "$max" ]; then max="${mtimes[$k]}"; idx="$k"; fi; done
-      def_keep="$idx" ;;
-    smallest) # same size; fallback to oldest
-      local min=9999999999 idx=0
-      for ((k=0;k<n;k++)); do if [ "${mtimes[$k]}" -lt "$min" ]; then min="${mtimes[$k]}"; idx="$k"; fi; done
-      def_keep="$idx" ;;
+    newest)   local max=0 idx=0; for ((k=0;k<n;k++)); do [ "${mtimes[$k]}" -gt "$max" ] && { max="${mtimes[$k]}"; idx="$k"; }; done; def_keep="$idx" ;;
+    oldest)   local min=9999999999 idx=0; for ((k=0;k<n;k++)); do [ "${mtimes[$k]}" -lt "$min" ] && { min="${mtimes[$k]}"; idx="$k"; }; done; def_keep="$idx" ;;
+    largest)  local max=0 idx=0; for ((k=0;k<n;k++)); do sz="$(size_of "${files[$k]}")"; [ "$sz" -gt "$max" ] && { max="$sz"; idx="$k"; }; done; def_keep="$idx" ;;
+    smallest) local min=999999999999 idx=0; for ((k=0;k<n;k++)); do sz="$(size_of "${files[$k]}")"; [ "$sz" -lt "$min" ] && { min="$sz"; idx="$k"; }; done; def_keep="$idx" ;;
     last) def_keep=$((n-1)) ;;
     first|*) def_keep=0 ;;
   esac
 
-  # Show choices (up to 12 paths to avoid massive spam)
   local show=12
   for ((k=0;k<n && k<show;k++)); do
     local ts="${mtimes[$k]}"
-    [ "$ts" -gt 0 ] && ts_fmt="$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$ts")" || ts_fmt="unknown"
+    if date -d "@$ts" "+%Y-%m-%d %H:%M:%S" >/dev/null 2>&1; then
+      ts_fmt="$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S")"
+    else
+      ts_fmt="$ts"
+    fi
     printf "    %2d) %-10s  \"%s\"\n" "$(($k+1))" "$size_human" "${files[$k]}"
     printf "        modified: %s\n" "$ts_fmt"
   done
@@ -288,13 +294,11 @@ prompt_keep(){
     esac
   fi
 
-  # Validate keep
   if [ "$keep" -lt 1 ] || [ "$keep" -gt "$n" ]; then
     echo "Invalid selection. Skipping group."
     return 2
   fi
 
-  # Emit plan (delete all except the kept one)
   local kept_path="${files[$((keep-1))]}"
   for ((k=0;k<n;k++)); do
     if [ "$k" -ne $((keep-1)) ]; then
@@ -307,43 +311,34 @@ prompt_keep(){
 
 # ───────────────────────── Review loop ──────────────────────────────
 REVIEW_MAX="$LIMIT"
-if $NON_INTERACTIVE; then REVIEW_MAX="$TOTAL_GROUPS"; fi
+$NON_INTERACTIVE && REVIEW_MAX="$TOTAL_GROUPS"
 
 reviewed=0
 for i in "${ORDER_IDX[@]}"; do
-  # Enforce limit
-  if [ "$reviewed" -ge "$REVIEW_MAX" ]; then break; fi
-
+  [ "$reviewed" -ge "$REVIEW_MAX" ] && break
   files_joined="${GROUP_FILES_MAP[$i]}"
   IFS=$'\0' read -r -d '' -a files <<< "${files_joined}"$'\0'
   n="${#files[@]}"
-  rep_size="${GROUP_FILE_SIZE[$i]}"
 
   # Divert low-value groups (all files <= threshold) to LOW_LIST
   lv_divert=true
   if [ "$LOW_VALUE_THRESHOLD_BYTES" -le 0 ]; then
-    # threshold 0 => only zero-byte groups are "low"
     for f in "${files[@]}"; do
-      sz="$(size_of "$f")"
-      if [ "$sz" -gt 0 ]; then lv_divert=false; break; fi
+      sz="$(size_of "$f")"; if [ "$sz" -gt 0 ]; then lv_divert=false; break; fi
     done
   else
     for f in "${files[@]}"; do
-      sz="$(size_of "$f")"
-      if [ "$sz" -gt "$LOW_VALUE_THRESHOLD_BYTES" ]; then lv_divert=false; break; fi
+      sz="$(size_of "$f")"; if [ "$sz" -gt "$LOW_VALUE_THRESHOLD_BYTES" ]; then lv_divert=false; break; fi
     done
   fi
-
   if $lv_divert; then
     for f in "${files[@]}"; do printf '%s\n' "$f" >> "$LOW_LIST"; done
-    diverted_low=$((diverted_low+1))
     continue
   fi
 
   reviewed=$((reviewed+1))
   REVIEW_POS="$reviewed"
-  prompt_keep "$i" || { skipped_count=$((skipped_count+1)); continue; }
-  kept_count=$((kept_count+1))
+  prompt_keep "$i" || { continue; }
 done
 
 # ───────────────────────── Summary & next steps ─────────────────────
