@@ -8,75 +8,18 @@
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
-# ───────────────────────── Layout discovery ─────────────────────────
-SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-APP_HOME="$SCRIPT_DIR"
+APP_HOME="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BIN_DIR="$APP_HOME/bin"
-LOG_DIR="$APP_HOME/logs"
+LOGS_DIR="$APP_HOME/logs"
 HASHES_DIR="$APP_HOME/hashes"
-VAR_DIR="$APP_HOME/var"
-ZERO_DIR="$VAR_DIR/zero-length"
-LOW_DIR="$VAR_DIR/low-value"
-QUAR_DIR="$VAR_DIR/quarantine"
+ZERO_DIR="$APP_HOME/zero-length"
+LOCAL_DIR="$APP_HOME/local"
+DEFAULT_DIR="$APP_HOME/default"
 
-# Ensure dirs
-mkdir -p "$LOG_DIR" "$HASHES_DIR" "$ZERO_DIR" "$LOW_DIR" "$QUAR_DIR"
+mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$ZERO_DIR"
 
-# Load helper paths if present
-if [ -r "$BIN_DIR/lib_paths.sh" ]; then
-  . "$BIN_DIR/lib_paths.sh" 2>/dev/null || true
-  # lib may override vars; ensure fallbacks exist
-  APP_HOME="${APP_HOME:-$SCRIPT_DIR}"
-  BIN_DIR="${BIN_DIR:-$APP_HOME/bin}"
-  LOG_DIR="${LOG_DIR:-$APP_HOME/logs}"
-  HASHES_DIR="${HASHES_DIR:-$APP_HOME/hashes}"
-  VAR_DIR="${VAR_DIR:-$APP_HOME/var}"
-  ZERO_DIR="${ZERO_DIR:-$VAR_DIR/zero-length}"
-  LOW_DIR="${LOW_DIR:-$VAR_DIR/low-value}"
-  QUAR_DIR="${QUAR_DIR:-$VAR_DIR/quarantine}"
-fi
-
-PATHFILE_DEFAULT="$APP_HOME/local/paths.txt"
-CONF_DEFAULT_LOCAL="$APP_HOME/local/hasher.conf"
-CONF_DEFAULT_DIST="$APP_HOME/default/hasher.conf"
-
-# ───────────────────────── Helpers ─────────────────────────
-ts(){ date +"%Y-%m-%d %H:%M:%S"; }
-say(){ printf "[%s] %s\n" "$(ts)" "$*"; }
-pause(){ read -rp "Press Enter to continue..." _; }
-
-pick_latest(){
-  # $1 = glob pattern (unquoted to allow expansion)
-  ls -1t $1 2>/dev/null | head -n1 || true
-}
-
-open_in_editor(){
-  # $1 = file
-  local f="$1"
-  local ed="${EDITOR:-}"
-  if [ -z "$ed" ]; then
-    if command -v nano >/dev/null 2>&1; then ed="nano"
-    elif command -v vi >/dev/null 2>&1; then ed="vi"
-    elif command -v vim >/dev/null 2>&1; then ed="vim"
-    else ed=""; fi
-  fi
-  if [ -n "$ed" ]; then "$ed" "$f" || true
-  else
-    say "No terminal editor found (looked for $EDITOR, nano, vi, vim). Please edit: $f"
-  fi
-}
-
-print_cmd(){
-  local out=""
-  for arg in "$@"; do
-    printf -v q '%q' "$arg"
-    out+="$q "
-  done
-  echo "${out%% }"
-}
-
-ascii(){
-cat <<'BANNER'
+draw_banner(){
+cat <<'EOF'
  _   _           _               
 | | | | __ _ ___| |__   ___ _ __ 
 | |_| |/ _` / __| '_ \ / _ \ '__|
@@ -84,13 +27,149 @@ cat <<'BANNER'
 |_| |_|\__,_|___/_| |_|\___|_|   
 
       NAS File Hasher & Dedupe
-BANNER
+EOF
 }
 
-menu(){
-  clear
-  ascii
-  cat <<'MENU'
+press_any(){ read -rp "Press Enter to continue..." _ || true; }
+
+latest_csv(){ ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true; }
+latest_report(){ ls -1t "$LOGS_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true; }
+latest_zero(){ ls -1t "$ZERO_DIR"/zero-length-*.txt 2>/dev/null | head -n1 || true; }
+
+# ───── Option 0: status (friendly ETA-to-clocktime) ─────
+status(){
+  echo "— Latest progress —"
+  tail -n 10 "$LOGS_DIR/background.log" 2>/dev/null || echo "(no background.log yet)"
+  local csv; csv="$(latest_csv)"
+  if [ -n "$csv" ]; then
+    echo; echo "Latest CSV: $csv"
+    local rows; rows="$(wc -l < "$csv" | tr -d ' ')"
+    echo "Row count (including header): $rows"
+  fi
+
+  # Try to parse the last PROGRESS line for ETA hh:mm:ss, convert to clock time
+  local last; last="$(tac "$LOGS_DIR/background.log" 2>/dev/null | grep -m1 '\[PROGRESS\]' || true)"
+  if [ -n "$last" ]; then
+    eta_hms="$(echo "$last" | sed -n 's/.* eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
+    pct="$(echo "$last" | sed -n 's/.* Hashing: \[\([0-9]\+\)%\].*/\1/p')"
+    if [ -n "$eta_hms" ]; then
+      IFS=: read -r eh em es <<< "$eta_hms"
+      secs=$((10#$eh*3600 + 10#$em*60 + 10#$es))
+      end_epoch=$(( $(date +%s) + secs ))
+      end_local="$(date -d "@$end_epoch" "+%H:%M:%S %Z")"
+      echo; echo "Summary: ${pct:-?}% complete • ETA in ~${eh}h ${em}m ${es}s (≈ ${end_local})"
+    fi
+  fi
+
+  # Activity heuristic
+  local last_ts; last_ts="$(tail -n 1 "$LOGS_DIR/background.log" 2>/dev/null | sed -n 's/^\[\(....-..-.. ..:..:..\)\].*/\1/p')"
+  if [ -n "$last_ts" ]; then
+    echo; echo "[STATUS] $(tail -n 1 "$LOGS_DIR/background.log")"
+  fi
+  press_any
+}
+
+# ───── Option 1: start hashing (safe defaults) ─────
+start_hashing(){
+  echo "Starting Hasher now using defaults..."
+  echo "Command:"
+  echo "  bin/hasher.sh --pathfile $LOCAL_DIR/paths.txt --algo sha256 --nohup"
+  ( cd "$APP_HOME" && "$BIN_DIR/hasher.sh" --pathfile "$LOCAL_DIR/paths.txt" --algo sha256 --nohup )
+  echo; echo "Tail logs with:"
+  echo "  tail -f \"$LOGS_DIR/background.log\" \"$LOGS_DIR/hasher.log\""
+  press_any
+}
+
+# ───── Option 2: find duplicates (summary) ─────
+find_dupes(){
+  echo "Finding duplicate groups from latest CSV..."
+  ( cd "$APP_HOME" && "$BIN_DIR/find-duplicates.sh" )
+  press_any
+}
+
+# ───── Option 3: review duplicates (interactive) ─────
+review_dupes(){
+  local rep; rep="$(latest_report)"
+  if [ -z "$rep" ]; then
+    echo "[INFO] No duplicate report found; generating one..."
+    ( cd "$APP_HOME" && "$BIN_DIR/find-duplicates.sh" )
+    rep="$(latest_report)"
+    [ -z "$rep" ] && { echo "[ERROR] Still no report found."; press_any; return; }
+  fi
+  echo "[INFO] Using latest report: $rep"
+  # Force interactive TTY read for child
+  ( cd "$APP_HOME" && "$BIN_DIR/review-duplicates.sh" --from-report "$rep" ) < /dev/tty
+  press_any
+}
+
+# ───── Option 4: delete zero-length files ─────
+delete_zero_len(){
+  local z; z="$(latest_zero)"
+  if [ -z "$z" ]; then
+    echo "[INFO] No zero-length list found. You can run: bin/hasher.sh --pathfile local/paths.txt --algo sha256 --zero-length-only"
+    press_any; return
+  fi
+  echo "Zero-length list: $z"
+  echo "Choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
+  read -r -p "> " mode || mode=""
+  case "${mode,,}" in
+    d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" ) ;;
+    f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force ) ;;
+    q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force --quarantine "$ZERO_DIR/quarantine-$(date +%F)" ) ;;
+    *|v|verify|verify-only) ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --verify-only ) ;;
+  esac
+  press_any
+}
+
+# ───── Option 5: delete junk files (Thumbs.db, .DS_Store, @eaDir…) ─────
+delete_junk(){
+  echo "Junk cleaner — choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
+  read -r -p "> " mode || mode=""
+  case "${mode,,}" in
+    d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --dry-run ) ;;
+    f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --force ) ;;
+    q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --quarantine "$APP_HOME/var/junk/quarantine-$(date +%F)" ) ;;
+    *|v|verify|verify-only) ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --verify-only ) ;;
+  esac
+  press_any
+}
+
+# ───── Option 6: write a starter paths file ─────
+populate_paths(){
+  local f="$LOCAL_DIR/paths.txt"
+  if [ -s "$f" ]; then
+    echo "[INFO] $f already exists:"
+    nl -ba "$f" | head -n 20
+  else
+    mkdir -p "$LOCAL_DIR"
+    cat > "$f" <<EOF
+/volume1/Family
+/volume1/James
+/volume1/Media
+EOF
+    echo "[INFO] Wrote starter $f"
+  fi
+  press_any
+}
+
+# ───── Option 7: edit conf (local overlays default) ─────
+edit_conf(){
+  local lf="$LOCAL_DIR/hasher.conf"
+  local df="$DEFAULT_DIR/hasher.conf"
+  [ -r "$df" ] && echo "[INFO] Default conf: $df"
+  if [ ! -r "$lf" ]; then
+    mkdir -p "$LOCAL_DIR"
+    cp -n "$df" "$lf" 2>/dev/null || true
+    echo "[INFO] Created local conf: $lf"
+  fi
+  ${EDITOR:-vi} "$lf" || true
+}
+
+main_menu(){
+  while :; do
+    clear || true
+    draw_banner
+    cat <<EOF
 
 ### Stage 1 - Hash ###
   0) Check hashing status
@@ -103,407 +182,29 @@ menu(){
 
 ### Stage 3 - Cleanup ###
   4) Delete Zero-Length files
-  5) Delete Low-Value files (tiny files diverted from review)
+  5) Delete Junk files (Thumbs.db, .DS_Store, @eaDir…)
 
 ### Other ###
   6) Populate the paths file (local/paths.txt)
   7) Edit config (local/hasher.conf; overlays default/hasher.conf)
 
   q) Quit
-MENU
-  echo -n "Select an option: "
-}
-
-# ───────────────────────── Status helpers ──────────────────
-is_hashing_active(){
-  local bg="$LOG_DIR/background.log"
-  [ -s "$bg" ] || return 1
-  local line ts_str pct
-  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
-  [ -n "$line" ] || return 1
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
-  if date -d "$ts_str" +%s >/dev/null 2>&1; then
-    local ts now age
-    ts="$(date -d "$ts_str" +%s)"
-    now="$(date +%s)"
-    age=$(( now - ts ))
-    if [ "$age" -gt $((10*60)) ]; then
-      return 1
-    fi
-  fi
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
-  if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
-    return 1
-  fi
-  return 0
-}
-
-gnu_date_epoch_ok(){
-  date -d "@0" +%s >/dev/null 2>&1
-}
-
-show_hash_status(){
-  local bg="$LOG_DIR/background.log"
-  if [ ! -s "$bg" ]; then
-    say "No background hashing log found at $bg"
-    echo "Start hashing with option 1, then re-check status."
-    pause; return
-  fi
-
-  local line ts_str pct eta_str eta_h eta_m eta_s friendly_eta
-  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p')"
-  eta_str="$(printf '%s\n' "$line" | awk -F'eta=' '{print $2}' | awk '{print $1}' )"
-  if [[ ! "$eta_str" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-    eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
-  fi
-
-  if [ -n "$eta_str" ]; then
-    IFS=':' read -r eta_h eta_m eta_s <<EOF
-$eta_str
 EOF
-    [ "${eta_h#0}" = "" ] && eta_h="0" || eta_h="${eta_h#0}"
-    [ "${eta_m#0}" = "" ] && eta_m="0" || eta_m="${eta_m#0}"
-    [ "${eta_s#0}" = "" ] && eta_s="0" || eta_s="${eta_s#0}"
-    friendly_eta="~${eta_h}h ${eta_m}m"
-    if gnu_date_epoch_ok; then
-      local now epoch abs_day abs_time label today tomorrow add
-      epoch="$(date +%s)"; now="$epoch"
-      add=$((10#$eta_h*3600 + 10#$eta_m*60 + 10#$eta_s))
-      abs_day="$(date -d "@$((now + add))" +%F)"
-      abs_time="$(date -d "@$((now + add))" +%T)"
-      today="$(date +%F)"
-      tomorrow="$(date -d "@$((now + 86400))" +%F)"
-      if [ "$abs_day" = "$today" ]; then label="today"
-      elif [ "$abs_day" = "$tomorrow" ]; then label="tomorrow"
-      else label="$abs_day"; fi
-      friendly_eta="$friendly_eta (around $abs_time $label)"
-    fi
-  else
-    friendly_eta="(ETA unavailable)"
-  fi
-
-  echo "— Latest progress —"
-  awk '/\[PROGRESS\]/{print}' "$bg" | tail -n 10
-
-  if [ -n "$pct" ]; then
-    echo
-    echo "Summary: ${pct}% complete • ETA ${friendly_eta}"
-  fi
-
-  local last_run_id run_log
-  last_run_id="$(awk '/\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\[RUN //;s/\]//')"
-
-  local completed_line completed_ts completed_csv completed_elapsed completed_fail completed_counts
-  if [ -n "$last_run_id" ]; then
-    completed_line="$(grep -F \"[RUN $last_run_id]\" \"$bg\" | grep -F \"] [INFO] Completed.\" | tail -n 1 || true)"
-    if [ -n \"$completed_line\" ]; then
-      completed_ts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')\"
-      completed_csv=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* CSV: \([^ ]\+\).*/\1/p')\"
-      completed_elapsed=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* in \([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)\. .*/\1/p')\"
-      completed_counts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* Hashed \([0-9]\+\/[^ ]\+\) files.*/\1/p')\"
-      echo
-      echo \"*** COMPLETED ***\"
-      [ -n \"$completed_ts\" ] && echo \"Finished at: $completed_ts\"
-      [ -n \"$completed_counts\" ] && echo \"Files hashed: $completed_counts\"
-      [ -n \"$completed_elapsed\" ] && echo \"Duration: $completed_elapsed\"
-      if [ -n \"$completed_csv\" ]; then
-        case \"$completed_csv\" in
-          /*) echo \"CSV: $completed_csv\" ;;
-          *)  echo \"CSV: $APP_HOME/$completed_csv\" ;;
-        esac
-      fi
-    fi
-  fi
-
-  local latest_csv
-  latest_csv="$(pick_latest "$HASHES_DIR/hasher-*.csv")"
-  if [ -n "$latest_csv" ]; then
-    echo
-    echo "Latest CSV: $latest_csv"
-    echo "Row count (including header): $(wc -l < "$latest_csv" 2>/dev/null || echo 0)"
-  fi
-
-  if [ -n "$last_run_id" ]; then
-    run_log="$LOG_DIR/hasher-$last_run_id.log"
-    if [ -f "$run_log" ]; then
-      echo
-      echo "Run log: $run_log (tail -n 20)"
-      tail -n 20 "$run_log" || true
-    fi
-  fi
-
-  if is_hashing_active; then
-    echo
-    echo "[STATUS] Hashing appears ACTIVE (recent progress in $bg)."
-    echo "Tip: avoid launching a second run until this completes."
-  else
-    if [ -n \"$completed_line\" ]; then
-      echo
-      echo "[STATUS] Hashing is COMPLETE for the latest run."
-    else
-      echo
-      echo "[STATUS] No recent progress detected — hashing may be idle or complete."
-    fi
-  fi
-  pause
-}
-
-# ───────────────────────── Actions ─────────────────────────
-start_hashing(){
-  if is_hashing_active; then
-    echo "[WARN] Hashing appears ACTIVE (recent progress in $LOG_DIR/background.log)."
-    read -r -p "Start another run anyway? (y/N): " yn
-    case "$yn" in y|Y) : ;; *) say "Cancelled."; pause; return ;; esac
-  fi
-
-  local algo="sha256"
-  local pathfile="$PATHFILE_DEFAULT"
-  if [ ! -f "$pathfile" ]; then
-    say "paths file not found: $pathfile"
-    echo -n "Create it now? (y/n) "
-    read -r yn
-    case "$yn" in
-      y|Y) : ;;
-      *) return ;;
+    read -r -p "Select an option: " opt || opt=""
+    case "$opt" in
+      0) status ;;
+      1) start_hashing ;;
+      2) find_dupes ;;
+      3) review_dupes ;;
+      4) delete_zero_len ;;
+      5) delete_junk ;;
+      6) populate_paths ;;
+      7) edit_conf ;;
+      8) echo "[INFO] Try: bin/hasher.sh --help"; press_any ;;
+      q|Q) exit 0 ;;
+      *) echo "Unknown option"; press_any ;;
     esac
-    mkdir -p "$(dirname "$pathfile")"
-    cat > "$pathfile" <<'TPL'
-# One directory per line (absolute paths recommended), e.g.:
-/volume1/Family
-/volume1/Media
-/volume1/James
-# Lines beginning with # are ignored.
-TPL
-    say "Template written: $pathfile"
-    open_in_editor "$pathfile"
-  fi
-
-  if grep -q $'\r' "$pathfile"; then
-    say "WARN: Detected CRLF in $pathfile (handled automatically). To normalise: sed -i 's/\r$//' \"$pathfile\""
-  fi
-
-  say "Starting hasher with nohup (algo=$algo, pathfile=$pathfile)"
-  "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" --nohup
-  echo
-  say "Tail logs with:"
-  echo "  tail -f \"$LOG_DIR/background.log\" \"$LOG_DIR/hasher.log\""
-  pause
+  done
 }
 
-custom_hashing(){
-  echo
-  echo "=== Advanced / Custom hashing ==="
-
-  read -r -p "Path file [default: $PATHFILE_DEFAULT]: " pathfile
-  pathfile="${pathfile:-$PATHFILE_DEFAULT}"
-  if [ ! -f "$pathfile" ]; then
-    say "WARN: paths file not found: $pathfile"
-    read -r -p "Create a template here? (y/N): " yn
-    case "$yn" in y|Y) : ;; *) say "Aborting custom hashing."; pause; return ;; esac
-    mkdir -p "$(dirname "$pathfile")"
-    cat > "$pathfile" <<'TPL'
-# One directory per line (absolute paths recommended), e.g.:
-/volume1/Family
-/volume1/Media
-/volume1/James
-# Lines beginning with # are ignored.
-TPL
-    say "Template written: $pathfile"
-  fi
-
-  echo "Select algorithm: [1] sha256 (default), [2] sha1, [3] sha512, [4] md5, [5] blake2"
-  read -r -p "> " algopt
-  case "${algopt:-1}" in
-    2) algo="sha1" ;;
-    3) algo="sha512" ;;
-    4) algo="md5" ;;
-    5) algo="blake2" ;;
-    *) algo="sha256" ;;
-  esac
-
-  echo "Run mode: [b]ackground (nohup, default) or [f]oreground?"
-  read -r -p "> " mode
-  case "${mode:-b}" in
-    f|F) nohup_flag=false ;;
-    *)   nohup_flag=true ;;
-  esac
-
-  echo "Zero-length-only scan (no hashing)? [y/N]"
-  read -r -p "> " zopt
-  case "${zopt:-n}" in y|Y) zlo=true ;; *) zlo=false ;; esac
-
-  read -r -p "Extra excludes (comma-separated substrings, leave blank for none): " extra_ex
-  IFS=',' read -r -a extra_patterns <<< "${extra_ex:-}"
-
-  read -r -p "Use a specific config file (leave blank to auto-detect): " conf_file
-  read -r -p "Output CSV path (leave blank for default in hashes/): " out_csv
-
-  cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" )
-  [ -n "$conf_file" ] && cmd+=( --config "$conf_file" )
-  [ -n "$out_csv" ] && cmd+=( --output "$out_csv" )
-  if [ "${#extra_patterns[@]}" -gt 0 ] && [ -n "${extra_patterns[0]}" ]; then
-    for p in "${extra_patterns[@]}"; do
-      p_trim="$(echo "$p" | sed 's/^ *//;s/ *$//')"
-      [ -n "$p_trim" ] && cmd+=( --exclude "$p_trim" )
-    done
-  fi
-  $zlo && cmd+=( --zero-length-only )
-  $nohup_flag && cmd+=( --nohup )
-
-  echo
-  echo "About to run:"
-  echo "  $(print_cmd "${cmd[@]}")"
-  read -r -p "Proceed? (y/N): " go
-  case "$go" in y|Y) "${cmd[@]}" ;; *) say "Cancelled." ;; esac
-  pause
-}
-
-find_duplicates(){
-  say "Finding duplicate groups using latest CSV in $HASHES_DIR"
-  "$BIN_DIR/find-duplicates.sh" || true
-  echo
-  local latest_report
-  latest_report="$(pick_latest "$LOG_DIR/*duplicate-hashes*.txt")"
-  if [ -n "$latest_report" ]; then
-    say "Report: $latest_report"
-  else
-    say "No duplicate report found."
-  fi
-  pause
-}
-
-review_duplicates(){
-  # Prefer the canonical full report: YYYY-MM-DD-duplicate-hashes.txt
-  local base_report=""
-  # 1) Strict pattern: leading date and exact suffix
-  base_report="$(ls -1t "$LOG_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
-  # 2) Fallback: any *-duplicate-hashes.txt that is NOT *-nonlow-* or *-low-*
-  if [ -z "$base_report" ]; then
-    base_report="$(ls -1t "$LOG_DIR"/*-duplicate-hashes*.txt 2>/dev/null | grep -vE -- '-(nonlow|low)-' | head -n1 || true)"
-  fi
-
-  if [ -z "$base_report" ]; then
-    say "No canonical duplicate report found in $LOG_DIR."
-    echo "Tip: run 'Find duplicate hashes' first; then use the file named like:"
-    echo "     YYYY-MM-DD-duplicate-hashes.txt (without -nonlow- / -low- in the name)."
-    pause; return
-  fi
-
-  say "Launching review for: $base_report"
-  if [ -x "$BIN_DIR/review-latest.sh" ]; then
-    "$BIN_DIR/review-latest.sh" || true
-  else
-    "$BIN_DIR/review-duplicates.sh" --from-report "$base_report" || true
-  fi
-  pause
-}
-
-delete_zero_length(){
-  local list
-  list="$(pick_latest "$ZERO_DIR/zero-length-*.txt")"
-  if [ -z "$list" ]; then
-    say "No zero-length candidate list found in $ZERO_DIR"
-    echo "Generate by running hashing or zero-length scan."
-    pause; return
-  fi
-  echo "Zero-length list: $list"
-  echo "Choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
-  read -r -p "> " mode
-  case "${mode:-v}" in
-    q|Q)
-      local qdir="$ZERO_DIR/quarantine-$(date +%F)"
-      "$BIN_DIR/delete-zero-length.sh" "$list" --force --quarantine "$qdir" ;;
-    f|F)
-      "$BIN_DIR/delete-zero-length.sh" "$list" --force ;;
-    d|D)
-      "$BIN_DIR/delete-zero-length.sh" "$list" ;;
-    *)
-      "$BIN_DIR/delete-zero-length.sh" "$list" --verify-only ;;
-  esac
-  pause
-}
-
-delete_low_value(){
-  local list
-  list="$(pick_latest "$LOW_DIR/low-value-candidates-*.txt")"
-  if [ -z "$list" ]; then
-    say "No low-value candidate list found in $LOW_DIR"
-    echo "Run 'Review duplicate hashes' to generate one."
-    pause; return
-  fi
-  echo "Low-value list: $list"
-  echo "Choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
-  read -r -p "> " mode
-  case "${mode:-v}" in
-    q|Q)
-      local qdir="$LOW_DIR/quarantine-$(date +%F)"
-      "$BIN_DIR/delete-low-value.sh" --from-list "$list" --force --quarantine "$qdir" ;;
-    f|F)
-      "$BIN_DIR/delete-low-value.sh" --from-list "$list" --force ;;
-    d|D)
-      "$BIN_DIR/delete-low-value.sh" --from-list "$list" ;;
-    *)
-      "$BIN_DIR/delete-low-value.sh" --from-list "$list" --verify-only ;;
-  esac
-  pause
-}
-
-populate_paths(){
-  local f="$PATHFILE_DEFAULT"
-  mkdir -p "$(dirname "$f")"
-  if [ ! -f "$f" ]; then
-    cat > "$f" <<'TPL'
-# One directory per line (absolute paths recommended), e.g.:
-/volume1/Family
-/volume1/Media
-/volume1/James
-# Lines beginning with # are ignored.
-TPL
-    say "Template written: $f"
-  else
-    say "Editing existing: $f"
-  fi
-  open_in_editor "$f"
-}
-
-edit_conf(){
-  local f_local="$CONF_DEFAULT_LOCAL"
-  mkdir -p "$(dirname "$f_local")"
-  if [ ! -f "$f_local" ]; then
-    if [ -r "$CONF_DEFAULT_DIST" ]; then
-      cp -f "$CONF_DEFAULT_DIST" "$f_local"
-      say "Created local override from default: $f_local"
-    else
-      cat > "$f_local" <<'TPL'
-# local/hasher.conf (overrides default/hasher.conf)
-# Example overrides:
-# LOW_VALUE_THRESHOLD_BYTES=0
-# ZERO_APPLY_EXCLUDES=false
-# EXCLUDES_FILE=local/excludes.txt
-TPL
-      say "Created blank local config: $f_local"
-    fi
-  fi
-  open_in_editor "$f_local"
-}
-
-# ───────────────────────── Main loop ───────────────────────
-while true; do
-  menu
-  read -r choice
-  case "${choice:-}" in
-    0) show_hash_status ;;
-    1) start_hashing ;;
-    8) custom_hashing ;;
-    2) find_duplicates ;;
-    3) review_duplicates ;;
-    4) delete_zero_length ;;
-    5) delete_low_value ;;
-    6) populate_paths ;;
-    7) edit_conf ;;
-    q|Q) echo "Bye!"; exit 0 ;;
-    *) echo "Unknown option: $choice"; sleep 1 ;;
-  esac
-done
+main_menu
