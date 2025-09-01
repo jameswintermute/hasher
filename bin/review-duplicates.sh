@@ -71,12 +71,12 @@ done
 [ -n "$REPORT" ] || { echo "[ERROR] Missing --from-report"; usage; exit 2; }
 [ -r "$REPORT" ] || { echo "[ERROR] Cannot read report: $REPORT"; exit 2; }
 
-# ───────────────────────── Ensure interactive TTY ───────────────────
-# If launched via a wrapper, stdin/stdout/stderr might not be a TTY.
-# Reattach all to /dev/tty to guarantee prompts and user input work.
-if ! [ -t 0 ] || ! [ -t 1 ]; then
+# ───────────────────────── Ensure interactive stdin ─────────────────
+# If called from a wrapper (e.g., launcher) where stdin isn't a TTY,
+# reattach to /dev/tty so `read` prompts work. If not possible, fallback to non-interactive.
+if ! [ -t 0 ]; then
   if [ -r /dev/tty ]; then
-    exec </dev/tty >/dev/tty 2>/dev/tty
+    exec </dev/tty || true
   else
     NON_INTERACTIVE=true
   fi
@@ -158,7 +158,7 @@ progress_line(){
   now="$(date +%s)"; elapsed=$(( now - PARSE_START ))
   if [ "$PARSED_GROUPS" -gt 0 ] && [ "$TOTAL_DECLARED_GROUPS" -gt 0 ]; then
     pct=$(( PARSED_GROUPS * 100 / TOTAL_DECLARED_GROUPS ))
-    eta=$(( elapsed * (TOTAL_DECLARED_GROUPS - PARSED_GROUPS) / PARSED_GROUPS  ))
+    eta=$(( elapsed * (TOTAL_DECLARED_GROUPS - PARSED_GROUPS) / PARSED_GROUPS ))
   else
     pct=0; eta=0
   fi
@@ -178,6 +178,7 @@ flush_group(){
     GROUP_FILES_COUNTS+=("${#current_files[@]}")
     GROUP_TOTAL_SIZES+=("$total_size")
     GROUP_FILE_SIZE+=("$rep_size")
+    # store NUL-joined
     local joined=""
     for f in "${current_files[@]}"; do
       joined+="$(strip_quotes "$f")"$'\0'
@@ -195,6 +196,7 @@ flush_group(){
   current_files=()
 }
 
+# Read & parse
 while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
     flush_group
@@ -287,6 +289,7 @@ prompt_keep(){
   if $NON_INTERACTIVE; then
     keep="$((def_keep+1))"
   else
+    # Use read in a conditional to avoid 'set -e' exit on non-zero (e.g., no TTY)
     if ! read -rp "Select the file ID to KEEP [1-$n], 's' to skip, 'q' to quit (default: $((def_keep+1))): " ans; then
       ans=""
     fi
