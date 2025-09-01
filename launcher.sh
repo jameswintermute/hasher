@@ -115,18 +115,13 @@ MENU
 }
 
 # ───────────────────────── Status helpers ──────────────────
-# Return 0 if hashing appears active (recent PROGRESS within 10 minutes), else 1.
 is_hashing_active(){
   local bg="$LOG_DIR/background.log"
   [ -s "$bg" ] || return 1
   local line ts_str pct
-  # last progress line
-  line="$(awk '/\\[PROGRESS\\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
   [ -n "$line" ] || return 1
-
-  # extract timestamp inside first [..]
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')"
-  # Try to compute age; if unavailable, assume active
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
   if date -d "$ts_str" +%s >/dev/null 2>&1; then
     local ts now age
     ts="$(date -d "$ts_str" +%s)"
@@ -136,16 +131,13 @@ is_hashing_active(){
       return 1
     fi
   fi
-
-  # if progress shows 100%, treat as not active
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \\[\\([0-9]\\+\\)%\\].*/\\1/p')"
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
   if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
     return 1
   fi
   return 0
 }
 
-# Return 0 if GNU date supports -d "@EPOCH"
 gnu_date_epoch_ok(){
   date -d "@0" +%s >/dev/null 2>&1
 }
@@ -158,33 +150,26 @@ show_hash_status(){
     pause; return
   fi
 
-  # Extract most recent progress line and derive friendly ETA
   local line ts_str pct eta_str eta_h eta_m eta_s friendly_eta
-  line="$(awk '/\\[PROGRESS\\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
-  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')"
-  pct="$(printf '%s\n' "$line" | sed -n 's/.*\\[\\([0-9]\\+\\)%\\].*/\\1/p')"
-
-  # Robust ETA extraction: first try awk split on 'eta=' token, then sed fallback
+  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p')"
   eta_str="$(printf '%s\n' "$line" | awk -F'eta=' '{print $2}' | awk '{print $1}' )"
   if [[ ! "$eta_str" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-    eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\).*/\\1/p')"
+    eta_str="$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
   fi
 
   if [ -n "$eta_str" ]; then
     IFS=':' read -r eta_h eta_m eta_s <<EOF
 $eta_str
 EOF
-    # Strip leading zeros for readability
     [ "${eta_h#0}" = "" ] && eta_h="0" || eta_h="${eta_h#0}"
     [ "${eta_m#0}" = "" ] && eta_m="0" || eta_m="${eta_m#0}"
     [ "${eta_s#0}" = "" ] && eta_s="0" || eta_s="${eta_s#0}"
     friendly_eta="~${eta_h}h ${eta_m}m"
-
-    # Optional absolute time if GNU date is available
     if gnu_date_epoch_ok; then
       local now epoch abs_day abs_time label today tomorrow add
-      epoch="$(date +%s)"
-      now="$epoch"
+      epoch="$(date +%s)"; now="$epoch"
       add=$((10#$eta_h*3600 + 10#$eta_m*60 + 10#$eta_s))
       abs_day="$(date -d "@$((now + add))" +%F)"
       abs_time="$(date -d "@$((now + add))" +%T)"
@@ -200,34 +185,30 @@ EOF
   fi
 
   echo "— Latest progress —"
-  awk '/\\[PROGRESS\\]/{print}' "$bg" | tail -n 10
+  awk '/\[PROGRESS\]/{print}' "$bg" | tail -n 10
 
   if [ -n "$pct" ]; then
     echo
     echo "Summary: ${pct}% complete • ETA ${friendly_eta}"
   fi
 
-  # Determine latest RUN ID seen in background.log
   local last_run_id run_log
-  last_run_id="$(awk '/\\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\\[RUN //;s/\\]//')"
+  last_run_id="$(awk '/\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\[RUN //;s/\]//')"
 
-  # If a Completed line exists for the last run, show it prominently
   local completed_line completed_ts completed_csv completed_elapsed completed_fail completed_counts
   if [ -n "$last_run_id" ]; then
     completed_line="$(grep -F \"[RUN $last_run_id]\" \"$bg\" | grep -F \"] [INFO] Completed.\" | tail -n 1 || true)"
     if [ -n \"$completed_line\" ]; then
-      completed_ts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/^\\[\\([^]]\\+\\)\\].*/\\1/p')\"
-      completed_csv=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* CSV: \\([^ ]\\+\\).*/\\1/p')\"
-      completed_elapsed=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* in \\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\)\\. .*/\\1/p')\"
-      completed_counts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* Hashed \\([0-9]\\+\\/[^ ]\\+\\) files.*/\\1/p')\"
-
+      completed_ts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')\"
+      completed_csv=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* CSV: \([^ ]\+\).*/\1/p')\"
+      completed_elapsed=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* in \([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)\. .*/\1/p')\"
+      completed_counts=\"$(printf '%s\n' \"$completed_line\" | sed -n 's/.* Hashed \([0-9]\+\/[^ ]\+\) files.*/\1/p')\"
       echo
       echo \"*** COMPLETED ***\"
       [ -n \"$completed_ts\" ] && echo \"Finished at: $completed_ts\"
       [ -n \"$completed_counts\" ] && echo \"Files hashed: $completed_counts\"
       [ -n \"$completed_elapsed\" ] && echo \"Duration: $completed_elapsed\"
       if [ -n \"$completed_csv\" ]; then
-        # If path is relative, show absolute
         case \"$completed_csv\" in
           /*) echo \"CSV: $completed_csv\" ;;
           *)  echo \"CSV: $APP_HOME/$completed_csv\" ;;
@@ -236,7 +217,6 @@ EOF
     fi
   fi
 
-  # Show latest CSV (still useful if no Completed line parsed)
   local latest_csv
   latest_csv="$(pick_latest "$HASHES_DIR/hasher-*.csv")"
   if [ -n "$latest_csv" ]; then
@@ -245,7 +225,6 @@ EOF
     echo "Row count (including header): $(wc -l < "$latest_csv" 2>/dev/null || echo 0)"
   fi
 
-  # Show tail of the per-run log if present
   if [ -n "$last_run_id" ]; then
     run_log="$LOG_DIR/hasher-$last_run_id.log"
     if [ -f "$run_log" ]; then
@@ -255,13 +234,11 @@ EOF
     fi
   fi
 
-  # Active/idle hint
   if is_hashing_active; then
     echo
     echo "[STATUS] Hashing appears ACTIVE (recent progress in $bg)."
     echo "Tip: avoid launching a second run until this completes."
   else
-    # If we showed a completed line, be explicit; otherwise generic
     if [ -n \"$completed_line\" ]; then
       echo
       echo "[STATUS] Hashing is COMPLETE for the latest run."
@@ -275,7 +252,6 @@ EOF
 
 # ───────────────────────── Actions ─────────────────────────
 start_hashing(){
-  # Guard against accidental double-start
   if is_hashing_active; then
     echo "[WARN] Hashing appears ACTIVE (recent progress in $LOG_DIR/background.log)."
     read -r -p "Start another run anyway? (y/N): " yn
@@ -304,7 +280,6 @@ TPL
     open_in_editor "$pathfile"
   fi
 
-  # CRLF warning
   if grep -q $'\r' "$pathfile"; then
     say "WARN: Detected CRLF in $pathfile (handled automatically). To normalise: sed -i 's/\r$//' \"$pathfile\""
   fi
@@ -321,7 +296,6 @@ custom_hashing(){
   echo
   echo "=== Advanced / Custom hashing ==="
 
-  # Pathfile
   read -r -p "Path file [default: $PATHFILE_DEFAULT]: " pathfile
   pathfile="${pathfile:-$PATHFILE_DEFAULT}"
   if [ ! -f "$pathfile" ]; then
@@ -339,7 +313,6 @@ TPL
     say "Template written: $pathfile"
   fi
 
-  # Algorithm
   echo "Select algorithm: [1] sha256 (default), [2] sha1, [3] sha512, [4] md5, [5] blake2"
   read -r -p "> " algopt
   case "${algopt:-1}" in
@@ -350,7 +323,6 @@ TPL
     *) algo="sha256" ;;
   esac
 
-  # Mode
   echo "Run mode: [b]ackground (nohup, default) or [f]oreground?"
   read -r -p "> " mode
   case "${mode:-b}" in
@@ -358,22 +330,16 @@ TPL
     *)   nohup_flag=true ;;
   esac
 
-  # Zero-length-only
   echo "Zero-length-only scan (no hashing)? [y/N]"
   read -r -p "> " zopt
   case "${zopt:-n}" in y|Y) zlo=true ;; *) zlo=false ;; esac
 
-  # Extra excludes (literal substring match; comma separated)
   read -r -p "Extra excludes (comma-separated substrings, leave blank for none): " extra_ex
   IFS=',' read -r -a extra_patterns <<< "${extra_ex:-}"
 
-  # Optional config file
   read -r -p "Use a specific config file (leave blank to auto-detect): " conf_file
-
-  # Optional custom output CSV path
   read -r -p "Output CSV path (leave blank for default in hashes/): " out_csv
 
-  # Build command
   cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" )
   [ -n "$conf_file" ] && cmd+=( --config "$conf_file" )
   [ -n "$out_csv" ] && cmd+=( --output "$out_csv" )
@@ -409,17 +375,27 @@ find_duplicates(){
 }
 
 review_duplicates(){
-  local latest_report
-  latest_report="$(pick_latest "$LOG_DIR/*duplicate-hashes*.txt")"
-  if [ -z "$latest_report" ]; then
-    say "No duplicate report found in $LOG_DIR. Run 'Find duplicate hashes' first."
+  # Prefer the canonical full report: YYYY-MM-DD-duplicate-hashes.txt
+  local base_report=""
+  # 1) Strict pattern: leading date and exact suffix
+  base_report="$(ls -1t "$LOG_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
+  # 2) Fallback: any *-duplicate-hashes.txt that is NOT *-nonlow-* or *-low-*
+  if [ -z "$base_report" ]; then
+    base_report="$(ls -1t "$LOG_DIR"/*-duplicate-hashes*.txt 2>/dev/null | grep -vE -- '-(nonlow|low)-' | head -n1 || true)"
+  fi
+
+  if [ -z "$base_report" ]; then
+    say "No canonical duplicate report found in $LOG_DIR."
+    echo "Tip: run 'Find duplicate hashes' first; then use the file named like:"
+    echo "     YYYY-MM-DD-duplicate-hashes.txt (without -nonlow- / -low- in the name)."
     pause; return
   fi
-  say "Launching review for: $latest_report"
+
+  say "Launching review for: $base_report"
   if [ -x "$BIN_DIR/review-latest.sh" ]; then
     "$BIN_DIR/review-latest.sh" || true
   else
-    "$BIN_DIR/review-duplicates.sh" --from-report "$latest_report" || true
+    "$BIN_DIR/review-duplicates.sh" --from-report "$base_report" || true
   fi
   pause
 }
