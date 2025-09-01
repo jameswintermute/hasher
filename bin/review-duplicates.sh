@@ -71,6 +71,17 @@ done
 [ -n "$REPORT" ] || { echo "[ERROR] Missing --from-report"; usage; exit 2; }
 [ -r "$REPORT" ] || { echo "[ERROR] Cannot read report: $REPORT"; exit 2; }
 
+# ───────────────────────── Ensure interactive stdin ─────────────────
+# If called from a wrapper (e.g., launcher) where stdin isn't a TTY,
+# reattach to /dev/tty so `read` prompts work. If not possible, fallback to non-interactive.
+if ! [ -t 0 ]; then
+  if [ -r /dev/tty ]; then
+    exec </dev/tty || true
+  else
+    NON_INTERACTIVE=true
+  fi
+fi
+
 # ───────────────────────── Load config (simple k=v) ─────────────────
 load_conf(){
   local f="$1"
@@ -177,7 +188,6 @@ flush_group(){
   if [ -n "$current_hash" ]; then
     PARSED_GROUPS=$((PARSED_GROUPS+1))
     FILES_SEEN=$((FILES_SEEN + ${#current_files[@]}))
-    # periodic progress
     if [ $(( PARSED_GROUPS % PROG_STEP )) -eq 0 ]; then
       progress_line
     fi
@@ -191,7 +201,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
     flush_group
     current_hash="${BASH_REMATCH[1]}"
-    # (we could optionally compare declared count ${BASH_REMATCH[2]})
   elif [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
     current_files+=("${BASH_REMATCH[1]}")
   else
@@ -199,7 +208,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   fi
 done < "$REPORT"
 flush_group
-# Final progress line
 progress_line
 
 TOTAL_GROUPS="${#GROUP_HASHES[@]}"
@@ -232,10 +240,6 @@ say "[RUN $RUN_ID] [INFO]   • Ordering:     $ORDER desc"
 say "[RUN $RUN_ID] [INFO]   • Limit:        $LIMIT"
 say "[RUN $RUN_ID] [INFO]   • Groups:       $TOTAL_GROUPS total"
 say "[RUN $RUN_ID] [INFO]   • Plan:         $PLAN_FILE"
-
-diverted_low=0
-kept_count=0
-skipped_count=0
 
 human_size_of_file(){
   local f="$1"; local sz; sz="$(size_of "$f")"; human "$sz"
@@ -285,7 +289,10 @@ prompt_keep(){
   if $NON_INTERACTIVE; then
     keep="$((def_keep+1))"
   else
-    read -rp "Select the file ID to KEEP [1-$n], 's' to skip, 'q' to quit (default: $((def_keep+1))): " ans
+    # Use read in a conditional to avoid 'set -e' exit on non-zero (e.g., no TTY)
+    if ! read -rp "Select the file ID to KEEP [1-$n], 's' to skip, 'q' to quit (default: $((def_keep+1))): " ans; then
+      ans=""
+    fi
     case "${ans:-$((def_keep+1))}" in
       q|Q) echo "Quitting."; exit 0 ;;
       s|S) echo "  → Skipped."; return 2 ;;
