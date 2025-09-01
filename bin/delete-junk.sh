@@ -75,14 +75,50 @@ DIRS_LIST="$JUNK_DIR/junk-dirs-$DATE_TAG-$RUN_ID.lst"
 : > "$FILES_LIST"
 : > "$DIRS_LIST"
 
+# ───── Normalize paths file (handles CRLF/UTF-16) ─────
+norm="$JUNK_DIR/paths-normalized-$DATE_TAG-$RUN_ID.txt"
+cp -f -- "$PATHS_FILE" "$norm" 2>/dev/null || { echo "[ERROR] Failed to read $PATHS_FILE"; exit 2; }
+
+# If file contains NULs, try to iconv from UTF-16 (LE/BE) to UTF-8
+if grep -qP '\x00' "$norm" 2>/dev/null; then
+  if command -v iconv >/dev/null 2>&1; then
+    # Try BOM autodetect first
+    if iconv -f UTF-16 -t UTF-8 "$norm" -o "$norm.utf8" 2>/dev/null; then
+      mv -f "$norm.utf8" "$norm"
+      echo "[INFO] Converted paths file from UTF‑16 to UTF‑8."
+    else
+      # Fallback: try LE then BE
+      if iconv -f UTF-16LE -t UTF-8 "$norm" -o "$norm.utf8" 2>/dev/null || iconv -f UTF-16BE -t UTF-8 "$norm" -o "$norm.utf8" 2>/dev/null; then
+        mv -f "$norm.utf8" "$norm"
+        echo "[INFO] Converted paths file (LE/BE) to UTF‑8."
+      else
+        echo "[WARN] Detected NULs in $PATHS_FILE but iconv conversion failed; results may be unreliable."
+      fi
+    end
+  else
+    echo "[WARN] Detected NULs in $PATHS_FILE (likely UTF‑16), but 'iconv' not available. Consider re-saving as UTF‑8."
+  fi
+fi
+
+# Strip CRs and empty lines
+sed -i 's/\r$//;/^[[:space:]]*$/d' "$norm" 2>/dev/null || true
+
 # ───── Collect roots ─────
 roots=()
 while IFS= read -r p || [ -n "$p" ]; do
-  p="${p%"${p##*[![:space:]]}"}"; p="${p#"${p%%[![:space:]]}"}"
+  p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
   [ -z "$p" ] && continue
-  [ -e "$p" ] && roots+=("$p") || echo "[WARN] Path not found (skipped): $p"
-done < "$PATHS_FILE"
-[ "${#roots[@]}" -gt 0 ] || { echo "[ERROR] No valid roots to scan."; exit 2; }
+  if [ -e "$p" ]; then
+    roots+=("$p")
+  else
+    echo "[WARN] Path not found (skipped): $p"
+  fi
+done < "$norm"
+
+if [ "${#roots[@]}" -eq 0 ]; then
+  echo "[ERROR] No valid roots to scan."
+  exit 2
+fi
 
 # ───── Build find expressions ─────
 file_name_args=( -iname 'Thumbs.db' -o -name '.DS_Store' -o -iname 'Desktop.ini' -o -name '._*' )
@@ -156,7 +192,6 @@ if [ -s "$DIRS_LIST" ]; then
     if [ "$MODE" = "quarantine" ]; then
       rel="${d#/}" ; dst="$QUAR_DIR/$rel"
       mkdir -p "$(dirname "$dst")" 2>/dev/null || true
-      # move dir as a whole
       mv -n -- "$d" "$dst" 2>/dev/null && acted=$((acted+1)) || failed=$((failed+1))
     else
       rm -rf -- "$d" 2>/dev/null && acted=$((acted+1)) || failed=$((failed+1))
