@@ -35,8 +35,9 @@ press_any(){ read -rp "Press Enter to continue..." _ || true; }
 latest_csv(){ ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true; }
 latest_report(){ ls -1t "$LOGS_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true; }
 latest_zero(){ ls -1t "$ZERO_DIR"/zero-length-*.txt 2>/dev/null | head -n1 || true; }
+latest_plan(){ ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true; }
 
-# ───── Option 0: status (friendly ETA-to-clocktime) ─────
+# ───── Option 0: status with ETA → wall clock ─────
 status(){
   echo "— Latest progress —"
   tail -n 10 "$LOGS_DIR/background.log" 2>/dev/null || echo "(no background.log yet)"
@@ -47,7 +48,6 @@ status(){
     echo "Row count (including header): $rows"
   fi
 
-  # Try to parse the last PROGRESS line for ETA hh:mm:ss, convert to clock time
   local last; last="$(tac "$LOGS_DIR/background.log" 2>/dev/null | grep -m1 '\[PROGRESS\]' || true)"
   if [ -n "$last" ]; then
     eta_hms="$(echo "$last" | sed -n 's/.* eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
@@ -56,20 +56,18 @@ status(){
       IFS=: read -r eh em es <<< "$eta_hms"
       secs=$((10#$eh*3600 + 10#$em*60 + 10#$es))
       end_epoch=$(( $(date +%s) + secs ))
-      end_local="$(date -d "@$end_epoch" "+%H:%M:%S %Z")"
+      end_local="$(date -d "@$end_epoch" "+%H:%M:%S %Z" 2>/dev/null || date -r "$end_epoch"  "+%H:%M:%S")"
       echo; echo "Summary: ${pct:-?}% complete • ETA in ~${eh}h ${em}m ${es}s (≈ ${end_local})"
     fi
   fi
 
-  # Activity heuristic
-  local last_ts; last_ts="$(tail -n 1 "$LOGS_DIR/background.log" 2>/dev/null | sed -n 's/^\[\(....-..-.. ..:..:..\)\].*/\1/p')"
-  if [ -n "$last_ts" ]; then
+  if [ -s "$LOGS_DIR/background.log" ]; then
     echo; echo "[STATUS] $(tail -n 1 "$LOGS_DIR/background.log")"
   fi
   press_any
 }
 
-# ───── Option 1: start hashing (safe defaults) ─────
+# ───── Option 1: start hashing ─────
 start_hashing(){
   echo "Starting Hasher now using defaults..."
   echo "Command:"
@@ -80,7 +78,7 @@ start_hashing(){
   press_any
 }
 
-# ───── Option 2: find duplicates (summary) ─────
+# ───── Option 2: find duplicate groups ─────
 find_dupes(){
   echo "Finding duplicate groups from latest CSV..."
   ( cd "$APP_HOME" && "$BIN_DIR/find-duplicates.sh" )
@@ -97,7 +95,6 @@ review_dupes(){
     [ -z "$rep" ] && { echo "[ERROR] Still no report found."; press_any; return; }
   fi
   echo "[INFO] Using latest report: $rep"
-  # Force interactive TTY read for child
   ( cd "$APP_HOME" && "$BIN_DIR/review-duplicates.sh" --from-report "$rep" ) < /dev/tty
   press_any
 }
@@ -121,7 +118,7 @@ delete_zero_len(){
   press_any
 }
 
-# ───── Option 5: delete junk files (Thumbs.db, .DS_Store, @eaDir…) ─────
+# ───── Option 5: delete junk files ─────
 delete_junk(){
   echo "Junk cleaner — choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
   read -r -p "> " mode || mode=""
@@ -134,7 +131,52 @@ delete_junk(){
   press_any
 }
 
-# ───── Option 6: write a starter paths file ─────
+# ───── Option 6: act on a duplicate delete PLAN ─────
+act_on_plan(){
+  local candidates; IFS=$'\n' read -r -d '' -a candidates < <(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n 20; printf '\0')
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    echo "[INFO] No review-dedupe plan files found in $LOGS_DIR."
+    echo "Run option 3 (Review duplicate hashes) to build a plan first."
+    press_any; return
+  fi
+  echo "Available delete plans:"
+  local i=0
+  for f in "${candidates[@]}"; do
+    i=$((i+1))
+    local n ts
+    n="$(wc -l < "$f" | tr -d ' ')" || n="?"
+    ts="$(date -r "$f" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$f" 2>/dev/null || echo "?")"
+    printf "  %2d) %-60s  (%s lines)  [%s]\n" "$i" "$(basename "$f")" "$n" "$ts"
+  done
+  echo
+  read -r -p "Select a plan [1-${#candidates[@]}] (default 1): " sel || sel=""
+  [[ -z "$sel" ]] && sel=1
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#candidates[@]}" ]; then
+    echo "Invalid selection."; press_any; return
+  fi
+  local plan="${candidates[$((sel-1))]}"
+  echo "Chosen: $plan"
+  echo "Choose mode: [d]ry-run (default), [f]orce, [q]uarantine"
+  read -r -p "> " mode || mode=""
+  case "${mode,,}" in
+    f|force)
+      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" --force )
+      ;;
+    q|quarantine)
+      local def_quar="$APP_HOME/var/quarantine/quarantine-$(date +%F)"
+      read -r -p "Quarantine dir [default: $def_quar]: " qd || qd=""
+      [[ -z "$qd" ]] && qd="$def_quar"
+      mkdir -p "$qd"
+      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" --force --quarantine "$qd" )
+      ;;
+    *|d|dry|dry-run)
+      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" )
+      ;;
+  end
+  press_any
+}
+
+# ───── Option 6/7/8 helpers ─────
 populate_paths(){
   local f="$LOCAL_DIR/paths.txt"
   if [ -s "$f" ]; then
@@ -152,7 +194,6 @@ EOF
   press_any
 }
 
-# ───── Option 7: edit conf (local overlays default) ─────
 edit_conf(){
   local lf="$LOCAL_DIR/hasher.conf"
   local df="$DEFAULT_DIR/hasher.conf"
@@ -183,10 +224,11 @@ main_menu(){
 ### Stage 3 - Cleanup ###
   4) Delete Zero-Length files
   5) Delete Junk files (Thumbs.db, .DS_Store, @eaDir…)
+  6) Delete Duplicates from PLAN
 
 ### Other ###
-  6) Populate the paths file (local/paths.txt)
-  7) Edit config (local/hasher.conf; overlays default/hasher.conf)
+  7) Populate the paths file (local/paths.txt)
+  8) Edit config (local/hasher.conf; overlays default/hasher.conf)
 
   q) Quit
 EOF
@@ -198,9 +240,9 @@ EOF
       3) review_dupes ;;
       4) delete_zero_len ;;
       5) delete_junk ;;
-      6) populate_paths ;;
-      7) edit_conf ;;
-      8) echo "[INFO] Try: bin/hasher.sh --help"; press_any ;;
+      6) act_on_plan ;;
+      7) populate_paths ;;
+      8) edit_conf ;;
       q|Q) exit 0 ;;
       *) echo "Unknown option"; press_any ;;
     esac
