@@ -1,3 +1,4 @@
+\
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
@@ -61,11 +62,10 @@ open_in_editor(){
   fi
   if [ -n "$ed" ]; then "$ed" "$f" || true
   else
-    say "No terminal editor found (looked for $EDITOR, nano, vi, vim). Please edit: $f"
+    say "No terminal editor found (looked for \$EDITOR, nano, vi, vim). Please edit: $f"
   fi
 }
 
-# Simpler, portable pretty-printer: quote everything safely
 print_cmd(){
   local out=""
   for arg in "$@"; do
@@ -93,6 +93,7 @@ menu(){
   cat <<'MENU'
 
 ### Stage 1 - Hash ###
+  0) Check hashing status
   1) Start Hashing (NAS-safe defaults)
   8) Advanced / Custom hashing
 
@@ -113,8 +114,91 @@ MENU
   echo -n "Select an option: "
 }
 
+# ───────────────────────── Status helpers ──────────────────
+# Return 0 if hashing appears active (recent PROGRESS within 10 minutes), else 1.
+is_hashing_active(){
+  local bg="$LOG_DIR/background.log"
+  [ -s "$bg" ] || return 1
+  local line ts_str pct
+  # last progress line
+  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  [ -n "$line" ] || return 1
+
+  # extract timestamp inside first [..]
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
+  # Try to compute age; if unavailable, assume active
+  if date -d "$ts_str" +%s >/dev/null 2>&1; then
+    local ts now age
+    ts="$(date -d "$ts_str" +%s)"
+    now="$(date +%s)"
+    age=$(( now - ts ))
+    if [ "$age" -gt $((10*60)) ]; then
+      return 1
+    fi
+  fi
+
+  # if progress shows 100%, treat as not active
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
+  if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
+    return 1
+  fi
+  return 0
+}
+
+show_hash_status(){
+  local bg="$LOG_DIR/background.log"
+  if [ ! -s "$bg" ]; then
+    say "No background hashing log found at $bg"
+    echo "Start hashing with option 1, then re-check status."
+    pause; return
+  fi
+
+  echo "— Latest progress —"
+  # Show last 10 progress lines
+  awk '/\[PROGRESS\]/{print}' "$bg" | tail -n 10
+
+  # Show latest RUN ID & related log if present
+  local last_run_id run_log
+  last_run_id="$(awk '/\[RUN /{rid=$3} END{print rid}' "$bg" | sed 's/\[RUN //;s/\]//')"
+  if [ -n "$last_run_id" ]; then
+    run_log="$LOG_DIR/hasher-$last_run_id.log"
+    if [ -f "$run_log" ]; then
+      echo
+      echo "Run log: $run_log (tail -n 20)"
+      tail -n 20 "$run_log" || true
+    fi
+  fi
+
+  # Show latest CSV
+  local latest_csv
+  latest_csv="$(pick_latest "$HASHES_DIR/hasher-*.csv")"
+  if [ -n "$latest_csv" ]; then
+    echo
+    echo "Latest CSV: $latest_csv"
+    echo "Row count (including header): $(wc -l < "$latest_csv" 2>/dev/null || echo 0)"
+  fi
+
+  # Give a simple 'active?' hint
+  if is_hashing_active; then
+    echo
+    echo "[STATUS] Hashing appears ACTIVE (recent progress in $bg)."
+    echo "Tip: avoid launching a second run until this completes."
+  else
+    echo
+    echo "[STATUS] No recent progress detected — hashing may be idle or complete."
+  fi
+  pause
+}
+
 # ───────────────────────── Actions ─────────────────────────
 start_hashing(){
+  # Guard against accidental double-start
+  if is_hashing_active; then
+    echo "[WARN] Hashing appears ACTIVE (recent progress in $LOG_DIR/background.log)."
+    read -r -p "Start another run anyway? (y/N): " yn
+    case "$yn" in y|Y) : ;; *) say "Cancelled."; pause; return ;; esac
+  fi
+
   local algo="sha256"
   local pathfile="$PATHFILE_DEFAULT"
   if [ ! -f "$pathfile" ]; then
@@ -139,14 +223,14 @@ TPL
 
   # CRLF warning
   if grep -q $'\r' "$pathfile"; then
-    say "WARN: Detected CRLF in $pathfile (handled automatically). To normalise: sed -i 's/\r$//' "$pathfile""
+    say "WARN: Detected CRLF in $pathfile (handled automatically). To normalise: sed -i 's/\r$//' \"$pathfile\""
   fi
 
   say "Starting hasher with nohup (algo=$algo, pathfile=$pathfile)"
   "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" --nohup
   echo
   say "Tail logs with:"
-  echo "  tail -f "$LOG_DIR/background.log" "$LOG_DIR/hasher.log""
+  echo "  tail -f \"$LOG_DIR/background.log\" \"$LOG_DIR/hasher.log\""
   pause
 }
 
@@ -207,23 +291,24 @@ TPL
   read -r -p "Output CSV path (leave blank for default in hashes/): " out_csv
 
   # Build command
-  args=( "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" )
-  [ -n "$conf_file" ] && args+=( --config "$conf_file" )
-  [ -n "$out_csv" ] && args+=( --output "$out_csv" )
+  args( ){ printf "%s\0" "$@"; }  # helper for robust array building (unused but placeholder)
+  cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" )
+  [ -n "$conf_file" ] && cmd+=( --config "$conf_file" )
+  [ -n "$out_csv" ] && cmd+=( --output "$out_csv" )
   if [ "${#extra_patterns[@]}" -gt 0 ] && [ -n "${extra_patterns[0]}" ]; then
     for p in "${extra_patterns[@]}"; do
       p_trim="$(echo "$p" | sed 's/^ *//;s/ *$//')"
-      [ -n "$p_trim" ] && args+=( --exclude "$p_trim" )
+      [ -n "$p_trim" ] && cmd+=( --exclude "$p_trim" )
     done
   fi
-  $zlo && args+=( --zero-length-only )
-  $nohup_flag && args+=( --nohup )
+  $zlo && cmd+=( --zero-length-only )
+  $nohup_flag && cmd+=( --nohup )
 
   echo
   echo "About to run:"
-  echo "  $(print_cmd "${args[@]}")"
+  echo "  $(print_cmd "${cmd[@]}")"
   read -r -p "Proceed? (y/N): " go
-  case "$go" in y|Y) "${args[@]}" ;; *) say "Cancelled." ;; esac
+  case "$go" in y|Y) "${cmd[@]}" ;; *) say "Cancelled." ;; esac
   pause
 }
 
@@ -351,6 +436,7 @@ while true; do
   menu
   read -r choice
   case "${choice:-}" in
+    0) show_hash_status ;;
     1) start_hashing ;;
     8) custom_hashing ;;
     2) find_duplicates ;;
