@@ -62,7 +62,7 @@ open_in_editor(){
   fi
   if [ -n "$ed" ]; then "$ed" "$f" || true
   else
-    say "No terminal editor found (looked for \$EDITOR, nano, vi, vim). Please edit: $f"
+    say "No terminal editor found (looked for $EDITOR, nano, vi, vim). Please edit: $f"
   fi
 }
 
@@ -120,13 +120,9 @@ is_hashing_active(){
   local bg="$LOG_DIR/background.log"
   [ -s "$bg" ] || return 1
   local line ts_str pct
-  # last progress line
   line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
   [ -n "$line" ] || return 1
-
-  # extract timestamp inside first [..]
   ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
-  # Try to compute age; if unavailable, assume active
   if date -d "$ts_str" +%s >/dev/null 2>&1; then
     local ts now age
     ts="$(date -d "$ts_str" +%s)"
@@ -136,8 +132,6 @@ is_hashing_active(){
       return 1
     fi
   fi
-
-  # if progress shows 100%, treat as not active
   pct="$(printf '%s\n' "$line" | sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p')"
   if [ -n "$pct" ] && [ "$pct" -ge 100 ]; then
     return 1
@@ -153,9 +147,44 @@ show_hash_status(){
     pause; return
   fi
 
+  # Extract most recent progress line and derive friendly ETA
+  local line ts_str pct eta_h eta_m eta_s eta_abs eta_day now_day tomorrow_day
+  line="$(awk '/\[PROGRESS\]/{l=$0} END{print l}' "$bg" 2>/dev/null)"
+  ts_str="$(printf '%s\n' "$line" | sed -n 's/^\[\([^]]\+\)\].*/\1/p')"
+  pct="$(printf '%s\n' "$line" | sed -n 's/.*\[\([0-9]\+\)%\].*/\1/p')"
+  read -r eta_h eta_m eta_s <<EOF
+$(printf '%s\n' "$line" | sed -n 's/.*eta=\([0-9][0-9]\):\([0-9][0-9]\):\([0-9][0-9]\).*/\1 \2 \3/p')
+EOF
+  if [ -n "$eta_h" ] && [ -n "$eta_m" ] && [ -n "$eta_s" ]; then
+    local eta_sec=$((10#$eta_h*3600 + 10#$eta_m*60 + 10#$eta_s))
+    if date -d "$ts_str + $eta_sec seconds" +%F\ %T >/dev/null 2>&1; then
+      eta_abs="$(date -d "$ts_str + $eta_sec seconds" +%F\ %T)"
+      now_day="$(date +%F)"
+      tomorrow_day="$(date -d "tomorrow" +%F 2>/dev/null || date -d "$now_day + 1 day" +%F)"
+      eta_day="${eta_abs%% *}"
+      eta_time="${eta_abs#* }"
+      if [ "$eta_day" = "$now_day" ]; then
+        eta_label="today"
+      elif [ "$eta_day" = "$tomorrow_day" ]; then
+        eta_label="tomorrow"
+      else
+        eta_label="$eta_day"
+      fi
+      friendly_eta="~${eta_h}h ${eta_m}m (around ${eta_time} ${eta_label})"
+    else
+      friendly_eta="~${eta_h}h ${eta_m}m ${eta_s}s"
+    fi
+  else
+    friendly_eta="(ETA unavailable)"
+  fi
+
   echo "— Latest progress —"
-  # Show last 10 progress lines
   awk '/\[PROGRESS\]/{print}' "$bg" | tail -n 10
+
+  if [ -n "$pct" ]; then
+    echo
+    echo "Summary: ${pct}% complete • ETA ${friendly_eta}"
+  fi
 
   # Show latest RUN ID & related log if present
   local last_run_id run_log
@@ -291,7 +320,6 @@ TPL
   read -r -p "Output CSV path (leave blank for default in hashes/): " out_csv
 
   # Build command
-  args( ){ printf "%s\0" "$@"; }  # helper for robust array building (unused but placeholder)
   cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pathfile" --algo "$algo" )
   [ -n "$conf_file" ] && cmd+=( --config "$conf_file" )
   [ -n "$out_csv" ] && cmd+=( --output "$out_csv" )
