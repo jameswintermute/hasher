@@ -4,9 +4,10 @@
 # License: GPLv3
 #
 # Notes:
+# - Restores "Delete junk files" (option 4).
 # - Adds "System check (deps & readiness)" under the "Other" section.
 # - Designed to be run from the repository root.
-# - Calls: hasher.sh, find-duplicates.sh, delete-duplicates.sh (if present), bin/check-deps.sh (if present).
+# - Calls: hasher.sh, find-duplicates.sh, delete-duplicates.sh, delete-junk.sh (if present), bin/check-deps.sh (if present).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -176,6 +177,75 @@ run_delete_duplicates() {
   }
 }
 
+_supports_flag() {
+  # $1 = script path, $2 = flag to probe
+  # returns 0 if --help output mentions the flag
+  local script="$1" flag="$2"
+  "$script" --help >/dev/null 2>&1 || true
+  "$script" --help 2>&1 | grep -qi -- "$flag"
+}
+
+run_delete_junk() {
+  echo -e "${C_CYN}Delete junk files (safe flow)…${C_RST}"
+  local script="./delete-junk.sh"
+  if ! [[ -f "$script" ]]; then
+    echo -e "${C_YLW}delete-junk.sh not found in repo root.${C_RST}"
+    echo "If you have it elsewhere, place it here and make it executable: chmod +x delete-junk.sh"
+    return 0
+  fi
+  if ! [[ -x "$script" ]]; then
+    chmod +x "$script" || true
+  fi
+
+  # Build arguments based on supported flags
+  local args=()
+  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+    if _supports_flag "$script" "--pathfile"; then
+      args+=(--pathfile "$ROOT_DIR/paths.txt")
+      echo "Using pathfile: $ROOT_DIR/paths.txt"
+    elif _supports_flag "$script" "--paths"; then
+      args+=(--paths "$ROOT_DIR/paths.txt")
+      echo "Using paths: $ROOT_DIR/paths.txt"
+    fi
+  fi
+
+  local dryrun_flag=""
+  if _supports_flag "$script" "--dry-run"; then
+    dryrun_flag="--dry-run"
+  elif _supports_flag "$script" "-n"; then
+    dryrun_flag="-n"
+  fi
+
+  local cmd_preview=("$script" "${args[@]}")
+  if [[ -n "$dryrun_flag" ]]; then
+    cmd_preview+=("$dryrun_flag")
+  fi
+
+  # Preview (dry-run if supported)
+  echo
+  echo -e "${C_BLU}Preview (no deletions will occur in this step)…${C_RST}"
+  echo "Command: ${cmd_preview[*]}"
+  echo
+  if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); fi
+  # shellcheck disable=SC2068
+  ${cmd_preview[@]} || true
+
+  echo
+  echo -e "${C_RED}Proceed to ACTUAL deletion?${C_RST}"
+  read -r -p "Type 'APPLY' to delete junk files, anything else to cancel: " go
+  [[ "$go" != "APPLY" ]] && { echo "Cancelled."; return 0; }
+
+  local cmd_apply=("$script" "${args[@]}")
+  # Some scripts use --apply; if supported, prefer it.
+  if _supports_flag "$script" "--apply"; then
+    cmd_apply+=(--apply)
+  fi
+  echo "Command: ${cmd_apply[*]}"
+  if have ionice; then cmd_apply=(ionice -c3 nice -n 19 "${cmd_apply[@]}"); fi
+  # shellcheck disable=SC2068
+  ${cmd_apply[@]}
+}
+
 run_system_check() {
   echo -e "${C_CYN}System check (deps & readiness)…${C_RST}"
   if [[ -x "$ROOT_DIR/bin/check-deps.sh" ]]; then
@@ -209,6 +279,9 @@ show_menu() {
   echo "  2) Find duplicate hashes"
   echo "  3) Delete duplicates (DANGER)"
   echo
+  echo "### Stage 3 - Clean up ###"
+  echo "  4) Delete junk files"
+  echo
   echo "### Other ###"
   echo "  7) System check (deps & readiness)"
   echo "  9) View logs (tail background.log)"
@@ -227,6 +300,7 @@ main_loop() {
       8) clear 2>/dev/null || true; advanced_hashing; echo; pause ;;
       2) clear 2>/dev/null || true; run_find_duplicates; echo; pause ;;
       3) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
+      4) clear 2>/dev/null || true; run_delete_junk; echo; pause ;;
       7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
       9) clear 2>/dev/null || true; view_logs ;;
       q|Q) echo "Bye!"; exit 0 ;;
