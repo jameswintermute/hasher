@@ -353,8 +353,7 @@ run_delete_junk() {
   echo -e "${C_BLU}Preview (no deletions will occur in this step)…${C_RST}"
   echo "Command: ${cmd_preview[*]}"
   echo
-  if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); endif
-  # shellcheck disable=SC2068
+  if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); fi
   ${cmd_preview[@]} || true
 
   echo
@@ -365,7 +364,6 @@ run_delete_junk() {
   local cmd_apply=("$script" "${args[@]}" --force)
   echo "Command: ${cmd_apply[*]}"
   if have ionice; then cmd_apply=(ionice -c3 nice -n 19 "${cmd_apply[@]}"); fi
-  # shellcheck disable=SC2068
   ${cmd_apply[@]}
 }
 
