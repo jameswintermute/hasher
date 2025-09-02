@@ -212,7 +212,7 @@ configure_paths() {
             total=$(( total + cnt ))
           elif [[ -f "$line" ]]; then
             printf '  %s : 1 file\n' "$line"
-            total=$(( total + 1 ))
+            total=$(( total + 1  ))
           else
             printf '  %s : (missing)\n' "$line"
           fi
@@ -267,19 +267,29 @@ run_find_duplicates() {
 
 run_review_duplicates() {
   echo -e "${C_CYN}Review duplicates (interactive)…${C_RST}"
-  local report=""
-  report="$(ls -1t "$LOGS_DIR"/du-*/duplicates.txt 2>/dev/null | head -n1 || true)"
-  if [[ -z "$report" ]]; then
-    report="$(ls -1t "$LOGS_DIR"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
+  # State file to remember progress
+  local state="$LOGS_DIR/review-batch.state"
+  local last_skip=0 last_take=100
+  if [[ -f "$state" ]]; then
+    # shellcheck disable=SC1090
+    . "$state" 2>/dev/null || true
+    [[ "${SKIP:-}" =~ ^[0-9]+$ ]] && last_skip="$SKIP" || true
+    [[ "${TAKE:-}" =~ ^[0-9]+$ ]] && last_take="$TAKE" || true
   fi
-  if [[ -z "$report" ]]; then
-    echo -e "${C_YLW}No duplicate report found. Run option 2 first.${C_RST}"
-    return 1
-  fi
-  echo "Using report: $report"
-  local cmd=("$SCRIPT_DIR/bin/review-duplicates.sh" --from-report "$report" --keep newest)
+  local def_skip=$(( last_skip + last_take ))
+  local def_take=100
+
+  read -r -p "How many groups to review this pass? [default ${def_take}]: " take
+  take="${take:-$def_take}"
+  read -r -p "Skip how many groups (already reviewed)? [default ${def_skip}]: " skip
+  skip="${skip:-$def_skip}"
+
+  # Persist chosen values
+  printf 'SKIP=%s\nTAKE=%s\n' "$skip" "$take" > "$state"
+
+  local cmd=("$SCRIPT_DIR/bin/review-batch.sh" --skip "$skip" --take "$take" --keep newest)
   echo "Command: ${cmd[*]}"
-  "${cmd[@]}" || { echo -e "${C_RED}review-duplicates.sh failed.${C_RST}"; return 1; }
+  "${cmd[@]}" || { echo -e "${C_RED}review-batch.sh failed.${C_RST}"; return 1; }
 
   local plan
   plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
@@ -343,7 +353,8 @@ run_delete_junk() {
   echo -e "${C_BLU}Preview (no deletions will occur in this step)…${C_RST}"
   echo "Command: ${cmd_preview[*]}"
   echo
-  if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); fi
+  if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); endif
+  # shellcheck disable=SC2068
   ${cmd_preview[@]} || true
 
   echo
@@ -354,6 +365,7 @@ run_delete_junk() {
   local cmd_apply=("$script" "${args[@]}" --force)
   echo "Command: ${cmd_apply[*]}"
   if have ionice; then cmd_apply=(ionice -c3 nice -n 19 "${cmd_apply[@]}"); fi
+  # shellcheck disable=SC2068
   ${cmd_apply[@]}
 }
 
