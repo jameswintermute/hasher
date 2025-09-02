@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
+export PATH="$SCRIPT_DIR:$SCRIPT_DIR/bin:$PATH"
 # launcher.sh — menu launcher for Hasher & Dedupe toolkit
 # Copyright (C) 2025
 # License: GPLv3
