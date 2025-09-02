@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"; export PATH="$SCRIPT_DIR:$SCRIPT_DIR/bin:$PATH"
 # launcher.sh — menu launcher for Hasher & Dedupe toolkit
-# Copyright (C) 2025
 # License: GPLv3
-#
-# Notes:
-# - Includes "Delete junk files" (option 4) and "Delete zero-length files" (option 5).
-# - Adds "System check (deps & readiness)" under the "Other" section.
-# - Restores one-line Summary with % complete and ETA + approximate finish clock time.
-# - Designed to be run from the repository root.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -21,7 +14,7 @@ LOGS_DIR="$ROOT_DIR/logs"
 HASHES_DIR="$ROOT_DIR/hashes"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 
-mkdir -p "$LOGS_DIR" "$HASHES_DIR"
+mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$ROOT_DIR/local"
 
 is_tty() { [[ -t 1 ]]; }
 if is_tty; then
@@ -33,6 +26,20 @@ fi
 pause() { read -r -p "Press Enter to return to the menu..." _; }
 exists() { [[ -f "$1" ]]; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ─────────────────────── path file resolution ────────────────────────
+_paths_file() {
+  # Prefer local/paths.txt, else legacy ./paths.txt. Create local if none.
+  if [[ -f "$ROOT_DIR/local/paths.txt" ]]; then
+    echo "$ROOT_DIR/local/paths.txt"; return 0
+  fi
+  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+    echo "$ROOT_DIR/paths.txt"; return 0
+  fi
+  mkdir -p "$ROOT_DIR/local"
+  : > "$ROOT_DIR/local/paths.txt"
+  echo "$ROOT_DIR/local/paths.txt"
+}
 
 # ────────────────────────────── Banner ───────────────────────────────
 banner() {
@@ -130,10 +137,13 @@ status_summary() {
 start_hashing_defaults() {
   echo -e "${C_CYN}Starting hashing (NAS-safe defaults)…${C_RST}"
   local args=(--algo sha256 --nohup)
-  # If a default pathfile exists, use it
-  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
-    args+=(--pathfile "$ROOT_DIR/paths.txt")
-    echo "Using pathfile: $ROOT_DIR/paths.txt"
+  # Prefer local/paths.txt, else legacy paths.txt
+  local pf; pf="$(_paths_file)"
+  if [[ -s "$pf" ]]; then
+    args+=(--pathfile "$pf")
+    echo "Using pathfile: $pf"
+  else
+    echo -e "${C_YLW}No paths found. Use menu option 6 to add paths before hashing.${C_RST}"
   fi
   echo "Command: \"$SCRIPT_DIR/bin/hasher.sh\" ${args[*]}"
   echo
@@ -145,7 +155,7 @@ start_hashing_defaults() {
 
 advanced_hashing() {
   echo -e "${C_CYN}Advanced / Custom hashing${C_RST}"
-  echo "Enter additional flags for hasher.sh (example: --pathfile paths.txt --algo sha256 --nohup)"
+  echo "Enter additional flags for hasher.sh (example: --pathfile local/paths.txt --algo sha256 --nohup)"
   echo "Leave empty to cancel."
   printf "hasher.sh "
   read -r extra || true
@@ -156,7 +166,16 @@ advanced_hashing() {
 
 configure_paths() {
   echo -e "${C_CYN}Configure paths to hash (paths.txt)${C_RST}"
-  local pf="$ROOT_DIR/paths.txt"
+  local pf legacy
+  legacy="$ROOT_DIR/paths.txt"
+  pf="$(_paths_file)"
+  # Inform if using legacy pathfile
+  if [[ "$pf" == "$legacy" ]]; then
+    echo -e "${C_YLW}Using legacy paths file: $legacy${C_RST}"
+    echo -e "${C_YLW}Tip:${C_RST} Create and use ${C_BLU}local/paths.txt${C_RST} for per-host config."
+  else
+    echo "Paths file: $pf"
+  fi
   touch "$pf"
   while true; do
     echo
@@ -167,6 +186,7 @@ configure_paths() {
     echo "r) Remove by number (comma or space separated)"
     echo "c) Clear all"
     echo "t) Test scan (count files quickly)"
+    echo "m) Migrate legacy ./paths.txt -> local/paths.txt"
     echo "b) Back"
     read -r -p "Choose: " act
     case "${act:-}" in
@@ -184,12 +204,9 @@ configure_paths() {
       r|R)
         read -r -p "Enter number(s) to remove: " nums
         [[ -z "${nums:-}" ]] && continue
-        # build awk pattern of lines to drop
         tmp="$(mktemp)"; nl -ba "$pf" > "$tmp" || true
         awk -v list="$nums" '
-          BEGIN{
-            n=split(list, arr, /[ ,]+/); for(i=1;i<=n;i++) del[arr[i]]=1
-          }
+          BEGIN{ n=split(list, arr, /[ ,]+/); for(i=1;i<=n;i++) del[arr[i]]=1 }
           { if (!($1 in del)) { $1=""; sub(/^[ \t]+/,""); print } }
         ' "$tmp" > "$pf.new" || true
         mv -f "$pf.new" "$pf"
@@ -216,6 +233,16 @@ configure_paths() {
           fi
         done < "$pf"
         echo "Total files (approx): $total"
+        ;;
+      m|M)
+        if [[ -f "$legacy" ]]; then
+          mkdir -p "$ROOT_DIR/local"
+          cat "$legacy" >> "$ROOT_DIR/local/paths.txt"
+          pf="$ROOT_DIR/local/paths.txt"
+          echo "Migrated entries to $pf"
+        else
+          echo "Legacy ./paths.txt not found."
+        fi
         ;;
       b|B) return 0 ;;
       *) echo "Unknown option." ;;
@@ -302,13 +329,14 @@ run_delete_junk() {
 
   # Build arguments based on supported flags
   local args=()
-  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+  local pf; pf="$(_paths_file)"
+  if [[ -s "$pf" ]]; then
     if _supports_flag "$script" "--pathfile"; then
-      args+=(--pathfile "$ROOT_DIR/paths.txt")
-      echo "Using pathfile: $ROOT_DIR/paths.txt"
+      args+=(--pathfile "$pf")
+      echo "Using pathfile: $pf"
     elif _supports_flag "$script" "--paths"; then
-      args+=(--paths "$ROOT_DIR/paths.txt")
-      echo "Using paths: $ROOT_DIR/paths.txt"
+      args+=(--paths "$pf")
+      echo "Using paths: $pf"
     fi
   fi
 
@@ -360,18 +388,19 @@ run_delete_zero_length() {
 
   # Determine base paths
   local bases=()
-  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+  local pf; pf="$(_paths_file)"
+  if [[ -s "$pf" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
       bases+=("$line")
-    done < "$ROOT_DIR/paths.txt"
+    done < "$pf"
   fi
   if [[ ${#bases[@]} -eq 0 ]]; then
     bases=("$ROOT_DIR")
     echo -e "${C_YLW}No paths.txt found or it was empty — scanning repo root: $ROOT_DIR${C_RST}"
-    echo "Tip: create paths.txt to scope cleanups to specific directories."
+    echo "Tip: use menu option 6 to add paths for targeted cleanup."
   else
-    echo "Scanning base paths from paths.txt:"
+    echo "Scanning base paths from: $pf"
     printf ' - %s\n' "${bases[@]}"
   fi
 
