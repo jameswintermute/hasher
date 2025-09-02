@@ -4,10 +4,10 @@
 # License: GPLv3
 #
 # Notes:
-# - Restores "Delete junk files" (option 4) and adds "Delete zero-length files" (option 5).
+# - Includes "Delete junk files" (option 4) and "Delete zero-length files" (option 5).
 # - Adds "System check (deps & readiness)" under the "Other" section.
+# - Restores one-line Summary with % complete and ETA + approximate finish clock time.
 # - Designed to be run from the repository root.
-# - Calls: hasher.sh, find-duplicates.sh, delete-duplicates.sh, delete-junk.sh (if present), bin/check-deps.sh (if present).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -65,6 +65,19 @@ latest_csv() {
   return 1
 }
 
+# Portable-ish future time print from now + N seconds
+_when_from_now() {
+  # $1 = seconds
+  local add="$1"
+  if date -d "@$(( $(date +%s) + add ))" "+%H:%M:%S %Z" >/dev/null 2>&1; then
+    date -d "@$(( $(date +%s) + add ))" "+%H:%M:%S %Z"
+  elif date -r "$(( $(date +%s) + add ))" "+%H:%M:%S %Z" >/dev/null 2>&1; then
+    date -r "$(( $(date +%s) + add ))" "+%H:%M:%S %Z"
+  else
+    echo "unknown"
+  fi
+}
+
 status_summary() {
   echo -e "${C_CYN}### Hashing status ###${C_RST}"
   if [[ -f "$BACKGROUND_LOG" ]]; then
@@ -88,6 +101,29 @@ status_summary() {
     echo "Rows (incl. header): $rows"
   else
     echo -e "${C_YLW}No CSV files found in $HASHES_DIR yet.${C_RST}"
+  fi
+
+  # ─────────────────────── One-line summary (ETA) ───────────────────────
+  if [[ -f "$BACKGROUND_LOG" ]] && grep -q "\[PROGRESS\]" "$BACKGROUND_LOG"; then
+    local last pct cur total eta h m s secs finish
+    last="$(grep "\[PROGRESS\]" "$BACKGROUND_LOG" | tail -n 1)"
+
+    # Extract percent, counts, eta
+    pct="$(sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p' <<<"$last" || true)"
+    cur="$(sed -n 's/.*] \([0-9]\+\)\/[0-9]\+.*/\1/p' <<<"$last" || true)"
+    total="$(sed -n 's/.*] [0-9]\+\/\([0-9]\+\).*/\1/p' <<<"$last" || true)"
+    eta="$(sed -n 's/.* eta=\([0-9:]\+\).*/\1/p' <<<"$last" || true)"
+
+    if [[ -n "$eta" ]]; then
+      IFS=':' read -r h m s <<< "$eta"
+      # shellcheck disable=SC2004
+      secs=$((10#$h*3600 + 10#$m*60 + 10#$s))
+      finish="$(_when_from_now "$secs")"
+      if [[ -n "$pct" && -n "$finish" ]]; then
+        echo
+        echo "Summary: ${pct}% complete • ETA ~${eta} (≈ ${finish})"
+      fi
+    fi
   fi
 }
 
