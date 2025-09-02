@@ -73,9 +73,7 @@ latest_csv() {
   return 1
 }
 
-# Portable-ish future time print from now + N seconds
 _when_from_now() {
-  # $1 = seconds
   local add="$1"
   if date -d "@$(( $(date +%s) + add ))" "+%H:%M:%S %Z" >/dev/null 2>&1; then
     date -d "@$(( $(date +%s) + add ))" "+%H:%M:%S %Z"
@@ -91,7 +89,6 @@ status_summary() {
   if [[ -f "$BACKGROUND_LOG" ]]; then
     echo "- Log: $BACKGROUND_LOG"
     echo "- Recent progress:"
-    # Show the last 12 PROGRESS lines if available, else tail the log
     if grep -q "\[PROGRESS\]" "$BACKGROUND_LOG"; then
       grep "\[PROGRESS\]" "$BACKGROUND_LOG" | tail -n 12
     else
@@ -111,17 +108,13 @@ status_summary() {
     echo -e "${C_YLW}No CSV files found in $HASHES_DIR yet.${C_RST}"
   fi
 
-  # ─────────────────────── One-line summary (ETA) ───────────────────────
   if [[ -f "$BACKGROUND_LOG" ]] && grep -q "\[PROGRESS\]" "$BACKGROUND_LOG"; then
     local last pct cur total eta h m s secs finish
     last="$(grep "\[PROGRESS\]" "$BACKGROUND_LOG" | tail -n 1)"
-
-    # Extract percent, counts, eta
     pct="$(sed -n 's/.*Hashing: \[\([0-9]\+\)%\].*/\1/p' <<<"$last" || true)"
     cur="$(sed -n 's/.*] \([0-9]\+\)\/[0-9]\+.*/\1/p' <<<"$last" || true)"
     total="$(sed -n 's/.*] [0-9]\+\/\([0-9]\+\).*/\1/p' <<<"$last" || true)"
     eta="$(sed -n 's/.* eta=\([0-9:]\+\).*/\1/p' <<<"$last" || true)"
-
     if [[ -n "$eta" ]]; then
       IFS=':' read -r h m s <<< "$eta"
       secs=$((10#$h*3600 + 10#$m*60 + 10#$s))
@@ -137,7 +130,6 @@ status_summary() {
 start_hashing_defaults() {
   echo -e "${C_CYN}Starting hashing (NAS-safe defaults)…${C_RST}"
   local args=(--algo sha256 --nohup)
-  # Prefer local/paths.txt, else legacy paths.txt
   local pf; pf="$(_paths_file)"
   if [[ -s "$pf" ]]; then
     args+=(--pathfile "$pf")
@@ -160,7 +152,6 @@ advanced_hashing() {
   printf "hasher.sh "
   read -r extra || true
   [[ -z "${extra:-}" ]] && { echo "Cancelled."; return 0; }
-  # shellcheck disable=SC2086
   "$SCRIPT_DIR/bin/hasher.sh" $extra
 }
 
@@ -169,7 +160,6 @@ configure_paths() {
   local pf legacy
   legacy="$ROOT_DIR/paths.txt"
   pf="$(_paths_file)"
-  # Inform if using legacy pathfile
   if [[ "$pf" == "$legacy" ]]; then
     echo -e "${C_YLW}Using legacy paths file: $legacy${C_RST}"
     echo -e "${C_YLW}Tip:${C_RST} Create and use ${C_BLU}local/paths.txt${C_RST} for per-host config."
@@ -193,13 +183,8 @@ configure_paths() {
       a|A)
         read -r -p "Enter absolute path to add: " p
         [[ -z "${p:-}" ]] && continue
-        if [[ -d "$p" || -f "$p" ]]; then
-          printf '%s\n' "$p" >> "$pf"
-          echo "Added."
-        else
-          echo -e "${C_YLW}Warning: Path not found now; keeping it in case of later mount.${C_RST}"
-          printf '%s\n' "$p" >> "$pf"
-        fi
+        printf '%s\n' "$p" >> "$pf"
+        echo "Added."
         ;;
       r|R)
         read -r -p "Enter number(s) to remove: " nums
@@ -222,7 +207,7 @@ configure_paths() {
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
           if [[ -d "$line" ]]; then
-            cnt="$(find "$line" -type f -printf '.' 2>/dev/null | wc -c | tr -d ' ' || echo 0)"
+            cnt="$(find "$line" -type f -print 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
             printf '  %s : %s files\n' "$line" "$cnt"
             total=$(( total + cnt ))
           elif [[ -f "$line" ]]; then
@@ -275,44 +260,63 @@ run_find_duplicates() {
 
   echo
   echo "Outputs (if script succeeded):"
-  for f in "$outdir"/duplicates.csv "$outdir"/groups.summary.txt "$outdir"/top-groups.txt "$outdir"/reclaimable.txt; do
+  for f in "$outdir"/duplicates.csv "$outdir"/groups.summary.txt "$outdir"/top-groups.txt "$outdir"/reclaimable.txt "$outdir"/duplicates.txt; do
     [[ -f "$f" ]] && echo " - $f"
   done
 }
 
-run_delete_duplicates() {
-  if ! [[ -f "$SCRIPT_DIR/bin/delete-duplicates.sh" ]]; then
-    echo -e "${C_YLW}delete-duplicates.sh not found. Skipping.${C_RST}"
-    return 0
+run_review_duplicates() {
+  echo -e "${C_CYN}Review duplicates (interactive)…${C_RST}"
+  local report=""
+  report="$(ls -1t "$LOGS_DIR"/du-*/duplicates.txt 2>/dev/null | head -n1 || true)"
+  if [[ -z "$report" ]]; then
+    report="$(ls -1t "$LOGS_DIR"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
   fi
-  echo -e "${C_RED}DANGER ZONE: This will delete files from duplicate groups.${C_RST}"
-  read -r -p "Type 'DELETE' to proceed, anything else to cancel: " confirm
-  [[ "$confirm" != "DELETE" ]] && { echo "Cancelled."; return 0; }
-
-  local in
-  if in="$(latest_csv)"; then
-    echo "Using CSV: $in"
-  else
-    echo -e "${C_RED}No CSV found. Aborting.${C_RST}"
+  if [[ -z "$report" ]]; then
+    echo -e "${C_YLW}No duplicate report found. Run option 2 first.${C_RST}"
     return 1
   fi
-
-  local cmd=("$SCRIPT_DIR/bin/delete-duplicates.sh" --input "$in")
-  if have ionice; then cmd=(ionice -c3 nice -n 19 "${cmd[@]}"); fi
-
+  echo "Using report: $report"
+  local cmd=("$SCRIPT_DIR/bin/review-duplicates.sh" --from-report "$report" --keep newest)
   echo "Command: ${cmd[*]}"
-  ${cmd[@]} || {
-    echo -e "${C_RED}delete-duplicates.sh failed.${C_RST}"
-    return 1
-  }
+  "${cmd[@]}" || { echo -e "${C_RED}review-duplicates.sh failed.${C_RST}"; return 1; }
+
+  local plan
+  plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  if [[ -n "$plan" ]]; then
+    echo
+    echo "Latest plan: $plan"
+    echo "Tip: Dry-run deletion with:"
+    echo "  ./bin/delete-duplicates.sh --from-plan \"$plan\""
+  fi
 }
 
-_supports_flag() {
-  # $1 = script path, $2 = flag to probe
-  # returns 0 if --help output mentions the flag
-  local script="$1" flag="$2"
-  "$script" --help >/dev/null 2>&1 || true
-  "$script" --help 2>&1 | grep -qi -- "$flag"
+run_delete_duplicates() {
+  echo -e "${C_RED}DANGER ZONE: Execute plan to delete files from duplicate groups.${C_RST}"
+  local plan
+  plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  if [[ -z "$plan" ]]; then
+    echo -e "${C_YLW}No review plan found. Run option 3 (Review duplicates) first.${C_RST}"
+    return 1
+  fi
+  echo "Using plan: $plan"
+  read -r -p "Type 'DELETE' to proceed (dry-run otherwise): " confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    echo "Dry-run…"
+    "$SCRIPT_DIR/bin/delete-duplicates.sh" --from-plan "$plan" || true
+    return 0
+  fi
+
+  echo
+  echo "Choose action:"
+  echo "  1) Move to quarantine (safer)"
+  echo "  2) Permanently delete"
+  read -r -p "Select: " mode
+  case "${mode:-}" in
+    1) "$SCRIPT_DIR/bin/delete-duplicates.sh" --from-plan "$plan" --force --quarantine "quarantine-$(date +%F)" ;;
+    2) "$SCRIPT_DIR/bin/delete-duplicates.sh" --from-plan "$plan" --force ;;
+    *) echo "Cancelled." ;;
+  esac
 }
 
 run_delete_junk() {
@@ -327,32 +331,14 @@ run_delete_junk() {
     chmod +x "$script" || true
   fi
 
-  # Build arguments based on supported flags
   local args=()
   local pf; pf="$(_paths_file)"
   if [[ -s "$pf" ]]; then
-    if _supports_flag "$script" "--pathfile"; then
-      args+=(--pathfile "$pf")
-      echo "Using pathfile: $pf"
-    elif _supports_flag "$script" "--paths"; then
-      args+=(--paths "$pf")
-      echo "Using paths: $pf"
-    fi
+    args+=(--paths-file "$pf")
+    echo "Using paths file: $pf"
   fi
 
-  local dryrun_flag=""
-  if _supports_flag "$script" "--dry-run"; then
-    dryrun_flag="--dry-run"
-  elif _supports_flag "$script" "-n"; then
-    dryrun_flag="-n"
-  fi
-
-  local cmd_preview=("$script" "${args[@]}")
-  if [[ -n "$dryrun_flag" ]]; then
-    cmd_preview+=("$dryrun_flag")
-  fi
-
-  # Preview (dry-run if supported)
+  local cmd_preview=("$script" "${args[@]}" --dry-run)
   echo
   echo -e "${C_BLU}Preview (no deletions will occur in this step)…${C_RST}"
   echo "Command: ${cmd_preview[*]}"
@@ -365,10 +351,7 @@ run_delete_junk() {
   read -r -p "Type 'APPLY' to delete junk files, anything else to cancel: " go
   [[ "$go" != "APPLY" ]] && { echo "Cancelled."; return 0; }
 
-  local cmd_apply=("$script" "${args[@]}")
-  if _supports_flag "$script" "--apply"; then
-    cmd_apply+=(--apply)
-  fi
+  local cmd_apply=("$script" "${args[@]}" --force)
   echo "Command: ${cmd_apply[*]}"
   if have ionice; then cmd_apply=(ionice -c3 nice -n 19 "${cmd_apply[@]}"); fi
   ${cmd_apply[@]}
@@ -386,7 +369,6 @@ run_delete_zero_length() {
   listfile="$outdir/candidates.txt"
   delog="$outdir/deleted.txt"
 
-  # Determine base paths
   local bases=()
   local pf; pf="$(_paths_file)"
   if [[ -s "$pf" ]]; then
@@ -404,17 +386,14 @@ run_delete_zero_length() {
     printf ' - %s\n' "${bases[@]}"
   fi
 
-  # Build find command per base and append to NUL list
   echo "Gathering zero-length candidates…"
   : > "$nulfile"
   for base in "${bases[@]}"; do
-    # Use -prune to skip common NAS/OS special dirs
     find "$base" \
       \( -type d \( -iname '#recycle' -o -name '@eaDir' -o -name '.Trash*' -o -name '.Spotlight-V100' -o -name '.fseventsd' \) -prune \) -o \
       -type f -size 0c -print0 >> "$nulfile" 2>/dev/null || true
   done
 
-  # Count & write human list
   local count
   count="$(tr -cd '\0' < "$nulfile" | wc -c | tr -d ' ')" || count=0
   tr '\0' '\n' < "$nulfile" > "$listfile"
@@ -440,7 +419,6 @@ run_delete_zero_length() {
 
   echo "Deleting…"
   : > "$delog"
-  # Delete using a NUL-safe loop (portable even without xargs -0)
   while IFS= read -r -d '' f; do
     if rm -f -- "$f"; then
       printf '%s\n' "$f" >> "$delog"
@@ -484,7 +462,8 @@ show_menu() {
   echo
   echo "### Stage 2 - Identify ###"
   echo "  2) Find duplicate hashes"
-  echo "  3) Delete duplicates (DANGER)"
+  echo "  3) Review duplicates (interactive)"
+  echo "  d) Delete duplicates (DANGER)"
   echo
   echo "### Stage 3 - Clean up ###"
   echo "  4) Delete junk files"
@@ -508,7 +487,8 @@ main_loop() {
       1) clear 2>/dev/null || true; start_hashing_defaults; echo; pause ;;
       8) clear 2>/dev/null || true; advanced_hashing; echo; pause ;;
       2) clear 2>/dev/null || true; run_find_duplicates; echo; pause ;;
-      3) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
+      3) clear 2>/dev/null || true; run_review_duplicates; echo; pause ;;
+      d|D) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
       4) clear 2>/dev/null || true; run_delete_junk; echo; pause ;;
       5) clear 2>/dev/null || true; run_delete_zero_length; echo; pause ;;
       6) clear 2>/dev/null || true; configure_paths; echo; pause ;;
