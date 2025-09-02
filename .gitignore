@@ -1,0 +1,16 @@
+# Runtime output
+logs/
+hashes/*.csv
+zero-length/
+quarantine*/
+logs/du-*/
+
+# Local, machine-specific config (optional: see below)
+local/
+
+# OS / editor junk
+.DS_Store
+@eaDir/
+#recycle/
+*.swp
+*~
