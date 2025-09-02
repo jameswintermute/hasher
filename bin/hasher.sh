@@ -586,37 +586,63 @@ post_run_reports() {
   local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
+  # CSV-safe: split each data line from the RIGHT by four commas to get
+  # PATH,SIZE,MTIME,ALGO,HASH (only PATH may contain commas).
   if [[ -f "$csv" ]]; then
-    awk -F',' '
-      NR==1 { for (i=1;i<=NF;i++) h[tolower($i)]=i; next }
+    awk '
+      NR==1 { next } # skip header
       {
-        sizecol = (h["size_bytes"] ? h["size_bytes"] : (h["size"] ? h["size"] : 0))
-        pathcol = (h["path"] ? h["path"] : (h["filepath"] ? h["filepath"] : 1))
-        if (sizecol>0) { if ($sizecol+0==0) print $pathcol }
-        else { if ($(NF)+0==0) print $1 }
+        s=$0
+        # collect comma positions
+        n=0; pos=0
+        while ( (i=index(substr(s,pos+1),",")) > 0 ) {
+          pos += i; n++; c[n]=pos
+        }
+        if (n < 4) next
+        c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n]
+        path = substr(s,1,c1-1)
+        size = substr(s,c1+1,c2-c1-1)
+        # mtime = substr(s,c2+1,c3-c2-1)   # not needed here
+        # algo  = substr(s,c3+1,c4-c3-1)   # not needed here
+        # hash  = substr(s,c4+1)           # not needed here
+        # unquote path if quoted; unescape doubled quotes
+        if (path ~ /^".*"$/) { sub(/^"/,"",path); sub(/"$/,"",path); gsub(/""/,"\"",path) }
+        if (size+0==0) print path
+        # clear c[] for next record
+        for (k=1;k<=n;k++) delete c[k]
       }
-    ' "$csv" | grep -v '^[[:space:]]*$' > "$zero_txt" || true
+    ' "$csv" > "$zero_txt" || true
   fi
 
-  awk -F',' '
+  # Duplicate groups by HASH, with member file list (CSV-safe right split again)
+  awk '
     BEGIN{ OFS="," }
-    NR==1 { for (i=1;i<=NF;i++){ low=tolower($i); h[low]=i } next }
+    NR==1 { next }
     {
-      hashcol = (h["hash"] ? h["hash"] :
-                (h["sha256"] ? h["sha256"] :
-                (h["sha1"] ? h["sha1"] :
-                (h["sha512"] ? h["sha512"] :
-                (h["md5"] ? h["md5"] : 0)))))
-      pathcol = (h["path"] ? h["path"] : (h["filepath"] ? h["filepath"] : 1))
-      if (hashcol==0) next
-      hash=$hashcol; path=$pathcol
+      s=$0
+      # collect comma positions
+      n=0; pos=0
+      while ( (i=index(substr(s,pos+1),",")) > 0 ) {
+        pos += i; n++; c[n]=pos
+      }
+      if (n < 4) next
+      c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n]
+      path = substr(s,1,c1-1)
+      hash = substr(s,c4+1)
+
+      if (path ~ /^".*"$/) { sub(/^"/,"",path); sub(/"$/,"",path); gsub(/""/,"\"",path) }
       gsub(/^[ \t]+|[ \t]+$/,"",hash)
-      gsub(/^[ \t]+|[ \t]+$/,"",path)
-      if (hash!="") { count[hash]++; files[hash]=files[hash]"\n"path }
+
+      if (hash!="") {
+        cnt[hash]++; files[hash]=files[hash]"\n"path
+      }
+
+      # clear c[] for next record
+      for (k=1;k<=n;k++) delete c[k]
     }
     END{
-      for (k in count) if (count[k]>1) {
-        print "HASH " k " (" count[k] " files):"
+      for (k in cnt) if (cnt[k]>1) {
+        print "HASH " k " (" cnt[k] " files):"
         s=files[k]; sub(/^\n/,"",s)
         n=split(s,arr,"\n")
         for (i=1;i<=n;i++) print "  " arr[i]
@@ -648,10 +674,10 @@ post_run_reports() {
   echo "       ./find-duplicates.sh"
   echo "       ./review-duplicates.sh --from-report \"$dupes_txt\" --keep newest"
   echo "       # Dry-run action on your latest reviewed plan:"
-  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\""
+  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\""
   echo "       # Execute (move to quarantine or delete):"
-  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force --quarantine \"quarantine-$DATE_TAG\""
-  echo "       ./delete-duplicates.sh --from-plan \"\$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force"
+  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force --quarantine \"quarantine-$DATE_TAG\""
+  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force"
   echo
 }
 
