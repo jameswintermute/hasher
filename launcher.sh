@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
-export PATH="$SCRIPT_DIR:$SCRIPT_DIR/bin:$PATH"
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"; export PATH="$SCRIPT_DIR:$SCRIPT_DIR/bin:$PATH"
 # launcher.sh — menu launcher for Hasher & Dedupe toolkit
 # Copyright (C) 2025
 # License: GPLv3
@@ -118,7 +117,6 @@ status_summary() {
 
     if [[ -n "$eta" ]]; then
       IFS=':' read -r h m s <<< "$eta"
-      # shellcheck disable=SC2004
       secs=$((10#$h*3600 + 10#$m*60 + 10#$s))
       finish="$(_when_from_now "$secs")"
       if [[ -n "$pct" && -n "$finish" ]]; then
@@ -137,9 +135,9 @@ start_hashing_defaults() {
     args+=(--pathfile "$ROOT_DIR/paths.txt")
     echo "Using pathfile: $ROOT_DIR/paths.txt"
   fi
-  echo "Command: ./hasher.sh ${args[*]}"
+  echo "Command: \"$SCRIPT_DIR/bin/hasher.sh\" ${args[*]}"
   echo
-  ./hasher.sh "${args[@]}" || {
+  "$SCRIPT_DIR/bin/hasher.sh" "${args[@]}" || {
     echo -e "${C_RED}hasher.sh failed. See logs for details.${C_RST}"
     return 1
   }
@@ -153,7 +151,76 @@ advanced_hashing() {
   read -r extra || true
   [[ -z "${extra:-}" ]] && { echo "Cancelled."; return 0; }
   # shellcheck disable=SC2086
-  ./hasher.sh $extra
+  "$SCRIPT_DIR/bin/hasher.sh" $extra
+}
+
+configure_paths() {
+  echo -e "${C_CYN}Configure paths to hash (paths.txt)${C_RST}"
+  local pf="$ROOT_DIR/paths.txt"
+  touch "$pf"
+  while true; do
+    echo
+    echo "Current entries:"
+    nl -ba "$pf" | sed 's/^/  /' || true
+    echo
+    echo "a) Add path"
+    echo "r) Remove by number (comma or space separated)"
+    echo "c) Clear all"
+    echo "t) Test scan (count files quickly)"
+    echo "b) Back"
+    read -r -p "Choose: " act
+    case "${act:-}" in
+      a|A)
+        read -r -p "Enter absolute path to add: " p
+        [[ -z "${p:-}" ]] && continue
+        if [[ -d "$p" || -f "$p" ]]; then
+          printf '%s\n' "$p" >> "$pf"
+          echo "Added."
+        else
+          echo -e "${C_YLW}Warning: Path not found now; keeping it in case of later mount.${C_RST}"
+          printf '%s\n' "$p" >> "$pf"
+        fi
+        ;;
+      r|R)
+        read -r -p "Enter number(s) to remove: " nums
+        [[ -z "${nums:-}" ]] && continue
+        # build awk pattern of lines to drop
+        tmp="$(mktemp)"; nl -ba "$pf" > "$tmp" || true
+        awk -v list="$nums" '
+          BEGIN{
+            n=split(list, arr, /[ ,]+/); for(i=1;i<=n;i++) del[arr[i]]=1
+          }
+          { if (!($1 in del)) { $1=""; sub(/^[ \t]+/,""); print } }
+        ' "$tmp" > "$pf.new" || true
+        mv -f "$pf.new" "$pf"
+        rm -f "$tmp"
+        echo "Updated."
+        ;;
+      c|C)
+        : > "$pf"; echo "Cleared."
+        ;;
+      t|T)
+        echo "Counting files under listed paths (quick scan)…"
+        total=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+          if [[ -d "$line" ]]; then
+            cnt="$(find "$line" -type f -printf '.' 2>/dev/null | wc -c | tr -d ' ' || echo 0)"
+            printf '  %s : %s files\n' "$line" "$cnt"
+            total=$(( total + cnt ))
+          elif [[ -f "$line" ]]; then
+            printf '  %s : 1 file\n' "$line"
+            total=$(( total + 1 ))
+          else
+            printf '  %s : (missing)\n' "$line"
+          fi
+        done < "$pf"
+        echo "Total files (approx): $total"
+        ;;
+      b|B) return 0 ;;
+      *) echo "Unknown option." ;;
+    esac
+  done
 }
 
 run_find_duplicates() {
@@ -170,11 +237,10 @@ run_find_duplicates() {
     return 1
   fi
 
-  local cmd=(./find-duplicates.sh --input "$in" --out "$outdir")
+  local cmd=("$SCRIPT_DIR/bin/find-duplicates.sh" --csv "$in" --out "$outdir")
   if have ionice; then cmd=(ionice -c3 nice -n 19 "${cmd[@]}"); fi
 
   echo "Command: ${cmd[*]}"
-  # shellcheck disable=SC2068
   ${cmd[@]} || {
     echo -e "${C_RED}find-duplicates.sh failed.${C_RST}"
     return 1
@@ -188,7 +254,7 @@ run_find_duplicates() {
 }
 
 run_delete_duplicates() {
-  if ! [[ -f ./delete-duplicates.sh ]]; then
+  if ! [[ -f "$SCRIPT_DIR/bin/delete-duplicates.sh" ]]; then
     echo -e "${C_YLW}delete-duplicates.sh not found. Skipping.${C_RST}"
     return 0
   fi
@@ -204,11 +270,10 @@ run_delete_duplicates() {
     return 1
   fi
 
-  local cmd=(./delete-duplicates.sh --input "$in")
+  local cmd=("$SCRIPT_DIR/bin/delete-duplicates.sh" --input "$in")
   if have ionice; then cmd=(ionice -c3 nice -n 19 "${cmd[@]}"); fi
 
   echo "Command: ${cmd[*]}"
-  # shellcheck disable=SC2068
   ${cmd[@]} || {
     echo -e "${C_RED}delete-duplicates.sh failed.${C_RST}"
     return 1
@@ -225,10 +290,10 @@ _supports_flag() {
 
 run_delete_junk() {
   echo -e "${C_CYN}Delete junk files (safe flow)…${C_RST}"
-  local script="./delete-junk.sh"
+  local script="$SCRIPT_DIR/bin/delete-junk.sh"
   if ! [[ -f "$script" ]]; then
-    echo -e "${C_YLW}delete-junk.sh not found in repo root.${C_RST}"
-    echo "If you have it elsewhere, place it here and make it executable: chmod +x delete-junk.sh"
+    echo -e "${C_YLW}delete-junk.sh not found in bin/.${C_RST}"
+    echo "Place it in bin/ and make it executable: chmod +x bin/delete-junk.sh"
     return 0
   fi
   if ! [[ -x "$script" ]]; then
@@ -265,7 +330,6 @@ run_delete_junk() {
   echo "Command: ${cmd_preview[*]}"
   echo
   if have ionice; then cmd_preview=(ionice -c3 nice -n 19 "${cmd_preview[@]}"); fi
-  # shellcheck disable=SC2068
   ${cmd_preview[@]} || true
 
   echo
@@ -274,13 +338,11 @@ run_delete_junk() {
   [[ "$go" != "APPLY" ]] && { echo "Cancelled."; return 0; }
 
   local cmd_apply=("$script" "${args[@]}")
-  # Some scripts use --apply; if supported, prefer it.
   if _supports_flag "$script" "--apply"; then
     cmd_apply+=(--apply)
   fi
   echo "Command: ${cmd_apply[*]}"
   if have ionice; then cmd_apply=(ionice -c3 nice -n 19 "${cmd_apply[@]}"); fi
-  # shellcheck disable=SC2068
   ${cmd_apply[@]}
 }
 
@@ -318,7 +380,6 @@ run_delete_zero_length() {
   : > "$nulfile"
   for base in "${bases[@]}"; do
     # Use -prune to skip common NAS/OS special dirs
-    # shellcheck disable=SC2016
     find "$base" \
       \( -type d \( -iname '#recycle' -o -name '@eaDir' -o -name '.Trash*' -o -name '.Spotlight-V100' -o -name '.fseventsd' \) -prune \) -o \
       -type f -size 0c -print0 >> "$nulfile" 2>/dev/null || true
@@ -351,7 +412,6 @@ run_delete_zero_length() {
   echo "Deleting…"
   : > "$delog"
   # Delete using a NUL-safe loop (portable even without xargs -0)
-  # shellcheck disable=SC2162
   while IFS= read -r -d '' f; do
     if rm -f -- "$f"; then
       printf '%s\n' "$f" >> "$delog"
@@ -402,6 +462,7 @@ show_menu() {
   echo "  5) Delete zero-length files"
   echo
   echo "### Other ###"
+  echo "  6) Configure paths to hash"
   echo "  7) System check (deps & readiness)"
   echo "  9) View logs (tail background.log)"
   echo
@@ -421,6 +482,7 @@ main_loop() {
       3) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
       4) clear 2>/dev/null || true; run_delete_junk; echo; pause ;;
       5) clear 2>/dev/null || true; run_delete_zero_length; echo; pause ;;
+      6) clear 2>/dev/null || true; configure_paths; echo; pause ;;
       7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
       9) clear 2>/dev/null || true; view_logs ;;
       q|Q) echo "Bye!"; exit 0 ;;
