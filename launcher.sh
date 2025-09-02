@@ -1,24 +1,42 @@
-#!/bin/bash
-# Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
-# This program comes with ABSOLUTELY NO WARRANTY.
+#!/usr/bin/env bash
+# launcher.sh — menu launcher for Hasher & Dedupe toolkit
+# Copyright (C) 2025
+# License: GPLv3
+#
+# Notes:
+# - Adds "System check (deps & readiness)" under the "Other" section.
+# - Designed to be run from the repository root.
+# - Calls: hasher.sh, find-duplicates.sh, delete-duplicates.sh (if present), bin/check-deps.sh (if present).
 
 set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
+IFS=$'\n\t'
 
-APP_HOME="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-BIN_DIR="$APP_HOME/bin"
-LOGS_DIR="$APP_HOME/logs"
-HASHES_DIR="$APP_HOME/hashes"
-ZERO_DIR="$APP_HOME/zero-length"
-LOCAL_DIR="$APP_HOME/local"
-DEFAULT_DIR="$APP_HOME/default"
+# ────────────────────────────── Globals ──────────────────────────────
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$ZERO_DIR"
+LOGS_DIR="$ROOT_DIR/logs"
+HASHES_DIR="$ROOT_DIR/hashes"
+BACKGROUND_LOG="$LOGS_DIR/background.log"
 
-draw_banner(){
-cat <<'EOF'
+mkdir -p "$LOGS_DIR" "$HASHES_DIR"
+
+is_tty() { [[ -t 1 ]]; }
+if is_tty; then
+  C_GRN="\033[0;32m"; C_YLW="\033[1;33m"; C_RED="\033[0;31m"; C_CYN="\033[0;36m"; C_MGN="\033[0;35m"; C_BLU="\033[0;34m"; C_RST="\033[0m"
+else
+  C_GRN=""; C_YLW=""; C_RED=""; C_CYN=""; C_MGN=""; C_BLU=""; C_RST=""
+fi
+
+pause() { read -r -p "Press Enter to return to the menu..." _; }
+exists() { [[ -f "$1" ]]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ────────────────────────────── Banner ───────────────────────────────
+banner() {
+  clear 2>/dev/null || true
+  cat <<'EOF'
+
  _   _           _               
 | | | | __ _ ___| |__   ___ _ __ 
 | |_| |/ _` / __| '_ \ / _ \ '__|
@@ -26,260 +44,195 @@ cat <<'EOF'
 |_| |_|\__,_|___/_| |_|\___|_|   
 
       NAS File Hasher & Dedupe
+
 EOF
 }
 
-press_any(){ read -r -p "Press Enter to continue..." _ || true; }
-
-latest_csv(){ ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true; }
-latest_report(){ ls -1t "$LOGS_DIR"/*duplicate-hashes*.txt 2>/dev/null | head -n1 || true; }
-latest_zero(){ ls -1t "$ZERO_DIR"/zero-length-*.txt 2>/dev/null | head -n1 || true; }
-latest_plan(){ ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true; }
-
-# ───── Option 0: status with ETA → wall clock ─────
-status(){
-  echo "— Latest progress —"
-  tail -n 10 "$LOGS_DIR/background.log" 2>/dev/null || echo "(no background.log yet)"
-  local csv; csv="$(latest_csv)"
-  if [ -n "$csv" ]; then
-    echo; echo "Latest CSV: $csv"
-    local rows; rows="$(wc -l < "$csv" | tr -d ' ')"
-    echo "Row count (including header): $rows"
+# ─────────────────────────── Helper funcs ────────────────────────────
+latest_csv() {
+  # Prefer explicit latest.csv if present; else newest hasher-*.csv
+  if [[ -f "$HASHES_DIR/latest.csv" ]]; then
+    echo "$HASHES_DIR/latest.csv"
+    return 0
   fi
-
-  local last; last="$(grep '\[PROGRESS\]' "$LOGS_DIR/background.log" 2>/dev/null | tail -n 1 || true)"
-  if [ -n "$last" ]; then
-    eta_hms="$(echo "$last" | sed -n 's/.* eta=\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\).*/\1/p')"
-    pct="$(echo "$last" | sed -n 's/.* Hashing: \[\([0-9]\+\)%\].*/\1/p')"
-    if [ -n "$eta_hms" ]; then
-      IFS=: read -r eh em es <<< "$eta_hms"
-      secs=$((10#$eh*3600 + 10#$em*60 + 10#$es))
-      end_epoch=$(( $(date +%s) + secs ))
-      end_local="$(date -d "@$end_epoch" "+%H:%M:%S %Z" 2>/dev/null || date -r "$end_epoch"  "+%H:%M:%S")"
-      echo; echo "Summary: ${pct:-?}% complete • ETA in ~${eh}h ${em}m ${es}s (≈ ${end_local})"
-    fi
+  local newest
+  newest="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+  if [[ -n "$newest" && -f "$newest" ]]; then
+    echo "$newest"
+    return 0
   fi
+  return 1
+}
 
-  if [ -s "$LOGS_DIR/background.log" ]; then
-    # If a completed line exists in last 50 lines, show it
-    comp="$(tail -n 50 "$LOGS_DIR/background.log" 2>/dev/null | grep -m1 'Completed\. Hashed' || true)"
-    if [ -n "$comp" ]; then
-      echo; echo "[STATUS] $comp"
+status_summary() {
+  echo -e "${C_CYN}### Hashing status ###${C_RST}"
+  if [[ -f "$BACKGROUND_LOG" ]]; then
+    echo "- Log: $BACKGROUND_LOG"
+    echo "- Recent progress:"
+    # Show the last 12 PROGRESS lines if available, else tail the log
+    if grep -q "\[PROGRESS\]" "$BACKGROUND_LOG"; then
+      grep "\[PROGRESS\]" "$BACKGROUND_LOG" | tail -n 12
     else
-      echo; echo "[STATUS] $(tail -n 1 "$LOGS_DIR/background.log")"
+      tail -n 12 "$BACKGROUND_LOG"
     fi
-  fi
-  press_any
-}
-
-# ───── Option 1: start hashing ─────
-start_hashing(){
-  echo "Starting Hasher now using defaults..."
-  echo "Command:"
-  echo "  bin/hasher.sh --pathfile $LOCAL_DIR/paths.txt --algo sha256 --nohup"
-  ( cd "$APP_HOME" && "$BIN_DIR/hasher.sh" --pathfile "$LOCAL_DIR/paths.txt" --algo sha256 --nohup )
-  echo; echo "Tail logs with:"
-  echo "  tail -f \"$LOGS_DIR/background.log\" \"$LOGS_DIR/hasher.log\""
-  press_any
-}
-
-# ───── Option 9: advanced/custom hashing ─────
-advanced_hashing(){
-  echo "Advanced / Custom hashing"
-  read -r -p "Pathfile [default: $LOCAL_DIR/paths.txt]: " pf || pf=""
-  [ -z "$pf" ] && pf="$LOCAL_DIR/paths.txt"
-  read -r -p "Algorithm sha256|sha1|sha512|md5|blake2 [default: sha256]: " algo || algo=""
-  [ -z "$algo" ] && algo="sha256"
-  read -r -p "Zero-length-only mode? (y/N): " z || z=""
-  zlc="$(printf "%s" "$z" | tr '[:upper:]' '[:lower:]')"
-  read -r -p "Run in background with nohup? (Y/n): " nh || nh=""
-  nhc="$(printf "%s" "$nh" | tr '[:upper:]' '[:lower:]')"
-  cmd=( "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" )
-  if [ "$zlc" = "y" ] || [ "$zlc" = "yes" ]; then cmd+=( --zero-length-only ); fi
-  if [ -z "$nhc" ] || [ "$nhc" = "y" ] || [ "$nhc" = "yes" ]; then cmd+=( --nohup ); fi
-  echo "Command:"
-  echo "  ${cmd[*]}"
-  ( cd "$APP_HOME" && "${cmd[@]}" )
-  press_any
-}
-
-# ───── Option 2: find duplicate groups ─────
-find_dupes(){
-  echo "Finding duplicate groups from latest CSV..."
-  ( cd "$APP_HOME" && "$BIN_DIR/find-duplicates.sh" )
-  press_any
-}
-
-# ───── Option 3: review duplicates (interactive) ─────
-review_dupes(){
-  local rep; rep="$(latest_report)"
-  if [ -z "$rep" ]; then
-    echo "[INFO] No duplicate report found; generating one..."
-    ( cd "$APP_HOME" && "$BIN_DIR/find-duplicates.sh" )
-    rep="$(latest_report)"
-    [ -z "$rep" ] && { echo "[ERROR] Still no report found."; press_any; return; }
-  fi
-  echo "[INFO] Using latest report: $rep"
-  ( cd "$APP_HOME" && "$BIN_DIR/review-duplicates.sh" --from-report "$rep" ) < /dev/tty
-  press_any
-}
-
-# ───── Option 4: delete zero-length files ─────
-delete_zero_len(){
-  local z; z="$(latest_zero)"
-  if [ -z "$z" ]; then
-    echo "[INFO] No zero-length list found. You can run: bin/hasher.sh --pathfile local/paths.txt --algo sha256 --zero-length-only"
-    press_any; return
-  fi
-  echo "Zero-length list: $z"
-  echo "Choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
-  read -r -p "> " mode || mode=""
-  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
-  case "$mode_lc" in
-    d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" ) ;;
-    f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force ) ;;
-    q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --force --quarantine "$ZERO_DIR/quarantine-$(date +%F)" ) ;;
-    *|v|verify|verify-only) ( cd "$APP_HOME" && "$BIN_DIR/delete-zero-length.sh" "$z" --verify-only ) ;;
-  esac
-  press_any
-}
-
-# ───── Option 5: delete junk files ─────
-delete_junk(){
-  echo "Junk cleaner — choose mode: [v]erify-only (default), [d]ry-run, [f]orce, [q]uarantine"
-  read -r -p "> " mode || mode=""
-  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
-  case "$mode_lc" in
-    d|dry|dry-run)      ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --dry-run ) ;;
-    f|force)            ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --force ) ;;
-    q|quarantine)       ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --quarantine "$APP_HOME/var/junk/quarantine-$(date +%F)" ) ;;
-    *|v|verify|verify-only) ( cd "$APP_HOME" && "$BIN_DIR/delete-junk.sh" --verify-only ) ;;
-  esac
-  press_any
-}
-
-# ───── Option 6: act on a duplicate delete PLAN ─────
-act_on_plan(){
-  mapfile -t candidates < <(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n 20)
-  if [ "${#candidates[@]}" -eq 0 ]; then
-    echo "[INFO] No review-dedupe plan files found in $LOGS_DIR."
-    echo "Run option 3 (Review duplicate hashes) to build a plan first."
-    press_any; return
-  fi
-  echo "Available delete plans:"
-  local i=0
-  for f in "${candidates[@]}"; do
-    i=$((i+1))
-    local n ts ts_h
-    n="$(wc -l < "$f" | tr -d ' ' 2>/dev/null || echo '?')"
-    if ts=$(stat -c %Y "$f" 2>/dev/null); then
-      ts_h="$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")"
-    else
-      ts_h="$(date '+%Y-%m-%d %H:%M:%S')"
-    fi
-    printf "  %2d) %-60s  (%s lines)  [%s]\n" "$i" "$(basename "$f")" "$n" "$ts_h"
-  done
-  echo
-  read -r -p "Select a plan [1-${#candidates[@]}] (default 1): " sel || sel=""
-  [[ -z "$sel" ]] && sel=1
-  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#candidates[@]}" ]; then
-    echo "Invalid selection."; press_any; return
-  fi
-  local plan="${candidates[$((sel-1))]}"
-  echo "Chosen: $plan"
-  echo "Choose mode: [d]ry-run (default), [f]orce, [q]uarantine"
-  read -r -p "> " mode || mode=""
-  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
-  case "$mode_lc" in
-    f|force)
-      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" --force )
-      ;;
-    q|quarantine)
-      local def_quar="$APP_HOME/var/quarantine/quarantine-$(date +%F)"
-      read -r -p "Quarantine dir [default: $def_quar]: " qd || qd=""
-      [[ -z "$qd" ]] && qd="$def_quar"
-      mkdir -p "$qd"
-      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" --force --quarantine "$qd" )
-      ;;
-    *|d|dry|dry-run)
-      ( cd "$APP_HOME" && "$BIN_DIR/delete-duplicates.sh" --from-plan "$plan" )
-      ;;
-  esac
-  press_any
-}
-
-# ───── Helpers ─────
-populate_paths(){
-  local f="$LOCAL_DIR/paths.txt"
-  if [ -s "$f" ]; then
-    echo "[INFO] $f already exists:"
-    nl -ba "$f" | head -n 20
   else
-    mkdir -p "$LOCAL_DIR"
-    cat > "$f" <<EOF
-/volume1/Family
-/volume1/James
-/volume1/Media
-EOF
-    echo "[INFO] Wrote starter $f"
+    echo "No background log found at $BACKGROUND_LOG"
   fi
-  press_any
+
+  echo
+  local csv; if csv="$(latest_csv)"; then
+    local rows; rows="$(wc -l <"$csv" | tr -d ' ')" || rows="unknown"
+    echo -e "${C_CYN}### Latest CSV ###${C_RST}"
+    echo "File: $csv"
+    echo "Rows (incl. header): $rows"
+  else
+    echo -e "${C_YLW}No CSV files found in $HASHES_DIR yet.${C_RST}"
+  fi
 }
 
-edit_conf(){
-  local lf="$LOCAL_DIR/hasher.conf"
-  local df="$DEFAULT_DIR/hasher.conf"
-  [ -r "$df" ] && echo "[INFO] Default conf: $df"
-  if [ ! -r "$lf" ]; then
-    mkdir -p "$LOCAL_DIR"
-    cp -n "$df" "$lf" 2>/dev/null || true
-    echo "[INFO] Created local conf: $lf"
+start_hashing_defaults() {
+  echo -e "${C_CYN}Starting hashing (NAS-safe defaults)…${C_RST}"
+  local args=(--algo sha256 --nohup)
+  # If a default pathfile exists, use it
+  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+    args+=(--pathfile "$ROOT_DIR/paths.txt")
+    echo "Using pathfile: $ROOT_DIR/paths.txt"
   fi
-  ${EDITOR:-vi} "$lf" || true
+  echo "Command: ./hasher.sh ${args[*]}"
+  echo
+  ./hasher.sh "${args[@]}" || {
+    echo -e "${C_RED}hasher.sh failed. See logs for details.${C_RST}"
+    return 1
+  }
 }
 
-main_menu(){
-  while :; do
-    clear || true
-    draw_banner
-    cat <<EOF
+advanced_hashing() {
+  echo -e "${C_CYN}Advanced / Custom hashing${C_RST}"
+  echo "Enter additional flags for hasher.sh (example: --pathfile paths.txt --algo sha256 --nohup)"
+  echo "Leave empty to cancel."
+  printf "hasher.sh "
+  read -r extra || true
+  [[ -z "${extra:-}" ]] && { echo "Cancelled."; return 0; }
+  # shellcheck disable=SC2086
+  ./hasher.sh $extra
+}
 
-### Stage 1 - Hash ###
-  0) Check hashing status
-  1) Start Hashing (NAS-safe defaults)
-  9) Advanced / Custom hashing
+run_find_duplicates() {
+  echo -e "${C_CYN}Running find-duplicates…${C_RST}"
+  local in outdir ts
+  ts="$(date +'%Y-%m-%d-%H%M%S')"
+  outdir="$LOGS_DIR/du-$ts"
+  mkdir -p "$outdir"
 
-### Stage 2 - Identify ###
-  2) Find duplicate hashes
-  3) Review duplicate hashes (latest report)
+  if in="$(latest_csv)"; then
+    echo "Input CSV: $in"
+  else
+    echo -e "${C_RED}No input CSV found. Run hashing first.${C_RST}"
+    return 1
+  fi
 
-### Stage 3 - Cleanup ###
-  4) Delete Zero-Length files
-  5) Delete Junk files (Thumbs.db, .DS_Store, @eaDir…)
-  6) Delete Duplicates from PLAN
+  local cmd=(./find-duplicates.sh --input "$in" --out "$outdir")
+  if have ionice; then cmd=(ionice -c3 nice -n 19 "${cmd[@]}"); fi
 
-### Other ###
-  7) Populate the paths file (local/paths.txt)
-  8) Edit config (local/hasher.conf; overlays default/hasher.conf)
+  echo "Command: ${cmd[*]}"
+  # shellcheck disable=SC2068
+  ${cmd[@]} || {
+    echo -e "${C_RED}find-duplicates.sh failed.${C_RST}"
+    return 1
+  }
 
-  q) Quit
-EOF
-    read -r -p "Select an option: " opt || opt=""
-    case "$opt" in
-      0) status ;;
-      1) start_hashing ;;
-      2) find_dupes ;;
-      3) review_dupes ;;
-      4) delete_zero_len ;;
-      5) delete_junk ;;
-      6) act_on_plan ;;
-      7) populate_paths ;;
-      8) edit_conf ;;
-      9) advanced_hashing ;;
-      q|Q) exit 0 ;;
-      *) echo "Unknown option"; press_any ;;
+  echo
+  echo "Outputs (if script succeeded):"
+  for f in "$outdir"/duplicates.csv "$outdir"/groups.summary.txt "$outdir"/top-groups.txt "$outdir"/reclaimable.txt; do
+    [[ -f "$f" ]] && echo " - $f"
+  done
+}
+
+run_delete_duplicates() {
+  if ! [[ -f ./delete-duplicates.sh ]]; then
+    echo -e "${C_YLW}delete-duplicates.sh not found. Skipping.${C_RST}"
+    return 0
+  fi
+  echo -e "${C_RED}DANGER ZONE: This will delete files from duplicate groups.${C_RST}"
+  read -r -p "Type 'DELETE' to proceed, anything else to cancel: " confirm
+  [[ "$confirm" != "DELETE" ]] && { echo "Cancelled."; return 0; }
+
+  local in
+  if in="$(latest_csv)"; then
+    echo "Using CSV: $in"
+  else
+    echo -e "${C_RED}No CSV found. Aborting.${C_RST}"
+    return 1
+  fi
+
+  local cmd=(./delete-duplicates.sh --input "$in")
+  if have ionice; then cmd=(ionice -c3 nice -n 19 "${cmd[@]}"); fi
+
+  echo "Command: ${cmd[*]}"
+  # shellcheck disable=SC2068
+  ${cmd[@]} || {
+    echo -e "${C_RED}delete-duplicates.sh failed.${C_RST}"
+    return 1
+  }
+}
+
+run_system_check() {
+  echo -e "${C_CYN}System check (deps & readiness)…${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/check-deps.sh" ]]; then
+    "$ROOT_DIR/bin/check-deps.sh" --fix || true
+  else
+    echo -e "${C_YLW}bin/check-deps.sh not found or not executable.${C_RST}"
+    echo "Create it from the template shared previously, then mark executable:"
+    echo "  mkdir -p bin"
+    echo "  chmod +x bin/check-deps.sh"
+  fi
+}
+
+view_logs() {
+  echo -e "${C_CYN}Tail logs/background.log (Ctrl+C to stop)…${C_RST}"
+  if [[ -f "$BACKGROUND_LOG" ]]; then
+    tail -n 50 -f "$BACKGROUND_LOG"
+  else
+    echo "No background log at $BACKGROUND_LOG"
+  fi
+}
+
+# ────────────────────────────── Menu ────────────────────────────────
+show_menu() {
+  banner
+  echo "### Stage 1 - Hash ###"
+  echo "  0) Check hashing status"
+  echo "  1) Start Hashing (NAS-safe defaults)"
+  echo "  8) Advanced / Custom hashing"
+  echo
+  echo "### Stage 2 - Identify ###"
+  echo "  2) Find duplicate hashes"
+  echo "  3) Delete duplicates (DANGER)"
+  echo
+  echo "### Other ###"
+  echo "  7) System check (deps & readiness)"
+  echo "  9) View logs (tail background.log)"
+  echo
+  echo "  q) Quit"
+  echo
+}
+
+main_loop() {
+  while true; do
+    show_menu
+    read -r -p "Select an option: " choice
+    case "${choice:-}" in
+      0) clear 2>/dev/null || true; status_summary; echo; pause ;;
+      1) clear 2>/dev/null || true; start_hashing_defaults; echo; pause ;;
+      8) clear 2>/dev/null || true; advanced_hashing; echo; pause ;;
+      2) clear 2>/dev/null || true; run_find_duplicates; echo; pause ;;
+      3) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
+      7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
+      9) clear 2>/dev/null || true; view_logs ;;
+      q|Q) echo "Bye!"; exit 0 ;;
+      *) echo -e "${C_YLW}Unknown option: ${choice}. Please try again.${C_RST}" ;;
     esac
   done
 }
 
-main_menu
+main_loop
