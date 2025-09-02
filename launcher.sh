@@ -4,7 +4,7 @@
 # License: GPLv3
 #
 # Notes:
-# - Restores "Delete junk files" (option 4).
+# - Restores "Delete junk files" (option 4) and adds "Delete zero-length files" (option 5).
 # - Adds "System check (deps & readiness)" under the "Other" section.
 # - Designed to be run from the repository root.
 # - Calls: hasher.sh, find-duplicates.sh, delete-duplicates.sh, delete-junk.sh (if present), bin/check-deps.sh (if present).
@@ -246,6 +246,86 @@ run_delete_junk() {
   ${cmd_apply[@]}
 }
 
+# Delete zero-length files native flow (no external script required)
+run_delete_zero_length() {
+  echo -e "${C_CYN}Delete zero-length files (safe flow)…${C_RST}"
+
+  local ts outdir nulfile listfile delog
+  ts="$(date +'%Y-%m-%d-%H%M%S')"
+  outdir="$LOGS_DIR/zlen-$ts"
+  mkdir -p "$outdir"
+  nulfile="$outdir/candidates.nul"
+  listfile="$outdir/candidates.txt"
+  delog="$outdir/deleted.txt"
+
+  # Determine base paths
+  local bases=()
+  if [[ -f "$ROOT_DIR/paths.txt" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      bases+=("$line")
+    done < "$ROOT_DIR/paths.txt"
+  fi
+  if [[ ${#bases[@]} -eq 0 ]]; then
+    bases=("$ROOT_DIR")
+    echo -e "${C_YLW}No paths.txt found or it was empty — scanning repo root: $ROOT_DIR${C_RST}"
+    echo "Tip: create paths.txt to scope cleanups to specific directories."
+  else
+    echo "Scanning base paths from paths.txt:"
+    printf ' - %s\n' "${bases[@]}"
+  fi
+
+  # Build find command per base and append to NUL list
+  echo "Gathering zero-length candidates…"
+  : > "$nulfile"
+  for base in "${bases[@]}"; do
+    # Use -prune to skip common NAS/OS special dirs
+    # shellcheck disable=SC2016
+    find "$base" \
+      \( -type d \( -iname '#recycle' -o -name '@eaDir' -o -name '.Trash*' -o -name '.Spotlight-V100' -o -name '.fseventsd' \) -prune \) -o \
+      -type f -size 0c -print0 >> "$nulfile" 2>/dev/null || true
+  done
+
+  # Count & write human list
+  local count
+  count="$(tr -cd '\0' < "$nulfile" | wc -c | tr -d ' ')" || count=0
+  tr '\0' '\n' < "$nulfile" > "$listfile"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo -e "${C_GRN}No zero-length files found. Nice and tidy!${C_RST}"
+    echo "Report folder: $outdir"
+    return 0
+  fi
+
+  echo -e "${C_YLW}Found $count zero-length files.${C_RST}"
+  echo "List saved to: $listfile"
+  echo
+  echo "Sample:"
+  head -n 20 "$listfile" || true
+  if [[ "$count" -gt 20 ]]; then
+    echo "… (see full list above)"
+  fi
+  echo
+  echo -e "${C_RED}Proceed to delete ALL $count zero-length files listed?${C_RST}"
+  read -r -p "Type 'APPLY' to delete them, anything else to cancel: " go
+  [[ "$go" != "APPLY" ]] && { echo "Cancelled. No files were deleted."; return 0; }
+
+  echo "Deleting…"
+  : > "$delog"
+  # Delete using a NUL-safe loop (portable even without xargs -0)
+  # shellcheck disable=SC2162
+  while IFS= read -r -d '' f; do
+    if rm -f -- "$f"; then
+      printf '%s\n' "$f" >> "$delog"
+    fi
+  done < "$nulfile"
+
+  local dcount
+  dcount="$(wc -l < "$delog" | tr -d ' ')" || dcount=0
+  echo -e "${C_GRN}Deleted $dcount zero-length files.${C_RST}"
+  echo "Deletion log: $delog"
+}
+
 run_system_check() {
   echo -e "${C_CYN}System check (deps & readiness)…${C_RST}"
   if [[ -x "$ROOT_DIR/bin/check-deps.sh" ]]; then
@@ -281,6 +361,7 @@ show_menu() {
   echo
   echo "### Stage 3 - Clean up ###"
   echo "  4) Delete junk files"
+  echo "  5) Delete zero-length files"
   echo
   echo "### Other ###"
   echo "  7) System check (deps & readiness)"
@@ -301,6 +382,7 @@ main_loop() {
       2) clear 2>/dev/null || true; run_find_duplicates; echo; pause ;;
       3) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
       4) clear 2>/dev/null || true; run_delete_junk; echo; pause ;;
+      5) clear 2>/dev/null || true; run_delete_zero_length; echo; pause ;;
       7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
       9) clear 2>/dev/null || true; view_logs ;;
       q|Q) echo "Bye!"; exit 0 ;;
