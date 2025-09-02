@@ -44,7 +44,7 @@ banner() {
 |  _  | (_| \__ \ | | |  __/ |   
 |_| |_|\__,_|___/_| |_|\___|_|   
 
-      NAS File Hasher & Dedupe
+      File System and NAS Integrity Hasher & Dedupe
 
 EOF
 }
