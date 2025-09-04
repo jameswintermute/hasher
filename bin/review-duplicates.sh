@@ -1,4 +1,3 @@
-\
 #!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
@@ -312,7 +311,17 @@ for idx in "${IDX_ARR[@]}"; do
   fi
 
   reviewed=$((reviewed+1)); REVIEW_POS="$reviewed"
+
+  # ── spacing for readability (inserted) ──
+  echo
+  echo
+
   prompt_keep "$list_path" || true
+
+  # ── spacing for readability (inserted) ──
+  echo
+  echo
+
 done
 
 log "[INFO] Plan written: $PLAN_FILE"
