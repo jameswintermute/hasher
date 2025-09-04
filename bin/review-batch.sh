@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 # review-window.sh — small wrapper to review a window of duplicate groups
 # - Clear prompts, default skip=0, optional auto-resume
 # - Calls existing bin/review-batch.sh
