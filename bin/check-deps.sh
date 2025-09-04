@@ -1,4 +1,9 @@
 #!/bin/sh
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 # Hasher — Minimal dependency & readiness check (BusyBox/POSIX safe)
 # Usage: bin/check-deps.sh [--fix]
 #  - Verifies required tools and directory layout
