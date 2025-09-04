@@ -1,4 +1,9 @@
 #!/bin/sh
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 # Hasher — Duplicate Finder (BusyBox/POSIX safe, CSV-safe)
 # Usage: bin/find-duplicates.sh --csv FILE [--out DIR] [--min-size-bytes N]
 # Also accepts legacy: --input FILE
