@@ -1,60 +1,73 @@
-#!/bin/sh
-# review-batch.sh — slice duplicates report and open interactive reviewer
-# Usage:
-#   bin/review-batch.sh [--skip N] [--take N] [--report FILE] [--keep newest|oldest|largest]
-# Notes:
-#   - Auto-detects report if not given (prefers logs/du-*/duplicates.txt, else logs/*-duplicate-hashes.txt).
-#   - Writes sliced batch to logs/review-batch-<from>-<to>.txt and calls bin/review-duplicates.sh.
+#!/usr/bin/env bash
+# review-window.sh — small wrapper to review a window of duplicate groups
+# - Clear prompts, default skip=0, optional auto-resume
+# - Calls existing bin/review-batch.sh
+# - Adds 2× spacing before/after the batch run for readability
 
-set -eu
+set -Eeuo pipefail
+IFS=$'\n\t'
+LC_ALL=C
 
-ROOT="$(cd -- "$(dirname "$0")/.." && pwd -P)"
-LOGS="$ROOT/logs"
+# ─── Layout ───
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+BIN_DIR="$APP_HOME/bin"
+LOG_DIR="$APP_HOME/logs"
+mkdir -p "$LOG_DIR"
 
-SKIP=0
-TAKE=100
-REPORT=""
-KEEP="newest"
+STATE_FILE="$LOG_DIR/review-duplicates.next_skip"  # keep old name for continuity
+KEEP="${KEEP:-newest}"                              # newest|oldest|largest|smallest|first|last
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --skip)   SKIP="${2:-0}"; shift ;;
-    --take)   TAKE="${2:-100}"; shift ;;
-    --report) REPORT="${2:-}"; shift ;;
-    --keep)   KEEP="${2:-newest}"; shift ;;
-    --help|-h)
-      echo "Usage: $0 [--skip N] [--take N] [--report FILE] [--keep newest|oldest|largest]"; exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; exit 2 ;;
-  esac
-  shift || true
-done
+# ─── Prompts ───
+echo "Review duplicates (interactive)…"
 
-# Auto-detect report if not provided
-if [ -z "${REPORT:-}" ]; then
-  REPORT="$(ls -1t "$LOGS"/du-*/duplicates.txt 2>/dev/null | head -n1 || true)"
-  if [ -z "$REPORT" ]; then
-    REPORT="$(ls -1t "$LOGS"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
+read -r -p "How many groups to review this pass? [default 100]: " TAKE || true
+TAKE="${TAKE:-100}"
+
+SUGGESTED=""
+if [[ -r "$STATE_FILE" ]]; then
+  val="$(tr -cd '0-9' < "$STATE_FILE" || true)"
+  if [[ -n "$val" && "$val" -gt 0 ]]; then
+    SUGGESTED="$val"
   fi
 fi
-[ -n "$REPORT" ] && [ -r "$REPORT" ] || { echo "No readable report found. Run find-duplicates first." >&2; exit 1; }
 
-FROM=$(( SKIP + 1 ))
-TO=$(( SKIP + TAKE ))
-OUT="$LOGS/review-batch-${FROM}-${TO}.txt"
-
-# Slice by groups starting with 'HASH '
-awk -v skip="$SKIP" -v take="$TAKE" '
-  /^HASH /{g++}
-  (g>skip && g<=skip+take){ print }
-' "$REPORT" > "$OUT"
-
-echo "Prepared batch: $OUT"
-if [ ! -s "$OUT" ]; then
-  echo "No groups in this range (skip=$SKIP, take=$TAKE). Nothing to review." >&2
-  exit 0
+SKIP_SET=""
+if [[ -n "$SUGGESTED" ]]; then
+  read -r -p "Resume from last position (~${SUGGESTED} groups already reviewed)? [Y/n]: " RESUME || true
+  case "${RESUME,,}" in
+    n|no) ;;
+    *) SKIP="$SUGGESTED"; SKIP_SET="yes" ;;
+  esac
 fi
 
-CMD="$ROOT/bin/review-duplicates.sh --from-report \"$OUT\" --keep \"$KEEP\""
-echo "Command: $CMD"
+if [[ -z "${SKIP_SET}" ]]; then
+  echo "Have you already partially reviewed and would like to skip?"
+  read -r -p "Enter how many groups to skip (0 if starting fresh) [default 0]: " SKIP || true
+  SKIP="${SKIP:-0}"
+fi
+
+# ─── Input hygiene ───
+[[ "$TAKE" =~ ^[0-9]+$ ]] || TAKE=100
+[[ "$SKIP" =~ ^[0-9]+$ ]] || SKIP=0
+
+# ─── Execute underlying batch reviewer ───
+CMD="$BIN_DIR/review-batch.sh --skip \"$SKIP\" --take \"$TAKE\" --keep \"$KEEP\""
+
+echo "Command: $BIN_DIR/review-batch.sh"
+echo "--skip"; echo "$SKIP"
+echo "--take"; echo "$TAKE"
+echo "--keep"; echo "$KEEP"
+
+# Spacing for readability
+echo; echo
+
 # shellcheck disable=SC2086
-exec $ROOT/bin/review-duplicates.sh --from-report "$OUT" --keep "$KEEP"
+eval "$CMD"
+
+# Spacing after the batch run
+echo; echo
+
+# ─── Persist next suggested starting point ───
+NEXT=$(( SKIP + TAKE ))
+printf "%d\n" "$NEXT" > "$STATE_FILE" || true
