@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"; export PATH="$SCRIPT_DIR:$SCRIPT_DIR/bin:$PATH"
 # launcher.sh — menu launcher for Hasher & Dedupe toolkit
 # License: GPLv3
