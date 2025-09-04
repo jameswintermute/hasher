@@ -1,4 +1,9 @@
 #!/bin/sh
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 # delete-junk.sh — remove OS/NAS junk safely (BusyBox-friendly)
 # Usage:
 #   delete-junk.sh [--paths-file FILE] [--include-recycle] [--verify-only|--dry-run|--force|--quarantine DIR]
