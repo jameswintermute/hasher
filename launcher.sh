@@ -379,4 +379,182 @@ run_delete_zero_length() {
   local ts outdir nulfile listfile delog
   ts="$(date +'%Y-%m-%d-%H%M%S')"
   outdir="$LOGS_DIR/zlen-$ts"
-  mkdir -p "$out
+  mkdir -p "$outdir"
+  nulfile="$outdir/candidates.nul"
+  listfile="$outdir/candidates.txt"
+  delog="$outdir/deleted.txt"
+
+  local bases=()
+  local pf; pf="$(_paths_file)"
+  if [[ -s "$pf" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      bases+=("$line")
+    done < "$pf"
+  fi
+  if [[ ${#bases[@]} -eq 0 ]]; then
+    bases=("$ROOT_DIR")
+    echo -e "${C_YLW}No paths.txt found or it was empty — scanning repo root: $ROOT_DIR${C_RST}"
+    echo "Tip: use menu option 6 to add paths for targeted cleanup."
+  else
+    echo "Scanning base paths from: $pf"
+    printf ' - %s\n' "${bases[@]}"
+  fi
+
+  echo "Gathering zero-length candidates…"
+  : > "$nulfile"
+  for base in "${bases[@]}"; do
+    find "$base" \
+      \( -type d \( -iname '#recycle' -o -name '@eaDir' -o -name '.Trash*' -o -name '.Spotlight-V100' -o -name '.fseventsd' \) -prune \) -o \
+      -type f -size 0c -print0 >> "$nulfile" 2>/dev/null || true
+  done
+
+  local count
+  count="$(tr -cd '\0' < "$nulfile" | wc -c | tr -d ' ')" || count=0
+  tr '\0' '\n' < "$nulfile" > "$listfile"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo -e "${C_GRN}No zero-length files found. Nice and tidy!${C_RST}"
+    echo "Report folder: $outdir"
+    return 0
+  fi
+
+  echo -e "${C_YLW}Found $count zero-length files.${C_RST}"
+  echo "List saved to: $listfile"
+  echo
+  echo "Sample:"
+  head -n 20 "$listfile" || true
+  if [[ "$count" -gt 20 ]]; then
+    echo "… (see full list above)"
+  fi
+  echo
+  echo -e "${C_RED}Proceed to delete ALL $count zero-length files listed?${C_RST}"
+  read -r -p "Type 'APPLY' to delete them, anything else to cancel: " go
+  [[ "$go" != "APPLY" ]] && { echo "Cancelled. No files were deleted."; return 0; }
+
+  echo "Deleting…"
+  : > "$delog"
+  while IFS= read -r -d '' f; do
+    if rm -f -- "$f"; then
+      printf '%s\n' "$f" >> "$delog"
+    fi
+  done < "$nulfile"
+
+  local dcount
+  dcount="$(wc -l < "$delog" | tr -d ' ')" || dcount=0
+  echo -e "${C_GRN}Deleted $dcount zero-length files.${C_RST}"
+  echo "Deletion log: $delog"
+}
+
+run_system_check() {
+  echo -e "${C_CYN}System check (deps & readiness)…${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/check-deps.sh" ]]; then
+    "$ROOT_DIR/bin/check-deps.sh" --fix || true
+  else
+    echo -e "${C_YLW}bin/check-deps.sh not found or not executable.${C_RST}"
+    echo "Create it from the template shared previously, then mark executable:"
+    echo "  mkdir -p bin"
+    echo "  chmod +x bin/check-deps.sh"
+  fi
+}
+
+view_logs() {
+  echo -e "${C_CYN}Tail logs/background.log (Ctrl+C to stop)…${C_RST}"
+  if [[ -f "$BACKGROUND_LOG" ]]; then
+    tail -n 50 -f "$BACKGROUND_LOG"
+  else
+    echo "No background log at $BACKGROUND_LOG"
+  fi
+}
+
+# ───────────── Scheduling helpers (minimal additions) ────────────────
+# Requires bin/schedule-hasher.sh (enable|disable|show) which reads CRON_SPEC from hasher.conf
+schedule_enable() {
+  echo -e "${C_CYN}Enable weekly schedule (cron) — default Sun 00:05 per hasher.conf${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo bash "$ROOT_DIR/bin/schedule-hasher.sh" enable || bash "$ROOT_DIR/bin/schedule-hasher.sh" enable
+    else
+      bash "$ROOT_DIR/bin/schedule-hasher.sh" enable
+    fi
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
+schedule_disable() {
+  echo -e "${C_CYN}Disable weekly schedule (cron)${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo bash "$ROOT_DIR/bin/schedule-hasher.sh" disable || bash "$ROOT_DIR/bin/schedule-hasher.sh" disable
+    else
+      bash "$ROOT_DIR/bin/schedule-hasher.sh" disable
+    fi
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
+schedule_show() {
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    bash "$ROOT_DIR/bin/schedule-hasher.sh" show
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
+# ────────────────────────────── Menu ────────────────────────────────
+show_menu() {
+  banner
+  echo "### Stage 1 - Hash ###"
+  echo "  0) Check hashing status"
+  echo "  1) Start Hashing (NAS-safe defaults)"
+  echo "  8) Advanced / Custom hashing"
+  echo
+  echo "### Stage 2 - Identify ###"
+  echo "  2) Find duplicate hashes"
+  echo "  3) Review duplicates (interactive)"
+  echo "  d) Delete duplicates (DANGER)"
+  echo
+  echo "### Stage 3 - Clean up ###"
+  echo "  4) Delete junk files"
+  echo "  5) Delete zero-length files"
+  echo
+  echo "### Other ###"
+  echo "  6) Configure paths to hash"
+  echo "  7) System check (deps & readiness)"
+  echo "  e) Enable weekly schedule (cron)"
+  echo "  x) Disable weekly schedule (cron)"
+  echo "  s) Show schedule status"
+  echo "  9) View logs (tail background.log)"
+  echo
+  echo "  q) Quit"
+  echo
+}
+
+main_loop() {
+  while true; do
+    show_menu
+    read -r -p "Select an option: " choice
+    case "${choice:-}" in
+      0) clear 2>/dev/null || true; status_summary; echo; pause ;;
+      1) clear 2>/dev/null || true; start_hashing_defaults; echo; pause ;;
+      8) clear 2>/dev/null || true; advanced_hashing; echo; pause ;;
+      2) clear 2>/dev/null || true; run_find_duplicates; echo; pause ;;
+      3) clear 2>/dev/null || true; run_review_duplicates; echo; pause ;;
+      d|D) clear 2>/dev/null || true; run_delete_duplicates; echo; pause ;;
+      4) clear 2>/dev/null || true; run_delete_junk; echo; pause ;;
+      5) clear 2>/dev/null || true; run_delete_zero_length; echo; pause ;;
+      6) clear 2>/dev/null || true; configure_paths; echo; pause ;;
+      7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
+      e|E) clear 2>/dev/null || true; schedule_enable; echo; pause ;;
+      x|X) clear 2>/dev/null || true; schedule_disable; echo; pause ;;
+      s|S) clear 2>/dev/null || true; schedule_show; echo; pause ;;
+      9) clear 2>/dev/null || true; view_logs ;;
+      q|Q) echo "Bye!"; exit 0 ;;
+      *) echo -e "${C_YLW}Unknown option: ${choice}. Please try again.${C_RST}" ;;
+    esac
+  done
+}
+
+main_loop
