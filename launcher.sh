@@ -467,6 +467,42 @@ view_logs() {
   fi
 }
 
+# ───────────── Scheduling helpers (minimal additions) ────────────────
+# Requires bin/schedule-hasher.sh (enable|disable|show) which reads CRON_SPEC from hasher.conf
+schedule_enable() {
+  echo -e "${C_CYN}Enable weekly schedule (cron) — default Sun 00:05 per hasher.conf${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo bash "$ROOT_DIR/bin/schedule-hasher.sh" enable || bash "$ROOT_DIR/bin/schedule-hasher.sh" enable
+    else
+      bash "$ROOT_DIR/bin/schedule-hasher.sh" enable
+    fi
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
+schedule_disable() {
+  echo -e "${C_CYN}Disable weekly schedule (cron)${C_RST}"
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo bash "$ROOT_DIR/bin/schedule-hasher.sh" disable || bash "$ROOT_DIR/bin/schedule-hasher.sh" disable
+    else
+      bash "$ROOT_DIR/bin/schedule-hasher.sh" disable
+    fi
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
+schedule_show() {
+  if [[ -x "$ROOT_DIR/bin/schedule-hasher.sh" ]]; then
+    bash "$ROOT_DIR/bin/schedule-hasher.sh" show
+  else
+    echo -e "${C_YLW}Missing helper: bin/schedule-hasher.sh${C_RST}"
+  fi
+}
+
 # ────────────────────────────── Menu ────────────────────────────────
 show_menu() {
   banner
@@ -487,6 +523,9 @@ show_menu() {
   echo "### Other ###"
   echo "  6) Configure paths to hash"
   echo "  7) System check (deps & readiness)"
+  echo "  e) Enable weekly schedule (cron)"
+  echo "  x) Disable weekly schedule (cron)"
+  echo "  s) Show schedule status"
   echo "  9) View logs (tail background.log)"
   echo
   echo "  q) Quit"
@@ -508,6 +547,9 @@ main_loop() {
       5) clear 2>/dev/null || true; run_delete_zero_length; echo; pause ;;
       6) clear 2>/dev/null || true; configure_paths; echo; pause ;;
       7) clear 2>/dev/null || true; run_system_check; echo; pause ;;
+      e|E) clear 2>/dev/null || true; schedule_enable; echo; pause ;;
+      x|X) clear 2>/dev/null || true; schedule_disable; echo; pause ;;
+      s|S) clear 2>/dev/null || true; schedule_show; echo; pause ;;
       9) clear 2>/dev/null || true; view_logs ;;
       q|Q) echo "Bye!"; exit 0 ;;
       *) echo -e "${C_YLW}Unknown option: ${choice}. Please try again.${C_RST}" ;;

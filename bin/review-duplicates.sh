@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
@@ -21,12 +21,15 @@ mkdir -p "$LOG_DIR" "$HASHES_DIR" "$VAR_DIR" "$LOW_DIR" "$IDX_ROOT"
 
 # ───── Defaults & args ─────
 ORDER="size"             # size|count
-LIMIT=100
+LIMIT=100                # max groups to review (ignored if --non-interactive)
 KEEP_POLICY="newest"     # newest|oldest|largest|smallest|first|last
 NON_INTERACTIVE=false
 REPORT=""
 CONFIG_FILE=""
 LOW_VALUE_THRESHOLD_BYTES=0
+SKIP=0                   # slice into ordered groups
+TAKE=0                   # 0 = use LIMIT/non-interactive logic
+QUIET=false
 
 ts(){ date +"%Y-%m-%d %H:%M:%S"; }
 log(){ printf "[%s] [RUN %s] %s\n" "$(ts)" "$RUN_ID" "$*"; }
@@ -34,12 +37,37 @@ log(){ printf "[%s] [RUN %s] %s\n" "$(ts)" "$RUN_ID" "$*"; }
 usage(){
   cat <<EOF
 Usage: $0 --from-report FILE [options]
-  --from-report FILE     Path to canonical duplicate report (logs/YYYY-MM-DD-duplicate-hashes.txt)
+
+Inputs:
+  --from-report FILE     Canonical duplicate-hashes report (logs/YYYY-MM-DD-duplicate-hashes.txt)
+                         or a pre-batched subset file (e.g. logs/review-batch-501-600.txt)
+
+Selection / ordering:
   --order size|count     Sort groups by total size (default) or by file count
-  --limit N              Max groups to review interactively (default: 100). Ignored in --non-interactive
-  --keep POLICY          Keep policy in non-interactive mode or default selection (newest|oldest|largest|smallest|first|last)
-  --non-interactive      Apply policy across all groups with no prompts
-  --config FILE          Load LOW_VALUE_THRESHOLD_BYTES
+  --skip N               Skip the first N ordered groups before reviewing (default: 0)
+  --take M               Review at most M groups after --skip (overrides --limit if set)
+
+Review behaviour:
+  --limit N              Max groups to review (default: 100). Ignored in --non-interactive or if --take is set
+  --keep POLICY          Default keep selection (newest|oldest|largest|smallest|first|last). Used automatically in non-interactive.
+  --non-interactive      Apply policy across selected groups with no per-group prompts
+  --quiet                Reduce chatter; still prints keep prompts unless --non-interactive
+
+Config:
+  --config FILE          Load LOW_VALUE_THRESHOLD_BYTES from a hasher.conf style k=v file
+
+Misc:
+  -h|--help              Show this help
+
+Examples:
+  # Review a launcher-prepared batch immediately:
+  $0 --from-report logs/review-batch-501-600.txt --keep newest
+
+  # Slice inside this script (no external batch):
+  $0 --from-report logs/2025-09-10-duplicate-hashes.txt --order size --skip 500 --take 100 --keep newest
+
+  # Fully automatic policy application across all groups:
+  $0 --from-report logs/2025-09-10-duplicate-hashes.txt --non-interactive --keep newest
 EOF
 }
 
@@ -51,6 +79,9 @@ while [ $# -gt 0 ]; do
     --keep) KEEP_POLICY="${2:-}"; shift ;;
     --non-interactive) NON_INTERACTIVE=true ;;
     --config) CONFIG_FILE="${2:-}"; shift ;;
+    --skip) SKIP="${2:-0}"; shift ;;
+    --take) TAKE="${2:-0}"; shift ;;
+    --quiet) QUIET=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -60,12 +91,15 @@ done
 [ -n "$REPORT" ] || { echo "[ERROR] Missing --from-report"; usage; exit 2; }
 [ -r "$REPORT" ] || { echo "[ERROR] Cannot read report: $REPORT"; exit 2; }
 
-# ───── Ensure real TTY for prompts ─────
-if ! [ -t 0 ] || ! [ -t 1 ]; then
-  if [ -r /dev/tty ]; then
-    exec </dev/tty >/dev/tty 2>/dev/tty
-  else
-    NON_INTERACTIVE=true
+# ───── Ensure real TTY for prompts (unless non-interactive) ─────
+if ! $NON_INTERACTIVE; then
+  if ! [ -t 0 ] || ! [ -t 1 ]; then
+    if [ -r /dev/tty ]; then
+      exec </dev/tty >/dev/tty 2>/dev/tty
+    else
+      echo "[WARN] No TTY available, switching to --non-interactive mode."
+      NON_INTERACTIVE=true
+    fi
   fi
 fi
 
@@ -92,14 +126,6 @@ load_conf(){
 [ -z "$CONFIG_FILE" ] && [ -r "$APP_HOME/default/hasher.conf" ] && CONFIG_FILE="$APP_HOME/default/hasher.conf"
 [ -n "$CONFIG_FILE" ] && load_conf "$CONFIG_FILE"
 
-# ───── Canonical report guard ─────
-if ! grep -Eq '^HASH[[:space:]][^[:space:]]+[[:space:]]+\([0-9]+[[:space:]]+files\):' "$REPORT"; then
-  echo "[ERROR] '$REPORT' is not a canonical duplicate-hashes report (expects 'HASH <digest> (<n> files):')."
-  cand="$(ls -1t "$(dirname "$REPORT")"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
-  [ -n "$cand" ] && echo "[SUGGEST] Try: $0 --from-report \"$cand\""
-  exit 2
-fi
-
 # ───── Run ID ─────
 if command -v uuidgen >/dev/null 2>&1; then
   RUN_ID="$(uuidgen)"
@@ -120,9 +146,24 @@ mtime_of(){ stat -c %Y -- "$1" 2>/dev/null || echo 0; }
 size_of(){  stat -c %s -- "$1" 2>/dev/null || echo 0; }
 strip_quotes(){ local p="$1"; p="${p%\"}"; p="${p#\"}"; printf '%s\n' "$p"; }
 
+# ───── Detect format ─────
+# Accept either canonical full report or a batch file that still has HASH headers.
+HAS_HASH_HEADERS=false
+if grep -Eq '^HASH[[:space:]][^[:space:]]+[[:space:]]+\([0-9]+[[:space:]]+files\):' "$REPORT"; then
+  HAS_HASH_HEADERS=true
+fi
+
+if ! $HAS_HASH_HEADERS; then
+  # Some batchers add a short header line; allow it as long as we still see indented file entries.
+  if ! grep -Eq '^[[:space:]]{2}.+' "$REPORT"; then
+    echo "[ERROR] '$REPORT' doesn't look like a duplicate-groups report or subset (no 'HASH ...' and no indented file lines)."
+    exit 2
+  fi
+fi
+
 # ───── Parse report to temp index (progress printed) ─────
 TOTAL_DECLARED_GROUPS="$(grep -c '^HASH ' "$REPORT" || echo 0)"
-echo "[INFO] Parsing report… groups declared: $TOTAL_DECLARED_GROUPS"
+$QUIET || echo "[INFO] Parsing report… groups declared (with headers): $TOTAL_DECLARED_GROUPS"
 
 IDX_DIR="$IDX_ROOT/$RUN_ID"
 rm -rf "$IDX_DIR" && mkdir -p "$IDX_DIR"
@@ -133,6 +174,7 @@ PARSED=0; FILES_SEEN=0; START=$(date +%s); STEP=200
 cur_hash=""; cur_files_path="$IDX_DIR/tmp_files.txt"; : > "$cur_files_path"
 
 progress(){
+  $QUIET && return 0
   now=$(date +%s); elapsed=$((now-START))
   if [ "$PARSED" -gt 0 ] && [ "$TOTAL_DECLARED_GROUPS" -gt 0 ]; then
     pct=$(( PARSED * 100 / TOTAL_DECLARED_GROUPS )); eta=$(( elapsed * (TOTAL_DECLARED_GROUPS - PARSED) / PARSED ))
@@ -146,7 +188,7 @@ progress(){
 }
 
 flush_group(){
-  if [ -n "$cur_hash" ]; then
+  if [ -s "$cur_files_path" ]; then
     sed -i '/^[[:space:]]*$/d' "$cur_files_path" || true
     local n; n=$(wc -l < "$cur_files_path" | tr -d ' ')
     if [ "$n" -gt 1 ]; then
@@ -155,7 +197,7 @@ flush_group(){
       local total_size=$(( rep_size * n ))
       local list_path="$IDX_DIR/g$(printf '%06d' "$PARSED").lst"
       awk '{gsub(/^ *"|" *$/,"",$0); print $0}' "$cur_files_path" > "$list_path"
-      printf '%d\t%s\t%d\t%d\t%d\t%s\n' "$PARSED" "$cur_hash" "$n" "$rep_size" "$total_size" "$list_path" >> "$GROUPS_FILE"
+      printf '%d\t%s\t%d\t%d\t%d\t%s\n' "$PARSED" "${cur_hash:-NA}" "$n" "$rep_size" "$total_size" "$list_path" >> "$GROUPS_FILE"
       FILES_SEEN=$((FILES_SEEN+n))
     fi
     : > "$cur_files_path"
@@ -165,17 +207,30 @@ flush_group(){
   cur_hash=""
 }
 
-while IFS= read -r line || [ -n "$line" ]; do
-  if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
-    flush_group
-    cur_hash="${BASH_REMATCH[1]}"
-  elif [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}" >> "$cur_files_path"
-  else
-    :
-  fi
-done < "$REPORT"
-flush_group
+if $HAS_HASH_HEADERS; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^HASH[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\(([0-9]+)[[:space:]]+files\): ]]; then
+      flush_group
+      cur_hash="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}" >> "$cur_files_path"
+    else
+      :
+    fi
+  done < "$REPORT"
+  flush_group
+else
+  # Batch file with no HASH headers: treat any block of indented lines separated by blank lines as a group
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]{2}(.+) ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}" >> "$cur_files_path"
+    else
+      # boundary
+      flush_group
+    fi
+  done < "$REPORT"
+  flush_group
+fi
 progress
 
 TOTAL_GROUPS="$(wc -l < "$GROUPS_FILE" | tr -d ' ')"
@@ -191,15 +246,21 @@ if [ "$ORDER" = "count" ]; then
 else # size
   awk -F'\t' '{printf "%d\t%d\n",$1,$5}' "$GROUPS_FILE" | sort -k2,2nr | awk '{print $1}' > "$ORDERED_IDX_FILE"
 fi
-
-# Load indices robustly
 readarray -t IDX_ARR < "$ORDERED_IDX_FILE" 2>/dev/null || IDX_ARR=()
-if [ "${#IDX_ARR[@]}" -eq 0 ]; then
-  echo "[ERROR] Failed to load ordered indices (empty list)."
-  echo "[DEBUG] GROUPS_FILE lines: $(wc -l < "$GROUPS_FILE" | tr -d ' ')"
-  echo "[DEBUG] ORDERED_IDX_FILE size: $(stat -c %s "$ORDERED_IDX_FILE" 2>/dev/null || echo 0)"
-  exit 2
+[ "${#IDX_ARR[@]}" -gt 0 ] || { echo "[ERROR] Ordered index list is empty."; exit 2; }
+
+# ───── Apply slice: --skip / --take ─────
+SEL_START="$SKIP"
+SEL_END=$(( ${#IDX_ARR[@]} - 1 ))
+if [ "$TAKE" -gt 0 ]; then
+  SEL_END=$(( SKIP + TAKE - 1 ))
 fi
+[ "$SEL_START" -lt 0 ] && SEL_START=0
+[ "$SEL_END" -ge "${#IDX_ARR[@]}" ] && SEL_END=$(( ${#IDX_ARR[@]} - 1 ))
+[ "$SEL_START" -le "$SEL_END" ] || { echo "[INFO] Nothing to review after applying --skip/--take."; exit 0; }
+
+# Slice array
+IDX_ARR=( "${IDX_ARR[@]:$SEL_START:$((SEL_END-SEL_START+1))}" )
 
 # ───── Low-value diversion, plan path ─────
 DATE_TAG="$(date +%F)"
@@ -207,11 +268,12 @@ PLAN_FILE="$LOG_DIR/review-dedupe-plan-$DATE_TAG-$RUN_ID.txt"
 LOW_LIST="$LOW_DIR/low-value-candidates-$DATE_TAG-$RUN_ID.txt"
 : > "$PLAN_FILE"; : > "$LOW_LIST"
 
-log "[INFO] Index ready. Starting review…"
-log "[INFO]   • Ordering:     $ORDER desc"
-log "[INFO]   • Limit:        $LIMIT"
-log "[INFO]   • Groups:       $TOTAL_GROUPS total"
-log "[INFO]   • Plan:         $PLAN_FILE"
+$QUIET || log "[INFO] Index ready. Starting review…"
+$QUIET || log "[INFO]   • Ordering:     $ORDER desc"
+$QUIET || log "[INFO]   • Slice:        skip=$SKIP take=$TAKE (0 means unlimited/limit-mode)"
+$QUIET || log "[INFO]   • Groups avail: $TOTAL_GROUPS (post-slice: ${#IDX_ARR[@]})"
+$QUIET || log "[INFO]   • Mode:         $([ $NON_INTERACTIVE = true ] && echo non-interactive || echo interactive)"
+$QUIET || log "[INFO]   • Plan:         $PLAN_FILE"
 
 # ───── Prompt keep (reads from per-group list path) ─────
 prompt_keep(){
@@ -289,16 +351,23 @@ prompt_keep(){
 }
 
 # ───── Review loop ─────
-REVIEW_MAX="$LIMIT"; $NON_INTERACTIVE && REVIEW_MAX="$TOTAL_GROUPS"
-reviewed=0
+# Determine how many to process this run:
+if [ "$TAKE" -gt 0 ]; then
+  REVIEW_MAX="$TAKE"
+elif $NON_INTERACTIVE; then
+  REVIEW_MAX="${#IDX_ARR[@]}"
+else
+  REVIEW_MAX="$LIMIT"
+fi
 
+reviewed=0
 for idx in "${IDX_ARR[@]}"; do
   [ "$reviewed" -ge "$REVIEW_MAX" ] && break
   meta=$(awk -F'\t' -v i="$idx" '($1==i){print $0}' "$GROUPS_FILE")
   [ -z "$meta" ] && continue
   list_path="$(echo "$meta" | awk -F'\t' '{print $6}')"
 
-  # Low-value diversion (all files <= threshold)
+  # Low-value diversion (all files <= threshold (or ==0 if threshold=0))
   lv_divert=1
   if [ "$LOW_VALUE_THRESHOLD_BYTES" -le 0 ]; then
     while IFS= read -r f; do sz=$(stat -c %s -- "$f" 2>/dev/null || echo 0); if [ "$sz" -gt 0 ]; then lv_divert=0; break; fi; done < "$list_path"
@@ -312,20 +381,17 @@ for idx in "${IDX_ARR[@]}"; do
 
   reviewed=$((reviewed+1)); REVIEW_POS="$reviewed"
 
-  # ── spacing for readability (inserted) ──
-  echo
-  echo
+  # spacing for readability
+  echo; echo
 
   prompt_keep "$list_path" || true
 
-  # ── spacing for readability (inserted) ──
-  echo
-  echo
-
+  echo; echo
 done
 
 log "[INFO] Plan written: $PLAN_FILE"
-log "[INFO] Next steps:"
-log "[INFO]   • Dry-run: ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\""
-log "[INFO]   • Execute: ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\" --force [--quarantine DIR]"
-log "[INFO]   • Low-value candidates, if any, saved to: $LOW_LIST"
+[ -s "$LOW_LIST" ] && log "[INFO] Low-value candidates saved to: $LOW_LIST"
+
+log "[INFO] Next:"
+log "[INFO]   • Dry-run : ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\""
+log "[INFO]   • Execute : ./bin/delete-duplicates.sh --from-plan \"$PLAN_FILE\" --force [--quarantine DIR]"
