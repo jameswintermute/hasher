@@ -268,6 +268,14 @@ run_find_duplicates() {
   for f in "$outdir"/duplicates.csv "$outdir"/groups.summary.txt "$outdir"/top-groups.txt "$outdir"/reclaimable.txt "$outdir"/duplicates.txt; do
     [[ -f "$f" ]] && echo " - $f"
   done
+
+  # ---- Friendly summary (new helper; minimal change) ----
+  if [[ -x "$SCRIPT_DIR/bin/du-summary.sh" ]]; then
+    "$SCRIPT_DIR/bin/du-summary.sh" "$outdir" "$in"
+  else
+    echo "[WARN] du-summary.sh not found or not executable. Skipping summary."
+  fi
+  # -------------------------------------------------------
 }
 
 run_review_duplicates() {
@@ -346,7 +354,7 @@ run_delete_junk() {
     chmod +x "$script" || true
   fi
 
-  local args=()
+  local args=[]
   local pf; pf="$(_paths_file)"
   if [[ -s "$pf" ]]; then
     args+=(--paths-file "$pf")
