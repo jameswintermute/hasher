@@ -97,7 +97,7 @@ echo
 
 if [ -r "$TOP" ]; then
   echo "Top hotspots (by total size):"
-  head -n 3 "$TOP" | sed 's/^/  /'
+  head -n 3 "$TOP" | awk -F',' '{printf "  • Hash: %.12s… | Files: %s\n", $1, $2}'
   echo "  … see: $TOP"
   echo
 fi
