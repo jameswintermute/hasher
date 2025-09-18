@@ -2,22 +2,7 @@
 # find-duplicate-folders.sh — detect duplicate folder trees by content (from hasher CSV)
 # Generates a review plan; can optionally apply it (delete or quarantine).
 # GPLv3
-#
-# Strategy
-# --------
-# For each file row in the hasher CSV (hash,path[,size]), we attribute that file to
-# every ancestor directory (recursive scope) using the file's *relative path* from the ancestor.
-# A directory's content signature is the SHA-256 of its sorted list of "relpath|filehash" lines.
-# Two directories with identical signatures have identical file trees (names + file hashes).
-#
-# Outputs
-#   - logs/duplicate-folders-<ts>.txt       (human group summary)
-#   - logs/duplicate-folders-<ts>.csv       (signature,dir,file_count)
-#   - logs/review-folder-dedupe-plan-<ts>.txt   (dirs to delete/move)
-#   - var/duplicates/latest-folder-plan.txt     (convenience copy)
-#
-# Safe by default: only builds a plan. To act, pass --mode apply --force (and ideally --quarantine DIR).
-#
+
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
@@ -42,44 +27,19 @@ Usage: find-duplicate-folders.sh [--input CSV] [--mode plan|apply]
                                  [--keep-strategy shortest-path|oldest|newest|first]
                                  [--scope recursive|leaf]
                                  [--quarantine DIR] [--force]
-
-Reads the hasher CSV (or latest in hashes/) and computes a *recursive* content signature
-for every directory. Folders with the same signature are true duplicates of their file tree.
-
-Defaults:
-  --mode plan
-  --min-group-size 2
-  --keep-strategy shortest-path
-  --scope recursive
-
-Outputs:
-  - Group summary: logs/duplicate-folders-YYYY-MM-DD-HHMMSS.txt
-  - Full CSV:      logs/duplicate-folders-YYYY-MM-DD-HHMMSS.csv
-  - Plan file:     logs/review-folder-dedupe-plan-YYYY-MM-DD-HHMMSS.txt
-
-Apply mode:
-  --mode apply requires --force. If --quarantine DIR is given, folders are moved there
-  instead of deleted. (Recommended for safety.)
-
-Examples:
-  # Plan only (recommended first)
-  bin/find-duplicate-folders.sh --input hashes/hasher-2025-09-17.csv
-
-  # Auto-plan, then apply to quarantine
-  bin/find-duplicate-folders.sh --mode apply --force --quarantine var/quarantine/$(date +%F)
 EOF
 }
 
 # Defaults
 INPUT=""
-MODE="plan"                 # plan | apply
+MODE="plan"
 MIN_GROUP=2
 KEEP_STRATEGY="shortest-path"
-SCOPE="recursive"           # recursive | leaf
+SCOPE="recursive"
 QUARANTINE=""
 FORCE=false
 
-# Arg parsing
+# Args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -107,7 +67,7 @@ INPUT="${INPUT:-$(pick_latest_csv)}"
 info "Input: $INPUT"
 info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP_STRATEGY"
 
-# --- Column detection (hash, path[, size]) ---
+# Header detection
 header="$(head -n1 "$INPUT")"
 lchead="$(printf "%s" "$header" | tr 'A-Z' 'a-z')"
 
@@ -134,26 +94,23 @@ else
   SKIP_HEADER=1
 fi
 
-# --- Helpers ---
+# Tools
 have() { command -v "$1" >/dev/null 2>&1; }
 hash_string() {
   if have sha256sum; then sha256sum | awk '{print $1}'
   elif have shasum; then shasum -a 256 | awk '{print $1}'
   elif have openssl; then openssl dgst -sha256 | awk '{print $2}'
   elif have md5sum; then md5sum | awk '{print $1}'
-  else
-    err "No hashing tool (sha256sum/shasum/openssl/md5sum) available"; exit 1
-  fi
+  else err "No hashing tool (sha256sum/shasum/openssl/md5sum) available"; exit 1; fi
 }
 get_mtime() {
-  # Portable-ish mtime for files/dirs
   if stat -c '%Y' -- "$1" >/dev/null 2>&1; then stat -c '%Y' -- "$1"
   elif stat -f '%m' -- "$1" >/dev/null 2>&1; then stat -f '%m' -- "$1"
   else echo 0; fi
 }
 path_len() { printf "%s" "$1" | wc -c; }
 
-# --- Extract minimal rows: hash,path,size? -> tmp (quote stripped) ---
+# Extract normalized rows hash,path,size? -> TMP_FILES
 TMP_FILES="$(mktemp)"; trap 'rm -f "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DUP_SIGS" "$BUF_FILE" 2>/dev/null || true' EXIT
 awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -F',' '
   NR==1 && skip==1 { next }
@@ -173,12 +130,9 @@ awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HE
   }
 ' "$INPUT" > "$TMP_FILES"
 
-# --- Build (dir, relpath, hash) entries for each ancestor (or just leaf) ---
+# Build (dir, relpath, hash) entries for each ancestor (or just leaf) — POSIX awk friendly
 TMP_DIR_ENT="$(mktemp)"
 awk -F',' -v scope="$SCOPE" '
-  function join_path(arr, from, to,    s,i) {
-    s=""; for (i=from;i<=to;i++) { if (arr[i]=="") continue; s=(s==""?"/":s"/") arr[i] } return s
-  }
   {
     h=$1; p=$2
     n=split(p, comp, "/")
@@ -187,11 +141,13 @@ awk -F',' -v scope="$SCOPE" '
     if (end<start) next
     if (scope=="leaf") {
       i=end
-      dir=join_path(comp,1,i); rel=join_path(comp,i+1,n)
+      dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
+      rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
       print dir "," rel "," h
     } else {
-      for (i=start;i<=end;i++) {
-        dir=join_path(comp,1,i); rel=join_path(comp,i+1,n)
+      for (i=start; i<=end; i++) {
+        dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
+        rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
         print dir "," rel "," h
       }
     }
@@ -232,7 +188,7 @@ fi
 DUP_SIGS="$(mktemp)"
 cut -d, -f1 "$DIR_SIGS" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$DUP_SIGS"
 if [[ ! -s "$DUP_SIGS" ]]; then
-  info "No duplicate folder groups found (>= $MIN_GROUP)."
+  info "No duplicate folder groups found (>= '"$MIN_GROUP"')."
   exit 0
 fi
 
@@ -261,7 +217,6 @@ while IFS= read -r sig; do
     printf "   - %s  (files: %s)\n" "$dir" "$cnt" >> "$OUT_SUM"
     dirs+=("$dir")
   done
-  # Choose keeper
   keep=""
   case "$KEEP_STRATEGY" in
     shortest-path)
@@ -309,7 +264,7 @@ else
   warn "Plan is empty (no deletable duplicates after keep-policy)."
 fi
 
-# Apply mode (dangerous — guarded)
+# Apply mode
 if [[ "$MODE" == "apply" ]]; then
   [[ "$FORCE" == true ]] || { err "--mode apply requires --force"; exit 1; }
   [[ -s "$OUT_PLAN" ]] || { warn "No entries to act on."; exit 0; }
