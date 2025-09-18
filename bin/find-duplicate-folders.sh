@@ -114,25 +114,41 @@ get_mtime() {
 }
 path_len() { printf "%s" "$1" | wc -c; }
 
-# Temp AWK programs to avoid shell quoting issues
-AWK1="$(mktemp)"; AWK2="$(mktemp)"
-trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DUP_SIGS" "$BUF_FILE" 2>/dev/null || true' EXIT
+human_bytes() {
+  # prints human-friendly size from bytes
+  local b=${1:-0}
+  awk -v b="$b" 'function p(n,u){printf("%.1f%s", n,u); exit}
+    BEGIN{
+      if (b<1024) {printf("%dB", b); exit}
+      kb=b/1024; if (kb<1024){p(kb,"KB")}
+      mb=kb/1024; if (mb<1024){p(mb,"MB")}
+      gb=mb/1024; if (gb<1024){p(gb,"GB")}
+      tb=gb/1024; p(tb,"TB")
+    }'
+}
 
+# Temp AWK programs (BusyBox-safe)
+AWK1="$(mktemp)"; AWK2="$(mktemp)"
+trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DIR_SIZE" "$DUP_SIGS" "$BUF_FILE" "$TMP_GROUP" 2>/dev/null || true' EXIT
+
+# AWK1: normalize CSV to h,p,s (size defaults to 0 if absent)
 cat > "$AWK1" <<'AWK'
 NR==1 && skip==1 { next }
 {
-  h=$ch; p=$cp; s=(cs>0?$cs:"")
+  h=$ch; p=$cp; s=(cs>0?$cs:"0")
   gsub(/"/,"",h); gsub(/"/,"",p); gsub(/"/,"",s)
   sub(/^[[:space:]]+/,"",h); sub(/[[:space:]]+$/,"",h)
   sub(/^[[:space:]]+/,"",p); sub(/[[:space:]]+$/,"",p)
   sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s)
+  if (s=="") s="0"
   if (h!="" && p!="") print h "," p "," s
 }
 AWK
 
+# AWK2: explode each file row onto its ancestor dirs (or just leaf), emit dir,rel,h,size
 cat > "$AWK2" <<'AWK'
 {
-  h=$1; p=$2
+  h=$1; p=$2; s=$3+0
   n=split(p, comp, "/")
   start=1; if (comp[1]=="") start=2
   end=n-1
@@ -141,12 +157,12 @@ cat > "$AWK2" <<'AWK'
     i=end
     dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
     rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
-    print dir "," rel "," h
+    print dir "," rel "," h "," s
   } else {
     for (i=start; i<=end; i++) {
       dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
       rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
-      print dir "," rel "," h
+      print dir "," rel "," h "," s
     }
   }
 }
@@ -156,18 +172,18 @@ AWK
 TMP_FILES="$(mktemp)"
 awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -F',' -f "$AWK1" "$INPUT" > "$TMP_FILES"
 
-# Build (dir,rel,hash)
+# Build (dir,rel,hash,size)
 TMP_DIR_ENT="$(mktemp)"
 awk -F',' -v scope="$SCOPE" -f "$AWK2" "$TMP_FILES" > "$TMP_DIR_ENT"
 
 # Empty?
 if [[ ! -s "$TMP_DIR_ENT" ]]; then
-  info "No files mapped to directories from $INPUT."
+  info "Verified hashes: no files mapped to directories from $INPUT."
   echo "signature,dir,file_count" > "$OUT_CSV"
-  : > "$OUT_SUM"
-  : > "$OUT_PLAN"
-  info "Group summary: $OUT_SUM"
-  info "CSV:           $OUT_CSV"
+  : > "$OUT_SUM"; : > "$OUT_PLAN"
+  info "Summary: $OUT_SUM"
+  info "CSV:     $OUT_CSV"
+  info "Next: proceed to duplicate FILE checker."
   exit 0
 fi
 
@@ -175,16 +191,18 @@ fi
 TMP_SORT="$(mktemp)"
 sort -t, -k1,1 -k2,2 "$TMP_DIR_ENT" > "$TMP_SORT"
 
-# Compute per-dir signature from sorted rel|hash lines
-DIR_SIGS="$(mktemp)"
+# Compute per-dir signature and per-dir total size/files
+DIR_SIGS="$(mktemp)"    # sig,dir,file_count
+DIR_SIZE="$(mktemp)"    # dir,total_bytes,file_count
 BUF_FILE="$(mktemp)"
 : > "$BUF_FILE"
-current=""; count=0
-while IFS=, read -r dir rel h; do
+current=""; count=0; size_sum=0
+while IFS=, read -r dir rel h sz; do
   if [[ -n "$current" && "$dir" != "$current" ]]; then
     sig="$(cat "$BUF_FILE" | hash_string)"
     printf "%s,%s,%d\n" "$sig" "$current" "$count" >> "$DIR_SIGS"
-    : > "$BUF_FILE"; count=0
+    printf "%s,%s,%d\n" "$current" "$size_sum" "$count" >> "$DIR_SIZE"
+    : > "$BUF_FILE"; count=0; size_sum=0
   fi
   current="$dir"
   if [[ "$SIGNATURE_MODE" == "content-only" ]]; then
@@ -193,102 +211,107 @@ while IFS=, read -r dir rel h; do
     printf "%s|%s\n" "$rel" "$h" >> "$BUF_FILE"
   fi
   count=$((count+1))
+  size_sum=$((size_sum + ${sz:-0}))
 done < "$TMP_SORT"
 if [[ -n "$current" ]]; then
   sig="$(cat "$BUF_FILE" | hash_string)"
   printf "%s,%s,%d\n" "$sig" "$current" "$count" >> "$DIR_SIGS"
+  printf "%s,%s,%d\n" "$current" "$size_sum" "$count" >> "$DIR_SIZE"
 fi
 
 # Find duplicate signatures (groups >= MIN_GROUP)
 DUP_SIGS="$(mktemp)"
 cut -d, -f1 "$DIR_SIGS" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$DUP_SIGS"
 
-# Outputs
-echo "signature,dir,file_count" > "$OUT_CSV"
-if [[ -s "$DUP_SIGS" ]]; then
-  grep -F -f "$DUP_SIGS" "$DIR_SIGS" >> "$OUT_CSV" || true
-else
-  : # keep header only
-fi
+# Prepare CSV output
+echo "signature,dir,file_count,total_bytes" > "$OUT_CSV"
 
-{
-  echo "Duplicate Folders — generated $timestamp"
-  echo "Source CSV: $INPUT"
-  echo "Scope: $SCOPE"
-  echo "Signature: $SIGNATURE_MODE"
-  echo
-} > "$OUT_SUM"
-
+# Grouping, summary, and plan
+: > "$OUT_SUM"; : > "$OUT_PLAN"
 group_no=0
-: > "$OUT_PLAN"
+plan_dirs_bytes=0
+plan_dirs_count=0
+
 if [[ -s "$DUP_SIGS" ]]; then
   while IFS= read -r sig; do
-    # Collect lines for this sig
-    mapfile -t lines < <(grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2)
-    (( ${#lines[@]} < MIN_GROUP )) && continue
-    ((group_no++))
-    echo "─ Group #$group_no — signature: $sig" >> "$OUT_SUM"
-    dirs=()
-    for line in "${lines[@]}"; do
-      dir="${line#*,}"; dir="${dir%,*}"
-      cnt="${line##*,}"
-      printf "   - %s  (files: %s)\n" "$dir" "$cnt" >> "$OUT_SUM"
-      dirs+=("$dir")
-    done
-    # Choose keeper
-    keep=""
-    case "$KEEP_STRATEGY" in
-      shortest-path)
-        shortest=999999
-        for d in "${dirs[@]}"; do
-          plen=$(path_len "$d")
-          if (( plen < shortest )); then shortest=$plen; keep="$d"; fi
-        done
-        ;;
-      oldest)
-        best=9999999999
-        for d in "${dirs[@]}"; do
-          mt=$(get_mtime "$d")
-          if (( mt < best )); then best=$mt; keep="$d"; fi
-        done
-        ;;
-      newest)
-        best=0
-        for d in "${dirs[@]}"; do
-          mt=$(get_mtime "$d")
-          if (( mt > best  )); then best=$mt; keep="$d"; fi
-        done
-        ;;
-      first|*)
-        keep="${dirs[0]}"
-        ;;
-    esac
+    # Collect lines for this signature
+    TMP_GROUP="$(mktemp)"
+    grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2 > "$TMP_GROUP"
+
+    # Determine keeper
+    keep=""; keep_metric=""
+    while IFS=, read -r _ d c; do
+      case "$KEEP_STRATEGY" in
+        shortest-path)
+          metric=$(path_len "$d")
+          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
+          ;;
+        oldest)
+          metric=$(get_mtime "$d")
+          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
+          ;;
+        newest)
+          metric=$(get_mtime "$d")
+          if [[ -z "$keep" || "$metric" -gt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
+          ;;
+        first|*)
+          keep="${keep:-$d}"
+          keep_metric=0
+          ;;
+      esac
+    done < "$TMP_GROUP"
+
+    # Now emit summary lines and plan entries
+    lines_in_group=0
+    echo "─ Group #$((++group_no)) — signature: $sig" >> "$OUT_SUM"
+    while IFS=, read -r _ d c; do
+      # lookup dir size and file count
+      size_line="$(awk -F, -v dd="$d" '$1==dd{print $2","$3; exit}' "$DIR_SIZE")"
+      dir_bytes="${size_line%%,*}"; dir_files="${size_line##*,}"
+      printf "   - %s  (files: %s, size: %s)\n" "$d" "${dir_files:-$c}" "$(human_bytes "${dir_bytes:-0}")" >> "$OUT_SUM"
+      # write CSV row
+      printf "%s,%s,%s,%s\n" "$sig" "$d" "${dir_files:-$c}" "${dir_bytes:-0}" >> "$OUT_CSV"
+      # plan: everything except keeper
+      if [[ "$d" != "$keep" ]]; then
+        echo "$d" >> "$OUT_PLAN"
+        plan_dirs_count=$((plan_dirs_count+1))
+        plan_dirs_bytes=$((plan_dirs_bytes + ${dir_bytes:-0}))
+      fi
+      lines_in_group=$((lines_in_group+1))
+    done < "$TMP_GROUP"
     echo "   → keep: $keep" >> "$OUT_SUM"
-    for d in "${dirs[@]}"; do
-      [[ "$d" == "$keep" ]] && continue
-      printf "%s\n" "$d" >> "$OUT_PLAN"
-    done
     echo >> "$OUT_SUM"
+    rm -f "$TMP_GROUP"
   done < "$DUP_SIGS"
+fi
+
+# Copy "latest" convenience link if plan exists
+if [[ -s "$OUT_PLAN" ]]; then
+  mkdir -p "$VAR_DIR"
+  cp -f "$OUT_PLAN" "$VAR_DIR/latest-folder-plan.txt" || true
 fi
 
 # Final UX
 if [[ "$MODE" == "plan" ]]; then
   if [[ "$group_no" -gt 0 ]]; then
-    items=$(wc -l < "$OUT_PLAN" | tr -d ' ')
-    info "Groups: $group_no"
-    info "Group summary: $OUT_SUM"
-    info "Auto-plan:     $OUT_PLAN  (items: $items)"
-    info "CSV:           $OUT_CSV"
-    echo
-    echo "Next (safe apply to quarantine):"
-    echo "  bin/find-duplicate-folders.sh --mode apply --force --quarantine \"var/quarantine/$(date +%F)\""
-  else
-    info "No duplicate folder groups found (>= $MIN_GROUP)."
+    info "Verified hashes, you have duplicate folders:"
+    info "- Duplicate groups: $group_no"
+    info "- Folders slated for deletion (plan items): $plan_dirs_count"
+    info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes")"
     info "Summary: $OUT_SUM"
     info "CSV:     $OUT_CSV"
-    echo "Tip: try a broader match:"
-    echo "  bin/find-duplicate-folders.sh --mode plan --scope leaf --signature content-only --keep-strategy oldest"
+    info "Plan:    ${VAR_DIR}/latest-folder-plan.txt"
+    echo
+    echo "Would you like to proceed to review and delete the duplicate folders?"
+    echo "Note: do this BEFORE deleting individual files."
+    echo
+    echo "Apply safely (move to quarantine):"
+    echo "  bin/find-duplicate-folders.sh --mode apply --force --quarantine \"var/quarantine/$(date +%F)\""
+  else
+    info "Verified hashes: zero duplicate folders found (>= $MIN_GROUP)."
+    info "Next: please proceed to the duplicate FILE checker for cleanup."
+    info "Summary: $OUT_SUM"
+    info "CSV:     $OUT_CSV"
   fi
 fi
 
