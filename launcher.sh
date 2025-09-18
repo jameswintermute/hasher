@@ -70,7 +70,7 @@ act_check_status() {
 }
 
 act_start_hashing_defaults() {
-  require "$ROOT_DIR/hasher.sh"
+  require "$BIN_DIR/hasher.sh"
   local pf; pf="$(paths_file_default)"
   if [[ -z "$pf" ]]; then
     warn "No paths file found. Create $LOCAL_DIR/paths.txt or ./paths.txt"
@@ -79,22 +79,23 @@ act_start_hashing_defaults() {
   info "Starting hashing with NAS-safe defaults…"
   info "Paths file: $pf"
   # Defaults: sha256, nohup in background
-  "$ROOT_DIR/hasher.sh" --pathfile "$pf" --algo sha256 --nohup | tee -a "$BACKGROUND_LOG"
+  "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo sha256 --nohup | tee -a "$BACKGROUND_LOG"
   press_any
 }
 
 act_start_hashing_advanced() {
-  require "$ROOT_DIR/hasher.sh"
+  require "$BIN_DIR/hasher.sh"
   local pf; pf="$(paths_file_default)"
   printf "Paths file [%s]: " "${pf:-<none>}"; read -r in_pf; pf="${in_pf:-$pf}"
   [[ -z "$pf" ]] && { err "No paths file provided."; press_any; return; }
 
   printf "Algo [sha256|sha1|sha512|md5|blake2] (default sha256): "; read -r algo; algo="${algo:-sha256}"
   printf "Run in background? [y/N]: "; read -r yn
-  if [[ "${yn,,}" == "y" ]]; then
-    "$ROOT_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" --nohup | tee -a "$BACKGROUND_LOG"
+  yn="$(printf "%s" "$yn" | tr 'A-Z' 'a-z')"
+  if [[ "$yn" == "y" ]]; then
+    "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" --nohup | tee -a "$BACKGROUND_LOG"
   else
-    "$ROOT_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" | tee -a "$BACKGROUND_LOG"
+    "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" | tee -a "$BACKGROUND_LOG"
   fi
   press_any
 }
@@ -148,7 +149,7 @@ act_find_duplicate_folders() {
     echo "  r) Review the duplicates (open summary)"
     echo "  b) Bulk delete (DANGER): keep newest copy -> quarantine"
     echo "  q) Quit back to main menu"
-    read -rp "Choose [r/b/q]: " choice
+    read -r -p "Choose [r/b/q]: " choice
     case "$choice" in
       r|R)
         if command -v less >/dev/null 2>&1; then
@@ -156,12 +157,12 @@ act_find_duplicate_folders() {
         else
           sed -n '1,200p' "$SUM"
           echo
-          read -rp "Press ENTER to return..." _
+          read -r -p "Press ENTER to return..." _
         fi
         ;;
       b|B)
         echo "This will MOVE duplicates (except the newest) to a quarantine folder."
-        read -rp "Type 'DELETE' to confirm: " conf
+        read -r -p "Type 'DELETE' to confirm: " conf
         if [[ "$conf" != "DELETE" ]]; then
           echo "Cancelled."
           continue
@@ -212,7 +213,8 @@ act_delete_zero_length() {
   local script="$BIN_DIR/delete-zero-length.sh"
   require "$script"
   printf "Dry run first? [Y/n]: "; read -r yn; yn="${yn:-Y}"
-  if [[ "${yn,,}" == "n" ]]; then
+  yn="$(printf "%s" "$yn" | tr 'A-Z' 'a-z')"
+  if [[ "$yn" == "n" ]]; then
     "$script"
   else
     "$script" --dry-run
