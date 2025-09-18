@@ -114,8 +114,12 @@ lchead="$(printf "%s" "$header" | tr 'A-Z' 'a-z')"
 find_col() {
   local name="$1"; local idx=0; local IFS=,
   for col in $lchead; do
-    idx=$((idx+1)); col="${col//"/}"; col="$(echo "$col" | xargs)"
-    [[ "$col" == "$name" ]] && { echo "$idx"; return; }
+    idx=$((idx+1))
+    col=${col//"/}
+    col="$(echo "$col" | xargs)"
+    if [[ "$col" == "$name" ]]; then
+      echo "$idx"; return 0
+    fi
   done
   echo ""
 }
@@ -144,7 +148,7 @@ hash_string() {
 get_mtime() {
   # Portable-ish mtime for files/dirs
   if stat -c '%Y' -- "$1" >/dev/null 2>&1; then stat -c '%Y' -- "$1"
-  elif stat -f '%m' -- "$1" >/devnull 2>&1; then stat -f '%m' -- "$1"
+  elif stat -f '%m' -- "$1" >/dev/null 2>&1; then stat -f '%m' -- "$1"
   else echo 0; fi
 }
 path_len() { printf "%s" "$1" | wc -c; }
@@ -212,19 +216,16 @@ current=""; count=0
 while IFS=, read -r dir rel h; do
   if [[ -n "$current" && "$dir" != "$current" ]]; then
     sig="$(cat "$BUF_FILE" | hash_string)"
-    printf "%s,%s,%d
-" "$sig" "$current" "$count" >> "$DIR_SIGS"
+    printf "%s,%s,%d\n" "$sig" "$current" "$count" >> "$DIR_SIGS"
     : > "$BUF_FILE"; count=0
   fi
   current="$dir"
-  printf "%s|%s
-" "$rel" "$h" >> "$BUF_FILE"
+  printf "%s|%s\n" "$rel" "$h" >> "$BUF_FILE"
   count=$((count+1))
 done < "$TMP_SORT"
 if [[ -n "$current" ]]; then
   sig="$(cat "$BUF_FILE" | hash_string)"
-  printf "%s,%s,%d
-" "$sig" "$current" "$count" >> "$DIR_SIGS"
+  printf "%s,%s,%d\n" "$sig" "$current" "$count" >> "$DIR_SIGS"
 fi
 
 # Find duplicate signatures (groups >= MIN_GROUP)
@@ -257,8 +258,7 @@ while IFS= read -r sig; do
   for line in "${lines[@]}"; do
     dir="${line#*,}"; dir="${dir%,*}"
     cnt="${line##*,}"
-    printf "   - %s  (files: %s)
-" "$dir" "$cnt" >> "$OUT_SUM"
+    printf "   - %s  (files: %s)\n" "$dir" "$cnt" >> "$OUT_SUM"
     dirs+=("$dir")
   done
   # Choose keeper
@@ -292,8 +292,7 @@ while IFS= read -r sig; do
   echo "   → keep: $keep" >> "$OUT_SUM"
   for d in "${dirs[@]}"; do
     [[ "$d" == "$keep" ]] && continue
-    printf "%s
-" "$d" >> "$OUT_PLAN"
+    printf "%s\n" "$d" >> "$OUT_PLAN"
   done
   echo >> "$OUT_SUM"
 done < "$DUP_SIGS"
