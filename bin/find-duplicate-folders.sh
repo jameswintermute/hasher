@@ -144,9 +144,21 @@ get_size() {
   fi
 }
 
+# Simple spinner/progress to stderr
+_spinner_frames='-\|/'
+show_progress() {
+  # args: current total label
+  cur=$1; total=$2; label=$3
+  pct=0
+  if [ "$total" -gt 0 ]; then pct=$(( (cur * 100) / total )); fi
+  idx=$((cur % 3))
+  ch=${_spinner_frames:$idx:1}
+  printf "\r[WORK] %s %d%% (%d/%d)" "$label" "$pct" "$cur" "$total" >&2
+}
+
 # Temp AWK programs (BusyBox-safe)
 AWK1="$(mktemp)"; AWK2="$(mktemp)"
-trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_FILES2" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DIR_SIZE" "$DUP_SIGS" "$BUF_FILE" "$TMP_GROUP" 2>/dev/null || true' EXIT
+trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_FILES2" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DIR_SIZE" "$DUP_SIGS" "$BUF_FILE" "$GROUP_INDEX" "$TMP_GROUP" "$TMP_SIZED" 2>/dev/null || true' EXIT
 
 # AWK1: normalize CSV to h,p,s (size defaults to 0 if absent)
 cat > "$AWK1" <<'AWK'
@@ -193,10 +205,16 @@ awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HE
 if [[ "$SIZE_SOURCE" == "filesystem" ]]; then
   info "Computing file sizes from filesystem metadata (CSV had no size column)..."
   TMP_FILES2="$(mktemp)"
+  total_lines=$(wc -l < "$TMP_FILES" | tr -d ' ')
+  i=0
   while IFS=, read -r h p s; do
+    i=$((i+1))
+    # progress every ~200 rows
+    if (( i % 200 == 0 )); then show_progress "$i" "$total_lines" "sizing files"; fi
     sz="$(get_size "$p")"
     printf "%s,%s,%s\n" "$h" "$p" "${sz:-0}" >> "$TMP_FILES2"
   done < "$TMP_FILES"
+  show_progress "$total_lines" "$total_lines" "sizing files"; printf "\n" >&2
   mv "$TMP_FILES2" "$TMP_FILES"
   SIZE_AVAILABLE=true
 fi
@@ -255,27 +273,13 @@ cut -d, -f1 "$DIR_SIGS" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $
 # Write CSV header
 echo "signature,dir,file_count,total_bytes" > "$OUT_CSV"
 
-# Grouping, summary, and plan
-: > "$OUT_SUM"; : > "$OUT_PLAN"
-{
-  echo "Duplicate Folders — generated $timestamp"
-  echo "Source CSV: $INPUT"
-  echo "Scope: $SCOPE"
-  echo "Signature: $SIGNATURE_MODE"
-  echo "Size source: $SIZE_SOURCE"
-  echo
-} >> "$OUT_SUM"
+# Group index: savings_bytes,signature,keep
+GROUP_INDEX="$(mktemp)"
 
-group_no=0
-plan_dirs_bytes=0
-plan_dirs_count=0
-
+# Build index with savings for sorting
 if [[ -s "$DUP_SIGS" ]]; then
   while IFS= read -r sig; do
-    TMP_GROUP="$(mktemp)"
-    grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2 > "$TMP_GROUP"
-
-    # Choose keeper
+    # determine keeper per strategy
     keep=""; keep_metric=""
     while IFS=, read -r _ d c; do
       case "$KEEP_STRATEGY" in
@@ -290,24 +294,67 @@ if [[ -s "$DUP_SIGS" ]]; then
           if [[ -z "$keep" || "$metric" -gt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi ;;
         first|*) keep="${keep:-$d}"; keep_metric=0 ;;
       esac
-    done < "$TMP_GROUP"
+    done < <(grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2)
 
-    echo "─ Group #$((++group_no)) — signature: $sig" >> "$OUT_SUM"
+    # compute savings = sum(bytes of all dirs except keeper)
+    savings=0
+    while IFS=, read -r _ d _; do
+      size_line="$(awk -F, -v dd="$d" '$1==dd{print $2; exit}' "$DIR_SIZE")"
+      b="${size_line:-0}"
+      if [[ "$d" != "$keep" ]]; then savings=$((savings + ${b:-0})); fi
+    done < <(grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2)
+
+    printf "%012d,%s,%s\n" "$savings" "$sig" "$keep" >> "$GROUP_INDEX"
+  done < "$DUP_SIGS"
+fi
+
+# Prepare summary header
+: > "$OUT_SUM"
+{
+  echo "Duplicate Folders — generated $timestamp"
+  echo "Source CSV: $INPUT"
+  echo "Scope: $SCOPE"
+  echo "Signature: $SIGNATURE_MODE"
+  echo "Size source: $SIZE_SOURCE"
+  echo "Sorted by: duplicate-savings (desc)"
+  echo
+} >> "$OUT_SUM"
+
+# Iterate groups in sorted order (largest savings first)
+group_no=0
+plan_dirs_bytes=0
+plan_dirs_count=0
+
+if [[ -s "$GROUP_INDEX" ]]; then
+  # sort numerically desc by the padded savings field
+  sort -r "$GROUP_INDEX" | while IFS=, read -r savings sig keep; do
+    group_no=$((group_no+1))
+    # Build per-dir sized list: bytes,dir,files
+    TMP_SIZED="$(mktemp)"
     while IFS=, read -r _ d c; do
       size_line="$(awk -F, -v dd="$d" '$1==dd{print $2","$3; exit}' "$DIR_SIZE")"
       dir_bytes="${size_line%%,*}"; dir_files="${size_line##*,}"
-      printf "   - %s  (files: %s, size: %s)\n" "$d" "${dir_files:-$c}" "$(human_bytes "${dir_bytes:-0}")" >> "$OUT_SUM"
-      printf "%s,%s,%s,%s\n" "$sig" "$d" "${dir_files:-$c}" "${dir_bytes:-0}" >> "$OUT_CSV"
+      printf "%012d,%s,%s\n" "${dir_bytes:-0}" "$d" "${dir_files:-$c}" >> "$TMP_SIZED"
+    done < <(grep "^$sig," "$DIR_SIGS")
+
+    echo "─ Group #$group_no — signature: $sig  (savings: $(human_bytes "$savings"))" >> "$OUT_SUM"
+
+    # Print dirs in size-desc order
+    sort -t, -k1,1r "$TMP_SIZED" | while IFS=, read -r b d f; do
+      hb="$(human_bytes "$b")"
+      printf "   - %s  (files: %s, size: %s)\n" "$d" "$f" "$hb" >> "$OUT_SUM"
+      printf "%s,%s,%s,%s\n" "$sig" "$d" "$f" "$b" >> "$OUT_CSV"
       if [[ "$d" != "$keep" ]]; then
         echo "$d" >> "$OUT_PLAN"
         plan_dirs_count=$((plan_dirs_count+1))
-        plan_dirs_bytes=$((plan_dirs_bytes + ${dir_bytes:-0}))
+        plan_dirs_bytes=$((plan_dirs_bytes + ${b:-0}))
       fi
-    done < "$TMP_GROUP"
+    done
+
     echo "   → keep: $keep" >> "$OUT_SUM"
     echo >> "$OUT_SUM"
-    rm -f "$TMP_GROUP"
-  done < "$DUP_SIGS"
+    rm -f "$TMP_SIZED"
+  done
 fi
 
 # Copy "latest" convenience link if plan exists
