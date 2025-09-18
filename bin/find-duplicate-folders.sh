@@ -21,32 +21,40 @@ err()  { printf "${c_red}[ERROR]${c_reset} %b\n" "$*"; }
 
 # Defaults
 INPUT=""
-MODE="plan"
+MODE="plan"                           # plan | apply
 MIN_GROUP=2
-KEEP_STRATEGY="shortest-path"
-SCOPE="recursive"
+KEEP_STRATEGY="shortest-path"         # shortest-path|oldest|newest|first
+SCOPE="recursive"                     # recursive | leaf
+SIGNATURE_MODE="name+content"         # name+content | content-only
 QUARANTINE=""
 FORCE=false
+
+usage() {
+  cat <<'EOF'
+Usage: find-duplicate-folders.sh [--input CSV]
+                                 [--mode plan|apply]
+                                 [--min-group-size N]
+                                 [--keep-strategy shortest-path|oldest|newest|first]
+                                 [--scope recursive|leaf]
+                                 [--signature name+content|content-only]
+                                 [--quarantine DIR]
+                                 [--force]
+EOF
+}
 
 # Args
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) cat <<'EOF'
-Usage: find-duplicate-folders.sh [--input CSV] [--mode plan|apply]
-                                 [--min-group-size N]
-                                 [--keep-strategy shortest-path|oldest|newest|first]
-                                 [--scope recursive|leaf]
-                                 [--quarantine DIR] [--force]
-EOF
-      exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     --input) INPUT="${2:-}"; shift 2 ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --min-group-size) MIN_GROUP="${2:-}"; shift 2 ;;
     --keep-strategy) KEEP_STRATEGY="${2:-}"; shift 2 ;;
     --scope) SCOPE="${2:-}"; shift 2 ;;
+    --signature) SIGNATURE_MODE="${2:-}"; shift 2 ;;
     --quarantine) QUARANTINE="${2:-}"; shift 2 ;;
     --force) FORCE=true; shift ;;
-    *) err "Unknown arg: $1"; exit 1 ;;
+    *) err "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
 
@@ -61,7 +69,7 @@ INPUT="${INPUT:-$(pick_latest_csv)}"
 [[ ! -f "$INPUT" ]] && { err "Input CSV not found: $INPUT"; exit 1; }
 
 info "Input: $INPUT"
-info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP_STRATEGY"
+info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP_STRATEGY  | Signature: $SIGNATURE_MODE"
 
 # Header detection
 header="$(head -n1 "$INPUT")"
@@ -154,7 +162,12 @@ awk -F',' -v scope="$SCOPE" -f "$AWK2" "$TMP_FILES" > "$TMP_DIR_ENT"
 
 # Empty?
 if [[ ! -s "$TMP_DIR_ENT" ]]; then
-  warn "No directory entries derived from input. Nothing to do."
+  info "No files mapped to directories from $INPUT."
+  echo "signature,dir,file_count" > "$OUT_CSV"
+  : > "$OUT_SUM"
+  : > "$OUT_PLAN"
+  info "Group summary: $OUT_SUM"
+  info "CSV:           $OUT_CSV"
   exit 0
 fi
 
@@ -174,7 +187,11 @@ while IFS=, read -r dir rel h; do
     : > "$BUF_FILE"; count=0
   fi
   current="$dir"
-  printf "%s|%s\n" "$rel" "$h" >> "$BUF_FILE"
+  if [[ "$SIGNATURE_MODE" == "content-only" ]]; then
+    printf "%s\n" "$h" >> "$BUF_FILE"
+  else
+    printf "%s|%s\n" "$rel" "$h" >> "$BUF_FILE"
+  fi
   count=$((count+1))
 done < "$TMP_SORT"
 if [[ -n "$current" ]]; then
@@ -185,87 +202,102 @@ fi
 # Find duplicate signatures (groups >= MIN_GROUP)
 DUP_SIGS="$(mktemp)"
 cut -d, -f1 "$DIR_SIGS" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$DUP_SIGS"
-if [[ ! -s "$DUP_SIGS" ]]; then
-  info "No duplicate folder groups found (>= '"$MIN_GROUP"')."
-  exit 0
-fi
 
 # Outputs
 echo "signature,dir,file_count" > "$OUT_CSV"
-grep -F -f "$DUP_SIGS" "$DIR_SIGS" >> "$OUT_CSV"
+if [[ -s "$DUP_SIGS" ]]; then
+  grep -F -f "$DUP_SIGS" "$DIR_SIGS" >> "$OUT_CSV" || true
+else
+  : # keep header only
+fi
 
 {
   echo "Duplicate Folders — generated $timestamp"
   echo "Source CSV: $INPUT"
   echo "Scope: $SCOPE"
+  echo "Signature: $SIGNATURE_MODE"
   echo
 } > "$OUT_SUM"
 
 group_no=0
 : > "$OUT_PLAN"
-while IFS= read -r sig; do
-  mapfile -t lines < <(grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2)
-  (( ${#lines[@]} < MIN_GROUP )) && continue
-  ((group_no++))
-  echo "─ Group #$group_no — signature: $sig" >> "$OUT_SUM"
-  declare -a dirs=()
-  for line in "${lines[@]}"; do
-    dir="${line#*,}"; dir="${dir%,*}"
-    cnt="${line##*,}"
-    printf "   - %s  (files: %s)\n" "$dir" "$cnt" >> "$OUT_SUM"
-    dirs+=("$dir")
-  done
-  keep=""
-  case "$KEEP_STRATEGY" in
-    shortest-path)
-      shortest=999999
-      for d in "${dirs[@]}"; do
-        plen=$(path_len "$d")
-        if (( plen < shortest )); then shortest=$plen; keep="$d"; fi
-      done
-      ;;
-    oldest)
-      best=9999999999
-      for d in "${dirs[@]}"; do
-        mt=$(get_mtime "$d")
-        if (( mt < best )); then best=$mt; keep="$d"; fi
-      done
-      ;;
-    newest)
-      best=0
-      for d in "${dirs[@]}"; do
-        mt=$(get_mtime "$d")
-        if (( mt > best )); then best=$mt; keep="$d"; fi
-      done
-      ;;
-    first|*)
-      keep="${dirs[0]}"
-      ;;
-  esac
-  echo "   → keep: $keep" >> "$OUT_SUM"
-  for d in "${dirs[@]}"; do
-    [[ "$d" == "$keep" ]] && continue
-    printf "%s\n" "$d" >> "$OUT_PLAN"
-  done
-  echo >> "$OUT_SUM"
-done < "$DUP_SIGS"
+if [[ -s "$DUP_SIGS" ]]; then
+  while IFS= read -r sig; do
+    # Collect lines for this sig
+    mapfile -t lines < <(grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2)
+    (( ${#lines[@]} < MIN_GROUP )) && continue
+    ((group_no++))
+    echo "─ Group #$group_no — signature: $sig" >> "$OUT_SUM"
+    dirs=()
+    for line in "${lines[@]}"; do
+      dir="${line#*,}"; dir="${dir%,*}"
+      cnt="${line##*,}"
+      printf "   - %s  (files: %s)\n" "$dir" "$cnt" >> "$OUT_SUM"
+      dirs+=("$dir")
+    done
+    # Choose keeper
+    keep=""
+    case "$KEEP_STRATEGY" in
+      shortest-path)
+        shortest=999999
+        for d in "${dirs[@]}"; do
+          plen=$(path_len "$d")
+          if (( plen < shortest )); then shortest=$plen; keep="$d"; fi
+        done
+        ;;
+      oldest)
+        best=9999999999
+        for d in "${dirs[@]}"; do
+          mt=$(get_mtime "$d")
+          if (( mt < best )); then best=$mt; keep="$d"; fi
+        done
+        ;;
+      newest)
+        best=0
+        for d in "${dirs[@]}"; do
+          mt=$(get_mtime "$d")
+          if (( mt > best  )); then best=$mt; keep="$d"; fi
+        done
+        ;;
+      first|*)
+        keep="${dirs[0]}"
+        ;;
+    esac
+    echo "   → keep: $keep" >> "$OUT_SUM"
+    for d in "${dirs[@]}"; do
+      [[ "$d" == "$keep" ]] && continue
+      printf "%s\n" "$d" >> "$OUT_PLAN"
+    done
+    echo >> "$OUT_SUM"
+  done < "$DUP_SIGS"
+fi
 
-info "Groups: $group_no"
-info "Group summary: $OUT_SUM"
-info "CSV:           $OUT_CSV"
-
-if [[ -s "$OUT_PLAN" ]]; then
-  info "Plan:          $OUT_PLAN"
-  cp -f "$OUT_PLAN" "$VAR_DIR/latest-folder-plan.txt" || true
-  info "Latest plan copied to: $VAR_DIR/latest-folder-plan.txt"
-else
-  warn "Plan is empty (no deletable duplicates after keep-policy)."
+# Final UX
+if [[ "$MODE" == "plan" ]]; then
+  if [[ "$group_no" -gt 0 ]]; then
+    items=$(wc -l < "$OUT_PLAN" | tr -d ' ')
+    info "Groups: $group_no"
+    info "Group summary: $OUT_SUM"
+    info "Auto-plan:     $OUT_PLAN  (items: $items)"
+    info "CSV:           $OUT_CSV"
+    echo
+    echo "Next (safe apply to quarantine):"
+    echo "  bin/find-duplicate-folders.sh --mode apply --force --quarantine \"var/quarantine/$(date +%F)\""
+  else
+    info "No duplicate folder groups found (>= $MIN_GROUP)."
+    info "Summary: $OUT_SUM"
+    info "CSV:     $OUT_CSV"
+    echo "Tip: try a broader match:"
+    echo "  bin/find-duplicate-folders.sh --mode plan --scope leaf --signature content-only --keep-strategy oldest"
+  fi
 fi
 
 # Apply mode
 if [[ "$MODE" == "apply" ]]; then
   [[ "$FORCE" == true ]] || { err "--mode apply requires --force"; exit 1; }
-  [[ -s "$OUT_PLAN" ]] || { warn "No entries to act on."; exit 0; }
+  if [[ ! -s "$OUT_PLAN" ]]; then
+    warn "No entries to act on."; exit 0
+  fi
   if [[ -n "$QUARANTINE" ]]; then
     info "Applying plan: MOVE to quarantine: $QUARANTINE"
     mkdir -p "$QUARANTINE"
@@ -288,6 +320,4 @@ if [[ "$MODE" == "apply" ]]; then
     done < "$OUT_PLAN"
   fi
   info "Done."
-else
-  info "Review the plan above. To apply: --mode apply --force [--quarantine DIR]"
 fi
