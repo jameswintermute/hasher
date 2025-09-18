@@ -2,7 +2,7 @@
 
 Robust hashing + duplicate discovery + safe cleanup tooling for NAS environments (Synology DSM friendly).
 
-> **Safety-first design:** everything is a *candidate at scan time* until re‑verified right before action. Deletions require an explicit `--force` and most flows support quarantine.
+> **Safety-first design:** everything is a *candidate at scan time* until re-verified right before action. Deletions require an explicit `--force` and most flows support quarantine.
 
 ---
 
@@ -27,7 +27,8 @@ nano local/paths.txt     # or use your editor of choice
 ./launcher.sh --foreground
 ```
 
-The launcher prints exactly what it runs and where to tail logs.
+The launcher prints exactly what it runs and where to tail logs.  
+**Tip:** In the launcher’s **Stage 2**, you’ll now see **“Find duplicate folders”** above **“Find duplicate files.”** Run the folder step first for the biggest, fastest wins.
 
 ---
 
@@ -48,6 +49,7 @@ This project helps protect NAS-stored data by:
 * Detecting mass corruption or file destruction (e.g., ransomware).
 * Supporting ingestion into SIEM tools (e.g., Splunk) for monitoring and alerting.
 * Identifying and managing duplicate files via hash comparison.
+* **Finding entire duplicate folders/trees** for bulk space recovery.
 * Detecting and cleaning up zero-length and other “low-value” files.
 
 ---
@@ -86,17 +88,65 @@ bin/hasher.sh --pathfile local/paths.txt --algo sha256 --nohup
 
 ---
 
-### 2) Find duplicate groups
+### 2) **Find duplicate folders (NEW — run this first)**
+Bulk wins by removing entire redundant directory trees (e.g., stale backups, duplicate ingest dumps).
+
+```bash
+bin/find-duplicate-folders.sh
+```
+
+**Outputs:**
+* `logs/YYYY-MM-DD-duplicate-folders.txt` – groups of folder paths that are content-identical
+
+> **How it works (high level):** builds a stable “fingerprint” of each folder based on the **relative paths + file sizes + file hashes** inside it. Two folders are considered duplicates only when the fingerprints match **exactly**. (Permissions/timestamps don’t matter; symlinks are ignored.)
+
+---
+
+### 3) Review duplicate folders and build a PLAN (no deletions here)
+
+```bash
+# Interactive (default), choose which folder to keep per group
+bin/review-duplicate-folders.sh --from-report "logs/2025-09-01-duplicate-folders.txt" --keep newest
+
+# Non-interactive (apply a policy to all groups)
+bin/review-duplicate-folders.sh --from-report "logs/2025-09-01-duplicate-folders.txt" --keep newest --non-interactive
+```
+
+**Outputs:**
+* `logs/review-dedupe-folders-plan-YYYY-MM-DD-<RUN_ID>.txt` – each line is a **directory** path to delete/quarantine
+
+---
+
+### 4) Act on the PLAN (duplicate folders)
+
+```bash
+# Dry-run (recommended)
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-folders-plan-*.txt | head -n1)"
+
+# Execute (delete)
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-folders-plan-*.txt | head -n1)" --force
+
+# Execute to quarantine instead of delete
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-folders-plan-*.txt | head -n1)" --force \
+  --quarantine "var/quarantine/$(date +%F)"
+```
+
+> The generic deleter accepts **files or directories** in a plan and will act accordingly. Quarantine moves whole trees safely.
+
+---
+
+### 5) Find duplicate files (remaining set)
 
 ```bash
 bin/find-duplicates.sh
 ```
+
 **Outputs:**
-* `logs/YYYY-MM-DD-duplicate-hashes.txt` – report for review
+* `logs/YYYY-MM-DD-duplicate-hashes.txt` – report for review (file-level groups)
 
 ---
 
-### 3) Review duplicates and build a PLAN (no deletions here)
+### 6) Review duplicate files and build a PLAN (no deletions here)
 
 ```bash
 # Interactive (default), prefer keeping the newest copy:
@@ -108,14 +158,14 @@ bin/review-duplicates.sh --from-report "logs/2025-08-30-duplicate-hashes.txt" --
 
 **What it does now:**
 * **Prefilters “low-value” groups** out of the UI per `LOW_VALUE_THRESHOLD_BYTES` in `hasher.conf`
-  (default `0`, i.e. only zero‑byte files). Those are written to:
+  (default `0`, i.e. only zero-byte files). Those are written to:
   `var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt`.
 * Builds a deletion plan for real space reclaim:
-  `logs/review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt` (each line is a path to delete).
+  `logs/review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt` (each line is a file path to delete).
 
 ---
 
-### 4) Act on the PLAN (duplicates)
+### 7) Act on the PLAN (duplicate files)
 
 ```bash
 # Dry-run (recommended)
@@ -125,12 +175,13 @@ bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | h
 bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)" --force
 
 # Execute to quarantine instead of delete
-bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)"   --force --quarantine "var/quarantine/$(date +%F)"
+bin/delete-duplicates.sh --from-plan "$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)" --force \
+  --quarantine "var/quarantine/$(date +%F)"
 ```
 
 ---
 
-### 5) Clean up zero-length files (verify → dry-run → execute)
+### 8) Clean up zero-length files (verify → dry-run → execute)
 
 ```bash
 # Verify current state and write a verified plan (no actions taken)
@@ -143,7 +194,8 @@ bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt"
 bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force
 
 # Execute to quarantine
-bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force   --quarantine "var/quarantine/$(date +%F)"
+bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force \
+  --quarantine "var/quarantine/$(date +%F)"
 ```
 
 **Extras:**
@@ -153,7 +205,7 @@ bin/delete-zero-length.sh "var/zero-length/zero-length-YYYY-MM-DD.txt" --force  
 
 ---
 
-### 6) Handle “low-value” candidates (tiny files)
+### 9) Handle “low-value” candidates (tiny files)
 
 `review-duplicates.sh` diverts tiny groups (≤ `LOW_VALUE_THRESHOLD_BYTES`) to a side list:
 
@@ -168,25 +220,41 @@ bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-
 bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --force
 
 # Execute to quarantine
-bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt"   --force --quarantine "var/quarantine/$(date +%F)"
+bin/delete-low-value.sh --from-list "var/low-value/low-value-candidates-YYYY-MM-DD-<RUN_ID>.txt" --force \
+  --quarantine "var/quarantine/$(date +%F)"
 ```
 
 **Threshold & Exclusions**
-* Threshold default is `0` (zero‑byte). Change via `hasher.conf` → `LOW_VALUE_THRESHOLD_BYTES` or CLI `--threshold-bytes`.
+* Threshold default is `0` (zero-byte). Change via `hasher.conf` → `LOW_VALUE_THRESHOLD_BYTES` or CLI `--threshold-bytes`.
 * Built-in excludes (case-insensitive): `Thumbs.db`, `.DS_Store`, `Desktop.ini`, and folders `#recycle`, `@eaDir`, `.snapshot`, `.AppleDouble`.
 * Add your own via `EXCLUDES_FILE` or `EXCLUDE_*` keys in `hasher.conf`, or CLI flags.
 
 ---
 
+## Why run **duplicate folders** before file review?
+
+Running the folder pass first is both **safer and faster**:
+
+* **Biggest space wins, minimal decisions.** One choice removes a whole duplicate tree (including sidecars like `.xmp`, `.srt`, `.json`) in one go.
+* **Massive noise reduction.** Removing duplicate trees collapses thousands of file-level duplicate groups you’d otherwise have to review manually.
+* **Consistency with sidecars.** Tree-level removal guarantees you don’t orphan sidecar files or leave empty directory skeletons.
+* **Faster review UI.** With redundant trees gone, the file-level review becomes smaller, quicker, and less error-prone.
+* **Lower risk.** The folder detector only marks **exact, content-identical** trees; it won’t collapse folders that merely “overlap.”
+* **Quarantine-friendly.** Moving an entire tree into quarantine is simpler and more reversible than acting on thousands of individual files.
+
+> Think of it as **bulk de-dup** first (folders), then **surgical tidy-up** (files).
+
+---
+
 ## Configuration (`hasher.conf`)
 
-We follow a Splunk‑style **default/local overlay**:
+We follow a Splunk-style **default/local overlay**:
 
 ```
 default/hasher.conf   # shipped defaults
 local/hasher.conf     # (optional) site overrides
 local/paths.txt       # directories to scan (one per line)
-local/excludes.txt    # one glob per line, case‑insensitive
+local/excludes.txt    # one glob per line, case-insensitive
 ```
 
 Minimal keys the cleanup/review helpers read:
@@ -205,7 +273,7 @@ EXCLUDES_FILE=local/excludes.txt
 #EXCLUDE_DIRS=#recycle,@eaDir,.snapshot,.AppleDouble
 ```
 
-> **Precedence:** CLI flags > `local/hasher.conf` > `default/hasher.conf` > `local/excludes.txt` > built‑ins.
+> **Precedence:** CLI flags > `local/hasher.conf` > `default/hasher.conf` > `local/excludes.txt` > built-ins.
 
 ---
 
@@ -214,6 +282,8 @@ EXCLUDES_FILE=local/excludes.txt
 ```
 ├── bin/
 │   ├── hasher.sh
+│   ├── find-duplicate-folders.sh
+│   ├── review-duplicate-folders.sh
 │   ├── find-duplicates.sh
 │   ├── review-duplicates.sh
 │   ├── delete-duplicates.sh
@@ -230,7 +300,9 @@ EXCLUDES_FILE=local/excludes.txt
 │   └── hasher-YYYY-MM-DD.csv
 ├── logs/
 │   ├── background.log
+│   ├── YYYY-MM-DD-duplicate-folders.txt
 │   ├── YYYY-MM-DD-duplicate-hashes.txt
+│   ├── review-dedupe-folders-plan-YYYY-MM-DD-<RUN_ID>.txt
 │   └── review-dedupe-plan-YYYY-MM-DD-<RUN_ID>.txt
 ├── var/
 │   ├── zero-length/
@@ -251,7 +323,7 @@ EXCLUDES_FILE=local/excludes.txt
 * **“Detected at scan time”**: counts are snapshots. Verify again before acting.
 * Scripts default to **verify** or **dry-run** modes.
 * **`--force`** is required for destructive actions.
-* **Quarantine** mode moves files instead of deleting, making it easy to roll back.
+* **Quarantine** mode moves files/folders instead of deleting, making it easy to roll back.
 
 ---
 
@@ -260,24 +332,22 @@ EXCLUDES_FILE=local/excludes.txt
 **All entries show as “missing” during verify**  
 Likely **CRLF** endings in your list file. Fix with:
 ```bash
-sed -i 's/
-$//' <listfile>
+sed -i 's/\r$//' <listfile>
 ```
-Readers trim `
-` automatically, but cleaning the file is good hygiene.
+Readers trim CRLF automatically, but cleaning the file is good hygiene.
 
 **Zero-byte groups appear in duplicate review UI**  
-This is now filtered out per `LOW_VALUE_THRESHOLD_BYTES`. Ensure your config is present (default `0` filters only zero‑byte).
+This is now filtered out per `LOW_VALUE_THRESHOLD_BYTES`. Ensure your config is present (default `0` filters only zero-byte).
 
 **Slow indexing with massive reports**  
-Reduce `--limit` during review or use `--non-interactive` with a keep policy (e.g., `--keep newest`).
+Run **duplicate folders** first to shrink the search space, then reduce `--limit` during file review or use `--non-interactive` with a keep policy (e.g., `--keep newest`).
 
 ---
 
 ## Best Practice on Synology
 
 * Prefer background mode to survive SSH disconnects (`./launcher.sh` does this by default).
-* Put the repo on the same volume you’re scanning to minimise cross‑volume I/O.
+* Put the repo on the same volume you’re scanning to minimise cross-volume I/O.
 * Keep `logs/` under version control ignore if they’re noisy.
 
 ---
