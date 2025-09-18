@@ -2,7 +2,6 @@
 # find-duplicate-folders.sh — detect duplicate folder trees by content (from hasher CSV)
 # Generates a review plan; can optionally apply it (delete or quarantine).
 # GPLv3
-
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
@@ -20,16 +19,6 @@ info() { printf "${c_green}[INFO]${c_reset} %b\n" "$*"; }
 warn() { printf "${c_yellow}[WARN]${c_reset} %b\n" "$*"; }
 err()  { printf "${c_red}[ERROR]${c_reset} %b\n" "$*"; }
 
-usage() {
-  cat <<'EOF'
-Usage: find-duplicate-folders.sh [--input CSV] [--mode plan|apply]
-                                 [--min-group-size N]
-                                 [--keep-strategy shortest-path|oldest|newest|first]
-                                 [--scope recursive|leaf]
-                                 [--quarantine DIR] [--force]
-EOF
-}
-
 # Defaults
 INPUT=""
 MODE="plan"
@@ -42,7 +31,14 @@ FORCE=false
 # Args
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
+    -h|--help) cat <<'EOF'
+Usage: find-duplicate-folders.sh [--input CSV] [--mode plan|apply]
+                                 [--min-group-size N]
+                                 [--keep-strategy shortest-path|oldest|newest|first]
+                                 [--scope recursive|leaf]
+                                 [--quarantine DIR] [--force]
+EOF
+      exit 0 ;;
     --input) INPUT="${2:-}"; shift 2 ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --min-group-size) MIN_GROUP="${2:-}"; shift 2 ;;
@@ -50,7 +46,7 @@ while [[ $# -gt 0 ]]; do
     --scope) SCOPE="${2:-}"; shift 2 ;;
     --quarantine) QUARANTINE="${2:-}"; shift 2 ;;
     --force) FORCE=true; shift ;;
-    *) err "Unknown arg: $1"; usage; exit 1 ;;
+    *) err "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
@@ -75,7 +71,7 @@ find_col() {
   local name="$1"; local idx=0; local IFS=,
   for col in $lchead; do
     idx=$((idx+1))
-    col=${col//"/}
+    col=${col//\"/}
     col="$(echo "$col" | xargs)"
     if [[ "$col" == "$name" ]]; then
       echo "$idx"; return 0
@@ -110,49 +106,51 @@ get_mtime() {
 }
 path_len() { printf "%s" "$1" | wc -c; }
 
-# Extract normalized rows hash,path,size? -> TMP_FILES
-TMP_FILES="$(mktemp)"; trap 'rm -f "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DUP_SIGS" "$BUF_FILE" 2>/dev/null || true' EXIT
-awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -F',' '
-  NR==1 && skip==1 { next }
-  {
-    h=$ch; p=$cp; s=(cs>0?$cs:"")
-    gsub(/"/,"",h); gsub(/"/,"",p); gsub(/"/,"",s)
-    sub(/^[ 	
-]+/,"",h); sub(/[ 	
-]+$/,"",h)
-    sub(/^[ 	
-]+/,"",p); sub(/[ 	
-]+$/,"",p)
-    sub(/^[ 	
-]+/,"",s); sub(/[ 	
-]+$/,"",s)
-    if (h!="" && p!="") print h "," p "," s
-  }
-' "$INPUT" > "$TMP_FILES"
+# Temp AWK programs to avoid shell quoting issues
+AWK1="$(mktemp)"; AWK2="$(mktemp)"
+trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DUP_SIGS" "$BUF_FILE" 2>/dev/null || true' EXIT
 
-# Build (dir, relpath, hash) entries for each ancestor (or just leaf) — POSIX awk friendly
-TMP_DIR_ENT="$(mktemp)"
-awk -F',' -v scope="$SCOPE" '
-  {
-    h=$1; p=$2
-    n=split(p, comp, "/")
-    start=1; if (comp[1]=="") start=2
-    end=n-1
-    if (end<start) next
-    if (scope=="leaf") {
-      i=end
+cat > "$AWK1" <<'AWK'
+NR==1 && skip==1 { next }
+{
+  h=$ch; p=$cp; s=(cs>0?$cs:"")
+  gsub(/"/,"",h); gsub(/"/,"",p); gsub(/"/,"",s)
+  sub(/^[[:space:]]+/,"",h); sub(/[[:space:]]+$/,"",h)
+  sub(/^[[:space:]]+/,"",p); sub(/[[:space:]]+$/,"",p)
+  sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s)
+  if (h!="" && p!="") print h "," p "," s
+}
+AWK
+
+cat > "$AWK2" <<'AWK'
+{
+  h=$1; p=$2
+  n=split(p, comp, "/")
+  start=1; if (comp[1]=="") start=2
+  end=n-1
+  if (end<start) next
+  if (scope=="leaf") {
+    i=end
+    dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
+    rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
+    print dir "," rel "," h
+  } else {
+    for (i=start; i<=end; i++) {
       dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
       rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
       print dir "," rel "," h
-    } else {
-      for (i=start; i<=end; i++) {
-        dir=""; for (k=start; k<=i; k++) { if (comp[k]=="") continue; dir = dir "/" comp[k] }
-        rel=""; for (k=i+1; k<=n; k++) { if (comp[k]=="") continue; rel = (rel=="" ? comp[k] : rel "/" comp[k]) }
-        print dir "," rel "," h
-      }
     }
   }
-' "$TMP_FILES" > "$TMP_DIR_ENT"
+}
+AWK
+
+# Extract normalized rows
+TMP_FILES="$(mktemp)"
+awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -F',' -f "$AWK1" "$INPUT" > "$TMP_FILES"
+
+# Build (dir,rel,hash)
+TMP_DIR_ENT="$(mktemp)"
+awk -F',' -v scope="$SCOPE" -f "$AWK2" "$TMP_FILES" > "$TMP_DIR_ENT"
 
 # Empty?
 if [[ ! -s "$TMP_DIR_ENT" ]]; then
