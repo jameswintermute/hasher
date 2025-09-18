@@ -318,13 +318,13 @@ fi
 
 # Final UX
 if [[ "$MODE" == "plan" ]]; then
-  if [[ "$group_no" -gt 0 ]]; then
+  if [[ "$group_no" -gt 0 ]] ; then
     info "Verified hashes, you have duplicate folders:"
     info "- Duplicate groups: $group_no"
     info "- Folders slated for deletion (plan items): $plan_dirs_count"
     if [[ "$SIZE_AVAILABLE" == true ]]; then
-      local src_label="CSV"
-      [[ "$SIZE_SOURCE" == "filesystem" ]] && src_label="filesystem metadata"
+      src_label="CSV"
+      if [[ "$SIZE_SOURCE" == "filesystem" ]]; then src_label="filesystem metadata"; fi
       info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes") (via $src_label)"
     else
       info "- Total potential duplicate disk space: unknown"
