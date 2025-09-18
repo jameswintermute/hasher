@@ -88,8 +88,12 @@ find_col() {
 COL_HASH="$(find_col hash)"
 COL_PATH="$(find_col path)"
 COL_SIZE="$(find_col size)"
+SIZE_SOURCE="csv"
 SIZE_AVAILABLE=true
-[[ -z "$COL_SIZE" ]] && SIZE_AVAILABLE=false
+if [[ -z "$COL_SIZE" ]]; then
+  SIZE_SOURCE="filesystem"
+  SIZE_AVAILABLE=false
+fi
 
 if [[ -z "$COL_HASH" || -z "$COL_PATH" ]]; then
   warn "Header detection failed; assuming two-column CSV: hash,path (no header)."
@@ -128,9 +132,21 @@ human_bytes() {
     }'
 }
 
+# Get file size from filesystem (metadata only). Returns 0 if missing or unsupported.
+get_size() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    if stat -c '%s' -- "$f" >/dev/null 2>&1; then stat -c '%s' -- "$f"
+    elif stat -f '%z' -- "$f" >/dev/null 2>&1; then stat -f '%z' -- "$f"
+    else echo 0; fi
+  else
+    echo 0
+  fi
+}
+
 # Temp AWK programs (BusyBox-safe)
 AWK1="$(mktemp)"; AWK2="$(mktemp)"
-trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DIR_SIZE" "$DUP_SIGS" "$BUF_FILE" "$TMP_GROUP" 2>/dev/null || true' EXIT
+trap 'rm -f "$AWK1" "$AWK2" "$TMP_FILES" "$TMP_FILES2" "$TMP_DIR_ENT" "$TMP_SORT" "$DIR_SIGS" "$DIR_SIZE" "$DUP_SIGS" "$BUF_FILE" "$TMP_GROUP" 2>/dev/null || true' EXIT
 
 # AWK1: normalize CSV to h,p,s (size defaults to 0 if absent)
 cat > "$AWK1" <<'AWK'
@@ -172,6 +188,18 @@ AWK
 # Extract normalized rows
 TMP_FILES="$(mktemp)"
 awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -F',' -f "$AWK1" "$INPUT" > "$TMP_FILES"
+
+# If CSV had no size, compute sizes from filesystem (metadata). This can be slow on first run.
+if [[ "$SIZE_SOURCE" == "filesystem" ]]; then
+  info "Computing file sizes from filesystem metadata (CSV had no size column)..."
+  TMP_FILES2="$(mktemp)"
+  while IFS=, read -r h p s; do
+    sz="$(get_size "$p")"
+    printf "%s,%s,%s\n" "$h" "$p" "${sz:-0}" >> "$TMP_FILES2"
+  done < "$TMP_FILES"
+  mv "$TMP_FILES2" "$TMP_FILES"
+  SIZE_AVAILABLE=true
+fi
 
 # Build (dir,rel,hash,size)
 TMP_DIR_ENT="$(mktemp)"
@@ -234,6 +262,7 @@ echo "signature,dir,file_count,total_bytes" > "$OUT_CSV"
   echo "Source CSV: $INPUT"
   echo "Scope: $SCOPE"
   echo "Signature: $SIGNATURE_MODE"
+  echo "Size source: $SIZE_SOURCE"
   echo
 } >> "$OUT_SUM"
 
@@ -294,9 +323,11 @@ if [[ "$MODE" == "plan" ]]; then
     info "- Duplicate groups: $group_no"
     info "- Folders slated for deletion (plan items): $plan_dirs_count"
     if [[ "$SIZE_AVAILABLE" == true ]]; then
-      info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes")"
+      local src_label="CSV"
+      [[ "$SIZE_SOURCE" == "filesystem" ]] && src_label="filesystem metadata"
+      info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes") (via $src_label)"
     else
-      info "- Total potential duplicate disk space: unknown (CSV had no size column)"
+      info "- Total potential duplicate disk space: unknown"
     fi
     info "Summary: $OUT_SUM"
     info "CSV:     $OUT_CSV"
