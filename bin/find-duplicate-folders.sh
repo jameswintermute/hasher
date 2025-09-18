@@ -68,9 +68,6 @@ INPUT="${INPUT:-$(pick_latest_csv)}"
 [[ -z "$INPUT" ]] && { err "No input CSV found in $HASHES_DIR and none provided."; exit 1; }
 [[ ! -f "$INPUT" ]] && { err "Input CSV not found: $INPUT"; exit 1; }
 
-info "Input: $INPUT"
-info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP_STRATEGY  | Signature: $SIGNATURE_MODE"
-
 # Header detection
 header="$(head -n1 "$INPUT")"
 lchead="$(printf "%s" "$header" | tr 'A-Z' 'a-z')"
@@ -91,12 +88,18 @@ find_col() {
 COL_HASH="$(find_col hash)"
 COL_PATH="$(find_col path)"
 COL_SIZE="$(find_col size)"
+SIZE_AVAILABLE=true
+[[ -z "$COL_SIZE" ]] && SIZE_AVAILABLE=false
+
 if [[ -z "$COL_HASH" || -z "$COL_PATH" ]]; then
   warn "Header detection failed; assuming two-column CSV: hash,path (no header)."
   COL_HASH=1; COL_PATH=2; SKIP_HEADER=0
 else
   SKIP_HEADER=1
 fi
+
+info "Input: $INPUT"
+info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP_STRATEGY  | Signature: $SIGNATURE_MODE"
 
 # Tools
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -113,9 +116,7 @@ get_mtime() {
   else echo 0; fi
 }
 path_len() { printf "%s" "$1" | wc -c; }
-
 human_bytes() {
-  # prints human-friendly size from bytes
   local b=${1:-0}
   awk -v b="$b" 'function p(n,u){printf("%.1f%s", n,u); exit}
     BEGIN{
@@ -179,11 +180,11 @@ awk -F',' -v scope="$SCOPE" -f "$AWK2" "$TMP_FILES" > "$TMP_DIR_ENT"
 # Empty?
 if [[ ! -s "$TMP_DIR_ENT" ]]; then
   info "Verified hashes: no files mapped to directories from $INPUT."
-  echo "signature,dir,file_count" > "$OUT_CSV"
+  echo "signature,dir,file_count,total_bytes" > "$OUT_CSV"
   : > "$OUT_SUM"; : > "$OUT_PLAN"
   info "Summary: $OUT_SUM"
   info "CSV:     $OUT_CSV"
-  info "Next: proceed to duplicate FILE checker."
+  info "Next: please proceed to the duplicate FILE checker."
   exit 0
 fi
 
@@ -223,61 +224,56 @@ fi
 DUP_SIGS="$(mktemp)"
 cut -d, -f1 "$DIR_SIGS" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$DUP_SIGS"
 
-# Prepare CSV output
+# Write CSV header
 echo "signature,dir,file_count,total_bytes" > "$OUT_CSV"
 
 # Grouping, summary, and plan
 : > "$OUT_SUM"; : > "$OUT_PLAN"
+{
+  echo "Duplicate Folders — generated $timestamp"
+  echo "Source CSV: $INPUT"
+  echo "Scope: $SCOPE"
+  echo "Signature: $SIGNATURE_MODE"
+  echo
+} >> "$OUT_SUM"
+
 group_no=0
 plan_dirs_bytes=0
 plan_dirs_count=0
 
 if [[ -s "$DUP_SIGS" ]]; then
   while IFS= read -r sig; do
-    # Collect lines for this signature
     TMP_GROUP="$(mktemp)"
     grep "^$sig," "$DIR_SIGS" | sort -t, -k2,2 > "$TMP_GROUP"
 
-    # Determine keeper
+    # Choose keeper
     keep=""; keep_metric=""
     while IFS=, read -r _ d c; do
       case "$KEEP_STRATEGY" in
         shortest-path)
           metric=$(path_len "$d")
-          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
-          ;;
+          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi ;;
         oldest)
           metric=$(get_mtime "$d")
-          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
-          ;;
+          if [[ -z "$keep" || "$metric" -lt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi ;;
         newest)
           metric=$(get_mtime "$d")
-          if [[ -z "$keep" || "$metric" -gt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi
-          ;;
-        first|*)
-          keep="${keep:-$d}"
-          keep_metric=0
-          ;;
+          if [[ -z "$keep" || "$metric" -gt "$keep_metric" ]]; then keep="$d"; keep_metric="$metric"; fi ;;
+        first|*) keep="${keep:-$d}"; keep_metric=0 ;;
       esac
     done < "$TMP_GROUP"
 
-    # Now emit summary lines and plan entries
-    lines_in_group=0
     echo "─ Group #$((++group_no)) — signature: $sig" >> "$OUT_SUM"
     while IFS=, read -r _ d c; do
-      # lookup dir size and file count
       size_line="$(awk -F, -v dd="$d" '$1==dd{print $2","$3; exit}' "$DIR_SIZE")"
       dir_bytes="${size_line%%,*}"; dir_files="${size_line##*,}"
       printf "   - %s  (files: %s, size: %s)\n" "$d" "${dir_files:-$c}" "$(human_bytes "${dir_bytes:-0}")" >> "$OUT_SUM"
-      # write CSV row
       printf "%s,%s,%s,%s\n" "$sig" "$d" "${dir_files:-$c}" "${dir_bytes:-0}" >> "$OUT_CSV"
-      # plan: everything except keeper
       if [[ "$d" != "$keep" ]]; then
         echo "$d" >> "$OUT_PLAN"
         plan_dirs_count=$((plan_dirs_count+1))
         plan_dirs_bytes=$((plan_dirs_bytes + ${dir_bytes:-0}))
       fi
-      lines_in_group=$((lines_in_group+1))
     done < "$TMP_GROUP"
     echo "   → keep: $keep" >> "$OUT_SUM"
     echo >> "$OUT_SUM"
@@ -297,7 +293,11 @@ if [[ "$MODE" == "plan" ]]; then
     info "Verified hashes, you have duplicate folders:"
     info "- Duplicate groups: $group_no"
     info "- Folders slated for deletion (plan items): $plan_dirs_count"
-    info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes")"
+    if [[ "$SIZE_AVAILABLE" == true ]]; then
+      info "- Total potential duplicate disk space: $(human_bytes "$plan_dirs_bytes")"
+    else
+      info "- Total potential duplicate disk space: unknown (CSV had no size column)"
+    fi
     info "Summary: $OUT_SUM"
     info "CSV:     $OUT_CSV"
     info "Plan:    ${VAR_DIR}/latest-folder-plan.txt"
