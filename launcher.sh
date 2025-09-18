@@ -102,14 +102,85 @@ act_start_hashing_advanced() {
 act_find_duplicate_folders() {
   local script="$BIN_DIR/find-duplicate-folders.sh"
   require "$script"
-  local base="$(latest_hashes_csv)"
+
+  local base
+  base="$(latest_hashes_csv)"
   if [[ -z "$base" ]]; then
     warn "No hasher CSV found in $HASHES_DIR. Run Stage 1 first."
     press_any; return
   fi
   info "Using hashes file: $base"
-  "$script" --input "$base" | tee -a "$LOGS_DIR/find-duplicate-folders.log"
-  press_any
+
+  # Force bash (avoid BusyBox /bin/sh quirks) + log
+  bash "$script" --input "$base" | tee -a "$LOGS_DIR/find-duplicate-folders.log"
+
+  # Post-run guidance
+  local SUM PLAN
+  SUM="$(ls -1t "$LOGS_DIR"/duplicate-folders-*.txt 2>/dev/null | head -n1 || true)"
+  PLAN="$ROOT_DIR/var/duplicates/latest-folder-plan.txt"
+
+  echo
+  if [[ -n "$SUM" && -f "$SUM" ]]; then
+    info "Summary: $SUM"
+    sed -n '1,60p' "$SUM" || true
+  else
+    warn "No summary file produced."
+  fi
+
+  if [[ ! -s "$PLAN" ]]; then
+    echo
+    info "Verified hashes, zero duplicate folders. Please proceed to the duplicate FILE checker."
+    press_any
+    return
+  fi
+
+  # Read scope/signature used (so we can re-run consistently in Bulk action)
+  local scope sig
+  scope="$(awk -F': ' '/^Scope:/{print $2}' "$SUM" | head -n1)"
+  sig="$(awk   -F': ' '/^Signature:/{print $2}' "$SUM" | head -n1)"
+  scope=${scope:-recursive}
+  sig=${sig:-name+content}
+
+  # Interactive post-run menu
+  while :; do
+    echo
+    echo "What would you like to do?"
+    echo "  r) Review the duplicates (open summary)"
+    echo "  b) Bulk delete (DANGER): keep newest copy -> quarantine"
+    echo "  q) Quit back to main menu"
+    read -rp "Choose [r/b/q]: " choice
+    case "$choice" in
+      r|R)
+        if command -v less >/dev/null 2>&1; then
+          less -N "$SUM"
+        else
+          sed -n '1,200p' "$SUM"
+          echo
+          read -rp "Press ENTER to return..." _
+        fi
+        ;;
+      b|B)
+        echo "This will MOVE duplicates (except the newest) to a quarantine folder."
+        read -rp "Type 'DELETE' to confirm: " conf
+        if [[ "$conf" != "DELETE" ]]; then
+          echo "Cancelled."
+          continue
+        fi
+        local qdir="var/quarantine/$(date +%F)"
+        bash "$script" \
+          --input "$base" \
+          --mode apply --force --quarantine "$qdir" \
+          --keep-strategy newest \
+          --scope "$scope" --signature "$sig" \
+          | tee -a "$LOGS_DIR/find-duplicate-folders.log"
+        echo "Bulk delete complete. Quarantine: $qdir"
+        press_any
+        break
+        ;;
+      q|Q) break ;;
+      *) echo "Invalid choice."; ;;
+    esac
+  done
 }
 
 act_find_duplicate_files() {
