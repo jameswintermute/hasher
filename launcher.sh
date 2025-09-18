@@ -23,7 +23,7 @@ require() {
   local p="$1"
   if [[ ! -x "$p" ]]; then
     if [[ -f "$p" ]]; then
-      warn "Making executable: $p"; chmod +x "$p" || true
+      chmod +x "$p" || true
     fi
   fi
   [[ -x "$p" ]] || { err "Missing or not executable: $p"; return 1; }
@@ -88,7 +88,6 @@ act_start_hashing() {
   local sh="$BIN_DIR/hasher.sh"
   require "$sh" || { press_any; return; }
   info "Using hashes dir: $HASHES_DIR"
-  # Runs with NAS-safe defaults (script controls flags)
   bash "$sh" || warn "Hasher exited non-zero."
   press_any
 }
@@ -131,13 +130,6 @@ act_find_duplicate_folders() {
     press_any; return
   fi
 
-  # Parse scope/signature to re-use for bulk
-  local scope sig
-  scope="$(awk -F': ' '/^Scope:/{print $2}' "$SUM" | head -n1)"
-  sig="$(awk   -F': ' '/^Signature:/{print $2}' "$SUM" | head -n1)"
-  scope=${scope:-recursive}
-  sig=${sig:-name+content}
-
   while :; do
     echo
     echo "What would you like to do?"
@@ -160,7 +152,7 @@ act_find_duplicate_folders() {
         local qdir="$APP_HOME/var/quarantine/$(date +%F)"
         bash "$script" \
           --input "$base" --mode apply --force --quarantine "$qdir" \
-          --keep-strategy newest --scope "$scope" --signature "$sig" \
+          --keep-strategy newest --scope recursive --signature name+content \
           | tee -a "$LOGS_DIR/find-duplicate-folders.log"
         info "Bulk move complete. Quarantine: $qdir"
         press_any; break
