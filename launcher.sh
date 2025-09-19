@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# launcher.sh — menu launcher for Hasher & Dedupe toolkit (heredoc-free, BusyBox-safe)
+# launcher.sh — menu launcher for Hasher & Dedupe toolkit (robust hasher discovery, BusyBox-safe)
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
@@ -19,7 +19,7 @@ BACKGROUND_LOG="$LOGS_DIR/background.log"
 _header() {
   printf "\n _   _           _               \n"
   printf "| | | | __ _ ___| |__   ___ _ __ \n"
-  printf "| |_| |/ _\` / __| '_ \\ / _ \\ '__|\n"
+  printf "| |_| |/ _\\` / __| '_ \\ / _ \\ '__|\n"
   printf "|  _  | (_| \\__ \\ | | |  __/ |   \n"
   printf "|_| |_|\\__,_|___/_| |_|\\___|_|   \n\n"
   printf "      NAS File Hasher & Dedupe\n\n"
@@ -86,6 +86,50 @@ latest_hashes_csv() {
 
 pause() { read -r -p "Press Enter to continue... " _ || true; }
 
+# --- Robust hasher discovery ---
+find_hasher_script() {
+  # Candidate paths in priority order
+  local candidates=(
+    "$ROOT_DIR/hasher.sh"
+    "$BIN_DIR/hasher.sh"
+    "$ROOT_DIR/scripts/hasher.sh"
+    "$ROOT_DIR/tools/hasher.sh"
+  )
+  local x
+  for x in "${candidates[@]}"; do
+    [ -f "$x" ] && { echo "$x"; return 0; }
+  done
+  # Fallback: any script matching *hasher*.sh under repo (depth 2)
+  x="$(find "$ROOT_DIR" -maxdepth 2 -type f -name '*hasher*.sh' 2>/dev/null | head -n1 || true)"
+  [ -n "$x" ] && { echo "$x"; return 0; }
+  return 1
+}
+
+run_hasher_nohup() {
+  local script="$1"
+  local runner=""
+  if [ -x "$script" ]; then
+    runner="$script"
+  else
+    runner="sh \"$script\""
+  fi
+  echo "[INFO] Starting hasher: $script (nohup to $BACKGROUND_LOG)"
+  nohup sh -c "$runner --nohup" >>"$BACKGROUND_LOG" 2>&1 &
+  echo "[OK] Hasher launched."
+}
+
+run_hasher_interactive() {
+  local script="$1"
+  local runner=""
+  if [ -x "$script" ]; then
+    runner="$script"
+  else
+    runner="sh \"$script\""
+  fi
+  echo "[INFO] Running hasher interactively: $script"
+  eval "$runner"
+}
+
 # Actions
 action_check_status() {
   echo "[INFO] Background log: $BACKGROUND_LOG"
@@ -94,20 +138,26 @@ action_check_status() {
 }
 
 action_start_hashing() {
-  if [ -x "$ROOT_DIR/hasher.sh" ]; then
-    echo "[INFO] Starting hasher with NAS-safe defaults (nohup)…"
-    "$ROOT_DIR/hasher.sh" --nohup || true
+  local hs
+  if hs="$(find_hasher_script)"; then
+    run_hasher_nohup "$hs" || true
   else
-    echo "[ERROR] hasher.sh not found or not executable."
+    echo "[ERROR] hasher.sh not found. Expected at one of:"
+    echo "  - $ROOT_DIR/hasher.sh"
+    echo "  - $BIN_DIR/hasher.sh"
+    echo "  - $ROOT_DIR/scripts/hasher.sh"
+    echo "  - $ROOT_DIR/tools/hasher.sh"
+    echo "  - or any *hasher*.sh within repo root"
   fi
   pause
 }
 
 action_custom_hashing() {
-  if [ -x "$ROOT_DIR/hasher.sh" ]; then
-    "$ROOT_DIR/hasher.sh" || true
+  local hs
+  if hs="$(find_hasher_script)"; then
+    run_hasher_interactive "$hs" || true
   else
-    echo "[ERROR] hasher.sh not found or not executable."
+    echo "[ERROR] hasher.sh not found. See option 1 notes."
   fi
   pause
 }
@@ -204,7 +254,6 @@ action_clean_caches() {
 }
 
 action_delete_junk() {
-  # Prefer a curated paths file; this keeps scope explicit & safe
   local paths=""
   if   [ -f "$LOCAL_DIR/paths.txt" ]; then paths="$LOCAL_DIR/paths.txt"
   elif [ -f "$ROOT_DIR/paths.txt" ]; then paths="$ROOT_DIR/paths.txt"
@@ -225,14 +274,11 @@ action_delete_junk() {
   case "${mode,,}" in
     q|quarantine)
       local qdir ts dest
-      qdir="$(resolve_quarantine_dir)"
-      ts="$(date +%F-%H%M%S)"
-      dest="$qdir/junk-$ts"
+      qdir="$(resolve_quarantine_dir)"; ts="$(date +%F-%H%M%S)"; dest="$qdir/junk-$ts"
       args+=(--quarantine "$dest")
       ;;
     f|force) args+=(--force);;
     *)       args+=(--verify-only);;
-  
   esac
 
   if [ -x "$BIN_DIR/delete-junk.sh" ]; then
