@@ -267,4 +267,13 @@
     fi
 
     info "TIP: Next, run option 6 in the launcher to apply the folder plan (move directories to quarantine)."
+# EMPTY_PLAN_CHECK
+if [ -s "$PLAN_FILE" ]; then
+  PLINES="$(wc -l < "$PLAN_FILE" | tr -d ' ')" || PLINES=0
+else
+  PLINES=0
+fi
+if [ "${PLINES:-0}" -eq 0 ]; then
+  ok "No folders to quarantine at this time. For next steps: try option 3 (duplicate files) or option 5 (delete zero-length files)."
+fi
     exit 0
