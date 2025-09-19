@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# launcher.sh — menu launcher for Hasher & Dedupe toolkit (heredoc-free, backticks escaped)
+# launcher.sh — menu launcher for Hasher & Dedupe toolkit (heredoc-free, BusyBox-safe)
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
@@ -37,7 +37,8 @@ print_menu() {
   printf "  4) Review duplicates (interactive)\n"
   printf "  5) Delete zero-length files\n"
   printf "  6) Delete duplicates (apply plan)\n"
-  printf "  10) Clean cache files & @eaDir (safe)\n\n"
+  printf "  10) Clean cache files & @eaDir (safe)\n"
+  printf "  11) Delete junk (Thumbs.db, .DS_Store, @eaDir, etc.)\n\n"
   printf "### Other ###\n"
   printf "  7) System check (deps & readiness)\n"
   printf "  9) View logs (tail background.log)\n\n"
@@ -53,11 +54,11 @@ resolve_quarantine_dir() {
     raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$DEFAULT_DIR/hasher.conf" | tail -n1 || true)"
   fi
   local val
-  val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
+  val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\\x27]//; s/[\"\\x27]$//')"
   if [ -z "$val" ]; then
     val="$ROOT_DIR/quarantine-$(date +%F)"
   else
-    val="${val//\$\(date +%F\)/$(date +%F)}"
+    val="${val//\$\((date +%F)\)/$(date +%F)}"
     val="${val//\$(date +%F)/$(date +%F)}"
   fi
   printf '%s\n' "$val"
@@ -202,6 +203,45 @@ action_clean_caches() {
   pause
 }
 
+action_delete_junk() {
+  # Prefer a curated paths file; this keeps scope explicit & safe
+  local paths=""
+  if   [ -f "$LOCAL_DIR/paths.txt" ]; then paths="$LOCAL_DIR/paths.txt"
+  elif [ -f "$ROOT_DIR/paths.txt" ]; then paths="$ROOT_DIR/paths.txt"
+  elif [ -f "$DEFAULT_DIR/paths.example.txt" ]; then paths="$DEFAULT_DIR/paths.example.txt"
+  fi
+  if [ -z "$paths" ]; then
+    echo "[ERROR] No paths file found (local/paths.txt or ./paths.txt). Create one to use 'Delete junk'."
+    pause; return
+  fi
+
+  echo "[INFO] Using paths file: $paths"
+  read -r -p "Include recycle bins (#recycle)? [y/N]: " inc || inc=""
+  read -r -p "Mode: verify only (v), quarantine (q), force delete (f) [v/q/f]: " mode || mode="v"
+
+  local args=(--paths-file "$paths")
+  case "${inc,,}" in y|yes) args+=(--include-recycle);; esac
+
+  case "${mode,,}" in
+    q|quarantine)
+      local qdir ts dest
+      qdir="$(resolve_quarantine_dir)"
+      ts="$(date +%F-%H%M%S)"
+      dest="$qdir/junk-$ts"
+      args+=(--quarantine "$dest")
+      ;;
+    f|force) args+=(--force);;
+    *)       args+=(--verify-only);;
+  
+  esac
+
+  if [ -x "$BIN_DIR/delete-junk.sh" ]; then
+    "$BIN_DIR/delete-junk.sh" "${args[@]}" || true
+  else
+    echo "[ERROR] $BIN_DIR/delete-junk.sh not found or not executable."
+  fi
+  pause
+}
 
 action_system_check() {
   echo "[INFO] System check:"
@@ -244,6 +284,7 @@ while :; do
     5) action_delete_zero_length ;;
     6) action_apply_plan ;;
     10) action_clean_caches ;;
+    11) action_delete_junk ;;
     7) action_system_check ;;
     9) action_view_logs ;;
     q|Q) echo "Bye."; exit 0 ;;
