@@ -1,11 +1,12 @@
 \
     #!/usr/bin/env bash
     # find-duplicate-folders.sh — folder-level dedupe using CSV size_bytes (fast path)
-    # Updates:
-    #  • Early quarantine explainer (reads QUARANTINE_DIR from hasher.conf like launcher)
-    #  • Progress indicator while indexing CSV rows
-    #  • Progress indicator while computing recursive du size
-    #  • BusyBox/Bash safe (no heredocs, no process substitution)
+    # Additions:
+    #  • TTY color (no dependencies)
+    #  • Spinner while sorting
+    #  • CSV indexing % progress
+    #  • du-based recursive size estimate with progress
+    #  • TIP to proceed to option 6
     set -Eeuo pipefail
     IFS=$'\n\t'; LC_ALL=C
 
@@ -22,6 +23,21 @@
 
     TMP_GROUP=""
     plan_dirs_bytes=0
+
+    # ── Colors (TTY only) ────────────────────────────────────────────────
+    init_colors() {
+      if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+        CINFO="\033[1;34m"; CWORK="\033[1;36m"; COK="\033[1;32m"; CWARN="\033[1;33m"; CERR="\033[1;31m"; CRESET="\033[0m"
+      else
+        CINFO=""; CWORK=""; COK=""; CWARN=""; CERR=""; CRESET=""
+      fi
+    }
+    info(){ printf "%b[INFO]%b %s\n" "$CINFO" "$CRESET" "$*"; }
+    work(){ printf "%b[WORK]%b %s\n" "$CWORK" "$CRESET" "$*"; }
+    ok(){   printf "%b[OK]%b %s\n"   "$COK"   "$CRESET" "$*"; }
+    warn(){ printf "%b[WARN]%b %s\n" "$CWARN" "$CRESET" "$*"; }
+    err(){  printf "%b[ERROR]%b %s\n" "$CERR" "$CRESET" "$*"; }
+    init_colors
 
     usage() {
       printf "%s\n" \
@@ -44,16 +60,16 @@
         -k|--keep)            KEEP_POLICY="${2:-}"; shift 2;;
         -s|--scope)           SCOPE="${2:-}"; shift 2;;
         -h|--help)            usage; exit 0;;
-        *) echo "[ERROR] Unknown arg: $1"; usage; exit 2;;
+        *) err "Unknown arg: $1"; usage; exit 2;;
       esac
     done
 
     if [ -z "${INPUT:-}" ] || [ ! -f "$INPUT" ]; then
-      echo "[ERROR] --input FILE is required and must exist." >&2
+      err "--input FILE is required and must exist."
       exit 2
     fi
 
-    # ── Resolve QUARANTINE_DIR exactly like launcher ──────────────────────
+    # ── Quarantine explainer ─────────────────────────────────────────────
     resolve_quarantine_dir() {
       local raw=""
       if [ -f "$ROOT_DIR/local/hasher.conf" ]; then
@@ -72,11 +88,10 @@
       fi
       printf '%s\n' "$val"
     }
-
     qdir="$(resolve_quarantine_dir)"
     mkdir -p -- "$qdir" 2>/dev/null || true
     dfh="$(df -h "$qdir" | awk 'NR==2{print $4" free on "$1" ("$6")"}')"
-    echo "[INFO] Quarantine: $qdir — $dfh"
+    info "Quarantine: $qdir — $dfh"
 
     # ── Delimiter & required columns ──────────────────────────────────────
     header="$(head -n1 -- "$INPUT" || true)"
@@ -97,18 +112,18 @@
     COL_SIZE="$(get_col_idx "size_bytes" "$header" "$DELIM")"
     COL_HASH="$(get_col_idx "hash" "$header" "$DELIM")"
     if [ -z "${COL_PATH:-}" ] || [ -z "${COL_HASH:-}" ]; then
-      echo "[ERROR] Input missing required columns: path, hash." >&2
+      err "Input missing required columns: path, hash."
       exit 2
     fi
     HAVE_SIZE_COL=0; [ -n "${COL_SIZE:-}" ] && HAVE_SIZE_COL=1
 
-    echo "[INFO] Using hashes file: $INPUT"
-    echo "[INFO] Input: $INPUT"
-    echo "[INFO] Mode: $MODE  | Min group size: $MIN_GROUP_SIZE  | Scope: $SCOPE  | Keep: $KEEP_POLICY  | Signature: $SIGNATURE"
+    info "Using hashes file: $INPUT"
+    info "Input: $INPUT"
+    info "Mode: $MODE  | Min group size: $MIN_GROUP_SIZE  | Scope: $SCOPE  | Keep: $KEEP_POLICY  | Signature: $SIGNATURE"
     if [ "$HAVE_SIZE_COL" -eq 1 ]; then
-      echo "[INFO] Using size_bytes from CSV/TSV (fast path)."
+      info "Using size_bytes from CSV/TSV (fast path)."
     else
-      echo "[INFO] CSV had no size_bytes; falling back to filesystem stat (slower)."
+      info "CSV had no size_bytes; falling back to filesystem stat (slower)."
     fi
 
     # ── Temp files ────────────────────────────────────────────────────────
@@ -161,8 +176,21 @@
       ' "$INPUT" > "$TMP_DIRMAP"
     fi
 
-    echo "[INFO] Sorting index…" >&2
-    sort -t$'\t' -k1,1 -k2,2 -k3,3 -- "$TMP_DIRMAP" > "$TMP_DIRSORT"
+    # ── Spinner while sorting ─────────────────────────────────────────────
+    work "Sorting index…"
+    ( LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k3,3 -- "$TMP_DIRMAP" > "$TMP_DIRSORT" ) &
+    SORT_PID=$!
+    if [ -t 2 ]; then
+      spin='|/-\\'; i=0
+      while kill -0 "$SORT_PID" 2>/dev/null; do
+        i=$(( (i+1) % 4 ))
+        printf "\\r[WORK] sorting %s" "${spin:$i:1}" >&2
+        sleep 0.2
+      done
+      printf "\\r" >&2
+    fi
+    wait "$SORT_PID"
+    ok "Sorting complete."
 
     # ── Collapse per directory ────────────────────────────────────────────
     : > "$TMP_SIGS"
@@ -199,9 +227,9 @@
     }
 
     if [ -s "$PLAN_FILE" ]; then
-      echo "[OK] Plan created: $PLAN_FILE"
+      ok "Plan created: $PLAN_FILE"
     else
-      echo "[OK] No duplicate folder groups (>= $MIN_GROUP_SIZE). No plan created."
+      ok "No duplicate folder groups (>= $MIN_GROUP_SIZE). No plan created."
       rm -f -- "$PLAN_FILE" 2>/dev/null || true
       exit 0
     fi
@@ -214,7 +242,7 @@
         [ -z "$d" ] && continue
         idx=$((idx+1))
         if [ $((idx % 5)) -eq 0 ] || [ "$idx" -eq "$PLAN_DIRS_TOTAL" ]; then
-          echo "[WORK] sizing plan ($idx/$PLAN_DIRS_TOTAL)" >&2
+          work "sizing plan ($idx/$PLAN_DIRS_TOTAL)"
         fi
         kb="$(du -sk -- "$d" 2>/dev/null | awk 'NR==1{print $1}')"
         if ! [[ "$kb" =~ ^[0-9]+$ ]]; then
@@ -234,10 +262,9 @@
       q_fs="$(df -Pk "$qdir" | awk 'NR==2{print $1}')"
       bytes_for_check="${du_bytes:-$plan_dirs_bytes}"
       if [ "$src_fs" != "$q_fs" ] && [ "${bytes_for_check:-0}" -gt "${free_bytes:-0}" ]; then
-        echo "[WARN] Plan size exceeds free space on quarantine filesystem for a cross-filesystem move."
-        echo "       Set QUARANTINE_DIR to the same filesystem as sources, or reduce the plan."
+        warn "Plan size may exceed free space on quarantine filesystem for a cross-filesystem move."
       fi
     fi
 
-    echo "[TIP] Next: choose option 6 in the launcher to apply the folder plan (move directories to quarantine)."
+    info "TIP: Next, run option 6 in the launcher to apply the folder plan (move directories to quarantine)."
     exit 0
