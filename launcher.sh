@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# launcher.sh — menu launcher for Hasher & Dedupe toolkit (heredoc-free)
+# launcher.sh — menu launcher for Hasher & Dedupe toolkit (heredoc-free, backticks escaped)
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
@@ -19,7 +19,7 @@ BACKGROUND_LOG="$LOGS_DIR/background.log"
 _header() {
   printf "\n _   _           _               \n"
   printf "| | | | __ _ ___| |__   ___ _ __ \n"
-  printf "| |_| |/ _` / __| '_ \\ / _ \\ '__|\n"
+  printf "| |_| |/ _\` / __| '_ \\ / _ \\ '__|\n"
   printf "|  _  | (_| \\__ \\ | | |  __/ |   \n"
   printf "|_| |_|\\__,_|___/_| |_|\\___|_|   \n\n"
   printf "      NAS File Hasher & Dedupe\n\n"
@@ -119,7 +119,7 @@ action_find_duplicate_folders() {
   fi
   echo "[INFO] Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true
+    "$BIN_DIR/find-uplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true
   else
     echo "[ERROR] $BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
