@@ -1,48 +1,40 @@
 \
-    #!/usr/bin/env bash
-    # launcher.sh — menu launcher for Hasher & Dedupe toolkit
-    # BusyBox-safe: no process substitution; explicit </dev/null on nohup.
-    set -Eeuo pipefail
-    IFS=$'\n\t'; LC_ALL=C
+    #!/bin/sh
+    # Minimal BusyBox-safe launcher for Hasher — correctly passes --pathfile/--exclude.
+    # No arrays, no bashisms, nohup with </dev/null, no eval, no process substitution.
+    set -eu
 
-    ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
     cd "$ROOT_DIR"
 
-    LOGS_DIR="$ROOT_DIR/logs"
-    HASHES_DIR="$ROOT_DIR/hashes"
+    LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
+    HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
     BIN_DIR="$ROOT_DIR/bin"
-    VAR_DIR="$ROOT_DIR/var"
     LOCAL_DIR="$ROOT_DIR/local"
-    DEFAULT_DIR="$ROOT_DIR/default"
-
-    mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$BIN_DIR" "$VAR_DIR" "$LOCAL_DIR"
     BACKGROUND_LOG="$LOGS_DIR/background.log"
 
-    # Colors
-    init_colors() {
-      if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
-        CHEAD="\033[1;35m"; CINFO="\033[1;34m"; COK="\033[1;32m"; CWARN="\033[1;33m"; CERR="\033[1;31m"; CRESET="\033[0m"
-      else CHEAD=""; CINFO=""; COK=""; CWARN=""; CERR=""; CRESET=""; fi
-    }
-    info(){ printf "%b[INFO]%b %s\n" "$CINFO" "$CRESET" "$*"; }
-    ok(){   printf "%b[OK]%b %s\n"   "$COK"   "$CRESET" "$*"; }
-    warn(){ printf "%b[WARN]%b %s\n" "$CWARN" "$CRESET" "$*"; }
-    err(){  printf "%b[ERROR]%b %s\n" "$CERR" "$CRESET" "$*"; }
-    init_colors
+    # Colors (only if stdout is a TTY)
+    if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+      CHEAD="$(printf '\033[1;35m')" ; CINFO="$(printf '\033[1;34m')" ; COK="$(printf '\033[1;32m')" ; CWARN="$(printf '\033[1;33m')" ; CERR="$(printf '\033[1;31m')" ; CRESET="$(printf '\033[0m')"
+    else
+      CHEAD=""; CINFO=""; COK=""; CWARN=""; CERR=""; CRESET=""
+    fi
 
-    pause(){ read -r -p "Press Enter to continue... " _ || true; }
+    info(){ printf "%s[INFO]%s %s\n" "$CINFO" "$CRESET" "$*"; }
+    ok(){   printf "%s[OK]%s %s\n"   "$COK"   "$CRESET" "$*"; }
+    warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$CRESET" "$*"; }
+    err(){  printf "%s[ERROR]%s %s\n" "$CERR"  "$CRESET" "$*"; }
 
-    _header() {
-      printf "%b" "$CHEAD"
+    header() {
+      printf "%s" "$CHEAD"
       printf "%s\n" " _   _           _               "
       printf "%s\n" "| | | | __ _ ___| |__   ___ _ __ "
-      printf "%s\n" "| |_| |/ _' / __| '_ \\ / _ \\ '__|"
-      printf "%s\n" "|  _  | (_| \\__ \\ | | |  __/ |   "
-      printf "%s\n" "|_| |_|\\__,_|___/_| |_|\\___|_|   "
-      printf "%s\n" ""
-      printf "%s\n" "      NAS File Hasher & Dedupe"
-      printf "%b" "$CRESET"
-      printf "%s\n" ""
+      printf "%s\n" "| |_| |/ _' / __| '_ \ / _ \ '__|"
+      printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
+      printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
+      printf "\n%s\n" "      NAS File Hasher & Dedupe"
+      printf "%s" "$CRESET"
+      printf "\n"
     }
 
     print_menu() {
@@ -50,72 +42,69 @@
       printf "%s\n" "  0) Check hashing status"
       printf "%s\n" "  1) Start Hashing (NAS-safe defaults)"
       printf "%s\n" "  8) Advanced / Custom hashing"
-      printf "%s\n" ""
+      printf "\n"
       printf "%s\n" "### Stage 2 - Identify ###"
       printf "%s\n" "  2) Find duplicate folders"
       printf "%s\n" "  3) Find duplicate files"
-      printf "%s\n" ""
+      printf "\n"
       printf "%s\n" "### Stage 3 - Clean up ###"
       printf "%s\n" "  4) Review duplicates (interactive)"
       printf "%s\n" "  5) Delete zero-length files"
       printf "%s\n" "  6) Delete duplicates (apply plan)"
       printf "%s\n" "  10) Clean cache files & @eaDir (safe)"
       printf "%s\n" "  11) Delete junk (Thumbs.db, .DS_Store, @eaDir, etc.)"
-      printf "%s\n" ""
+      printf "\n"
       printf "%s\n" "### Other ###"
       printf "%s\n" "  7) System check (deps & readiness)"
       printf "%s\n" "  9) View logs (tail background.log)"
-      printf "%s\n" ""
+      printf "\n"
       printf "%s\n" "  q) Quit"
-      printf "%s\n" ""
+      printf "\n"
     }
 
     latest_hashes_csv() {
-      local f
+      # shellcheck disable=SC2012
       f="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
-      [ -n "$f" ] && echo "$f" || echo ""
+      [ -n "${f:-}" ] && printf "%s" "$f" || printf ""
     }
 
     determine_paths_file() {
-      if   [ -s "$LOCAL_DIR/paths.txt" ]; then echo "$LOCAL_DIR/paths.txt"
-      elif [ -s "$ROOT_DIR/paths.txt" ]; then echo "$ROOT_DIR/paths.txt"
-      else echo ""; fi
-    }
-    determine_excludes_file() {
-      if [ -s "$LOCAL_DIR/excludes.txt" ]; then echo "$LOCAL_DIR/excludes.txt"; else echo ""; fi
+      if [ -s "$LOCAL_DIR/paths.txt" ]; then printf "%s" "$LOCAL_DIR/paths.txt"; return; fi
+      if [ -s "$ROOT_DIR/paths.txt" ]; then printf "%s" "$ROOT_DIR/paths.txt"; return; fi
+      printf ""
     }
 
-    # Quick sample (lower bound)
+    determine_excludes_file() {
+      if [ -s "$LOCAL_DIR/excludes.txt" ]; then printf "%s" "$LOCAL_DIR/excludes.txt"; return; fi
+      printf ""
+    }
+
     sample_files_quick() {
-      local paths="$1"; [ -s "$paths" ] || { echo 0; return; }
-      local total=0 line c
+      pfile="$1"
+      [ -s "$pfile" ] || { printf "0"; return; }
+      total=0
+      # shellcheck disable=SC2162
       while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in \#*|"") continue;; esac
+        case "$line" in \#*|"") continue ;; esac
         [ -d "$line" ] || continue
         c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" || c=0
         total=$(( total + c ))
-      done < "$paths"
-      echo "$total"
-    }
-
-    # Normalize simple globs to substrings for hasher's --exclude (literal match)
-    normalize_exclude() {
-      local pat="$1"
-      pat="${pat//\*/}"
-      while [ "${pat//\/\//\/}" != "$pat" ]; do pat="${pat//\/\//\/}"; done
-      pat="${pat%/}"
-      printf '%s' "$pat"
+      done < "$pfile"
+      printf "%s" "$total"
     }
 
     preflight_hashing() {
-      local pfile efile roots=0 exist=0 missing=0 line
-      pfile="$(determine_paths_file)"; efile="$(determine_excludes_file)"
+      pfile="$(determine_paths_file)"
+      efile="$(determine_excludes_file)"
       if [ -n "$pfile" ]; then
-        info "Paths file: $pfile"
+        roots=0; exist=0; missing=0
+        # shellcheck disable=SC2162
         while IFS= read -r line || [ -n "$line" ]; do
-          case "$line" in \#*|"") continue;; esac
-          roots=$((roots+1)); [ -d "$line" ] && exist=$((exist+1)) || missing=$((missing+1))
+          case "$line" in \#*|"") continue ;; esac
+          roots=$((roots+1))
+          if [ -d "$line" ]; then exist=$((exist+1)); else missing=$((missing+1)); fi
         done < "$pfile"
+        info "Paths file: $pfile"
         info "Roots listed: $roots (existing: $exist, missing: $missing)"
         info "Quick sample (depth≤2): at least $(sample_files_quick "$pfile") files to scan (lower-bound)."
       else
@@ -124,119 +113,108 @@
       if [ -n "$efile" ]; then info "Excludes file: $efile"; fi
     }
 
-    # Finder for hasher script
     find_hasher_script() {
-      local c
       for c in "$ROOT_DIR/hasher.sh" "$BIN_DIR/hasher.sh" "$ROOT_DIR/scripts/hasher.sh" "$ROOT_DIR/tools/hasher.sh"; do
-        [ -f "$c" ] && { echo "$c"; return 0; }
+        [ -f "$c" ] && { printf "%s" "$c"; return 0; }
       done
-      c="$(find "$ROOT_DIR" -maxdepth 2 -type f -name '*hasher*.sh' 2>/dev/null | head -n1 || true)"
-      [ -n "$c" ] && { echo "$c"; return 0; }
+      # shellcheck disable=SC2010
+      f="$(ls -1 "$BIN_DIR"/hasher*.sh 2>/dev/null | head -n1 || true)"
+      [ -n "${f:-}" ] && { printf "%s" "$f"; return 0; }
       return 1
     }
 
-    # Build exclude args (no process substitution)
-    build_args_with_excludes() {
-      local efile="$1"; local out=""
-      if [ -s "$efile" ]; then
-        local line pat
-        # shellcheck disable=SC2162
-        while IFS= read -r line || [ -n "$line" ]; do
-          case "$line" in \#*|"") continue;; esac
-          pat="$(normalize_exclude "$line")"
-          [ -n "$pat" ] && out="$out --exclude '$pat'"
-        done < "$efile"
-      fi
-      printf '%s' "$out"
-    }
-
     run_hasher_nohup() {
-      local script="$1" pfile efile
-      pfile="$(determine_paths_file)"; efile="$(determine_excludes_file)"
+      script="$(find_hasher_script || true)"
+      if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
       preflight_hashing
       : >"$BACKGROUND_LOG" 2>/dev/null || true
 
-      # Build argv
+      pfile="$(determine_paths_file)"
+      efile="$(determine_excludes_file)"
+
+      # Build argv in POSIX-safe way (set --)
+      # Start with the script path
       set -- "$script"
-      [ -n "$pfile" ] && set -- "$@" --pathfile "$pfile"
+      # Always pass --pathfile if we have one
+      if [ -n "$pfile" ]; then
+        set -- "$@" --pathfile "$pfile"
+      fi
+      # Append --exclude for each normalized pattern
       if [ -n "$efile" ]; then
-        # append normalized --exclude args via eval (BusyBox-safe)
-        eval "set -- $* $(build_args_with_excludes "$efile")"
+        # shellcheck disable=SC2162
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in \#*|"") continue ;; esac
+          pat="$line"
+          # normalize: strip '*' and trailing '/'; collapse '//' -> '/'
+          pat="${pat%\r}"; pat="${pat%\n}"
+          pat="${pat%%\**}" && pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/$::')" || pat="$line"
+          # Use the sed-normalized value if available
+          pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/$::')"
+          [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+        done < "$efile"
       fi
 
       info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
+      # Run with stdin from /dev/null to avoid 'cat -' Bad FD in child
       if [ -x "$script" ]; then
         nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
       else
         nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
       fi
 
-      local pid=$!
-      sleep 0.6
-      if kill -0 "$pid" 2>/dev/null; then
-        ok "Hasher launched (pid $pid)."
+      # small delay then basic status
+      sleep 1
+      if tail -n 5 "$BACKGROUND_LOG" 2>/dev/null | grep -q 'Run-ID:'; then
+        ok "Hasher launched."
       else
         warn "Hasher may not be running. Recent log:"
-        tail -n 80 "$BACKGROUND_LOG" 2>/dev/null || true
-      fi
-
-      local csv lc
-      csv="$(latest_hashes_csv)"; lc=0
-      [ -n "$csv" ] && [ -s "$csv" ] && lc="$(wc -l < "$csv" | tr -d ' ')" || true
-      if [ "$lc" -gt 1 ]; then info "Last run indexed approximately: $((lc-1)) files."; fi
-
-      sleep 0.8
-      if tail -n 40 "$BACKGROUND_LOG" 2>/dev/null | grep -q "Discovered 0 files to scan"; then
-        warn "Hasher reported 0 files discovered. Try option 8 (Advanced) to see CLI errors live."
+        tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
       fi
       info "While it runs, use option 9 to watch logs. Path: $BACKGROUND_LOG"
     }
 
     run_hasher_interactive() {
-      local script="$1" pfile efile
-      pfile="$(determine_paths_file)"; efile="$(determine_excludes_file)"
+      script="$(find_hasher_script || true)"
+      if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
+
+      pfile="$(determine_paths_file)"
+      efile="$(determine_excludes_file)"
+
       set -- "$script"
-      [ -n "$pfile" ] && set -- "$@" --pathfile "$pfile"
+      if [ -n "$pfile" ]; then set -- "$@" --pathfile "$pfile"; fi
       if [ -n "$efile" ]; then
-        eval "set -- $* $(build_args_with_excludes "$efile")"
+        # shellcheck disable=SC2162
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in \#*|"") continue ;; esac
+          pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/$::')"
+          [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+        done < "$efile"
       fi
+
       info "Running hasher interactively: $script"
       if [ -x "$script" ]; then "$@"; else sh "$@"; fi
     }
 
-    action_check_status(){ info "Background log: $BACKGROUND_LOG"; [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."; pause; }
-    action_start_hashing(){ local hs; if hs="$(find_hasher_script)"; then run_hasher_nohup "$hs" || true; else err "hasher.sh not found."; fi; pause; }
-    action_custom_hashing(){ local hs; if hs="$(find_hasher_script)"; then run_hasher_interactive "$hs" || true; else err "hasher.sh not found."; fi; pause; }
-    action_find_duplicate_folders(){ local input; input="$(latest_hashes_csv)"; if [ -z "$input" ]; then err "No hashes CSV found."; pause; return; fi; info "Using hashes file: $input"; if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true; else err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."; fi; pause; }
-    action_find_duplicate_files(){ local input; input="$(latest_hashes_csv)"; if [ -z "$input" ]; then err "No hashes CSV found."; pause; return; fi; info "Using hashes file: $input"; if [ -x "$BIN_DIR/find-duplicates.sh" ]; then "$BIN_DIR/find-duplicates.sh" --input "$input" || true; else err "$BIN_DIR/find-duplicates.sh not found or not executable."; fi; pause; }
-    action_review_duplicates(){ if [ -x "$BIN_DIR/review-duplicates.sh" ]; then "$BIN_DIR/review-duplicates.sh" || true; else err "$BIN_DIR/review-duplicates.sh not found or not executable."; fi; pause; }
-    action_delete_zero_length(){ if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then "$BIN_DIR/delete-zero-length.sh" || true; else err "$BIN_DIR/delete-zero-length.sh not found or not executable."; fi; pause; }
+    action_check_status(){ info "Background log: $BACKGROUND_LOG"; [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."; printf "Press Enter to continue... "; read -r _ || true; }
+    action_start_hashing(){ run_hasher_nohup; printf "Press Enter to continue... "; read -r _ || true; }
+    action_custom_hashing(){ run_hasher_interactive; printf "Press Enter to continue... "; read -r _ || true; }
+
+    # Keep the rest of the actions as placeholders; they call existing bin scripts if present.
+    action_find_duplicate_folders(){ input="$(latest_hashes_csv)"; [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }; info "Using hashes file: $input"; if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true; else err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
+    action_find_duplicate_files(){ input="$(latest_hashes_csv)"; [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }; info "Using hashes file: $input"; if [ -x "$BIN_DIR/find-duplicates.sh" ]; then "$BIN_DIR/find-duplicates.sh" --input "$input" || true; else err "$BIN_DIR/find-duplicates.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
+    action_review_duplicates(){ if [ -x "$BIN_DIR/review-duplicates.sh" ]; then "$BIN_DIR/review-duplicates.sh" || true; else err "$BIN_DIR/review-duplicates.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
+    action_delete_zero_length(){ if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then "$BIN_DIR/delete-zero-length.sh" || true; else err "$BIN_DIR/delete-zero-length.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
     action_apply_plan(){
-      local plan_file; plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-      if [ -z "$plan_file" ]; then info "No folder plan found."; pause; return; fi
-      info "Found folder plan: $plan_file"
-      read -r -p "Apply folder plan now (move directories to quarantine)? [y/N]: " ans || ans=""
-      case "${ans,,}" in
-        y|yes)
-          if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
-            "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --force || true
-          else
-            err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
-          fi
-          pause; return
-          ;;
-      esac
-      info "Skipping folder plan. Checking for file plan…"
-      if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
-        "$BIN_DIR/delete-duplicates.sh" || true
-      else
-        err "$BIN_DIR/delete-duplicates.sh not found or not executable."
-      fi
-      pause
+      plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+      if [ -z "$plan" ]; then info "No folder plan found."; printf "Press Enter to continue... "; read -r _ || true; return; fi
+      info "Found folder plan: $plan"
+      printf "Apply folder plan now (move directories to quarantine)? [y/N]: "; read -r ans || ans=""
+      case "$ans" in y|Y|yes|YES) if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --force || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; esac
+      printf "Press Enter to continue... "; read -r _ || true;
     }
-    action_clean_caches(){ local plan_file; plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"; if [ -z "$plan_file" ]; then info "No folder plan found."; pause; return; fi; if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --delete-metadata || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; pause; }
-    action_delete_junk(){ if [ -x "$BIN_DIR/delete-junk.sh" ]; then "$BIN_DIR/delete-junk.sh" || true; else err "$BIN_DIR/delete-junk.sh not found or not executable."; fi; pause; }
+    action_clean_caches(){ plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"; if [ -z "$plan" ]; then info "No folder plan found."; printf "Press Enter to continue... "; read -r _ || true; return; fi; if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --delete-metadata || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
+    action_delete_junk(){ if [ -x "$BIN_DIR/delete-junk.sh" ]; then "$BIN_DIR/delete-junk.sh" || true; else err "$BIN_DIR/delete-junk.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
 
     action_system_check(){
       info "System check:"
@@ -249,19 +227,28 @@
       echo "  - Hashes dir:  $HASHES_DIR"
       echo "  - Bin dir:     $BIN_DIR"
       echo "  - Latest CSV:  $(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || echo none)"
-      pfile="$(determine_paths_file)"; if [ -n "$pfile" ]; then
-        echo "  - Paths file: $pfile"; sed -n '1,10p' "$pfile" | sed 's/^/      /'; echo "    Lower-bound (depth≤2): $(sample_files_quick "$pfile") files"
-      else echo "  - Paths file: (none found)"; fi
-      efile="$(determine_excludes_file)"; if [ -n "$efile" ]; then echo "  - Excludes: $efile"; sed -n '1,10p' "$efile" | sed 's/^/      /'; fi
-      pause
+      pfile="$(determine_paths_file)"
+      if [ -n "$pfile" ]; then
+        echo "  - Paths file: $pfile"
+        sed -n '1,10p' "$pfile" | sed 's/^/      /'
+        echo "    Lower-bound (depth≤2): $(sample_files_quick "$pfile") files"
+      else
+        echo "  - Paths file: (none found)"
+      fi
+      efile="$(determine_excludes_file)"
+      if [ -n "$efile" ]; then
+        echo "  - Excludes: $efile"
+        sed -n '1,10p' "$efile" | sed 's/^/      /'
+      fi
+      printf "Press Enter to continue... "; read -r _ || true;
     }
 
-    # Menu
+    # Menu loop
     while :; do
-      clear || true
-      _header
+      clear 2>/dev/null || true
+      header
       print_menu
-      read -r -p "Choose an option: " choice || { echo; exit 0; }
+      printf "Choose an option: "; read -r choice || { echo; exit 0; }
       case "${choice:-}" in
         0) action_check_status ;;
         1) action_start_hashing ;;
@@ -276,6 +263,6 @@
         7) action_system_check ;;
         9) action_check_status ;;
         q|Q) echo "Bye."; exit 0 ;;
-        *) echo "Unknown option: $choice"; sleep 1 ;;
+        *) echo "Unknown option: $choice" ; sleep 1 ;;
       esac
     done
