@@ -1,326 +1,312 @@
-#!/usr/bin/env bash
-# Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James
-# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
-# This program comes with ABSOLUTELY NO WARRANTY.
+\
+    #!/usr/bin/env bash
+    # launcher.sh — menu launcher for Hasher & Dedupe toolkit
+    # Minimal update: add quarantine free-space heads-up using QUARANTINE_DIR from hasher.conf
+    # Safe defaults, Synology-friendly.
+    #
+    set -Eeuo pipefail
+    IFS=$'\n\t'; LC_ALL=C
 
-set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
+    # ────────────────────────────── Globals ──────────────────────────────
+    ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    cd "$ROOT_DIR"
 
-# ────────────────────────────── Globals ──────────────────────────────
-ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-cd "$ROOT_DIR"
+    LOGS_DIR="$ROOT_DIR/logs"
+    HASHES_DIR="$ROOT_DIR/hashes"
+    BIN_DIR="$ROOT_DIR/bin"
+    VAR_DIR="$ROOT_DIR/var"
+    LOCAL_DIR="$ROOT_DIR/local"
+    DEFAULT_DIR="$ROOT_DIR/default"
 
-LOGS_DIR="$ROOT_DIR/logs"
-HASHES_DIR="$ROOT_DIR/hashes"
-BIN_DIR="$ROOT_DIR/bin"
-VAR_DIR="$ROOT_DIR/var"
-LOCAL_DIR="$ROOT_DIR/local"
+    mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$BIN_DIR" "$VAR_DIR" "$LOCAL_DIR"
+    BACKGROUND_LOG="$LOGS_DIR/background.log"
 
-mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$BIN_DIR" "$VAR_DIR" "$LOCAL_DIR"
+    # ────────────────────────────── Helpers ──────────────────────────────
+    _header() {
+      cat <<'BANNER'
 
-BACKGROUND_LOG="$LOGS_DIR/background.log"
+     _   _           _               
+    | | | | __ _ ___| |__   ___ _ __ 
+    | |_| |/ _` / __| '_ \ / _ \ '__|
+    |  _  | (_| \__ \ | | |  __/ |   
+    |_| |_|\__,_|___/_| |_|\___|_|   
 
-# ────────────────────────────── Helpers ──────────────────────────────
-c_green='\033[0;32m'; c_yellow='\033[1;33m'; c_red='\033[0;31m'; c_reset='\033[0m'
-info() { printf "${c_green}[INFO]${c_reset} %b\n" "$*"; }
-warn() { printf "${c_yellow}[WARN]${c_reset} %b\n" "$*"; }
-err()  { printf "${c_red}[ERROR]${c_reset} %b\n" "$*"; }
+          NAS File Hasher & Dedupe
 
-press_any() { printf "\nPress ENTER to continue..."; read -r _; }
+    BANNER
+    }
 
-paths_file_default() {
-  # Prefer user override in local/paths.txt if present; else fall back to paths.txt
-  if [[ -f "$LOCAL_DIR/paths.txt" ]]; then
-    printf "%s\n" "$LOCAL_DIR/paths.txt"
-  elif [[ -f "$ROOT_DIR/paths.txt" ]]; then
-    printf "%s\n" "$ROOT_DIR/paths.txt"
-  else
-    printf "%s\n" ""
-  fi
-}
+    # Extract QUARANTINE_DIR from config (local overrides default).
+    # Supports a literal value or the pattern $(date +%F) in the path.
+    resolve_quarantine_dir() {
+      local raw=""
+      if [ -f "$LOCAL_DIR/hasher.conf" ]; then
+        raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$LOCAL_DIR/hasher.conf" | tail -n1 || true)"
+      fi
+      if [ -z "$raw" ] && [ -f "$DEFAULT_DIR/hasher.conf" ]; then
+        raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$DEFAULT_DIR/hasher.conf" | tail -n1 || true)"
+      fi
+      # Parse value
+      local val
+      val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
+      if [ -z "$val" ]; then
+        # fallback default on same volume as ROOT_DIR
+        val="$ROOT_DIR/quarantine-$(date +%F)"
+      else
+        # Only expand the specific pattern $(date +%F) to avoid arbitrary evaluation
+        val="${val//\$\(date +%F\)/$(date +%F)}"
+      fi
+      printf '%s\n' "$val"
+    }
 
-latest_hashes_csv() {
-  # Pick the newest hasher CSV
-  local f
-  f="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
-  printf "%s" "${f:-}"
-}
+    # Show free space for the quarantine target. Warn if cross-filesystem and insufficient.
+    show_quarantine_status() {
+      local qdir; qdir="$(resolve_quarantine_dir)"
+      mkdir -p -- "$qdir" 2>/dev/null || true
 
-require() {
-  local path="$1"
-  if [[ ! -x "$path" ]]; then
-    err "Missing or not executable: $path"
-    exit 1
-  fi
-}
+      local dfh dfp free_bytes
+      dfh="$(df -h "$qdir" | awk 'NR==2{print $4" free on "$1" ("$6")"}')"
+      free_bytes="$(df -Pk "$qdir" | awk 'NR==2{print $4 * 1024}')"
+      echo "[INFO] Quarantine: $qdir — $dfh"
 
-run_tail_background() {
-  if [[ -f "$BACKGROUND_LOG" ]]; then
-    info "Tailing $BACKGROUND_LOG (Ctrl+C to stop)…"
-    tail -f "$BACKGROUND_LOG"
-  else
-    warn "No $BACKGROUND_LOG yet."
-  fi
-}
-
-# ────────────────────────────── Menu Actions ─────────────────────────
-act_check_status() {
-  run_tail_background
-}
-
-act_start_hashing_defaults() {
-  require "$BIN_DIR/hasher.sh"
-  local pf; pf="$(paths_file_default)"
-  if [[ -z "$pf" ]]; then
-    warn "No paths file found. Create $LOCAL_DIR/paths.txt or ./paths.txt"
-    press_any; return
-  fi
-  info "Starting hashing with NAS-safe defaults…"
-  info "Paths file: $pf"
-  # Defaults: sha256, nohup in background
-  "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo sha256 --nohup | tee -a "$BACKGROUND_LOG"
-  press_any
-}
-
-act_start_hashing_advanced() {
-  require "$BIN_DIR/hasher.sh"
-  local pf; pf="$(paths_file_default)"
-  printf "Paths file [%s]: " "${pf:-<none>}"; read -r in_pf; pf="${in_pf:-$pf}"
-  [[ -z "$pf" ]] && { err "No paths file provided."; press_any; return; }
-
-  printf "Algo [sha256|sha1|sha512|md5|blake2] (default sha256): "; read -r algo; algo="${algo:-sha256}"
-  printf "Run in background? [y/N]: "; read -r yn
-  yn="$(printf "%s" "$yn" | tr 'A-Z' 'a-z')"
-  if [[ "$yn" == "y" ]]; then
-    "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" --nohup | tee -a "$BACKGROUND_LOG"
-  else
-    "$BIN_DIR/hasher.sh" --pathfile "$pf" --algo "$algo" | tee -a "$BACKGROUND_LOG"
-  fi
-  press_any
-}
-
-act_find_duplicate_folders() {
-  local script="$BIN_DIR/find-duplicate-folders.sh"
-  require "$script"
-
-  local base
-  base="$(latest_hashes_csv)"
-  if [[ -z "$base" ]]; then
-    warn "No hasher CSV found in $HASHES_DIR. Run Stage 1 first."
-    press_any; return
-  fi
-  info "Using hashes file: $base"
-
-  # Force bash (avoid BusyBox /bin/sh quirks) + log
-  bash "$script" --input "$base" | tee -a "$LOGS_DIR/find-duplicate-folders.log"
-
-  # Post-run guidance
-  local SUM PLAN
-  SUM="$(ls -1t "$LOGS_DIR"/duplicate-folders-*.txt 2>/dev/null | head -n1 || true)"
-  PLAN="$ROOT_DIR/var/duplicates/latest-folder-plan.txt"
-
-  echo
-  if [[ -n "$SUM" && -f "$SUM" ]]; then
-    info "Summary: $SUM"
-    sed -n '1,60p' "$SUM" || true
-  else
-    warn "No summary file produced."
-  fi
-
-  if [[ ! -s "$PLAN" ]]; then
-    echo
-    info "Verified hashes, zero duplicate folders. Please proceed to the duplicate FILE checker."
-    press_any
-    return
-  fi
-
-  # Read scope/signature used (so we can re-run consistently in Bulk action)
-  local scope sig
-  scope="$(awk -F': ' '/^Scope:/{print $2}' "$SUM" | head -n1)"
-  sig="$(awk   -F': ' '/^Signature:/{print $2}' "$SUM" | head -n1)"
-  scope=${scope:-recursive}
-  sig=${sig:-name+content}
-
-  # Interactive post-run menu
-  while :; do
-    echo
-    echo "What would you like to do?"
-    echo "  r) Review the duplicates (open summary)"
-    echo "  b) Bulk delete (DANGER): keep newest copy -> quarantine"
-    echo "  q) Quit back to main menu"
-    read -r -p "Choose [r/b/q]: " choice
-    case "$choice" in
-      r|R)
-        if command -v less >/dev/null 2>&1; then
-          less -N "$SUM"
-        else
-          sed -n '1,200p' "$SUM"
-          echo
-          read -r -p "Press ENTER to return..." _
+      # If we can detect a plan file for files or directories, estimate size (optional best-effort)
+      local plan_size_bytes=0 plan_file=""
+      # Prefer latest duplicate-folders plan
+      plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+      if [ -z "$plan_file" ]; then
+        # Fallback: any generic review plan file produced by review-duplicates
+        plan_file="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+      fi
+      if [ -n "$plan_file" ] && [ -s "$plan_file" ]; then
+        echo "[INFO] Detected latest plan: $plan_file"
+        # If plan lists directories, sum using CSV; if it lists files, stat (best-effort).
+        # We try to use size_bytes from the latest hashes CSV for speed.
+        local latest_csv=""; latest_csv="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+        if [ -n "$latest_csv" ]; then
+          # Build a path→size map in awk and sum
+          plan_size_bytes="$(awk -v plan="$plan_file" -v csv="$latest_csv" '
+            BEGIN{FS=","}
+            NR==FNR{ next } # placeholder
+            ' /dev/null )"
+          # The above placeholder avoids macOS awk weirdness; do real work below with tabs
+          plan_size_bytes="$(awk -v PF="$plan_file" -v CSV="$latest_csv" '
+            BEGIN{
+              FS=","; OFS="\t"
+              # Preload CSV size map path->size
+              while ((getline < CSV) > 0) {
+                if (NR==1) {
+                  # header: find indexes
+                  for (i=1;i<=NF;i++) {
+                    h=tolower($i); gsub(/^[ \t"]+|[ \t"]+$/,"",h)
+                    if (h=="path") p=i
+                    if (h=="size_bytes") s=i
+                  }
+                  if (!p || !s) { close(CSV); break }
+                  continue
+                }
+                path=$p
+                gsub(/^"|"$/,"",path)
+                size=$s+0
+                sz[path]=size
+              }
+              close(CSV)
+              total=0
+              while ((getline line < PF) > 0) {
+                gsub(/\r$/,"", line)
+                if (line=="") continue
+                if (line in sz) total+=sz[line]
+                else {
+                  # if plan holds directories, we cannot sum without walking; skip
+                }
+              }
+              print total
+            }' )"
         fi
-        ;;
-      b|B)
-        echo "This will MOVE duplicates (except the newest) to a quarantine folder."
-        read -r -p "Type 'DELETE' to confirm: " conf
-        if [[ "$conf" != "DELETE" ]]; then
-          echo "Cancelled."
-          continue
+        if [ -z "${plan_size_bytes:-}" ] || ! [[ "$plan_size_bytes" =~ ^[0-9]+$ ]]; then
+          plan_size_bytes=0
         fi
-        local qdir="var/quarantine/$(date +%F)"
-        bash "$script" \
-          --input "$base" \
-          --mode apply --force --quarantine "$qdir" \
-          --keep-strategy newest \
-          --scope "$scope" --signature "$sig" \
-          | tee -a "$LOGS_DIR/find-duplicate-folders.log"
-        echo "Bulk delete complete. Quarantine: $qdir"
-        press_any
-        break
-        ;;
-      q|Q) break ;;
-      *) echo "Invalid choice."; ;;
-    esac
-  done
-}
+        if [ "$plan_size_bytes" -gt 0 ]; then
+          awk -v b="$plan_size_bytes" 'BEGIN{
+            gb=b/1024/1024/1024; mb=b/1024/1024;
+            if (gb>=1) printf("[INFO] Estimated plan size (files matched in CSV): %.2f GB\n", gb);
+            else printf("[INFO] Estimated plan size (files matched in CSV): %.2f MB\n", mb);
+          }'
+        fi
+        # Cross-filesystem warning only if we know at least one source path
+        local first_src=""; first_src="$(head -n1 "$plan_file" || true)"
+        if [ -n "$first_src" ]; then
+          local src_fs q_fs
+          src_fs="$(df -Pk "$first_src" | awk 'NR==2{print $1}')"
+          q_fs="$(df -Pk "$qdir" | awk 'NR==2{print $1}')"
+          if [ "$src_fs" != "$q_fs" ] && [ "${plan_size_bytes:-0}" -gt "${free_bytes:-0}" ]; then
+            echo "[WARN] Plan may exceed free space on quarantine filesystem for a cross-filesystem move."
+            echo "       Consider setting QUARANTINE_DIR on the same filesystem as sources, or reduce the plan."
+          fi
+        fi
+      fi
+    }
 
-act_find_duplicate_files() {
-  local script="$BIN_DIR/find-duplicates.sh"
-  require "$script"
-  local base="$(latest_hashes_csv)"
-  if [[ -z "$base" ]]; then
-    warn "No hasher CSV found in $HASHES_DIR. Run Stage 1 first."
-    press_any; return
-  fi
-  info "Using hashes file: $base"
-  printf "Mode: 1) Standard (interactive)  2) Bulk (auto) [1/2]: "; read -r mode_pick
-  if [[ "$mode_pick" == "2" ]]; then
-    "$script" --input "$base" --mode bulk | tee -a "$LOGS_DIR/find-duplicates.log"
-  else
-    "$script" --input "$base" --mode standard | tee -a "$LOGS_DIR/find-duplicates.log"
-  fi
-  press_any
-}
+    latest_hashes_csv() {
+      local f
+      f="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+      if [ -z "$f" ]; then
+        echo ""
+      else
+        echo "$f"
+      fi
+    }
 
-act_review_duplicates() {
-  local script="$BIN_DIR/review-duplicates.sh"
-  require "$script"
-  "$script"
-  press_any
-}
+    pause() { read -r -p "Press Enter to continue... " _ || true; }
 
-act_delete_zero_length() {
-  local script="$BIN_DIR/delete-zero-length.sh"
-  require "$script"
-  printf "Dry run first? [Y/n]: "; read -r yn; yn="${yn:-Y}"
-  yn="$(printf "%s" "$yn" | tr 'A-Z' 'a-z')"
-  if [[ "$yn" == "n" ]]; then
-    "$script"
-  else
-    "$script" --dry-run
-  fi
-  press_any
-}
+    # ────────────────────────────── Menu Actions ──────────────────────────
+    action_check_status() {
+      echo "[INFO] Background log: $BACKGROUND_LOG"
+      [ -f "$BACKGROUND_LOG" ] && tail -n 100 "$BACKGROUND_LOG" || echo "[INFO] No background.log yet."
+      pause
+    }
 
-act_delete_duplicates_apply_plan() {
-  local script="$BIN_DIR/delete-duplicates.sh"
-  require "$script"
-  printf "Plan file to apply [leave blank for latest generated plan]: "
-  read -r plan
-  if [[ -z "$plan" ]]; then
-    # Find most recent plan
-    plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
-  fi
-  if [[ -z "$plan" || ! -f "$plan" ]]; then
-    warn "No plan file found. Generate one via 'Find duplicate files' (Bulk) or 'Review duplicates'."
-    press_any; return
-  fi
-  info "Applying plan: $plan"
-  printf "Final confirmation — permanently delete listed files? [type YES]: "
-  read -r confirm
-  if [[ "$confirm" == "YES" ]]; then
-    "$script" --plan "$plan"
-  else
-    warn "Aborted."
-  fi
-  press_any
-}
+    action_start_hashing() {
+      if [ -x "$ROOT_DIR/hasher.sh" ]; then
+        echo "[INFO] Starting hasher with NAS-safe defaults (nohup)…"
+        "$ROOT_DIR/hasher.sh" --nohup || true
+      else
+        echo "[ERROR] hasher.sh not found or not executable."
+      end_if:
+      pause
+    }
 
-act_system_check() {
-  local script="$BIN_DIR/system-check.sh"
-  if [[ -x "$script" ]]; then
-    "$script" | tee -a "$LOGS_DIR/system-check.log"
-  else
-    warn "No system-check.sh found. Skipping."
-  fi
-  press_any
-}
+    action_custom_hashing() {
+      if [ -x "$ROOT_DIR/hasher.sh" ]; then
+        "$ROOT_DIR/hasher.sh" || true
+      else
+        echo "[ERROR] hasher.sh not found or not executable."
+      fi
+      pause
+    }
 
-act_tail_logs() {
-  run_tail_background
-}
+    action_find_duplicate_folders() {
+      local input; input="$(latest_hashes_csv)"
+      if [ -z "$input" ]; then
+        echo "[ERROR] No hashes CSV found in $HASHES_DIR. Run hashing first."
+        pause; return
+      fi
+      echo "[INFO] Using hashes file: $input"
+      if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
+        "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true
+      else
+        echo "[ERROR] $BIN_DIR/find-duplicate-folders.sh not found or not executable."
+      fi
+      pause
+    }
 
-# ────────────────────────────── Menu UI ──────────────────────────────
-print_header() {
-  cat <<'ASCII'
- _   _           _               
-| | | | __ _ ___| |__   ___ _ __ 
-| |_| |/ _` / __| '_ \ / _ \ '__|
-|  _  | (_| \__ \ | | |  __/ |   
-|_| |_|\__,_|___/_| |_|\___|_|   
+    action_find_duplicate_files() {
+      local input; input="$(latest_hashes_csv)"
+      if [ -z "$input" ]; then
+        echo "[ERROR] No hashes CSV found in $HASHES_DIR. Run hashing first."
+        pause; return
+      fi
+      echo "[INFO] Using hashes file: $input"
+      if [ -x "$BIN_DIR/find-duplicates.sh" ]; then
+        "$BIN_DIR/find-duplicates.sh" --input "$input" || true
+      else
+        echo "[ERROR] $BIN_DIR/find-duplicates.sh not found or not executable."
+      fi
+      pause
+    }
 
-      NAS File Hasher & Dedupe
-ASCII
-}
+    action_review_duplicates() {
+      show_quarantine_status
+      if [ -x "$BIN_DIR/review-duplicates.sh" ]; then
+        "$BIN_DIR/review-duplicates.sh" || true
+      else
+        echo "[ERROR] $BIN_DIR/review-duplicates.sh not found or not executable."
+      fi
+      pause
+    }
 
-print_menu() {
-  print_header
-  cat <<EOF
+    action_delete_zero_length() {
+      if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then
+        "$BIN_DIR/delete-zero-length.sh" || true
+      else
+        echo "[ERROR] $BIN_DIR/delete-zero-length.sh not found or not executable."
+      fi
+      pause
+    }
 
-### Stage 1 - Hash ###
-  0) Check hashing status
-  1) Start Hashing (NAS-safe defaults)
-  8) Advanced / Custom hashing
+    action_apply_plan() {
+      show_quarantine_status
+      if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+        "$BIN_DIR/delete-duplicates.sh" || true
+      else
+        echo "[ERROR] $BIN_DIR/delete-duplicates.sh not found or not executable."
+      fi
+      pause
+    }
 
-### Stage 2 - Identify ###
-  2) Find duplicate folders
-  3) Find duplicate files
+    action_system_check() {
+      echo "[INFO] System check:"
+      command -v awk >/dev/null && echo "  - awk: OK" || echo "  - awk: MISSING"
+      command -v sort >/dev/null && echo "  - sort: OK" || echo "  - sort: MISSING"
+      command -v cksum >/dev/null && echo "  - cksum: OK" || echo "  - cksum: MISSING"
+      command -v stat >/dev/null && echo "  - stat: OK" || echo "  - stat: MISSING"
+      command -v df   >/dev/null && echo "  - df:   OK" || echo "  - df:   MISSING"
+      echo "  - Logs dir:    $LOGS_DIR"
+      echo "  - Hashes dir:  $HASHES_DIR"
+      echo "  - Bin dir:     $BIN_DIR"
+      echo "  - Latest CSV:  $(latest_hashes_csv || echo 'none')"
+      echo
+      show_quarantine_status
+      pause
+    }
 
-### Stage 3 - Clean up ###
-  4) Review duplicates (interactive)
-  5) Delete zero-length files
-  6) Delete duplicates (apply plan)
+    action_view_logs() {
+      if [ -f "$BACKGROUND_LOG" ]; then
+        tail -n 200 "$BACKGROUND_LOG"
+      else
+        echo "[INFO] No background.log yet."
+      fi
+      pause
+    }
 
-### Other ###
-  7) System check (deps & readiness)
-  9) View logs (tail background.log)
+    # ────────────────────────────── Menu Loop ─────────────────────────────
+    while :; do
+      clear || true
+      _header
+      cat <<'MENU'
+    ### Stage 1 - Hash ###
+      0) Check hashing status
+      1) Start Hashing (NAS-safe defaults)
+      8) Advanced / Custom hashing
 
-  q) Quit
-EOF
-}
+    ### Stage 2 - Identify ###
+      2) Find duplicate folders
+      3) Find duplicate files
 
-dispatch() {
-  case "${1:-}" in
-    0) act_check_status ;;
-    1) act_start_hashing_defaults ;;
-    2) act_find_duplicate_folders ;;
-    3) act_find_duplicate_files ;;
-    4) act_review_duplicates ;;
-    5) act_delete_zero_length ;;
-    6) act_delete_duplicates_apply_plan ;;
-    7) act_system_check ;;
-    8) act_start_hashing_advanced ;;
-    9) act_tail_logs ;;
-    q|Q) exit 0 ;;
-    *) warn "Unknown option: $1"; press_any ;;
-  esac
-}
+    ### Stage 3 - Clean up ###
+      4) Review duplicates (interactive)
+      5) Delete zero-length files
+      6) Delete duplicates (apply plan)
 
-# ────────────────────────────── Main Loop ────────────────────────────
-while true; do
-  clear || true
-  print_menu
-  printf "\nChoose an option: "
-  read -r choice
-  dispatch "$choice"
-done
+    ### Other ###
+      7) System check (deps & readiness)
+      9) View logs (tail background.log)
+
+      q) Quit
+
+    MENU
+      read -r -p "Choose an option: " choice || { echo; exit 0; }
+      case "${choice:-}" in
+        0) action_check_status ;;
+        1) action_start_hashing ;;
+        8) action_custom_hashing ;;
+        2) action_find_duplicate_folders ;;
+        3) action_find_duplicate_files ;;
+        4) action_review_duplicates ;;
+        5) action_delete_zero_length ;;
+        6) action_apply_plan ;;
+        7) action_system_check ;;
+        9) action_view_logs ;;
+        q|Q) echo "Bye."; exit 0 ;;
+        *) echo "Unknown option: $choice"; sleep 1 ;;
+      esac
+    done
