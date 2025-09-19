@@ -1,7 +1,7 @@
 \
     #!/usr/bin/env bash
     # launcher.sh — menu launcher for Hasher & Dedupe toolkit
-    # Safe banner, color, preflight, nohup, and correct hasher flags.
+    # BusyBox-safe: no process substitution; explicit </dev/null on nohup.
     set -Eeuo pipefail
     IFS=$'\n\t'; LC_ALL=C
 
@@ -29,6 +29,8 @@
     warn(){ printf "%b[WARN]%b %s\n" "$CWARN" "$CRESET" "$*"; }
     err(){  printf "%b[ERROR]%b %s\n" "$CERR" "$CRESET" "$*"; }
     init_colors
+
+    pause(){ read -r -p "Press Enter to continue... " _ || true; }
 
     _header() {
       printf "%b" "$CHEAD"
@@ -74,7 +76,6 @@
       [ -n "$f" ] && echo "$f" || echo ""
     }
 
-    # Determine files
     determine_paths_file() {
       if   [ -s "$LOCAL_DIR/paths.txt" ]; then echo "$LOCAL_DIR/paths.txt"
       elif [ -s "$ROOT_DIR/paths.txt" ]; then echo "$ROOT_DIR/paths.txt"
@@ -97,17 +98,13 @@
       echo "$total"
     }
 
-    pause(){ read -r -p "Press Enter to continue... " _ || true; }
-
-    # Discovery
-    find_hasher_script() {
-      local c
-      for c in "$ROOT_DIR/hasher.sh" "$BIN_DIR/hasher.sh" "$ROOT_DIR/scripts/hasher.sh" "$ROOT_DIR/tools/hasher.sh"; do
-        [ -f "$c" ] && { echo "$c"; return 0; }
-      done
-      c="$(find "$ROOT_DIR" -maxdepth 2 -type f -name '*hasher*.sh' 2>/dev/null | head -n1 || true)"
-      [ -n "$c" ] && { echo "$c"; return 0; }
-      return 1
+    # Normalize simple globs to substrings for hasher's --exclude (literal match)
+    normalize_exclude() {
+      local pat="$1"
+      pat="${pat//\*/}"
+      while [ "${pat//\/\//\/}" != "$pat" ]; do pat="${pat//\/\//\/}"; done
+      pat="${pat%/}"
+      printf '%s' "$pat"
     }
 
     preflight_hashing() {
@@ -127,18 +124,30 @@
       if [ -n "$efile" ]; then info "Excludes file: $efile"; fi
     }
 
-    # Normalize excludes globs -> substring patterns for hasher's --exclude
-    build_exclude_args() {
-      local efile="$1"
-      [ -s "$efile" ] || return 0
-      # shellcheck disable=SC2162
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in \#*|"") continue;; esac
-        # crude normalization: drop '*' and '**', collapse multiple slashes, strip trailing slashes
-        pat="${line//\*\*/}"; pat="${pat//\*/}"; pat="${pat/////}"
-        case "$pat" in */) pat="${pat%/}";; esac
-        [ -n "$pat" ] && printf -- "--exclude\0%s\0" "$pat"
-      done < "$efile"
+    # Finder for hasher script
+    find_hasher_script() {
+      local c
+      for c in "$ROOT_DIR/hasher.sh" "$BIN_DIR/hasher.sh" "$ROOT_DIR/scripts/hasher.sh" "$ROOT_DIR/tools/hasher.sh"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+      done
+      c="$(find "$ROOT_DIR" -maxdepth 2 -type f -name '*hasher*.sh' 2>/dev/null | head -n1 || true)"
+      [ -n "$c" ] && { echo "$c"; return 0; }
+      return 1
+    }
+
+    # Build exclude args (no process substitution)
+    build_args_with_excludes() {
+      local efile="$1"; local out=""
+      if [ -s "$efile" ]; then
+        local line pat
+        # shellcheck disable=SC2162
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in \#*|"") continue;; esac
+          pat="$(normalize_exclude "$line")"
+          [ -n "$pat" ] && out="$out --exclude '$pat'"
+        done < "$efile"
+      fi
+      printf '%s' "$out"
     }
 
     run_hasher_nohup() {
@@ -152,17 +161,15 @@
       set -- "$script"
       [ -n "$pfile" ] && set -- "$@" --pathfile "$pfile"
       if [ -n "$efile" ]; then
-        # Read normalized excludes as NUL-separated pairs (--exclude, value)
-        while IFS= read -r -d '' tok; do
-          set -- "$@" "$tok"
-        done < <(build_exclude_args "$efile")
+        # append normalized --exclude args via eval (BusyBox-safe)
+        eval "set -- $* $(build_args_with_excludes "$efile")"
       fi
 
       info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
       if [ -x "$script" ]; then
-        nohup "$@" >>"$BACKGROUND_LOG" 2>&1 &
+        nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
       else
-        nohup sh "$@" >>"$BACKGROUND_LOG" 2>&1 &
+        nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
       fi
 
       local pid=$!
@@ -171,16 +178,18 @@
         ok "Hasher launched (pid $pid)."
       else
         warn "Hasher may not be running. Recent log:"
-        tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
+        tail -n 80 "$BACKGROUND_LOG" 2>/dev/null || true
       fi
 
       local csv lc
       csv="$(latest_hashes_csv)"; lc=0
       [ -n "$csv" ] && [ -s "$csv" ] && lc="$(wc -l < "$csv" | tr -d ' ')" || true
       if [ "$lc" -gt 1 ]; then info "Last run indexed approximately: $((lc-1)) files."; fi
+
       sleep 0.8
-      tail -n 30 "$BACKGROUND_LOG" 2>/dev/null | grep -q "Discovered 0 files to scan" && \
+      if tail -n 40 "$BACKGROUND_LOG" 2>/dev/null | grep -q "Discovered 0 files to scan"; then
         warn "Hasher reported 0 files discovered. Try option 8 (Advanced) to see CLI errors live."
+      fi
       info "While it runs, use option 9 to watch logs. Path: $BACKGROUND_LOG"
     }
 
@@ -190,13 +199,12 @@
       set -- "$script"
       [ -n "$pfile" ] && set -- "$@" --pathfile "$pfile"
       if [ -n "$efile" ]; then
-        while IFS= read -r -d '' tok; do set -- "$@" "$tok"; done < <(build_exclude_args "$efile")
+        eval "set -- $* $(build_args_with_excludes "$efile")"
       fi
       info "Running hasher interactively: $script"
       if [ -x "$script" ]; then "$@"; else sh "$@"; fi
     }
 
-    # Actions
     action_check_status(){ info "Background log: $BACKGROUND_LOG"; [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."; pause; }
     action_start_hashing(){ local hs; if hs="$(find_hasher_script)"; then run_hasher_nohup "$hs" || true; else err "hasher.sh not found."; fi; pause; }
     action_custom_hashing(){ local hs; if hs="$(find_hasher_script)"; then run_hasher_interactive "$hs" || true; else err "hasher.sh not found."; fi; pause; }
@@ -204,14 +212,37 @@
     action_find_duplicate_files(){ local input; input="$(latest_hashes_csv)"; if [ -z "$input" ]; then err "No hashes CSV found."; pause; return; fi; info "Using hashes file: $input"; if [ -x "$BIN_DIR/find-duplicates.sh" ]; then "$BIN_DIR/find-duplicates.sh" --input "$input" || true; else err "$BIN_DIR/find-duplicates.sh not found or not executable."; fi; pause; }
     action_review_duplicates(){ if [ -x "$BIN_DIR/review-duplicates.sh" ]; then "$BIN_DIR/review-duplicates.sh" || true; else err "$BIN_DIR/review-duplicates.sh not found or not executable."; fi; pause; }
     action_delete_zero_length(){ if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then "$BIN_DIR/delete-zero-length.sh" || true; else err "$BIN_DIR/delete-zero-length.sh not found or not executable."; fi; pause; }
-    action_apply_plan(){ local plan_file; plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"; if [ -z "$plan_file" ]; then info "No folder plan found."; pause; return; fi; info "Found folder plan: $plan_file"; read -r -p "Apply folder plan now (move directories to quarantine)? [y/N]: " ans || ans=""; case "${ans,,}" in y|yes) if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --force || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; pause; return;; esac; info "Skipping folder plan. Checking for file plan…"; if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then "$BIN_DIR/delete-duplicates.sh" || true; else err "$BIN_DIR/delete-duplicates.sh not found or not executable."; fi; pause; }
+    action_apply_plan(){
+      local plan_file; plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+      if [ -z "$plan_file" ]; then info "No folder plan found."; pause; return; fi
+      info "Found folder plan: $plan_file"
+      read -r -p "Apply folder plan now (move directories to quarantine)? [y/N]: " ans || ans=""
+      case "${ans,,}" in
+        y|yes)
+          if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
+            "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --force || true
+          else
+            err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
+          fi
+          pause; return
+          ;;
+      esac
+      info "Skipping folder plan. Checking for file plan…"
+      if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+        "$BIN_DIR/delete-duplicates.sh" || true
+      else
+        err "$BIN_DIR/delete-duplicates.sh not found or not executable."
+      fi
+      pause
+    }
     action_clean_caches(){ local plan_file; plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"; if [ -z "$plan_file" ]; then info "No folder plan found."; pause; return; fi; if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --delete-metadata || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; pause; }
     action_delete_junk(){ if [ -x "$BIN_DIR/delete-junk.sh" ]; then "$BIN_DIR/delete-junk.sh" || true; else err "$BIN_DIR/delete-junk.sh not found or not executable."; fi; pause; }
+
     action_system_check(){
       info "System check:"
       command -v awk >/dev/null && echo "  - awk: OK" || echo "  - awk: MISSING"
       command -v sort >/dev/null && echo "  - sort: OK" || echo "  - sort: MISSING"
-      command -v cksum >/dev/null && echo "  - cksum: OK" || echo "  - cksum: MISSING"
+      command -v cksum >/dev/null && echo "  - cksum: OK"|| echo "  - cksum: MISSING"
       command -v stat >/dev/null && echo "  - stat: OK" || echo "  - stat: MISSING"
       command -v df >/dev/null && echo "  - df:   OK" || echo "  - df:   MISSING"
       echo "  - Logs dir:    $LOGS_DIR"
