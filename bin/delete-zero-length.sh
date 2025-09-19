@@ -1,141 +1,174 @@
-#!/bin/bash
-# Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
-# This program comes with ABSOLUTELY NO WARRANTY.
-#!/bin/bash
-# delete-zero-length.sh — verify and delete/quarantine zero-length files from a list
-# Supports hasher.conf-driven exclusions (optional). CRLF-safe. --verify-only / --force / --quarantine.
-set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
+\
+    #!/usr/bin/env bash
+    # delete-zero-length.sh — delete zero-byte files using latest hashes CSV (fast) or direct filesystem scan
+    # BusyBox/bash safe. Color when TTY. Prompts for confirmation.
+    set -Eeuo pipefail
+    IFS=$'\n\t'; LC_ALL=C
 
-# Path/layout discovery
-. "$(dirname "$0")/lib_paths.sh" 2>/dev/null || true
+    ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd -P)"
+    LOGS_DIR="${ROOT_DIR}/logs"
+    HASHES_DIR="${ROOT_DIR}/hashes"
+    LOCAL_DIR="${ROOT_DIR}/local"
+    DEFAULT_DIR="${ROOT_DIR}/default"
+    mkdir -p "$LOGS_DIR"
 
-ts(){ date +"%Y-%m-%d %H:%M:%S"; }
-if [ -r /proc/sys/kernel/random/uuid ]; then RUN_ID="$(cat /proc/sys/kernel/random/uuid)"; else RUN_ID="$(date +%s)-$$-$RANDOM"; fi
-log(){ printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
-log_info(){ log "INFO" "$*"; }; log_warn(){ log "WARN" "$*"; }; log_error(){ log "ERROR" "$*"; }
+    MODE="csv"           # csv|scan
+    INPUT=""             # optional CSV
+    FORCE=false
+    QUIET=false
+    QUARANTINE=false     # if true, move to quarantine instead of delete
 
-INPUT_LIST=""; FORCE=false; VERIFY_ONLY=false; QUARANTINE_DIR=""
-APPLY_EXCLUDES=""; EXCLUDES_FILE_OPT=""; EXTRA_EXCLUDES=(); LIST_EXCLUDES=false
+    # Colors
+    init_colors() {
+      if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+        CINFO="\033[1;34m"; CWORK="\033[1;36m"; COK="\033[1;32m"; CWARN="\033[1;33m"; CERR="\033[1;31m"; CRESET="\033[0m"
+      else
+        CINFO=""; CWORK=""; COK=""; CWARN=""; CERR=""; CRESET=""
+      fi
+    }
+    info(){ $QUIET || printf "%b[INFO]%b %s\n" "$CINFO" "$CRESET" "$*"; }
+    work(){ $QUIET || printf "%b[WORK]%b %s\n" "$CWORK" "$CRESET" "$*"; }
+    ok(){   $QUIET || printf "%b[OK]%b %s\n"   "$COK"   "$CRESET" "$*"; }
+    warn(){ $QUIET || printf "%b[WARN]%b %s\n" "$CWARN" "$CRESET" "$*"; }
+    err(){  printf "%b[ERROR]%b %s\n" "$CERR" "$CRESET" "$*"; }
+    init_colors
 
-to_lc(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-has_glob_meta(){ case "$1" in *'*'*|*'?'*|*'['*']'* ) return 0 ;; * ) return 1 ;; esac; }
+    usage() {
+      printf "%s\n" \
+        "Usage: delete-zero-length.sh [--input CSV] [--scan] [--force] [--quarantine] [--quiet]" \
+        "" \
+        "If --input not provided, uses latest CSV in hashes/. --scan performs a direct filesystem find (slower)." \
+        "By default, files are deleted; use --quarantine to move them into QUARANTINE_DIR for review."
+    }
 
-declare -a EX_BASENAMES=( "thumbs.db" ".ds_store" "desktop.ini" )
-declare -a EX_SUBSTRINGS=( "/#recycle/" "/@eadir/" "/.snapshot/" "/.appledouble/" )
-declare -a EX_GLOBS=()
+    resolve_quarantine_dir() {
+      local raw=""
+      if [ -f "$LOCAL_DIR/hasher.conf" ]; then
+        raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$LOCAL_DIR/hasher.conf" | tail -n1 || true)"
+      fi
+      if [ -z "$raw" ] && [ -f "$DEFAULT_DIR/hasher.conf" ]; then
+        raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$DEFAULT_DIR/hasher.conf" | tail -n1 || true)"
+      fi
+      local val
+      val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
+      if [ -z "$val" ]; then
+        val="$ROOT_DIR/quarantine-$(date +%F)"
+      else
+        val="${val//\$\((date +%F)\)/$(date +%F)}"
+        val="${val//\$(date +%F)/$(date +%F)}"
+      fi
+      printf '%s\n' "$val"
+    }
 
-add_ex_glob(){ local p="$(to_lc "$1")"; if has_glob_meta "$p"; then EX_GLOBS+=( "$p" ); else EX_GLOBS+=( "*${p}*" ); fi; }
-load_excludes_file(){ local f="$1"; [ -r "$f" ] || return 1; local n=0; while IFS= read -r raw || [ -n "$raw" ]; do l="${raw%$'\r'}"; case "$l" in ""|\#*) continue ;; esac; add_ex_glob "$l"; n=$((n+1)); done < "$f"; log_info "Loaded $n excludes from: $f"; }
-discover_hasher_excludes(){
-  for c in "$EXCLUDES_FILE_CANDIDATE" "excludes.txt" "exclude-paths.txt" "exclude-globs.txt"; do [ -r "$c" ] && { load_excludes_file "$c"; return 0; }; done
-  if [ -r "$CONF_FILE" ]; then cf="$(awk -F= '/^(EXCLUDES_FILE|EXCLUDE_FILE|EXCLUDE_LIST)[ \t]*=/{print $2; exit }' "$CONF_FILE" | sed 's/^[ \t"'\'' ]*//; s/[ \t"'\'' ]*$//')"; [ -n "$cf" ] && [ -r "$cf" ] && { load_excludes_file "$cf"; return 0; }; fi
-  return 1
-}
-is_excluded(){
-  local p="$1"; local plc="$(to_lc "$p")"; local b="$(basename -- "$p")"; local blc="$(to_lc "$b")"
-  for x in "${EX_BASENAMES[@]}"; do [ "$blc" = "$x" ] && return 0; done
-  for s in "${EX_SUBSTRINGS[@]}"; do case "$plc" in *"$s"*) return 0 ;; esac; done
-  for g in "${EX_GLOBS[@]:-}"; do case "$plc" in $g) return 0 ;; esac; done
-  return 1
-}
+    # Parse args
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --input) INPUT="${2:-}"; shift 2;;
+        --scan) MODE="scan"; shift;;
+        --force) FORCE=true; shift;;
+        --quarantine) QUARANTINE=true; shift;;
+        --quiet) QUIET=true; shift;;
+        -h|--help) usage; exit 0;;
+        *) err "Unknown arg: $1"; usage; exit 2;;
+      esac
+    done
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --force) FORCE=true ;;
-    --verify-only) VERIFY_ONLY=true ;;
-    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
-    --apply-excludes) APPLY_EXCLUDES=true ;;
-    --no-excludes) APPLY_EXCLUDES=false ;;
-    --excludes-file) EXCLUDES_FILE_OPT="${2:-}"; shift ;;
-    --exclude) EXTRA_EXCLUDES+=( "${2:-}" ); shift ;;
-    --list-excludes) LIST_EXCLUDES=true ;;
-    -h|--help) cat <<'EOF'
-Usage: delete-zero-length.sh <listfile> [options]
-  --verify-only            Only verify and build a plan; do not delete or move
-  --force                  Execute deletions/quarantine using the verified plan
-  --quarantine DIR         Move files to DIR instead of deleting
-  --apply-excludes         Apply hasher/external excludes to zero-length processing
-  --no-excludes            Do not apply excludes (overrides config)
-  --excludes-file FILE     Load additional case-insensitive glob patterns (one per line)
-  --exclude PATTERN        Add an inline exclude glob (may repeat). Matches FULL path, case-insensitive.
-  --list-excludes          Print the active exclusion rules and exit
-EOF
-      exit 0 ;;
-    *)
-      if [ -z "$INPUT_LIST" ]; then INPUT_LIST="${1:-}"; else log_error "Unexpected argument: $1"; exit 2; fi ;;
-  esac; shift || true
-done
-[ -n "$INPUT_LIST" ] || { log_error "No input list provided."; exit 2; }
-[ -r "$INPUT_LIST" ]  || { log_error "Input list not readable: $INPUT_LIST"; exit 2; }
+    # Determine CSV
+    if [ "$MODE" = "csv" ]; then
+      if [ -z "${INPUT:-}" ]; then
+        INPUT="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+      fi
+      if [ -z "${INPUT:-}" ] || [ ! -f "$INPUT" ]; then
+        warn "No CSV found; falling back to --scan mode."
+        MODE="scan"
+      fi
+    fi
 
-SUMMARY_LOG="$LOG_DIR/delete-zero-length-$(date +'%Y-%m-%d').log"
-VERIFIED_PLAN="$ZERO_DIR/verified-zero-length-$(date +'%Y-%m-%d')-${RUN_ID}.txt"; : > "$VERIFIED_PLAN"
+    # Collect candidate paths into a tmp list
+    TMP_LIST="$(mktemp -t zero-list.XXXXXX)"
+    cleanup(){ rm -f -- "$TMP_LIST" 2>/dev/null || true; }
+    trap cleanup EXIT
 
-ZERO_APPLY_EXCLUDES=false
-if [ -r "$CONF_FILE" ]; then
-  z="$(awk -F= '/^[[:space:]]*ZERO_APPLY_EXCLUDES[[:space:]]*=/{print $2; exit}' "$CONF_FILE" | tr -d '\r\n"'\''[:space:]' | tr '[:upper:]' '[:lower:]')"
-  case "$z" in (true|1|yes|y|on) ZERO_APPLY_EXCLUDES=true ;; esac
-  cf="$(awk -F= '/^[[:space:]]*(EXCLUDES_FILE|EXCLUDE_FILE|EXCLUDE_LIST)[[:space:]]*=/{print $2; exit}' "$CONF_FILE" | sed 's/^[[:space:]"'\'' ]*//; s/[[:space:]"'\'' ]*$//')"
-  [ -z "$EXCLUDES_FILE_OPT" ] && EXCLUDES_FILE_OPT="$cf"
-  b="$(awk -F= '/^[[:space:]]*EXCLUDE_BASENAMES[[:space:]]*=/{print $2; exit}' "$CONF_FILE")"
-  if [ -n "$b" ]; then bcl="$(echo "$b" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"; IFS=',' read -r -a arr <<< "$bcl"; for x in "${arr[@]:-}"; do xlc="$(echo "$x" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; [ -n "$xlc" ] && EX_BASENAMES+=( "$xlc" ); done; fi
-  d="$(awk -F= '/^[[:space:]]*EXCLUDE_DIRS[[:space:]]*=/{print $2; exit}' "$CONF_FILE")"
-  if [ -n "$d" ]; then dcl="$(echo "$d" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"; IFS=',' read -r -a arr <<< "$dcl"; for x in "${arr[@]:-}"; do xlc="$(echo "$x" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; [ -n "$xlc" ] && EX_SUBSTRINGS+=( "/${xlc}/" ); done; fi
-  g="$(awk -F= '/^[[:space:]]*EXCLUDE_GLOBS[[:space:]]*=/{print $2; exit}' "$CONF_FILE")"
-  if [ -n "$g" ]; then gcl="$(echo "$g" | tr -d '\r\n' | sed 's/^["'\'' ]\|["'\'' ]$//g')"; IFS=',' read -r -a arr <<< "$gcl"; for x in "${arr[@]:-}"; do xt="$(echo "$x" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; [ -n "$xt" ] && add_ex_glob "$xt"; done; fi
-fi
+    if [ "$MODE" = "csv" ]; then
+      info "Finding zero-length files from CSV: $INPUT"
+      header="$(head -n1 -- "$INPUT" || true)"
+      if printf %s "$header" | grep -q $'\t'; then dlm=$'\t'; else dlm=','; fi
+      col_idx(){ printf '%s\n' "$1" | awk -v dlm="$2" 'BEGIN{FS=dlm} NR==1{for(i=1;i<=NF;i++){h=tolower($i); gsub(/^[ \t"]+|[ \t"]+$/,"",h); if(h=="path"){p=i} if(h=="size_bytes"){s=i}}} END{print p+0","s+0}' ; }
+      idx="$(printf '%s\n' "$header" | col_idx "$header" "$dlm")"
+      pidx="${idx%,*}"; sidx="${idx#*,}"
+      if [ "$pidx" = "0" ] || [ "$sidx" = "0" ]; then
+        err "CSV missing path/size_bytes columns."; exit 2
+      fi
+      awk -v FS="$dlm" -v p="$pidx" -v s="$sidx" 'NR>1{ if ($s==0) {path=$p; gsub(/^"|"$/,"",path); print path} }' "$INPUT" > "$TMP_LIST"
+    else
+      info "Scanning filesystem for zero-length files (this may take a while)…"
+      # Scope: if a paths file exists, use it; otherwise scan /volume1 (Synology default root) safely
+      SCOPE_FILE=""
+      for f in "$LOCAL_DIR/paths.txt" "$DEFAULT_DIR/paths.example.txt" "$DEFAULT_DIR/paths.txt"; do
+        [ -f "$f" ] && SCOPE_FILE="$f" && break
+      done
+      if [ -n "$SCOPE_FILE" ]; then
+        while IFS= read -r pth; do
+          [ -z "$pth" ] && continue
+          [ "${pth#\#}" != "$pth" ] && continue
+          find "$pth" -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
+        done < "$SCOPE_FILE"
+      else
+        find /volume1 -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
+      fi
+    fi
 
-if [ -z "$APPLY_EXCLUDES" ]; then $ZERO_APPLY_EXCLUDES && APPLY_EXCLUDES=true || APPLY_EXCLUDES=false; fi
-if [ -n "$EXCLUDES_FILE_OPT" ]; then load_excludes_file "$EXCLUDES_FILE_OPT" || log_warn "Could not read excludes: $EXCLUDES_FILE_OPT"; else discover_hasher_excludes || true; fi
-for p in "${EXTRA_EXCLUDES[@]:-}"; do add_ex_glob "$p"; done
-if $LIST_EXCLUDES; then
-  echo "Active excludes (apply=${APPLY_EXCLUDES}):"; echo "  Basenames:"; for b in "${EX_BASENAMES[@]}"; do echo "    - $b"; done
-  echo "  Dir substrings:"; for s in "${EX_SUBSTRINGS[@]}"; do echo "    - $s"; done
-  echo "  Glob patterns:"; for g in "${EX_GLOBS[@]:-}"; do echo "    - $g"; done; exit 0
-fi
+    COUNT="$(wc -l < "$TMP_LIST" | tr -d ' ')"
+    if [ "${COUNT:-0}" -eq 0 ]; then
+      ok "No zero-length files found."
+      exit 0
+    fi
+    info "Zero-length files found: $COUNT"
 
-if $VERIFY_ONLY; then log_info "Mode: VERIFY-ONLY (no actions)"; elif ! $FORCE; then log_info "Mode: DRY-RUN (no changes)"; else log_info "Mode: EXECUTE"; fi
-$APPLY_EXCLUDES && log_info "Exclusions: ENABLED (per CLI/config)" || log_info "Exclusions: DISABLED"
-log_info "Verifying zero-length files…"; log_info "Input list: $INPUT_LIST"; log_info "Summary log: $SUMMARY_LOG"; log_info "Run-ID: $RUN_ID"
+    # Confirm
+    if ! $FORCE; then
+      if $QUARANTINE; then
+        read -r -p "Move $COUNT zero-length files to quarantine? [y/N]: " a || a=""
+      else
+        read -r -p "Delete $COUNT zero-length files now? [y/N]: " a || a=""
+      fi
+      case "${a,,}" in y|yes) ;; *) echo "Aborted."; exit 0;; esac
+    fi
 
-has_crlf=false; grep -q $'\r' "$INPUT_LIST" && has_crlf=true
-considered=0; excluded=0; missing=0; not_regular=0; not_zero_now=0; verified=0
-: > "$VERIFIED_PLAN"
+    # Prepare quarantine if needed
+    if $QUARANTINE; then
+      QDIR="$(resolve_quarantine_dir)"
+      TS="$(date +%F-%H%M%S)"
+      DEST="$QDIR/zero-length-$TS"
+      mkdir -p -- "$DEST"
+      info "Quarantine: $DEST"
+    fi
 
-while IFS= read -r rawline || [ -n "$rawline" ]; do
-  line=${rawline%$'\r'}; [ -z "$line" ] && continue; case "$line" in \#*) continue ;; esac
-  considered=$((considered+1))
-  if $APPLY_EXCLUDES && is_excluded "$line"; then excluded=$((excluded+1)); continue; fi
-  [ -e "$line" ] || { missing=$((missing+1)); continue; }
-  [ -f "$line" ] || { not_regular=$((not_regular+1)); continue; }
-  if [ ! -s "$line" ]; then printf '%s\n' "$line" >> "$VERIFIED_PLAN"; verified=$((verified+1)); else not_zero_now=$((not_zero_now+1)); fi
-done < "$INPUT_LIST"
+    LOG_FILE="$LOGS_DIR/delete-zero-length-$(date +%F-%H%M%S).log"
+    info "Logging to $LOG_FILE"
 
-$has_crlf && { log_warn "Input list has Windows (CRLF) endings; handled during read."; log_warn "To normalise: sed -i 's/\\r$//' \"$INPUT_LIST\""; }
-if [ "$missing" -gt 0 ] && [ "$missing" -eq "$considered" ]; then log_warn "All entries missing — possible CRLF or moved paths."; fi
+    idx=0; okc=0; fail=0
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      idx=$((idx+1))
+      # Re-verify zero size to be safe
+      sz="$(stat -c %s -- "$f" 2>/dev/null || stat -f %z -- "$f" 2>/dev/null || echo 1)"
+      if [ "${sz:-1}" != "0" ]; then
+        continue
+      fi
+      if $QUARANTINE; then
+        base="$(basename -- "$f")"
+        tgt="$DEST/$base"
+        if mv -- "$f" "$tgt" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
+      else
+        if rm -f -- "$f" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
+      fi
+      if [ $((idx % 200)) -eq 0 ]; then work "processed $idx/$COUNT"; fi
+    done < "$TMP_LIST"
 
-log_info "Verification complete."
-log_info "  • Input entries considered: $considered"
-$APPLY_EXCLUDES && log_info "  • Excluded by rules: $excluded"
-log_info "  • Missing paths: $missing"
-log_info "  • Not regular files: $not_regular"
-log_info "  • No longer zero-length: $not_zero_now"
-log_info "  • Verified zero-length now: $verified"
-log_info "Verified plan file: $VERIFIED_PLAN"
-
-if $VERIFY_ONLY; then printf "[VERIFY-ONLY SUMMARY]\n  Verified zero-length files: %s\n" "$verified"; exit 0; fi
-if ! $FORCE; then printf "[DRY-RUN SUMMARY]\n  Verified zero-length files: %s\n" "$verified"; exit 0; fi
-
-[ -n "$QUARANTINE_DIR" ] && mkdir -p "$QUARANTINE_DIR"
-acted=0; errs=0
-while IFS= read -r path || [ -n "$path" ]; do
-  [ -z "$path" ] && continue
-  if [ -n "$QUARANTINE_DIR" ]; then dest="${QUARANTINE_DIR%/}/$(basename "$path")"; mv -f -- "$path" "$dest" 2>>"$SUMMARY_LOG" && { log_info "Quarantined: $path -> $dest"; acted=$((acted+1)); } || { log_error "Failed to quarantine: $path"; errs=$((errs+1)); }
-  else rm -f -- "$path" 2>>"$SUMMARY_LOG" && { log_info "Deleted: $path"; acted=$((acted+1)); } || { log_error "Failed to delete: $path"; errs=$((errs+1)); }
-  fi
-done < "$VERIFIED_PLAN"
-log_info "Execution complete. Acted on: $acted, errors: $errs"
-exit 0
+    if $QUARANTINE; then
+      ok "Moved zero-length files: $okc | Failed: $fail | Dest: $DEST | Log: $LOG_FILE"
+    else
+      ok "Deleted zero-length files: $okc | Failed: $fail | Log: $LOG_FILE"
+    fi
+    exit 0
