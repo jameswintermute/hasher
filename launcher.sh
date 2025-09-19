@@ -119,7 +119,7 @@ action_find_duplicate_folders() {
   fi
   echo "[INFO] Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-uplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true
+    "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --min-group-size 2 --keep shortest-path --scope recursive || true
   else
     echo "[ERROR] $BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
@@ -198,6 +198,32 @@ action_clean_caches() {
     "$BIN_DIR/apply-folder-plan.sh" --plan "$plan_file" --delete-metadata || true
   else
     echo "[ERROR] $BIN_DIR/apply-folder-plan.sh not found or not executable."
+  fi
+  pause
+}
+
+
+action_system_check() {
+  echo "[INFO] System check:"
+  command -v awk  >/dev/null && echo "  - awk: OK"  || echo "  - awk: MISSING"
+  command -v sort >/dev/null && echo "  - sort: OK" || echo "  - sort: MISSING"
+  command -v cksum>/dev/null && echo "  - cksum: OK"|| echo "  - cksum: MISSING"
+  command -v stat >/dev/null && echo "  - stat: OK" || echo "  - stat: MISSING"
+  command -v df   >/dev/null && echo "  - df:   OK"  || echo "  - df:   MISSING"
+  echo "  - Logs dir:    $LOGS_DIR"
+  echo "  - Hashes dir:  $HASHES_DIR"
+  echo "  - Bin dir:     $BIN_DIR"
+  echo "  - Latest CSV:  $(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || echo none)"
+  echo
+  show_quarantine_status
+  pause
+}
+
+action_view_logs() {
+  if [ -f "$BACKGROUND_LOG" ]; then
+    tail -n 200 "$BACKGROUND_LOG"
+  else
+    echo "[INFO] No background.log yet."
   fi
   pause
 }
