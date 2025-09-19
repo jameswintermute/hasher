@@ -1,7 +1,7 @@
 \
     #!/usr/bin/env bash
     # find-duplicate-folders.sh — folder-level dedupe using CSV size_bytes (fast path)
-    # Minimal changes, now *heredoc-free* to avoid terminator issues.
+    # Minimal changes, BusyBox/Bash-safe, now with an additional recursive size estimate via `du`.
     #
     set -Eeuo pipefail
     IFS=$'\n\t'; LC_ALL=C
@@ -57,7 +57,7 @@
       DELIM=','
     fi
 
-    # Identify column indexes (1-based), case-insensitive headers (no process substitution)
+    # Identify column indexes (1-based), case-insensitive headers
     get_col_idx() {
       # $1 = wanted name, $2 = header, $3 = delimiter
       local want="$1" hdr="$2" dlm="$3"
@@ -193,7 +193,7 @@
             for (i=1;i<=n;i++) {
               if (i==best) continue
               print ddir[s,i] >> plan
-              total += dsz[s,i]
+              total += dsz[s,i]  # direct-files-only bytes
               dirs++
             }
             groups++
@@ -208,8 +208,8 @@
       plan_dirs_bytes="$total_bytes"
       awk -v b="$plan_dirs_bytes" 'BEGIN{
         gb=b/1024/1024/1024; mb=b/1024/1024;
-        if (gb>=1) printf("[INFO] Estimated plan size: %.2f GB\n", gb);
-        else printf("[INFO] Estimated plan size: %.2f MB\n", mb);
+        if (gb>=1) printf("[INFO] Estimated plan size (direct files only): %.2f GB\n", gb);
+        else printf("[INFO] Estimated plan size (direct files only): %.2f MB\n", mb);
       }'
     }
 
@@ -219,6 +219,27 @@
       echo "[OK] No duplicate folder groups (>= $MIN_GROUP_SIZE). No plan created."
       rm -f -- "$PLAN_FILE" 2>/dev/null || true
       exit 0
+    fi
+
+    # ────────────────────────────── Recursive on-disk size (du) ───────────
+    # Provide an encouraging, realistic number based on the actual directory sizes.
+    if command -v du >/dev/null 2>&1; then
+      du_total_k=0
+      while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        # Try -sk (POSIX-ish); fallback: sum of -k lines
+        kb="$(du -sk -- "$d" 2>/dev/null | awk 'NR==1{print $1}')"
+        if ! [[ "$kb" =~ ^[0-9]+$ ]]; then
+          kb="$(du -k -- "$d" 2>/dev/null | awk '{sum+=$1} END{print sum+0}')"
+        fi
+        du_total_k=$(( 10#${du_total_k:-0} + 10#${kb:-0} ))
+      done < "$PLAN_FILE"
+      du_bytes=$((du_total_k * 1024))
+      awk -v b="$du_bytes" 'BEGIN{
+        gb=b/1024/1024/1024; mb=b/1024/1024;
+        if (gb>=1) printf("[INFO] Estimated plan size (recursive, on-disk): %.2f GB\n", gb);
+        else printf("[INFO] Estimated plan size (recursive, on-disk): %.2f MB\n", mb);
+      }'
     fi
 
     # ────────────────────────────── Quarantine heads-up ───────────────────
@@ -231,7 +252,9 @@
       if [ -n "$first_dir" ]; then
         src_fs="$(df -Pk "$first_dir" | awk 'NR==2{print $1}')"
         q_fs="$(df -Pk "$QUARANTINE_DIR" | awk 'NR==2{print $1}')"
-        if [ "$src_fs" != "$q_fs" ] && [ "${plan_dirs_bytes:-0}" -gt "${free_bytes:-0}" ]; then
+        # Prefer the du-based estimate if available
+        bytes_for_check="${du_bytes:-$plan_dirs_bytes}"
+        if [ "$src_fs" != "$q_fs" ] && [ "${bytes_for_check:-0}" -gt "${free_bytes:-0}" ]; then
           echo "[WARN] Plan size exceeds free space on quarantine filesystem for a cross-filesystem move."
           echo "       Set QUARANTINE_DIR to the same filesystem as sources, or reduce the plan."
         fi
