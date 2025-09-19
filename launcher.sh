@@ -33,6 +33,7 @@
       printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
       printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
       printf "\n%s\n" "      NAS File Hasher & Dedupe"
+      printf "\n%s\n" "      v1.0.2 - Sept 2025"
       printf "%s" "$CRESET"
       printf "\n"
     }
