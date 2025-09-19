@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# launcher.sh — menu launcher for Hasher & Dedupe toolkit (robust hasher discovery, BusyBox-safe)
-set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
+# launcher.sh — menu launcher for Hasher & Dedupe toolkit (no backticks/heredocs)
+set -euo pipefail
+LC_ALL=C
 
 ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$ROOT_DIR"
@@ -17,32 +17,36 @@ mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$BIN_DIR" "$VAR_DIR" "$LOCAL_DIR"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 
 _header() {
-  printf "\n _   _           _               \n"
-  printf "| | | | __ _ ___| |__   ___ _ __ \n"
-  printf "| |_| |/ _\\` / __| '_ \\ / _ \\ '__|\n"
-  printf "|  _  | (_| \\__ \\ | | |  __/ |   \n"
-  printf "|_| |_|\\__,_|___/_| |_|\\___|_|   \n\n"
-  printf "      NAS File Hasher & Dedupe\n\n"
+  printf '%s\n' ''
+  printf '%s\n' '======================================'
+  printf '%s\n' '      NAS File Hasher & Dedupe'
+  printf '%s\n' '======================================'
+  printf '%s\n' ''
 }
 
 print_menu() {
-  printf "### Stage 1 - Hash ###\n"
-  printf "  0) Check hashing status\n"
-  printf "  1) Start Hashing (NAS-safe defaults)\n"
-  printf "  8) Advanced / Custom hashing\n\n"
-  printf "### Stage 2 - Identify ###\n"
-  printf "  2) Find duplicate folders\n"
-  printf "  3) Find duplicate files\n\n"
-  printf "### Stage 3 - Clean up ###\n"
-  printf "  4) Review duplicates (interactive)\n"
-  printf "  5) Delete zero-length files\n"
-  printf "  6) Delete duplicates (apply plan)\n"
-  printf "  10) Clean cache files & @eaDir (safe)\n"
-  printf "  11) Delete junk (Thumbs.db, .DS_Store, @eaDir, etc.)\n\n"
-  printf "### Other ###\n"
-  printf "  7) System check (deps & readiness)\n"
-  printf "  9) View logs (tail background.log)\n\n"
-  printf "  q) Quit\n\n"
+  printf '%s\n' '### Stage 1 - Hash ###'
+  printf '%s\n' '  0) Check hashing status'
+  printf '%s\n' '  1) Start Hashing (NAS-safe defaults)'
+  printf '%s\n' '  8) Advanced / Custom hashing'
+  printf '%s\n' ''
+  printf '%s\n' '### Stage 2 - Identify ###'
+  printf '%s\n' '  2) Find duplicate folders'
+  printf '%s\n' '  3) Find duplicate files'
+  printf '%s\n' ''
+  printf '%s\n' '### Stage 3 - Clean up ###'
+  printf '%s\n' '  4) Review duplicates (interactive)'
+  printf '%s\n' '  5) Delete zero-length files'
+  printf '%s\n' '  6) Delete duplicates (apply plan)'
+  printf '%s\n' '  10) Clean cache files & @eaDir (safe)'
+  printf '%s\n' '  11) Delete junk (Thumbs.db, .DS_Store, @eaDir, etc.)'
+  printf '%s\n' ''
+  printf '%s\n' '### Other ###'
+  printf '%s\n' '  7) System check (deps & readiness)'
+  printf '%s\n' '  9) View logs (tail background.log)'
+  printf '%s\n' ''
+  printf '%s\n' '  q) Quit'
+  printf '%s\n' ''
 }
 
 resolve_quarantine_dir() {
@@ -67,9 +71,8 @@ resolve_quarantine_dir() {
 show_quarantine_status() {
   local qdir; qdir="$(resolve_quarantine_dir)"
   mkdir -p -- "$qdir" 2>/dev/null || true
-  local dfh free_bytes
+  local dfh
   dfh="$(df -h "$qdir" | awk 'NR==2{print $4" free on "$1" ("$6")"}')"
-  free_bytes="$(df -Pk "$qdir" | awk 'NR==2{print $4 * 1024}')"
   echo "[INFO] Quarantine: $qdir — $dfh"
   local plan_file=""
   plan_file="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
@@ -89,16 +92,17 @@ pause() { read -r -p "Press Enter to continue... " _ || true; }
 # --- Robust hasher discovery ---
 find_hasher_script() {
   # Candidate paths in priority order
-  local candidates=(
-    "$ROOT_DIR/hasher.sh"
-    "$BIN_DIR/hasher.sh"
-    "$ROOT_DIR/scripts/hasher.sh"
-    "$ROOT_DIR/tools/hasher.sh"
-  )
+  local candidates
+  candidates="$ROOT_DIR/hasher.sh
+$BIN_DIR/hasher.sh
+$ROOT_DIR/scripts/hasher.sh
+$ROOT_DIR/tools/hasher.sh"
   local x
-  for x in "${candidates[@]}"; do
+  while IFS= read -r x; do
     [ -f "$x" ] && { echo "$x"; return 0; }
-  done
+  done <<EOF
+$candidates
+EOF
   # Fallback: any script matching *hasher*.sh under repo (depth 2)
   x="$(find "$ROOT_DIR" -maxdepth 2 -type f -name '*hasher*.sh' 2>/dev/null | head -n1 || true)"
   [ -n "$x" ] && { echo "$x"; return 0; }
@@ -187,7 +191,7 @@ action_find_duplicate_files() {
   if [ -x "$BIN_DIR/find-duplicates.sh" ]; then
     "$BIN_DIR/find-duplicates.sh" --input "$input" || true
   else
-    echo "[ERROR] $BIN_DIR/find-duplicates.sh not found or not executable."
+    echo "[ERROR] $BIN_DIR/find-duplicates.sh" not found or not executable.
   fi
   pause
 }
@@ -268,21 +272,21 @@ action_delete_junk() {
   read -r -p "Include recycle bins (#recycle)? [y/N]: " inc || inc=""
   read -r -p "Mode: verify only (v), quarantine (q), force delete (f) [v/q/f]: " mode || mode="v"
 
-  local args=(--paths-file "$paths")
-  case "${inc,,}" in y|yes) args+=(--include-recycle);; esac
+  # Build args list safely without arrays (BusyBox ash portability)
+  args="--paths-file \"$paths\""
+  case "${inc,,}" in y|yes) args="$args --include-recycle";; esac
 
   case "${mode,,}" in
     q|quarantine)
-      local qdir ts dest
       qdir="$(resolve_quarantine_dir)"; ts="$(date +%F-%H%M%S)"; dest="$qdir/junk-$ts"
-      args+=(--quarantine "$dest")
+      args="$args --quarantine \"$dest\""
       ;;
-    f|force) args+=(--force);;
-    *)       args+=(--verify-only);;
+    f|force) args="$args --force";;
+    *)       args="$args --verify-only";;
   esac
 
   if [ -x "$BIN_DIR/delete-junk.sh" ]; then
-    "$BIN_DIR/delete-junk.sh" "${args[@]}" || true
+    eval "\"$BIN_DIR/delete-junk.sh\" $args" || true
   else
     echo "[ERROR] $BIN_DIR/delete-junk.sh not found or not executable."
   fi
