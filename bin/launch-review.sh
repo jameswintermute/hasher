@@ -1,5 +1,5 @@
 #!/bin/sh
-# launch-review.sh — Option 4 helper (POSIX/BusyBox-safe)
+# launch-review.sh — Option 4 helper (POSIX/BusyBox-safe) with size ordering by default
 set -eu
 
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
@@ -52,4 +52,4 @@ if [ -z "${report:-}" ] || [ ! -s "$report" ]; then
 fi
 
 info "Using report: $report"
-exec "$BIN_DIR/review-duplicates.sh" --from-report "$report"
+exec "$BIN_DIR/review-duplicates.sh" --from-report "$report" --order size
