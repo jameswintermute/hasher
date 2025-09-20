@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # find-duplicates.sh — group duplicate files by hash using hasher CSV output
-# Now with a BusyBox-friendly progress bar while parsing the CSV.
+# BusyBox-friendly progress bar; hardened no-match handling.
 # License: GPLv3
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
@@ -119,22 +119,18 @@ fi
 PROG_FILE="$(mktemp)"; trap 'rm -f "$PROG_FILE"' EXIT
 
 draw_bar() {
-  # $1=current, $2=total
   local cur="$1" tot="$2" width=40 perc filled empty
   if [[ "$tot" -gt 0 ]]; then perc=$(( cur * 100 / tot )); else perc=0; fi
   (( perc > 100 )) && perc=100
   filled=$(( perc * width / 100 ))
   empty=$(( width - filled ))
-  # build bar segments
   printf -v hashes "%${filled}s" ""; hashes="${hashes// /#}"
   printf -v spaces "%${empty}s" ""
   printf "\r[%s%s] %3d%%  (%s/%s lines)" "$hashes" "$spaces" "$perc" "$cur" "$tot" >&2
 }
 
-# Build a tmp working file of "hash,path,size"
 TMP="$(mktemp)"; trap 'rm -f "$TMP" "$PROG_FILE"' EXIT
 
-# Launch the parsing awk in background and monitor progress from $PROG_FILE
 (
   awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -v FS="$DELIM" -v prog="$PROG_FILE" -v step=5000 '
     BEGIN{ OFS=","; n=0 }
@@ -148,37 +144,23 @@ TMP="$(mktemp)"; trap 'rm -f "$TMP" "$PROG_FILE"' EXIT
       if (h!="" && p!="") {
         print h, p, s
         n++
-        if (n % step == 0) { print n >> prog; close(prog) }
+        if (n % step == 0) { print n > prog; close(prog) }
       }
     }
-    END{ print n >> prog; close(prog) }
+    END{ print n > prog; close(prog) }
   ' "$INPUT" > "$TMP"
 ) &
 PID_AWK=$!
 
-# Progress monitor loop (TTY only)
-if [ -t 1 ] && [ "$TOTAL_WORK" -gt 0 ]; then
+if [ -t 1 ] && [[ "$TOTAL_WORK" -gt 0 ]]; then
   while kill -0 "$PID_AWK" >/dev/null 2>&1; do
     cur="$(tail -n1 "$PROG_FILE" 2>/dev/null || echo 0)"
-    # draw bar
-    width=40
-    cur=${cur:-0}
-    tot="$TOTAL_WORK"
-    if [ "$tot" -gt 0 ]; then perc=$(( cur * 100 / tot )); else perc=0; fi
-    [ "$perc" -gt 100 ] && perc=100
-    filled=$(( perc * width / 100 ))
-    empty=$(( width - filled ))
-    hashes="$(printf "%${filled}s" "")"; hashes="${hashes// /#}"
-    spaces="$(printf "%${empty}s" "")"
-    printf "\r[%s%s] %3d%%  (%s/%s lines)" "$hashes" "$spaces" "$perc" "$cur" "$tot"
+    draw_bar "${cur:-0}" "$TOTAL_WORK"
     sleep 0.2
   done
-  # final bar
-  hashes="$(printf "%40s" "")"; hashes="${hashes// /#}"
-  printf "\r[%s] 100%%  (%s/%s lines)\n" "$hashes" "$TOTAL_WORK" "$TOTAL_WORK"
+  draw_bar "$TOTAL_WORK" "$TOTAL_WORK"; echo
 fi
 
-# Wait for awk to finish
 wait "$PID_AWK"
 
 if [[ ! -s "$TMP" ]]; then
@@ -207,7 +189,8 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   exit 0
 fi
 
-grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV"
+# Robust to no-match (grep returns 1 when no lines match). We don't want to abort the script.
+grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV" || true
 
 group_count=0
 total_dupe_files=0
