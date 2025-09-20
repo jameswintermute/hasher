@@ -1,79 +1,38 @@
 #!/usr/bin/env bash
 # review-duplicates.sh — interactive/non-interactive review of duplicate file groups
-# Consumes the canonical report produced by find-duplicates.sh:
-#   HASH <digest> (N=<count>)
-#     /abs/path/one
-#     /abs/path/two
-#   <blank line>
-# Writes a delete plan listing paths to delete (one path per line).
-# Safe-by-default: never deletes files; only prepares a plan.
 # License: GPLv3
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
-# ────────────────────────────── Layout ────────────────────────────────
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 LOGS_DIR="$APP_HOME/logs"
 VAR_DIR="$APP_HOME/var/duplicates"
 mkdir -p "$LOGS_DIR" "$VAR_DIR"
 
-# ───────────────────────────── Colours ────────────────────────────────
 c_green='\033[0;32m'; c_yellow='\033[1;33m'; c_red='\033[0;31m'; c_blue='\033[0;34m'; c_reset='\033[0m'
 info() { printf "${c_green}[INFO]${c_reset} %b\n" "$*"; }
 warn() { printf "${c_yellow}[WARN]${c_reset} %b\n" "$*"; }
 err()  { printf "${c_red}[ERROR]${c_reset} %b\n" "$*"; }
 
-# ───────────────────────────── Usage ──────────────────────────────────
 usage() {
   cat <<'EOF'
 Usage: review-duplicates.sh --from-report FILE [options]
-
-Inputs:
-  --from-report FILE     Canonical duplicate-hashes report (logs/YYYY-MM-DD-duplicate-hashes.txt)
-                         or a pre-batched subset file (e.g. logs/review-batch-501-600.txt)
-
-Selection / ordering:
-  --order size|count     Sort groups by total size (default: size) or by file count
-  --skip N               Skip the first N ordered groups before reviewing (default: 0)
-  --take M               Review at most M groups after --skip (overrides --limit if set)
-
-Review behaviour:
-  --limit N              Max groups to review interactively (default: 100). Ignored in --non-interactive or if --take is set
-  --keep POLICY          Default keep selection for ties/prompts (newest|oldest|largest|smallest|first|last). Default: newest
-  --non-interactive      Apply policy across selected groups with no per-group prompts
-  --quiet                Reduce chatter; still prints keep prompts unless --non-interactive
-
-Config:
-  --config FILE          Optional k=v file (hasher.conf style). Recognised: LOW_VALUE_THRESHOLD_BYTES=NNN
-
-Misc:
-  -h|--help              Show this help and exit
-
-Examples:
-  # Review a launcher-prepared batch immediately:
-  review-duplicates.sh --from-report logs/review-batch-501-600.txt --keep newest
-
-  # Slice inside this script (no external batch):
-  review-duplicates.sh --from-report logs/2025-09-10-duplicate-hashes.txt --order size --skip 500 --take 100 --keep newest
-
-  # Fully automatic policy application across all groups:
-  review-duplicates.sh --from-report logs/2025-09-10-duplicate-hashes.txt --non-interactive --keep newest
+  --order size|count     (default: size)
+  --skip N               (default: 0)
+  --take M               (overrides --limit)
+  --limit N              (interactive only; default: 100)
+  --keep POLICY          newest|oldest|largest|smallest|first|last (default: newest)
+  --non-interactive      apply policy without prompts
+  --quiet                reduce chatter
+  --config FILE          k=v file (supports LOW_VALUE_THRESHOLD_BYTES=NNN)
 EOF
 }
 
-# ─────────────────────────── Defaults/flags ───────────────────────────
 FROM_REPORT=""
-ORDER="size"          # size | count
-SKIP=0
-TAKE=""
-LIMIT=100
-KEEP_POLICY="newest"  # newest|oldest|largest|smallest|first|last
-NON_INTERACTIVE=false
-QUIET=false
-CONFIG=""
+ORDER="size"; SKIP=0; TAKE=""; LIMIT=100
+KEEP_POLICY="newest"; NON_INTERACTIVE=false; QUIET=false; CONFIG=""
 
-# ─────────────────────────── Parse arguments ──────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -90,26 +49,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ──────────────────────── Load config (optional) ──────────────────────
 LOW_VALUE_THRESHOLD_BYTES=""
-if [[ -n "$CONFIG" ]]; then
-  if [[ -f "$CONFIG" ]]; then
-    while IFS= read -r line; do
-      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-      key="${line%%=*}"; val="${line#*=}"
-      key="$(echo "$key" | tr -d '[:space:]')"
-      val="$(echo "$val" | tr -d '[:space:]' | tr -d '"')"
-      case "$key" in
-        LOW_VALUE_THRESHOLD_BYTES) LOW_VALUE_THRESHOLD_BYTES="$val" ;;
-      esac
-    done < "$CONFIG"
-    $QUIET || info "Config loaded: LOW_VALUE_THRESHOLD_BYTES=${LOW_VALUE_THRESHOLD_BYTES:-unset}"
-  else
-    warn "Config file not found: $CONFIG"
-  fi
+if [[ -n "$CONFIG" && -f "$CONFIG" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    key="$(echo "$key" | tr -d '[:space:]')"
+    val="$(echo "$val" | tr -d '[:space:]' | tr -d '"')"
+    case "$key" in LOW_VALUE_THRESHOLD_BYTES) LOW_VALUE_THRESHOLD_BYTES="$val" ;; esac
+  done < "$CONFIG"
+  $QUIET || info "Config loaded: LOW_VALUE_THRESHOLD_BYTES=${LOW_VALUE_THRESHOLD_BYTES:-unset}"
 fi
 
-# ─────────────── Latest report fallback if none supplied ──────────────
 if [[ -z "${FROM_REPORT:-}" ]]; then
   if [[ -s "$LOGS_DIR/duplicate-hashes-latest.txt" ]]; then
     FROM_REPORT="$LOGS_DIR/duplicate-hashes-latest.txt"
@@ -122,81 +73,51 @@ if [[ -z "${FROM_REPORT:-}" ]]; then
     else
       err "Missing --from-report and no reports found in $LOGS_DIR."
       err "Next: run 'find-duplicates.sh' (or menu option 3) to generate the report."
-      usage
-      exit 2
+      usage; exit 2
     fi
   fi
 fi
 
-# Validate input report
 if [[ ! -s "$FROM_REPORT" ]]; then
   err "Report not found or empty: $FROM_REPORT"
-  usage
-  exit 2
+  usage; exit 2
 fi
 
-# ────────────────────────── Helpers (stats) ───────────────────────────
 get_size() {
   local f="$1" out=""
-  if out="$(stat -c '%s' -- "$f" 2>/dev/null)"; then
-    printf "%s" "$out"
-  elif out="$(busybox stat -c '%s' "$f" 2>/dev/null)"; then
-    printf "%s" "$out"
-  elif out="$(ls -ln -- "$f" 2>/dev/null | awk '{print $5}' || true)"; then
-    printf "%s" "${out:-0}"
-  else
-    printf "0"
-  fi
+  if out="$(stat -c '%s' -- "$f" 2>/dev/null)"; then printf "%s" "$out"
+  elif out="$(busybox stat -c '%s' "$f" 2>/dev/null)"; then printf "%s" "$out"
+  elif out="$(ls -ln -- "$f" 2>/dev/null | awk '{print $5}' || true)"; then printf "%s" "${out:-0}"
+  else printf "0"; fi
 }
 get_mtime() {
   local f="$1" out=""
-  if out="$(stat -c '%Y' -- "$f" 2>/dev/null)"; then
-    printf "%s" "$out"
-  elif out="$(busybox stat -c '%Y' "$f" 2>/dev/null)"; then
-    printf "%s" "$out"
-  else
-    printf "0"
-  fi
+  if out="$(stat -c '%Y' -- "$f" 2>/dev/null)"; then printf "%s" "$out"
+  elif out="$(busybox stat -c '%Y' "$f" 2>/dev/null)"; then printf "%s" "$out"
+  else printf "0"; fi
 }
-human() {
-  awk -v b="$1" 'function hum(x){ s="B KMGTPEZY"; while (x>=1024 && length(s)>1){x/=1024; s=substr(s,3)}; return sprintf("%.1f %s", x, substr(s,1,1)) } BEGIN{print hum(b+0)}'
-}
+human() { awk -v b="$1" 'function hum(x){ s="B KMGTPEZY"; while (x>=1024 && length(s)>1){x/=1024; s=substr(s,3)}; return sprintf("%.1f %s", x, substr(s,1,1)) } BEGIN{print hum(b+0)}'; }
 
-# ────────────────────────── Parse report ──────────────────────────────
 timestamp="$(date +'%Y-%m-%d-%H%M%S')"
 TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
-GROUPS_META="$TMPDIR/groups.meta"   # id,hash,count,total_size
-> "$GROUPS_META"
+GROUPS_META="$TMPDIR/groups.meta"; > "$GROUPS_META"
 
-# Progress-friendly parse: echo every ~2000 lines
 total_lines="$(wc -l < "$FROM_REPORT" 2>/dev/null || echo 0)"
-lines_seen=0
-group_id=0
-current_hash=""
-declare -a current_paths=()
+lines_seen=0; group_id=0; current_hash=""; declare -a current_paths=()
 
 flush_group() {
-  local id="$1" hash="$2"
-  local count="${#current_paths[@]}"
+  local id="$1" hash="$2"; local count="${#current_paths[@]}"
   (( count == 0 )) && return 0
   (( group_id++ ))
-  local total=0
-  local csv="$TMPDIR/g${group_id}.csv"
-  : > "$csv"
+  local total=0; local csv="$TMPDIR/g${group_id}.csv"; : > "$csv"
   local p size mt
   for p in "${current_paths[@]}"; do
-    if [[ -e "$p" ]]; then
-      size="$(get_size "$p")"
-      mt="$(get_mtime "$p")"
-    else
-      size="0"; mt="0"
-    fi
+    if [[ -e "$p" ]]; then size="$(get_size "$p")"; mt="$(get_mtime "$p")"; else size="0"; mt="0"; fi
     printf "%s,%s,%s\n" "$size" "$mt" "$p" >> "$csv"
     total=$(( total + size ))
   done
   printf "%s,%s,%s,%s\n" "$group_id" "$hash" "$count" "$total" >> "$GROUPS_META"
   current_paths=()
-  return 0
 }
 
 $QUIET || printf "${c_blue}Parsing report: %s — this may take a moment…${c_reset}\n" "$FROM_REPORT"
@@ -211,8 +132,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     continue
   fi
   if [[ "$line" =~ ^[[:space:]]{2}(/.*)$ ]]; then
-    current_paths+=("${BASH_REMATCH[1]}")
-    continue
+    current_paths+=("${BASH_REMATCH[1]}"); continue
   fi
 done < "$FROM_REPORT"
 flush_group "$group_id" "$current_hash"
@@ -224,10 +144,8 @@ if [[ "${total_groups:-0}" -eq 0 ]]; then
   warn "If you just ran hashing, run 'find-duplicates.sh' (menu option 3) first."
   exit 0
 fi
-
 $QUIET || info "Parsed groups: $total_groups from: $FROM_REPORT"
 
-# ────────────────────────── Order & slice ─────────────────────────────
 ordered_ids_file="$TMPDIR/ordered.ids"
 case "$ORDER" in
   size)  sort -t',' -k4,4nr "$GROUPS_META" | awk -F',' '{print $1}' > "$ordered_ids_file" ;;
@@ -253,59 +171,24 @@ if [[ "${selected_count:-0}" -eq 0 ]]; then
 fi
 $QUIET || info "Selected groups: $selected_count  (order: $ORDER, skip: $SKIP, take: ${TAKE:-all})"
 
-# ──────────────────────── Plan output destinations ────────────────────
 PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"
 SUMMARY="$LOGS_DIR/review-summary-$timestamp.txt"
-: > "$PLAN"
-: > "$SUMMARY"
+: > "$PLAN"; : > "$SUMMARY"
 
-# ─────────────────────── Keep policy helper functions ─────────────────
 pick_index_by_policy() {
-  local csv="$1" policy="$2"
-  local best_idx=1 best_val=0 idx=0
+  local csv="$1" policy="$2"; local best_idx=1 best_val=0 idx=0
   case "$policy" in
-    newest)
-      best_val=0; idx=0
-      while IFS=, read -r size mt path; do
-        idx=$((idx+1))
-        if (( mt > best_val )); then best_val="$mt"; best_idx="$idx"; fi
-      done < "$csv"
-      ;;
-    oldest)
-      best_val=9999999999; idx=0
-      while IFS=, read -r size mt path; do
-        idx=$((idx+1))
-        if (( mt < best_val )); then best_val="$mt"; best_idx="$idx"; fi
-      done < "$csv"
-      ;;
-    largest)
-      best_val=0; idx=0
-      while IFS=, read -r size mt path; do
-        idx=$((idx+1))
-        if (( size > best_val )); then best_val="$size"; best_idx="$idx"; fi
-      done < "$csv"
-      ;;
-    smallest)
-      best_val=9223372036854775807; idx=0
-      while IFS=, read -r size mt path; do
-        idx=$((idx+1))
-        if (( size < best_val )); then best_val="$size"; best_idx="$idx"; fi
-      done < "$csv"
-      ;;
-    last)
-      best_idx="$(wc -l < "$csv" | tr -d '[:space:]')"
-      ;;
-    first|*)
-      best_idx=1
-      ;;
+    newest)   best_val=0; idx=0; while IFS=, read -r size mt path; do idx=$((idx+1)); (( mt > best_val )) && { best_val="$mt"; best_idx="$idx"; }; done < "$csv" ;;
+    oldest)   best_val=9999999999; idx=0; while IFS=, read -r size mt path; do idx=$((idx+1)); (( mt < best_val )) && { best_val="$mt"; best_idx="$idx"; }; done < "$csv" ;;
+    largest)  best_val=0; idx=0; while IFS=, read -r size mt path; do idx=$((idx+1)); (( size > best_val )) && { best_val="$size"; best_idx="$idx"; }; done < "$csv" ;;
+    smallest) best_val=9223372036854775807; idx=0; while IFS=, read -r size mt path; do idx=$((idx+1)); (( size < best_val )) && { best_val="$size"; best_idx="$idx"; }; done < "$csv" ;;
+    last)     best_idx="$(wc -l < "$csv" | tr -d '[:space:]')" ;;
+    first|*)  best_idx=1 ;;
   esac
   printf "%s" "$best_idx"
 }
 
-# ───────────────────────────── Review loop ────────────────────────────
-reviewed=0
-deleted_candidates=0
-low_threshold="${LOW_VALUE_THRESHOLD_BYTES:-}"
+reviewed=0; deleted_candidates=0; low_threshold="${LOW_VALUE_THRESHOLD_BYTES:-}"
 
 while IFS= read -r gid; do
   csv="$TMPDIR/g${gid}.csv"
@@ -316,16 +199,8 @@ while IFS= read -r gid; do
   def_idx="$(pick_index_by_policy "$csv" "$KEEP_POLICY")"
 
   if [[ "$NON_INTERACTIVE" == true ]]; then
-    idx=0
-    while IFS=, read -r size mt path; do
-      idx=$((idx+1))
-      if (( idx != def_idx )); then
-        printf "%s\n" "$path" >> "$PLAN"
-        deleted_candidates=$((deleted_candidates+1))
-      fi
-    done < "$csv"
-    reviewed=$((reviewed+1))
-    continue
+    idx=0; while IFS=, read -r size mt path; do idx=$((idx+1)); (( idx != def_idx )) && { printf "%s\n" "$path" >> "$PLAN"; deleted_candidates=$((deleted_candidates+1)); }; done < "$csv"
+    reviewed=$((reviewed+1)); continue
   fi
 
   if [[ "$QUIET" != true ]]; then
@@ -336,19 +211,15 @@ while IFS= read -r gid; do
     while IFS=, read -r size mt path; do
       idx=$((idx+1))
       tag=""
-      if [[ -n "$low_threshold" && "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < low_threshold )); then
-        tag=" [low]"
-      fi>
-      marker=" "
-      [[ "$idx" -eq "$def_idx" ]] && marker="*"
+      if [[ -n "$low_threshold" && "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < low_threshold )); then tag=" [low]"; fi
+      marker=" "; [[ "$idx" -eq "$def_idx" ]] && marker="*"
       printf "  %s %2d) %s  (%s)%s\n" "$marker" "$idx" "$path" "$(human "$size")" "$tag"
     done < "$csv"
     echo
   fi
 
   read -rp $'Choose keep [1..N], Enter=default, s=skip, q=quit: ' answer || true
-  if [[ -z "${answer:-}" ]]; then
-    keep_idx="$def_idx"
+  if [[ -z "${answer:-}" ]]; then keep_idx="$def_idx"
   else
     case "$answer" in
       q|Q) info "Stopping early at user request."; break ;;
@@ -374,7 +245,6 @@ while IFS= read -r gid; do
   fi
 done < "$TMPDIR/selected.ids"
 
-# ───────────────────────────── Summary ────────────────────────────────
 if [[ -s "$PLAN" ]]; then
   cp -f "$PLAN" "$VAR_DIR/latest-plan.txt" || true
   {
