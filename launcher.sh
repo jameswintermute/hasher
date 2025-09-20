@@ -230,6 +230,20 @@ action_apply_plan(){
     return
   fi
 
+  action_clean_caches(){
+  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+  if [ -z "$plan" ]; then
+    info "No folder plan found."
+    printf "Press Enter to continue... "; read -r _ || true; return
+  fi
+  if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
+    "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --delete-metadata || true
+  else
+    err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
   # Fallback: FOLDER plan
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
   if [ -z "$plan" ]; then
