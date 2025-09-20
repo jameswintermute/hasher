@@ -1,258 +1,409 @@
 #!/usr/bin/env bash
-# find-duplicates.sh — group duplicate files by hash using hasher CSV output
-# Emits the canonical duplicate-hashes report expected by review-duplicates.sh:
+# review-duplicates.sh — interactive/non-interactive review of duplicate file groups
+# Consumes the canonical report produced by find-duplicates.sh:
 #   HASH <digest> (N=<count>)
 #     /abs/path/one
 #     /abs/path/two
 #   <blank line>
-# Also writes summary + flat CSV, and optional bulk plan.
+# Writes a delete plan listing paths to delete (one path per line).
+# Safe-by-default: never deletes files; only prepares a plan.
 # License: GPLv3
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
+# ────────────────────────────── Layout ────────────────────────────────
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-
-HASHES_DIR="$APP_HOME/hashes"
 LOGS_DIR="$APP_HOME/logs"
 VAR_DIR="$APP_HOME/var/duplicates"
 mkdir -p "$LOGS_DIR" "$VAR_DIR"
 
-c_green='\033[0;32m'; c_yellow='\033[1;33m'; c_red='\033[0;31m'; c_reset='\033[0m'
+# ───────────────────────────── Colours ────────────────────────────────
+c_green='\033[0;32m'; c_yellow='\033[1;33m'; c_red='\033[0;31m'; c_blue='\033[0;34m'; c_reset='\033[0m'
 info() { printf "${c_green}[INFO]${c_reset} %b\n" "$*"; }
 warn() { printf "${c_yellow}[WARN]${c_reset} %b\n" "$*"; }
 err()  { printf "${c_red}[ERROR]${c_reset} %b\n" "$*"; }
 
+# ───────────────────────────── Usage ──────────────────────────────────
 usage() {
   cat <<'EOF'
-Usage: find-duplicates.sh [--input CSV] [--mode standard|bulk]
-                          [--min-group-size N] [--keep-strategy shortest-path|oldest|newest|first]
-Outputs:
-  - Canonical: logs/YYYY-MM-DD-duplicate-hashes.txt   (for review-duplicates.sh --from-report)
-  - Summary:   logs/duplicate-groups-YYYY-MM-DD-HHMMSS.txt
-  - Flat CSV:  logs/duplicates-YYYY-MM-DD-HHMMSS.csv
-Bulk mode also writes:
-  - Plan:      logs/review-dedupe-plan-YYYY-MM-DD-HHMMSS.txt
+Usage: review-duplicates.sh --from-report FILE [options]
+
+Inputs:
+  --from-report FILE     Canonical duplicate-hashes report (logs/YYYY-MM-DD-duplicate-hashes.txt)
+                         or a pre-batched subset file (e.g. logs/review-batch-501-600.txt)
+
+Selection / ordering:
+  --order size|count     Sort groups by total size (default: size) or by file count
+  --skip N               Skip the first N ordered groups before reviewing (default: 0)
+  --take M               Review at most M groups after --skip (overrides --limit if set)
+
+Review behaviour:
+  --limit N              Max groups to review interactively (default: 100). Ignored in --non-interactive or if --take is set
+  --keep POLICY          Default keep selection for ties/prompts (newest|oldest|largest|smallest|first|last). Default: newest
+  --non-interactive      Apply policy across selected groups with no per-group prompts
+  --quiet                Reduce chatter; still prints keep prompts unless --non-interactive
+
+Config:
+  --config FILE          Optional k=v file (hasher.conf style). Recognised: LOW_VALUE_THRESHOLD_BYTES=NNN
+
+Misc:
+  -h|--help              Show this help and exit
+
+Examples:
+  # Review a launcher-prepared batch immediately:
+  review-duplicates.sh --from-report logs/review-batch-501-600.txt --keep newest
+
+  # Slice inside this script (no external batch):
+  review-duplicates.sh --from-report logs/2025-09-10-duplicate-hashes.txt --order size --skip 500 --take 100 --keep newest
+
+  # Fully automatic policy application across all groups:
+  review-duplicates.sh --from-report logs/2025-09-10-duplicate-hashes.txt --non-interactive --keep newest
 EOF
 }
 
-# Defaults
-INPUT=""
-MODE="standard"        # standard | bulk
-MIN_GROUP=2
-KEEP_STRATEGY="shortest-path"
+# ─────────────────────────── Defaults/flags ───────────────────────────
+FROM_REPORT=""
+ORDER="size"          # size | count
+SKIP=0
+TAKE=""
+LIMIT=100
+KEEP_POLICY="newest"  # newest|oldest|largest|smallest|first|last
+NON_INTERACTIVE=false
+QUIET=false
+CONFIG=""
 
-# Parse args
+# ─────────────────────────── Parse arguments ──────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --input) INPUT="${2:-}"; shift 2 ;;
-    --mode) MODE="${2:-}"; shift 2 ;;
-    --min-group-size) MIN_GROUP="${2:-}"; shift 2 ;;
-    --keep-strategy) KEEP_STRATEGY="${2:-}"; shift 2 ;;
-    *) err "Unknown arg: $1"; usage; exit 1 ;;
+    --from-report) FROM_REPORT="${2:-}"; shift 2 ;;
+    --order) ORDER="${2:-}"; shift 2 ;;
+    --skip) SKIP="${2:-0}"; shift 2 ;;
+    --take) TAKE="${2:-}"; shift 2 ;;
+    --limit) LIMIT="${2:-100}"; shift 2 ;;
+    --keep) KEEP_POLICY="${2:-}"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --quiet) QUIET=true; shift ;;
+    --config) CONFIG="${2:-}"; shift 2 ;;
+    *) err "Unknown argument: $1"; usage; exit 1 ;;
   esac
 done
 
-date_tag="$(date +'%Y-%m-%d')"
-timestamp="$(date +'%Y-%m-%d-%H%M%S')"
-
-OUT_CANON="$LOGS_DIR/${date_tag}-duplicate-hashes.txt"
-OUT_GROUPS="$LOGS_DIR/duplicate-groups-$timestamp.txt"
-OUT_CSV="$LOGS_DIR/duplicates-$timestamp.csv"
-OUT_PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"  # only when bulk
-OUT_LATEST="$LOGS_DIR/duplicate-hashes-latest.txt"
-
-pick_latest_csv() {
-  ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true
-}
-
-INPUT="${INPUT:-$(pick_latest_csv)}"
-[[ -z "$INPUT" ]] && { err "No input CSV found in $HASHES_DIR and none provided."; exit 1; }
-[[ ! -f "$INPUT" ]] && { err "Input CSV not found: $INPUT"; exit 1; }
-
-info "Input: $INPUT"
-info "Mode: $MODE  | Min group size: $MIN_GROUP"
-
-# Read first two lines to detect delimiter and header
-header="$(head -n1 "$INPUT" || true)"
-second="$(sed -n '2p' "$INPUT" || true)"
-
-# Auto-detect delimiter: comma, TAB, pipe, semicolon (fallback comma)
-detect_delim() {
-  local line="$1"
-  if [[ "$line" == *$'\t'* ]]; then echo $'\t'; return; fi
-  if [[ "$line" == *","* ]]; then echo ","; return; fi
-  if [[ "$line" == *"|"* ]]; then echo "|"; return; fi
-  if [[ "$line" == *";"* ]]; then echo ";"; return; fi
-  echo ","
-}
-DELIM="$(detect_delim "$header")"
-
-# Lowercased header fields for matching
-lower_header="$(printf "%s" "$header" | tr 'A-Z' 'a-z')"
-
-# Return 1-based index of a header whose name matches any of a pipe-separated pattern list
-find_hdr_idx() {
-  local patterns="$1"
-  local idx=0 IFS="$DELIM"
-  for col in $lower_header; do
-    idx=$((idx+1))
-    col="${col//\"/}"; col="$(echo "$col" | xargs)"
-    IFS="|" read -r -a pats <<< "$patterns"
-    for p in "${pats[@]}"; do
-      if [[ "$col" == "$p" ]]; then echo "$idx"; return 0; fi
-    done
-  done
-  echo ""
-}
-
-# Try common variants
-COL_HASH="$(find_hdr_idx 'hash|digest|checksum|sha256|sha1|sha512|md5|blake2|blake2b|blake2s')"
-COL_PATH="$(find_hdr_idx 'path|filepath|file|fullpath')"
-COL_SIZE="$(find_hdr_idx 'size|size_bytes|bytes|filesize|size_mb')"
-
-# Determine if header row is present by seeing if any match
-if [[ -n "$COL_HASH" && -n "$COL_PATH" ]]; then
-  SKIP_HEADER=1
-else
-  SKIP_HEADER=0
-  COL_HASH="${COL_HASH:-5}"   # for hasher CSV: path,size_bytes,mtime_epoch,algo,hash
-  COL_PATH="${COL_PATH:-1}"
+# ──────────────────────── Load config (optional) ──────────────────────
+LOW_VALUE_THRESHOLD_BYTES=""
+if [[ -n "$CONFIG" ]]; then
+  if [[ -f "$CONFIG" ]]; then
+    # Parse simple k=v lines, ignore comments/empties
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      key="${line%%=*}"; val="${line#*=}"
+      key="$(echo "$key" | tr -d '[:space:]')"
+      val="$(echo "$val" | tr -d '[:space:]' | tr -d '"')"
+      case "$key" in
+        LOW_VALUE_THRESHOLD_BYTES) LOW_VALUE_THRESHOLD_BYTES="$val" ;;
+      esac
+    done < "$CONFIG"
+    $QUIET || info "Config loaded: LOW_VALUE_THRESHOLD_BYTES=${LOW_VALUE_THRESHOLD_BYTES:-unset}"
+  else
+    warn "Config file not found: $CONFIG"
+  fi
 fi
 
-# Build a tmp working file of "hash,path,size" (comma-separated)
-TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
-awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -v FS="$DELIM" '
-  BEGIN{ OFS="," }
-  NR==1 && skip==1 { next }
-  {
-    h=$ch; p=$cp; s=(cs>0 ? $cs : "")
-    gsub(/"/,"",h); gsub(/"/,"",p); gsub(/"/,"",s)
-    sub(/^[ \t\r\n]+/,"",h); sub(/[ \t\r\n]+$/,"",h)
-    sub(/^[ \t\r\n]+/,"",p); sub(/[ \t\r\n]+$/,"",p)
-    sub(/^[ \t\r\n]+/,"",s); sub(/[ \t\r\n]+$/,"",s)
-    if (h!="" && p!="") print h, p, s
-  }
-' "$INPUT" > "$TMP"
+# ─────────────── Latest report fallback if none supplied ──────────────
+if [[ -z "${FROM_REPORT:-}" ]]; then
+  if [[ -s "$LOGS_DIR/duplicate-hashes-latest.txt" ]]; then
+    FROM_REPORT="$LOGS_DIR/duplicate-hashes-latest.txt"
+    $QUIET || info "No --from-report supplied; using latest: $FROM_REPORT"
+  else
+    cand="$(ls -1t "$LOGS_DIR"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
+    if [[ -n "$cand" && -s "$cand" ]]; then
+      FROM_REPORT="$cand"
+      $QUIET || info "No --from-report supplied; using newest: $FROM_REPORT"
+    else
+      err "Missing --from-report and no reports found in $LOGS_DIR."
+      err "Next: run 'find-duplicates.sh' (or menu option 3) to generate the report."
+      usage
+      exit 2
+    fi
+  fi
+fi
 
-if [[ ! -s "$TMP" ]]; then
-  err "Parsed 0 rows from input. Detected delimiter: '$(printf "%q" "$DELIM")'. Header: '$header'"
-  err "Sample line 2: '$second'"
+# Validate input report
+if [[ ! -s "$FROM_REPORT" ]]; then
+  err "Report not found or empty: $FROM_REPORT"
+  usage
   exit 2
 fi
 
-# Create list of hashes meeting threshold (>= MIN_GROUP)
-HASHES_TMP="$(mktemp)"; trap 'rm -f "$TMP" "$HASHES_TMP"' EXIT
-cut -d',' -f1 "$TMP" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$HASHES_TMP"
+# ────────────────────────── Helpers (stats) ───────────────────────────
+# Prefer GNU stat; fall back to busybox; last resort parse ls -ln (size in 5th col)
+get_size() {
+  local f="$1" out=""
+  if out="$(stat -c '%s' -- "$f" 2>/dev/null)"; then
+    printf "%s" "$out"
+  elif out="$(busybox stat -c '%s' "$f" 2>/dev/null)"; then
+    printf "%s" "$out"
+  elif out="$(ls -ln -- "$f" 2>/dev/null | awk '{print $5}' || true)"; then
+    printf "%s" "${out:-0}"
+  else
+    printf "0"
+  fi
+}
+# Modification time epoch; default 0 if unknown
+get_mtime() {
+  local f="$1" out=""
+  if out="$(stat -c '%Y' -- "$f" 2>/dev/null)"; then
+    printf "%s" "$out"
+  elif out="$(busybox stat -c '%Y' "$f" 2>/dev/null)"; then
+    printf "%s" "$out"
+  else
+    printf "0"
+  fi
+}
+# Human size (bytes -> friendly)
+human() {
+  local b="$1"
+  awk -v b="$1" 'function hum(x){ s="B KMGTPEZY"; while (x>=1024 && length(s)>1){x/=1024; s=substr(s,3)}; return sprintf("%.1f %s", x, substr(s,1,1)) } BEGIN{print hum(b+0)}'
+}
 
-: > "$OUT_CANON"
-: > "$OUT_LATEST"
-{
-  echo "Duplicate Groups — generated $timestamp"
-  echo "Source CSV: $INPUT"
-  echo "Delimiter: $( [[ "$DELIM" == $'\t' ]] && echo 'TAB' || echo "$DELIM" )"
-  echo
-} > "$OUT_GROUPS"
+# ────────────────────────── Parse report ──────────────────────────────
+timestamp="$(date +'%Y-%m-%d-%H%M%S')"
+TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
+GROUPS_META="$TMPDIR/groups.meta"   # id,hash,count,total_size
+> "$GROUPS_META"
 
-if [[ ! -s "$HASHES_TMP" ]]; then
-  warn "No duplicate groups found (>= $MIN_GROUP)."
-  info "Canonical report (empty): $OUT_CANON"
-  info "Group summary:           $OUT_GROUPS"
-  : > "$OUT_CSV"
+group_id=0
+current_hash=""
+declare -a current_paths=()
+
+flush_group() {
+  local id="$1" hash="$2"
+  local count="${#current_paths[@]}"
+  (( count == 0 )) && return 0
+  (( group_id++ ))
+  local total=0
+  local csv="$TMPDIR/g${group_id}.csv"
+  : > "$csv"
+  local p size mt
+  for p in "${current_paths[@]}"; do
+    if [[ -e "$p" ]]; then
+      size="$(get_size "$p")"
+      mt="$(get_mtime "$p")"
+    else
+      size="0"; mt="0"
+    fi
+    printf "%s,%s,%s\n" "$size" "$mt" "$p" >> "$csv"
+    total=$(( total + size ))
+  done
+  printf "%s,%s,%s,%s\n" "$group_id" "$hash" "$count" "$total" >> "$GROUPS_META"
+  current_paths=()
+  return 0
+}
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" =~ ^HASH[[:space:]]+([a-fA-F0-9]+)[[:space:]]+\(N=([0-9]+)\) ]]; then
+    # new group encountered; flush previous
+    flush_group "$group_id" "$current_hash"
+    current_hash="${BASH_REMATCH[1]}"
+    continue
+  fi
+  # path lines start with two spaces
+  if [[ "$line" =~ ^[[:space:]]{2}(/.*)$ ]]; then
+    current_paths+=("${BASH_REMATCH[1]}")
+    continue
+  fi
+  # blank lines just separate groups; ignore
+done < "$FROM_REPORT"
+# flush last group
+flush_group "$group_id" "$current_hash"
+
+total_groups="$(wc -l < "$GROUPS_META" | tr -d '[:space:]')"
+if [[ "${total_groups:-0}" -eq 0 ]]; then
+  warn "No groups parsed from: $FROM_REPORT"
   exit 0
 fi
 
-# Flat CSV of duplicates (still comma-separated)
-grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV"
+$QUIET || info "Parsed groups: $total_groups from: $FROM_REPORT"
 
-group_count=0
-total_dupe_files=0
+# ────────────────────────── Order & slice ─────────────────────────────
+# Sort: by total_size desc (field 4) or by count desc (field 3)
+ordered_ids_file="$TMPDIR/ordered.ids"
+case "$ORDER" in
+  size)  sort -t',' -k4,4nr "$GROUPS_META" | awk -F',' '{print $1}' > "$ordered_ids_file" ;;
+  count) sort -t',' -k3,3nr "$GROUPS_META" | awk -F',' '{print $1}' > "$ordered_ids_file" ;;
+  *) warn "Unknown --order '$ORDER', defaulting to size"; sort -t',' -k4,4nr "$GROUPS_META" | awk -F',' '{print $1}' > "$ordered_ids_file" ;;
+esac
 
-get_mtime() { stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }   # GNU stat preferred; busybox fallback -> 0
-path_len() { printf "%s" "$1" | wc -c; }
-
-while IFS= read -r h; do
-  mapfile -t rows < <(grep "^${h}," "$OUT_CSV" || true)
-  (( ${#rows[@]} < MIN_GROUP )) && continue
-  ((group_count++))
-
-  declare -a paths=()
-  declare -a sizes=()
-  for r in "${rows[@]}"; do
-    p="${r#*,}"; p="${p%,*}"
-    s="${r##*,}"
-    paths+=("$p")
-    sizes+=("$s")
-  done
-
-  printf "HASH %s (N=%d)\n" "$h" "${#paths[@]}" >> "$OUT_CANON"
-  printf "HASH %s (N=%d)\n" "$h" "${#paths[@]}" >> "$OUT_LATEST"
-  echo "─ Group #$group_count — hash: $h" >> "$OUT_GROUPS"
-
-  for i in "${!paths[@]}"; do
-    p="${paths[$i]}"; s="${sizes[$i]}"
-    printf "  %s\n" "$p" >> "$OUT_CANON"
-    printf "  %s\n" "$p" >> "$OUT_LATEST"
-    if [[ -n "$s" ]]; then
-      printf "   %2d) %s  (size: %s)\n" "$((i+1))" "$p" "$s" >> "$OUT_GROUPS"
-    else
-      printf "   %2d) %s\n" "$((i+1))" "$p" >> "$OUT_GROUPS"
-    fi
-    ((total_dupe_files++))
-  done
-  printf "\n" >> "$OUT_CANON"
-  printf "\n" >> "$OUT_LATEST"
-  echo >> "$OUT_GROUPS"
-
-  if [[ "$MODE" == "bulk" ]]; then
-    keep=""
-    case "$KEEP_STRATEGY" in
-      shortest-path)
-        shortest=999999
-        for p in "${paths[@]}"; do
-          plen="$(path_len "$p")"
-          if (( plen < shortest )); then shortest=$plen; keep="$p"; fi
-        done
-        ;;
-      oldest)
-        best=9999999999
-        for p in "${paths[@]}"; do
-          mt="$(get_mtime "$p")"
-          if (( mt < best )); then best=$mt; keep="$p"; fi
-        done
-        ;;
-      newest)
-        best=0
-        for p in "${paths[@]}"; do
-          mt="$(get_mtime "$p")"
-          if (( mt > best )); then best=$mt; keep="$p"; fi
-        done
-        ;;
-      first|*)
-        keep="${paths[0]}"
-        ;;
-    esac
-    for p in "${paths[@]}"; do
-      [[ "$p" == "$keep" ]] && continue
-      printf "%s\n" "$p" >> "$OUT_PLAN"
-    done
-  fi
-done < "$HASHES_TMP"
-
-info "Groups: $group_count  | Duplicate files (incl. keepers): $total_dupe_files"
-info "Canonical report: $OUT_CANON"
-info "Group summary:    $OUT_GROUPS"
-info "Flat CSV:         $OUT_CSV"
-
-if [[ "$MODE" == "bulk" ]]; then
-  if [[ -s "$OUT_PLAN" ]]; then
-    info "Auto delete plan: $OUT_PLAN"
-    cp -f "$OUT_PLAN" "$VAR_DIR/latest-plan.txt"
-    info "Latest plan copied to: $VAR_DIR/latest-plan.txt"
-  else
-    warn "Bulk mode produced no deletable items (unexpected)."
-  fi
+# Apply skip/take/limit (limit only for interactive if take not set)
+start=$(( SKIP + 1 ))
+if [[ -n "${TAKE:-}" ]]; then
+  sed -n "${start},$(( SKIP + TAKE ))p" "$ordered_ids_file" > "$TMPDIR/selected.ids"
 else
-  info "Next: run 'review-duplicates.sh --from-report \"$OUT_CANON\"' to interactively refine a plan."
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    sed -n "${start},\$p" "$ordered_ids_file" > "$TMPDIR/selected.ids"
+  else
+    sed -n "${start},$(( SKIP + LIMIT ))p" "$ordered_ids_file" > "$TMPDIR/selected.ids"
+  fi
 fi
+
+selected_count="$(wc -l < "$TMPDIR/selected.ids" | tr -d '[:space:]')"
+if [[ "${selected_count:-0}" -eq 0 ]]; then
+  warn "No groups selected after applying --skip/--take/--limit."
+  exit 0
+fi
+$QUIET || info "Selected groups: $selected_count  (order: $ORDER, skip: $SKIP, take: ${TAKE:-all})"
+
+# ──────────────────────── Plan output destinations ────────────────────
+PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"
+SUMMARY="$LOGS_DIR/review-summary-$timestamp.txt"
+: > "$PLAN"
+: > "$SUMMARY"
+
+# ─────────────────────── Keep policy helper functions ─────────────────
+pick_index_by_policy() {
+  local csv="$1" policy="$2"
+  local best_idx=1 best_val=0 idx=0 val=0
+  case "$policy" in
+    newest)
+      best_val=0; idx=0
+      while IFS=, read -r size mt path; do
+        idx=$((idx+1))
+        if (( mt > best_val )); then best_val="$mt"; best_idx="$idx"; fi
+      done < "$csv"
+      ;;
+    oldest)
+      best_val=9999999999; idx=0
+      while IFS=, read -r size mt path; do
+        idx=$((idx+1))
+        if (( mt < best_val )); then best_val="$mt"; best_idx="$idx"; fi
+      done < "$csv"
+      ;;
+    largest)
+      best_val=0; idx=0
+      while IFS=, read -r size mt path; do
+        idx=$((idx+1))
+        if (( size > best_val )); then best_val="$size"; best_idx="$idx"; fi
+      done < "$csv"
+      ;;
+    smallest)
+      best_val=9223372036854775807; idx=0
+      while IFS=, read -r size mt path; do
+        idx=$((idx+1))
+        if (( size < best_val )); then best_val="$size"; best_idx="$idx"; fi
+      done < "$csv"
+      ;;
+    last)
+      best_idx="$(wc -l < "$csv" | tr -d '[:space:]')"
+      ;;
+    first|*)
+      best_idx=1
+      ;;
+  esac
+  printf "%s" "$best_idx"
+}
+
+# ───────────────────────────── Review loop ────────────────────────────
+reviewed=0
+deleted_candidates=0
+low_threshold="${LOW_VALUE_THRESHOLD_BYTES:-}"
+
+while IFS= read -r gid; do
+  csv="$TMPDIR/g${gid}.csv"
+  # Recompute count and sum for display
+  count="$(wc -l < "$csv" | tr -d '[:space:]')"
+  total_bytes="$(awk -F',' '{s+=$1} END{print s+0}' "$csv")"
+
+  # Load hash for display
+  gline="$(grep -E "^${gid}," "$GROUPS_META" | head -n1 || true)"
+  ghash="$(printf "%s" "$gline" | awk -F',' '{print $2}')"
+
+  # Determine default keep by policy
+  def_idx="$(pick_index_by_policy "$csv" "$KEEP_POLICY")"
+
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    # Non-interactive: apply policy blindly
+    idx=0
+    while IFS=, read -r size mt path; do
+      idx=$((idx+1))
+      if (( idx != def_idx )); then
+        printf "%s\n" "$path" >> "$PLAN"
+        deleted_candidates=$((deleted_candidates+1))
+      fi
+    done < "$csv"
+    reviewed=$((reviewed+1))
+    continue
+  fi
+
+  # Interactive display
+  if [[ "$QUIET" != true ]]; then
+    echo
+    printf "${c_blue}─ Group #%s — hash: %s — files: %s — total: %s${c_reset}\n" "$gid" "$ghash" "$count" "$(human "$total_bytes")"
+    printf "  Default keep policy: %s (suggested: index %s)\n" "$KEEP_POLICY" "$def_idx"
+    # List items with sizes and (optional) LOW tag
+    idx=0
+    while IFS=, read -r size mt path; do
+      idx=$((idx+1))
+      tag=""
+      if [[ -n "$low_threshold" && "$size" =~ ^[0-9]+$ ]] && (( size > 0 && size < low_threshold )); then
+        tag=" [low]"
+      fi
+      marker=" "
+      [[ "$idx" -eq "$def_idx" ]] && marker="*"
+      printf "  %s %2d) %s  (%s)%s\n" "$marker" "$idx" "$path" "$(human "$size")" "$tag"
+    done < "$csv"
+    echo
+  fi
+
+  # Prompt user
+  read -rp $'Choose keep [1..N], Enter=default, s=skip, q=quit: ' answer || true
+  if [[ -z "${answer:-}" ]]; then
+    keep_idx="$def_idx"
+  else
+    case "$answer" in
+      q|Q) info "Stopping early at user request."; break ;;
+      s|S) reviewed=$((reviewed+1)); continue ;;
+      ''|*[!0-9]*) warn "Invalid input. Using default."; keep_idx="$def_idx" ;;
+      *) keep_idx="$answer" ;;
+    esac
+  fi
+
+  # Write deletions for this group
+  idx=0
+  while IFS=, read -r size mt path; do
+    idx=$((idx+1))
+    if (( idx != keep_idx )); then
+      printf "%s\n" "$path" >> "$PLAN"
+      deleted_candidates=$((deleted_candidates+1))
+    fi
+  done < "$csv"
+
+  reviewed=$((reviewed+1))
+  # Apply interactive limit when not using --take
+  if [[ -z "${TAKE:-}" && "$reviewed" -ge "$LIMIT" ]]; then
+    warn "Reached interactive --limit=$LIMIT groups. You can continue with --skip $((SKIP+LIMIT)) to resume."
+    break
+  fi
+done < "$TMPDIR/selected.ids"
+
+# ───────────────────────────── Summary ────────────────────────────────
+if [[ -s "$PLAN" ]]; then
+  cp -f "$PLAN" "$VAR_DIR/latest-plan.txt" || true
+  {
+    echo "Review summary — $timestamp"
+    echo "Report: $FROM_REPORT"
+    echo "Order: $ORDER  | Skip: $SKIP  | Take: ${TAKE:-all}  | Limit: $LIMIT  | Policy: $KEEP_POLICY  | Mode: $([[ "$NON_INTERACTIVE" == true ]] && echo 'non-interactive' || echo 'interactive')"
+    echo "Groups parsed: $total_groups"
+    echo "Groups reviewed: $reviewed"
+    echo "Deletion candidates written: $deleted_candidates"
+    echo "Plan: $PLAN"
+    echo "Latest plan copy: $VAR_DIR/latest-plan.txt"
+  } > "$SUMMARY"
+  info "Plan written: $PLAN"
+  info "Latest plan: $VAR_DIR/latest-plan.txt"
+  $QUIET || info "Next: review the plan, then apply via menu option 6 (Delete duplicates)."
+else
+  warn "No deletion candidates were produced. Nothing written to plan."
+fi
+
+exit 0
