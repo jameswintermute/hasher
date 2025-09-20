@@ -1,5 +1,6 @@
 #!/bin/sh
 # review-duplicates.sh — POSIX/BusyBox-friendly interactive reviewer
+# Reads from the controlling TTY (FD 3/4) so prompts always block even when launched from a parent menu.
 # Progress bars, size ordering, per-group reclaim, summary, and %/count scope selection.
 set -eu
 IFS="$(printf '\n\t')"
@@ -9,14 +10,22 @@ APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 LOGS_DIR="$APP_HOME/logs"; mkdir -p "$LOGS_DIR"
 VAR_DIR="$APP_HOME/var/duplicates"; mkdir -p "$VAR_DIR"
 
+# Open dedicated TTY FDs for reliable prompts/reads
+if [ -r /dev/tty ]; then
+  exec 3</dev/tty 4>/dev/tty
+else
+  # Fallback to stdin/stdout
+  exec 3<&0 4>&1
+fi
+
 COK="$(printf '\033[0;32m')"; CWARN="$(printf '\033[1;33m')"; CERR="$(printf '\033[0;31m')"; CCYAN="$(printf '\033[0;36m')"; CRESET="$(printf '\033[0m')"
-info(){ printf "%s[INFO]%s %s\n" "$COK" "$CRESET" "$*"; }
+info(){ printf "%s[INFO]%s %s\n" "$COK" "$CRESET" "$*" >&4; }
 warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$CRESET" "$*"; }
 err(){  printf "%s[ERROR]%s %s\n" "$CERR" "$CRESET" "$*"; }
 next(){ printf "%s[NEXT]%s %s\n" "$CCYAN" "$CRESET" "$*"; }
 
 usage(){
-cat <<'EOF'
+cat >&4 <<'EOF'
 Usage: review-duplicates.sh --from-report FILE [options]
   --from-report FILE     Canonical duplicate-hashes report
   --limit N              Review at most N groups (default 50)
@@ -26,14 +35,14 @@ Usage: review-duplicates.sh --from-report FILE [options]
 EOF
 }
 
-REPORT=""; LIMIT=50; KEEP="newest"; NONINT=0; ORDER="count"
+REPORT=""; LIMIT=50; KEEP="newest"; NONINT=0; ORDER="size"
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-report) REPORT="${2:-}"; shift 2 ;;
     --limit) LIMIT="${2:-50}"; shift 2 ;;
     --keep) KEEP="${2:-newest}"; shift 2 ;;
     --non-interactive) NONINT=1; shift ;;
-    --order) ORDER="${2:-count}"; shift 2 ;;
+    --order) ORDER="${2:-size}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) err "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -45,13 +54,13 @@ timestamp="$(date +'%Y-%m-%d-%H%M%S')"
 PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"; : > "$PLAN"
 QUIT=0
 
-is_tty(){ [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; }
+is_tty(){ [ -t 4 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; }
 draw_bar(){ cur="$1"; tot="$2"; label="$3"; width=40
   if [ "${tot:-0}" -gt 0 ]; then perc=$(( cur * 100 / tot )); else perc=0; fi
   [ "$perc" -gt 100 ] && perc=100
   filled=$(( perc * width / 100 )); empty=$(( width - filled ))
   hashes="$(printf "%${filled}s" | tr ' ' '#')"; spaces="$(printf "%${empty}s")"
-  printf "\r[%s%s] %3d%%  %s" "$hashes" "$spaces" "$perc" "$label"
+  printf "\r[%s%s] %3d%%  %s" "$hashes" "$spaces" "$perc" "$label" >&4
 }
 human(){ bytes="$1"; awk -v b="$bytes" 'BEGIN{
   if (b<1024) printf "%d B", b;
@@ -63,17 +72,21 @@ human(){ bytes="$1"; awk -v b="$bytes" 'BEGIN{
 get_mtime(){ stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }
 get_size(){  stat -c '%s' -- "$1" 2>/dev/null || echo 0; }
 
-read_tty() {
+read_prompt(){
   prompt="$1"
-  printf "%s" "$prompt"
-  if [ -r /dev/tty ]; then IFS= read -r ans </dev/tty || return 1; printf "%s" "$ans"; return 0
-  else IFS= read -r ans || return 1; printf "%s" "$ans"; return 0
-  fi
+  printf "%s" "$prompt" >&4
+  : >&4
+  set +e
+  IFS= read -r ans <&3
+  rc=$?
+  set -e
+  [ $rc -ne 0 ] && return 1
+  printf "%s" "$ans"
+  return 0
 }
 
 review_group() {
   hash="$1"; shift
-  # De-duplicate paths within the group for safety
   TMPG="$(mktemp)"; printf "%s\n" "$@" | sed '/^[[:space:]]*$/d' | sort -u > "$TMPG"
   set -- $(cat "$TMPG"); rm -f "$TMPG"
   count=$#
@@ -99,13 +112,13 @@ review_group() {
     SAVED=$((SAVED + potential)); return 0
   fi
 
-  echo
-  echo "─ Group  hash: $hash  (N=$count)  (potential reclaim: $(human "$potential"))"
+  echo >&4
+  printf "─ Group  hash: %s  (N=%d)  (potential reclaim: %s)\n" "$hash" "$count" "$(human "$potential")" >&4
   i=0
-  for p in "$@"; do i=$((i+1)); mark=" "; [ "$p" = "$keeper" ] && mark="*"; printf "  %2d) %s%s\n" "$i" "$mark" "$p"; done
-  echo "    Policy: $KEEP  [* marks suggested keeper]"
+  for p in "$@"; do i=$((i+1)); mark=" "; [ "$p" = "$keeper" ] && mark="*"; printf "  %2d) %s%s\n" "$i" "$mark" "$p" >&4; done
+  printf "    Policy: %s  [* marks suggested keeper]\n" "$KEEP" >&4
 
-  ans="$(read_tty "    Action: (Enter=accept) [N=pick keep] [k N=set keep] [s=skip] [q=quit] > " || echo "__EOF__")"
+  ans="$(read_prompt "    Action: (Enter=accept) [N=pick keep] [k N=set keep] [s=skip] [q=quit] > " || echo "__EOF__")"
   [ "$ans" = "__EOF__" ] && { info "Stopping (no TTY)."; QUIT=1; return 0; }
   trimmed="$(printf "%s" "$ans" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
@@ -146,15 +159,16 @@ SAVED=0
 ) & PID1=$!
 if is_tty; then
   while kill -0 "$PID1" >/dev/null 2>&1; do cur="$(wc -l < "$HASHLIST" 2>/dev/null || echo 0)"; draw_bar "${cur:-0}" "${TOTAL_GROUPS:-0}" "Parsing groups…"; sleep 0.2; done
-  draw_bar "${TOTAL_GROUPS:-0}" "${TOTAL_GROUPS:-0}" "Parsing groups…"; echo
+  draw_bar "${TOTAL_GROUPS:-0}" "${TOTAL_GROUPS:-0}" "Parsing groups…"; echo >&4
 fi
 wait "$PID1" || { err "Failed to parse report."; exit 1; }
 
 # Phase 1b: summary — compute deletables from group files (unique paths)
-DUPFILES=0
+DUPFILES=0; FILESINGROUPS=0
 for f in "$TMPDIR"/*.grp; do
   [ -f "$f" ] || continue
-  c="$(sort -u "$f" | wc -l | tr -d ' ' )"
+  c="$(sort -u "$f" | wc -l | tr -d ' ')"
+  FILESINGROUPS=$((FILESINGROUPS + c))
   if [ "$c" -ge 2 ] 2>/dev/null; then DUPFILES=$((DUPFILES + c - 1)); fi
 done
 
@@ -171,11 +185,12 @@ fi
 
 TOTAL_GROUPS="$(wc -l < "$HASHLIST" 2>/dev/null || echo 0)"
 info "Summary: Groups: $TOTAL_GROUPS  | Duplicate files (deletable): ${DUPFILES:-0}  | Potential reclaim: $(human "${POT:-0}")"
+info "Scope hint: files-in-groups: $FILESINGROUPS | average files/group: $(awk -v f="$FILESINGROUPS" -v g="$TOTAL_GROUPS" 'BEGIN{ if(g>0) printf "%.2f\n", f/g; else print "0.00" }')"
 
 # Phase 1c: scope selection
 if [ "$NONINT" -eq 0 ]; then
   defpct=10
-  sel="$(read_tty "How much to review this pass? Enter % (10/25/50/100) or exact group count (e.g. 500). [default: ${defpct}%] > " || echo "")"
+  sel="$(read_prompt "How much to review this pass? Enter % (10/25/50/100) or exact group count (e.g. 500). [default: ${defpct}%] > " || echo "")"
   sel="$(printf "%s" "$sel" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   if printf "%s" "$sel" | grep -Eq '^[0-9]+%$'; then
     p="$(printf "%s" "$sel" | tr -d '%')"; [ "$p" -gt 100 ] 2>/dev/null && p=100
@@ -184,7 +199,7 @@ if [ "$NONINT" -eq 0 ]; then
     LIMIT="$sel"
   else
     LIMIT=$(( (TOTAL_GROUPS * defpct + 99) / 100  ))
-  fi
+  }
   info "Reviewing up to $LIMIT groups this pass."
 fi
 
@@ -205,7 +220,7 @@ if [ "$ORDER" = "size" ] && [ -n "${CSV:-}" ] && [ -f "$CSV" ]; then
     while kill -0 "$PID2" >/dev/null 2>&1; do
       cur=$((cur+50000)); draw_bar "$cur" "$TOTAL_LINES" "Ranking by size from $(basename "$CSV")…"; sleep 0.2
     done
-    draw_bar "$TOTAL_LINES" "$TOTAL_LINES" "Ranking by size from $(basename "$CSV")…"; echo
+    draw_bar "$TOTAL_LINES" "$TOTAL_LINES" "Ranking by size from $(basename "$CSV")…"; echo >&4
   fi
   wait "$PID2" || { err "Failed to rank by size."; exit 1; }
 else
@@ -226,7 +241,6 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ -z "${line:-}" ] && continue
   h="$(printf "%s" "$line" | awk '{print $2}')"
   f="$TMPDIR/$h.grp"; [ -s "$f" ] || continue
-  # unique paths for this group
   gpaths="$(sort -u "$f")"
   oldIFS=$IFS; IFS="$(printf '\n\t')"; set -- $gpaths; IFS=$oldIFS
   review_group "$h" "$@"
@@ -234,7 +248,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   shown=$((shown+1)); [ "$shown" -ge "$LIMIT" ] && break
 done < "$ORDER_FILE"
 
-echo
+echo >&4
 info "Review complete. Planned deletions so far: $(wc -l < "$PLAN" 2>/dev/null || echo 0) files"
 info "Estimated reclaim from accepted groups: $(human "$SAVED")"
 info "Plan: $PLAN"
