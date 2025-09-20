@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# find-duplicates.sh — group duplicate files by hash using hasher CSV output
-# Emits the canonical duplicate-hashes report expected by review-duplicates.sh:
-#   HASH <digest> (N=<count>)
-#     /abs/path/one
-#     /abs/path/two
-#   <blank line>
-# Also writes summary + flat CSV, and optional bulk plan.
+# find-duplicates.sh — robust duplicate grouper (BusyBox/GNU friendly)
+# - De-duplicates identical (hash,path) rows from the hasher CSV
+# - Groups by hash; emits canonical report + summary + flat CSV
+# - Avoids bash arrays/mapfile pitfalls under `set -e` by using a single awk pass
 # License: GPLv3
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
@@ -74,11 +71,10 @@ INPUT="${INPUT:-$(pick_latest_csv)}"
 info "Input: $INPUT"
 info "Mode: $MODE  | Min group size: $MIN_GROUP"
 
-# Read first two lines to detect delimiter and header
+# Read header to detect delimiter
 header="$(head -n1 "$INPUT" || true)"
 second="$(sed -n '2p' "$INPUT" || true)"
 
-# Auto-detect delimiter: comma, TAB, pipe, semicolon (fallback comma)
 detect_delim() {
   local line="$1"
   if [[ "$line" == *$'\t'* ]]; then echo $'\t'; return; fi
@@ -89,10 +85,8 @@ detect_delim() {
 }
 DELIM="$(detect_delim "$header")"
 
-# Lowercased header fields for matching
 lower_header="$(printf "%s" "$header" | tr 'A-Z' 'a-z')"
 
-# Return 1-based index of a header whose name matches any of a pipe-separated pattern list
 find_hdr_idx() {
   local patterns="$1"
   local idx=0 IFS="$DELIM"
@@ -107,22 +101,21 @@ find_hdr_idx() {
   echo ""
 }
 
-# Try common variants
 COL_HASH="$(find_hdr_idx 'hash|digest|checksum|sha256|sha1|sha512|md5|blake2|blake2b|blake2s')"
 COL_PATH="$(find_hdr_idx 'path|filepath|file|fullpath')"
 COL_SIZE="$(find_hdr_idx 'size|size_bytes|bytes|filesize|size_mb')"
 
-# Determine if header row is present by seeing if any match
 if [[ -n "$COL_HASH" && -n "$COL_PATH" ]]; then
   SKIP_HEADER=1
 else
   SKIP_HEADER=0
   COL_HASH="${COL_HASH:-5}"   # for hasher CSV: path,size_bytes,mtime_epoch,algo,hash
   COL_PATH="${COL_PATH:-1}"
+  COL_SIZE="${COL_SIZE:-2}"
 fi
 
-# Build a tmp working file of "hash,path,size" (comma-separated)
 TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+# Build "hash,path,size" with de-duplication of (hash,path)
 awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -v FS="$DELIM" '
   BEGIN{ OFS="," }
   NR==1 && skip==1 { next }
@@ -132,7 +125,8 @@ awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HE
     sub(/^[ \t\r\n]+/,"",h); sub(/[ \t\r\n]+$/,"",h)
     sub(/^[ \t\r\n]+/,"",p); sub(/[ \t\r\n]+$/,"",p)
     sub(/^[ \t\r\n]+/,"",s); sub(/[ \t\r\n]+$/,"",s)
-    if (h!="" && p!="") print h, p, s
+    k=h SUBSEP p
+    if (h!="" && p!="" && !seen[k]++) print h, p, s
   }
 ' "$INPUT" > "$TMP"
 
@@ -142,18 +136,14 @@ if [[ ! -s "$TMP" ]]; then
   exit 2
 fi
 
-# Create list of hashes meeting threshold (>= MIN_GROUP)
+# Pre-compute counts by hash (>= MIN_GROUP)
 HASHES_TMP="$(mktemp)"; trap 'rm -f "$TMP" "$HASHES_TMP"' EXIT
 cut -d',' -f1 "$TMP" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$HASHES_TMP"
 
 : > "$OUT_CANON"
+: > "$OUT_GROUPS"
 : > "$OUT_LATEST"
-{
-  echo "Duplicate Groups — generated $timestamp"
-  echo "Source CSV: $INPUT"
-  echo "Delimiter: $( [[ "$DELIM" == $'\t' ]] && echo 'TAB' || echo "$DELIM" )"
-  echo
-} > "$OUT_GROUPS"
+: > "$OUT_CSV"
 
 if [[ ! -s "$HASHES_TMP" ]]; then
   warn "No duplicate groups found (>= $MIN_GROUP)."
@@ -163,89 +153,58 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   exit 0
 fi
 
-# Flat CSV of duplicates (still comma-separated)
-grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV"
+# Keep only rows belonging to duplicate hashes
+grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV" || true
 
-group_count=0
-total_dupe_files=0
+# Single-pass AWK to render canonical + groups; avoids bash loops under set -e
+awk -F',' -v min="$MIN_GROUP" \
+  -v canon="$OUT_CANON" -v latest="$OUT_LATEST" -v groups="$OUT_GROUPS" '
+  function flush(h,   n,i,p,s) {
+    n = cnt[h]; if (n < min) return
+    group++
+    printf "HASH %s (N=%d)\n", h, n >> canon
+    printf "HASH %s (N=%d)\n", h, n >> latest
+    printf "─ Group #%d — hash: %s\n", group, h >> groups
+    for (i=1;i<=idx[h];i++) {
+      p = order[h,i]; s = size[h,p]
+      printf "  %s\n", p >> canon
+      printf "  %s\n", p >> latest
+      if (s != "") printf "   %2d) %s  (size: %s)\n", i, p, s >> groups
+      else         printf "   %2d) %s\n", i, p >> groups
+    }
+    printf "\n" >> canon; printf "\n" >> latest; printf "\n" >> groups
+  }
+  {
+    h=$1; p=$2; s=$3
+    k=h SUBSEP p
+    if (!seen[k]++) { cnt[h]++; size[h,p]=s; order[h, ++idx[h]] = p }
+  }
+  END {
+    for (h in cnt) flush(h)
+  }
+' "$OUT_CSV"
 
-get_mtime() { stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }   # GNU stat preferred; busybox fallback -> 0
-path_len() { printf "%s" "$1" | wc -c; }
-
-while IFS= read -r h; do
-  mapfile -t rows < <(grep "^${h}," "$OUT_CSV" || true)
-  (( ${#rows[@]} < MIN_GROUP )) && continue
-  ((group_count++))
-
-  declare -a paths=()
-  declare -a sizes=()
-  for r in "${rows[@]}"; do
-    p="${r#*,}"; p="${p%,*}"
-    s="${r##*,}"
-    paths+=("$p")
-    sizes+=("$s")
-  done
-
-  printf "HASH %s (N=%d)\n" "$h" "${#paths[@]}" >> "$OUT_CANON"
-  printf "HASH %s (N=%d)\n" "$h" "${#paths[@]}" >> "$OUT_LATEST"
-  echo "─ Group #$group_count — hash: $h" >> "$OUT_GROUPS"
-
-  for i in "${!paths[@]}"; do
-    p="${paths[$i]}"; s="${sizes[$i]}"
-    printf "  %s\n" "$p" >> "$OUT_CANON"
-    printf "  %s\n" "$p" >> "$OUT_LATEST"
-    if [[ -n "$s" ]]; then
-      printf "   %2d) %s  (size: %s)\n" "$((i+1))" "$p" "$s" >> "$OUT_GROUPS"
-    else
-      printf "   %2d) %s\n" "$((i+1))" "$p" >> "$OUT_GROUPS"
-    fi
-    ((total_dupe_files++))
-  done
-  printf "\n" >> "$OUT_CANON"
-  printf "\n" >> "$OUT_LATEST"
-  echo >> "$OUT_GROUPS"
-
-  if [[ "$MODE" == "bulk" ]]; then
-    keep=""
-    case "$KEEP_STRATEGY" in
-      shortest-path)
-        shortest=999999
-        for p in "${paths[@]}"; do
-          plen="$(path_len "$p")"
-          if (( plen < shortest )); then shortest=$plen; keep="$p"; fi
-        done
-        ;;
-      oldest)
-        best=9999999999
-        for p in "${paths[@]}"; do
-          mt="$(get_mtime "$p")"
-          if (( mt < best )); then best=$mt; keep="$p"; fi
-        done
-        ;;
-      newest)
-        best=0
-        for p in "${paths[@]}"; do
-          mt="$(get_mtime "$p")"
-          if (( mt > best )); then best=$mt; keep="$p"; fi
-        done
-        ;;
-      first|*)
-        keep="${paths[0]}"
-        ;;
-    esac
-    for p in "${paths[@]}"; do
-      [[ "$p" == "$keep" ]] && continue
-      printf "%s\n" "$p" >> "$OUT_PLAN"
-    done
-  fi
-done < "$HASHES_TMP"
-
-info "Groups: $group_count  | Duplicate files (incl. keepers): $total_dupe_files"
+# Footer
+groups_count="$(grep -c '^HASH ' "$OUT_CANON" || true)"
+info "Groups: $groups_count"
 info "Canonical report: $OUT_CANON"
-info "Group summary:    $OUT_GROUPS"
 info "Flat CSV:         $OUT_CSV"
+info "Group summary:    $OUT_GROUPS"
 
 if [[ "$MODE" == "bulk" ]]; then
+  # Optional: build a naive plan (keep shortest path)
+  : > "$OUT_PLAN"
+  awk -F',' '
+    { h=$1; p=$2; len=length(p); paths[h,++idx[h]]=p; if (!best[h] || len<bestlen[h]) { best[h]=p; bestlen[h]=len } }
+    END {
+      for (h in idx) {
+        if (idx[h] >= 2) {
+          k=best[h]
+          for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) print p }
+        }
+      }
+    }
+  ' "$OUT_CSV" >> "$OUT_PLAN"
   if [[ -s "$OUT_PLAN" ]]; then
     info "Auto delete plan: $OUT_PLAN"
     cp -f "$OUT_PLAN" "$VAR_DIR/latest-plan.txt"
@@ -254,5 +213,7 @@ if [[ "$MODE" == "bulk" ]]; then
     warn "Bulk mode produced no deletable items (unexpected)."
   fi
 else
-  info "Next: run 'review-duplicates.sh --from-report \"$OUT_CANON\"' to interactively refine a plan."
+  info "Next: run 'review-duplicates.sh --from-report \"$OUT_CANON\"' (or menu option 4)."
+  cp -f "$OUT_CANON" "$OUT_LATEST" 2>/dev/null || true
+  info "Canonical report ready: $OUT_LATEST"
 fi
