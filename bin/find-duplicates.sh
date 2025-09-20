@@ -176,9 +176,13 @@ total_dupe_files=0
 get_mtime() { stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }   # GNU stat preferred; busybox fallback -> 0
 path_len() { printf "%s" "$1" | wc -c; }
 
-while IFS= read -r h; do
+while IFS= read -r h || [ -n "$h" ]; do
   # Ensure paths are unique within each hash
+  set +e
   mapfile -t rows < <(grep "^${h}," "$OUT_CSV" | awk -F',' '!seen[$2]++')
+  rc=$?
+  set -e
+  [ $rc -ne 0 ] && rows=()
   (( ${#rows[@]} < MIN_GROUP )) && continue
   ((group_count++))
 
