@@ -1,9 +1,7 @@
 #!/bin/sh
-# run-find-duplicates.sh — Menu Option 3 helper (POSIX/BusyBox-safe)
-# Runs find-duplicates.sh in-foreground so its progress is visible,
-# then prints a clear next step and groups count.
+# run-find-duplicates.sh — Option 3 helper (POSIX/BusyBox-safe)
 set -eu
-IFS=$(printf '\n\t')
+IFS="$(printf '\n\t')"
 
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
 APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -20,7 +18,6 @@ next(){ printf "%s[NEXT]%s %s\n" "$CNEXT" "$CRESET" "$*"; }
 latest_hasher_csv() { ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true; }
 latest_duplicate_report() {
   if [ -s "$LOGS_DIR/duplicate-hashes-latest.txt" ]; then printf "%s" "$LOGS_DIR/duplicate-hashes-latest.txt"; return 0; fi
-  # shellcheck disable=SC2012
   newest="$(ls -1t "$LOGS_DIR"/*-duplicate-hashes.txt 2>/dev/null | head -n1 || true)"
   if [ -n "${newest:-}" ] && [ -s "$newest" ]; then printf "%s" "$newest"; return 0; fi
   return 1
@@ -33,9 +30,13 @@ if [ -z "${csv:-}" ] || [ ! -f "$csv" ]; then
 fi
 
 info "Using hashes file: $csv"
-"$BIN_DIR/find-duplicates.sh" --input "$csv" || rc=$?
+# Hard sanity: make sure we're calling the right script
+if grep -m1 '^Usage: review-duplicates.sh' "$BIN_DIR/find-duplicates.sh" >/dev/null 2>&1; then
+  err "bin/find-duplicates.sh appears to be the REVIEW script by mistake (has 'Usage: review-duplicates.sh'). Reinstall it."
+  exit 2
+fi
 
-# shellcheck disable=SC2181
+"$BIN_DIR/find-duplicates.sh" --input "$csv" || rc=$?
 if [ "${rc:-0}" -ne 0 ]; then
   err "find-duplicates.sh exited with ${rc:-$?}"
   exit "${rc:-1}"
