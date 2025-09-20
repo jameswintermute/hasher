@@ -1,6 +1,9 @@
 #!/bin/sh
 # review-duplicates.sh — minimal POSIX/BusyBox interactive reviewer
+# Works with logs/*-duplicate-hashes.txt. No bash arrays; newline-safe.
 set -eu
+# Keep IFS off spaces to preserve file paths with spaces:
+IFS="$(printf '\n\t')"
 
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
 APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -39,16 +42,16 @@ done
 
 timestamp="$(date +'%Y-%m-%d-%H%M%S')"
 PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"; : > "$PLAN"
+QUIT=0
 
-groups=0
 get_mtime(){ stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }
 
 review_group() {
   hash="$1"; shift
   count=$#
   [ "$count" -ge 2 ] || return 0
-  groups=$((groups+1))
 
+  # default keeper
   keeper="$1"
   if [ "$KEEP" = "newest" ] || [ "$KEEP" = "oldest" ]; then
     best="$([ "$KEEP" = "newest" ] && echo 0 || echo 9999999999)"
@@ -70,7 +73,7 @@ review_group() {
   fi
 
   echo
-  echo "─ Group #$groups  hash: $hash  (N=$count)"
+  echo "─ Group  hash: $hash  (N=$count)"
   i=0
   for p in "$@"; do
     i=$((i+1))
@@ -82,7 +85,7 @@ review_group() {
   read -r ans || ans="q"
   case "$ans" in
     "" ) for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done ;;
-    q|Q) info "Stopping early per user request."; echo "__QUIT__" ;;
+    q|Q) info "Stopping early per user request."; QUIT=1 ;;
     s|S) : ;;
     k* ) n="$(printf "%s" "$ans" | awk '{print $2}')" || n=""
          if [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null; then
@@ -93,34 +96,52 @@ review_group() {
   esac
 }
 
-# Emit groups from the canonical report
-awk '
-  /^HASH / { if (n>0) print ""; n=0; print $0; next }
-  /^[[:space:]]*$/ { next }
-  /^  / { sub(/^[ ]+/, "", $0); print $0; n++; next }
-' -- "$REPORT" |
+# Build a bounded stream of groups with a single awk pass (no '--' to stay BusyBox-safe)
+STREAM="$LOGS_DIR/.review-stream-$$.txt"
+trap 'rm -f "$STREAM"' EXIT
+
 awk -v limit="$LIMIT" '
-  BEGIN{g=0}
-  /^HASH / { if (g==limit) exit; print; g++; next }
-  { print }
-' |
-while IFS= read -r line; do
+  BEGIN{g=0; n=0}
+  /^HASH[[:space:]]/ {
+    if (g==limit) exit
+    if (n>0) print ""
+    print
+    g++; n=0
+    next
+  }
+  /^[[:space:]]*$/ { next }
+  /^  / { sub(/^[ ]+/, "", $0); print; n++; next }
+' "$REPORT" > "$STREAM" || { err "Failed to parse report."; exit 1; }
+
+# Iterate the stream in the current shell (no subshell), preserving QUIT flag
+ghash=""; gpaths=""
+while IFS= read -r line || [ -n "$line" ]; do
   if [ -z "${line:-}" ]; then
-    [ -n "${ghash:-}" ] && review_group "$ghash" $gpaths || true
-    ghash=""; gpaths=""
-    continue
+    if [ -n "${ghash:-}" ]; then
+      oldIFS=$IFS; IFS="$(printf '\n\t')"
+      # shellcheck disable=SC2086
+      set -- $gpaths
+      IFS=$oldIFS
+      review_group "$ghash" "$@"
+      [ "$QUIT" -eq 1 ] && break
+    fi
+    ghash=""; gpaths=""; continue
   fi
   case "$line" in
     HASH\ *)
+      if [ -n "${ghash:-}" ]; then
+        oldIFS=$IFS; IFS="$(printf '\n\t')"; set -- $gpaths; IFS=$oldIFS
+        review_group "$ghash" "$@"; [ "$QUIT" -eq 1 ] && break
+        gpaths=""
+      fi
       ghash="$(printf "%s" "$line" | awk '{print $2}')"
-      gpaths=""
       ;;
     *)
       if [ -z "$gpaths" ]; then gpaths="$(printf "%s" "$line")"; else gpaths="$gpaths
 $(printf "%s" "$line")"; fi
       ;;
   esac
-done
+done < "$STREAM"
 
 echo
 info "Review complete. Plan: $PLAN"
