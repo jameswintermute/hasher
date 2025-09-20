@@ -208,15 +208,47 @@ action_find_duplicate_files(){ if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
 action_review_duplicates(){ if [ -x "$BIN_DIR/launch-review.sh" ]; then "$BIN_DIR/launch-review.sh" || true; else if [ -x "$BIN_DIR/review-duplicates.sh" ]; then "$BIN_DIR/review-duplicates.sh" || true; else err "$BIN_DIR/review-duplicates.sh not found or not executable."; fi; fi; printf "Press Enter to continue... "; read -r _ || true; }
 action_delete_zero_length(){ if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then "$BIN_DIR/delete-zero-length.sh" || true; else err "$BIN_DIR/delete-zero-length.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
 action_apply_plan(){
+  VAR_DIR="$ROOT_DIR/var/duplicates"
+
+  # Prefer FILE plan (from review-duplicates.sh)
+  file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  [ -z "$file_plan" ] && [ -f "$VAR_DIR/latest-plan.txt" ] && file_plan="$VAR_DIR/latest-plan.txt"
+
+  if [ -n "$file_plan" ]; then
+    info "Found file delete plan: $file_plan"
+    printf "Apply FILE plan now (move files to quarantine)? [y/N]: "; read -r ans || ans=""
+    case "$ans" in
+      y|Y|yes|YES)
+        if [ -x "$BIN_DIR/apply-file-plan.sh" ]; then
+          "$BIN_DIR/apply-file-plan.sh" --plan "$file_plan" --force || true
+        else
+          err "$BIN_DIR/apply-file-plan.sh not found or not executable."
+        fi
+      ;;
+    esac
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # Fallback: FOLDER plan
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-  if [ -z "$plan" ]; then info "No folder plan found."; printf "Press Enter to continue... "; read -r _ || true; return; fi
+  if [ -z "$plan" ]; then
+    info "No folder plan found."
+    printf "Press Enter to continue... "; read -r _ || true; return
+  fi
   info "Found folder plan: $plan"
-  printf "Apply folder plan now (move directories to quarantine)? [y/N]: "; read -r ans || ans=""
-  case "$ans" in y|Y|yes|YES) if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --force || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; esac
-  printf "Press Enter to continue... "; read -r _ || true;
+  printf "Apply FOLDER plan now (move directories to quarantine)? [y/N]: "; read -r ans || ans=""
+  case "$ans" in
+    y|Y|yes|YES)
+      if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
+        "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --force || true
+      else
+        err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
+      fi
+    ;;
+  esac
+  printf "Press Enter to continue... "; read -r _ || true
 }
-action_clean_caches(){ plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"; if [ -z "$plan" ]; then info "No folder plan found."; printf "Press Enter to continue... "; read -r _ || true; return; fi; if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --delete-metadata || true; else err "$BIN_DIR/apply-folder-plan.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
-action_delete_junk(){ if [ -x "$BIN_DIR/delete-junk.sh" ]; then "$BIN_DIR/delete-junk.sh" || true; else err "$BIN_DIR/delete-junk.sh not found or not executable."; fi; printf "Press Enter to continue... "; read -r _ || true; }
 
 action_system_check(){
   info "System check:"
