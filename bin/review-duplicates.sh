@@ -1,8 +1,10 @@
 #!/bin/sh
-# review-duplicates.sh — minimal POSIX/BusyBox interactive reviewer
-# Works with logs/*-duplicate-hashes.txt. No bash arrays; newline-safe.
+# review-duplicates.sh — POSIX/BusyBox-friendly interactive reviewer
+# - Reads canonical report: logs/*-duplicate-hashes.txt
+# - Optional ordering: --order size|count (default count). "size" ranks by total bytes using latest logs/duplicates-*.csv
+# - Interactive: Enter=accept suggested, 'k N'=set keeper index, number alone chooses keeper & accepts, 's'=skip, 'q'=quit
+# - Non-interactive policy: --non-interactive with --keep newest|oldest|first|last
 set -eu
-# Keep IFS off spaces to preserve file paths with spaces:
 IFS="$(printf '\n\t')"
 
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
@@ -23,16 +25,18 @@ Usage: review-duplicates.sh --from-report FILE [options]
   --limit N              Review at most N groups (default 50)
   --keep POLICY          newest|oldest|first|last (default newest)
   --non-interactive      Apply policy without prompts
+  --order size|count     Order groups by total duplicate bytes (size) or by count (default: count)
 EOF
 }
 
-REPORT=""; LIMIT=50; KEEP="newest"; NONINT=0
+REPORT=""; LIMIT=50; KEEP="newest"; NONINT=0; ORDER="count"
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-report) REPORT="${2:-}"; shift 2 ;;
     --limit) LIMIT="${2:-50}"; shift 2 ;;
     --keep) KEEP="${2:-newest}"; shift 2 ;;
     --non-interactive) NONINT=1; shift ;;
+    --order) ORDER="${2:-count}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) err "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -51,7 +55,7 @@ review_group() {
   count=$#
   [ "$count" -ge 2 ] || return 0
 
-  # default keeper
+  # default keeper proposal
   keeper="$1"
   if [ "$KEEP" = "newest" ] || [ "$KEEP" = "oldest" ]; then
     best="$([ "$KEEP" = "newest" ] && echo 0 || echo 9999999999)"
@@ -81,67 +85,93 @@ review_group() {
     printf "  %2d) %s%s\n" "$i" "$mark" "$p"
   done
   echo "    Policy: $KEEP  [* marks suggested keeper]"
-  printf "    Action: (Enter=accept) [k N=set keep] [s=skip] [q=quit] > "
+  printf "    Action: (Enter=accept) [N=pick keep] [k N=set keep] [s=skip] [q=quit] > "
   read -r ans || ans="q"
-  case "$ans" in
-    "" ) for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done ;;
+  # normalize CR & whitespace-only to blank
+  trimmed="$(printf "%s" "$ans" | tr -d '\r' | sed 's/^[[:space:]]*$//')"
+  if [ -z "$trimmed" ]; then
+    for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done
+    return 0
+  fi
+
+  case "$trimmed" in
     q|Q) info "Stopping early per user request."; QUIT=1 ;;
     s|S) : ;;
-    k* ) n="$(printf "%s" "$ans" | awk '{print $2}')" || n=""
-         if [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null; then
-           i=0; for p in "$@"; do i=$((i+1)); [ "$i" -eq "$n" ] && keeper="$p"; done
-           for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done
-         else echo "    Invalid index."; fi ;;
-    * ) echo "    Unknown input." ;;
-  esac
-}
-
-# Build a bounded stream of groups with a single awk pass (no '--' to stay BusyBox-safe)
-STREAM="$LOGS_DIR/.review-stream-$$.txt"
-trap 'rm -f "$STREAM"' EXIT
-
-awk -v limit="$LIMIT" '
-  BEGIN{g=0; n=0}
-  /^HASH[[:space:]]/ {
-    if (g==limit) exit
-    if (n>0) print ""
-    print
-    g++; n=0
-    next
-  }
-  /^[[:space:]]*$/ { next }
-  /^  / { sub(/^[ ]+/, "", $0); print; n++; next }
-' "$REPORT" > "$STREAM" || { err "Failed to parse report."; exit 1; }
-
-# Iterate the stream in the current shell (no subshell), preserving QUIT flag
-ghash=""; gpaths=""
-while IFS= read -r line || [ -n "$line" ]; do
-  if [ -z "${line:-}" ]; then
-    if [ -n "${ghash:-}" ]; then
-      oldIFS=$IFS; IFS="$(printf '\n\t')"
-      # shellcheck disable=SC2086
-      set -- $gpaths
-      IFS=$oldIFS
-      review_group "$ghash" "$@"
-      [ "$QUIT" -eq 1 ] && break
-    fi
-    ghash=""; gpaths=""; continue
-  fi
-  case "$line" in
-    HASH\ *)
-      if [ -n "${ghash:-}" ]; then
-        oldIFS=$IFS; IFS="$(printf '\n\t')"; set -- $gpaths; IFS=$oldIFS
-        review_group "$ghash" "$@"; [ "$QUIT" -eq 1 ] && break
-        gpaths=""
-      fi
-      ghash="$(printf "%s" "$line" | awk '{print $2}')"
+    k\ *)
+      n="$(printf "%s" "$trimmed" | awk '{print $2}')" || n=""
       ;;
     *)
-      if [ -z "$gpaths" ]; then gpaths="$(printf "%s" "$line")"; else gpaths="$gpaths
-$(printf "%s" "$line")"; fi
+      # if plain number, treat as 'k N'
+      if printf "%s" "$trimmed" | grep -Eq '^[0-9]+$'; then n="$trimmed"; else n=""; fi
       ;;
   esac
-done < "$STREAM"
+
+  if [ -n "${n:-}" ]; then
+    # choose index
+    idx="$n"
+    # bounds check
+    if [ "$idx" -ge 1 ] 2>/dev/null; then
+      i=0; for p in "$@"; do i=$((i+1)); [ "$i" -eq "$idx" ] && keeper="$p"; done
+      for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done
+    else
+      echo "    Invalid index."
+    fi
+  else
+    echo "    Unknown input."
+  fi
+}
+
+TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
+# First pass: split report into per-hash group files; also capture hash list
+HASHLIST="$TMPDIR/hashes.txt"; : > "$HASHLIST"
+awk -v dir="$TMPDIR" '
+  /^HASH[[:space:]]/ { h=$2; f=dir "/" h ".grp"; print h >> "'"$HASHLIST"'"; next }
+  /^[[:space:]]*$/ { next }
+  /^  / { sub(/^[ ]+/, "", $0); if (h!="") print $0 >> f; next }
+' "$REPORT"
+
+# Determine ordering
+ORDER_FILE="$TMPDIR/order.txt"; : > "$ORDER_FILE"
+if [ "$ORDER" = "size" ]; then
+  csv="$(ls -1t "$LOGS_DIR"/duplicates-*.csv 2>/dev/null | head -n1 || true)"
+  if [ -n "${csv:-}" ] && [ -f "$csv" ]; then
+    info "Ranking groups by total size (largest first)…"
+    awk -F',' 'NR==FNR{ok[$0]=1; next} ok[$1]{ s=($3==""?0:$3); sum[$1]+=s } END{ for (k in sum) printf "%012d %s\n", sum[k], k }' "$HASHLIST" "$csv" \
+      | sort -nr > "$ORDER_FILE"
+  else
+    warn "No duplicates-*.csv found; falling back to count ordering."
+    ORDER="count"
+  fi
+fi
+
+if [ "$ORDER" = "count" ]; then
+  info "Ranking groups by file count (largest first)…"
+  # count lines in each .grp file
+  # shellcheck disable=SC2045
+  for f in $(ls "$TMPDIR"/*.grp 2>/dev/null || true); do
+    h="$(basename "$f" .grp)"
+    c="$(wc -l < "$f" 2>/dev/null || echo 0)"
+    printf "%012d %s\n" "$c" "$h" >> "$ORDER_FILE"
+  done
+  sort -nr "$ORDER_FILE" -o "$ORDER_FILE"
+fi
+
+# Iterate in chosen order, up to LIMIT groups
+shown=0
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -z "${line:-}" ] && continue
+  h="$(printf "%s" "$line" | awk '{print $2}')"
+  f="$TMPDIR/$h.grp"
+  [ -s "$f" ] || continue
+  # read paths for this group
+  gpaths="$(cat "$f")"
+  # call reviewer
+  oldIFS=$IFS; IFS="$(printf '\n\t')"; set -- $gpaths; IFS=$oldIFS
+  review_group "$h" "$@"
+  [ "$QUIT" -eq 1 ] && break
+  shown=$((shown+1))
+  [ "$shown" -ge "$LIMIT" ] && break
+done < "$ORDER_FILE"
 
 echo
 info "Review complete. Plan: $PLAN"
