@@ -11,6 +11,7 @@ HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
 BIN_DIR="$ROOT_DIR/bin"
 LOCAL_DIR="$ROOT_DIR/local"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
+VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
 # Colors (only if stdout is a TTY)
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
@@ -289,6 +290,71 @@ action_system_check(){
     sed -n '1,10p' "$efile" | sed 's/^/      /'
   fi
   printf "Press Enter to continue... "; read -r _ || true;
+}
+
+# ────────────────────────────── Action 10 ──────────────────────────────
+# Clean cache dirs (@eaDir only) — safe & reversible (Synology will rebuild)
+action_clean_caches() {
+  local paths_file="$LOCAL_DIR/paths.txt"
+  local roots=()
+  local default_root="/volume1"
+
+  # Resolve roots (prefer local/paths.txt if present)
+  if [[ -f "$paths_file" ]]; then
+    mapfile -t roots < <(grep -Ev '^\s*(#|$)' "$paths_file")
+    [[ ${#roots[@]} -gt 0 ]] || roots=("$default_root")
+  else
+    read -r -p "Root to clean (default: $default_root): " _r
+    roots=("${_r:-$default_root}")
+  fi
+
+  log_info "Searching for Synology cache directories (@eaDir)…"
+  mkdir -p "$VAR_DIR"
+  local listfile="$VAR_DIR/eadir-list-$(date +%s).txt"
+  : > "$listfile"
+
+  # Build list (null-delimited for safety)
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || { log_warn "Missing root: $root"; continue; }
+    find "$root" -type d -name '@eaDir' -prune -print0 >> "$listfile"
+  done
+
+  # Count matches
+  local total=0
+  if [[ -s "$listfile" ]]; then
+    total=$(tr -cd '\0' < "$listfile" | wc -c | tr -d ' ')
+  fi
+  log_info "Found @eaDir directories: $total"
+  if (( total == 0 )); then
+    read -r -p "Nothing to clean. Press Enter to continue…" _
+    return 0
+  fi
+
+  # Preview a few
+  printf '[INFO] Examples:\n'
+  tr '\0' '\n' < "$listfile" | head -n 10
+
+  # Confirm
+  read -r -p "Delete ALL @eaDir directories found? [y/N]: " ans
+  case "${ans,,}" in
+    y|yes) ;;
+    *) log_info "Aborted."; read -r -p "Press Enter to continue…" _; return 0 ;;
+  esac
+
+  # Delete with a 15s heartbeat
+  local done=0; local last=$(date +%s)
+  while IFS= read -r -d '' d; do
+    rm -rf -- "$d" || true
+    ((done++))
+    local now=$(date +%s)
+    if (( now - last >= 15 )); then
+      printf '[PROGRESS] Deleted %d/%d @eaDir folders\n' "$done" "$total"
+      last=$now
+    fi
+  done < "$listfile"
+
+  printf '[OK] Deleted %d @eaDir folders.\n' "$done"
+  read -r -p "Press Enter to continue…" _
 }
 
 # Menu loop
