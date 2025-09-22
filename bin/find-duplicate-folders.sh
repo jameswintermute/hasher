@@ -1,191 +1,227 @@
-#!/usr/bin/env bash
-# find-duplicate-folders.sh — Hasher: detect duplicate folders
-# Safe-by-default; no deletes. Emits a report grouping identical folders.
-# Copyright (C) 2025 James
-# License: GPLv3
+#!/bin/sh
+# find-duplicate-folders.sh — identify duplicate folders and write a plan
+# POSIX / BusyBox sh compatible. No bashisms.
+# Signature logic: for each directory, build a sorted list of "basename|hash|size".
+# Directories with identical signatures are duplicates.
+#
+# Usage: find-duplicate-folders.sh --input <hashes.csv> [--mode plan] [--min-group-size N] [--keep POLICY]
+#   -i, --input FILE         CSV/TSV with columns: path,size_bytes,algo,hash  (mtime optional)
+#   -m, --mode MODE          Only 'plan' is supported [default: plan]
+#   -g, --min-group-size N   Minimum duplicate dirs in a group [default: 2]
+#   -k, --keep POLICY        shortest-path|longest-path|first-seen [default: shortest-path]
+#   -s, --scope SCOPE        Informational label [default: recursive]
+#   --signature SIG          Accepted for compatibility; currently fixed to name+content
+#   -h, --help               Show help
+set -eu
 
-set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
-
-# ────────────────────────────── Layout ───────────────────────────────
-SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# layout
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-LOGS_DIR="$ROOT_DIR/logs"
-HASHES_DIR="$ROOT_DIR/hashes"
-VAR_DIR="$ROOT_DIR/var"
-mkdir -p "$LOGS_DIR" "$VAR_DIR"
+LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
+VAR_DIR="$ROOT_DIR/var";   mkdir -p "$VAR_DIR"
 
-# ───────────────────────────── Defaults ──────────────────────────────
-HASHES_FILE=""
-SCOPE="recursive"            # recursive|shallow
-SIGNATURE="name+content"     # name|name+size|name+content
-MIN_GROUP_SIZE=2
-KEEP="shortest-path"         # informational only in this step
-RUN_ID="$(date +%s)"
-REPORT="$LOGS_DIR/duplicate-folders-$(date +%F)-$RUN_ID.txt"
-INDEX_TSV="$VAR_DIR/dupfolders-index-$RUN_ID.tsv"
-SORTED_TSV="$VAR_DIR/dupfolders-sorted-$RUN_ID.tsv"
+INPUT=""
+MODE="plan"
+MIN_GROUP=2
+KEEP="shortest-path"
+SCOPE="recursive"
+SIGNATURE="name+content"   # printed for info only
 
-# ───────────────────────────── Logging ───────────────────────────────
-log_info() { printf '[INFO] %s\n' "$*"; }
-log_work() { printf '[WORK] %s\n' "$*"; }
-log_ok()   { printf '[OK] %s\n'   "$*"; }
-log_warn() { printf '[WARN] %s\n' "$*"; }
-log_err()  { printf '[ERR ] %s\n' "$*" >&2; }
+# colors if tty
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+  CINFO="$(printf '\033[1;34m')"; COK="$(printf '\033[1;32m')"; CWARN="$(printf '\033[1;33m')"; CERR="$(printf '\033[1;31m')"; C0="$(printf '\033[0m')"
+else
+  CINFO=""; COK=""; CWARN=""; CERR=""; C0=""
+fi
 
-pause()    { read -r -p "Press Enter to continue..." _ || true; }
+info(){ printf "%s[INFO]%s %s\n" "$CINFO" "$C0" "$*"; }
+ok(){   printf "%s[OK]%s %s\n"   "$COK"   "$C0" "$*"; }
+warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$C0" "$*"; }
+err(){  printf "%s[ERROR]%s %s\n" "$CERR" "$C0" "$*"; }
 
-# ───────────────────────────── Args ──────────────────────────────────
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [--hashes-file FILE] [--scope recursive|shallow]
-                         [--signature name|name+size|name+content]
-                         [--min-group-size N] [--keep policy]
-
-Find duplicate folders by comparing normalized file inventories.
-
-Outputs: $REPORT
-EOF
-  exit 1
+usage(){
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-while (($#)); do
+# parse args
+while [ $# -gt 0 ]; do
   case "$1" in
-    --hashes-file) HASHES_FILE="${2:-}"; shift 2 ;;
-    --scope) SCOPE="${2:-}"; shift 2 ;;
-    --signature) SIGNATURE="${2:-}"; shift 2 ;;
-    --min-group-size|--min) MIN_GROUP_SIZE="${2:-}"; shift 2 ;;
-    --keep) KEEP="${2:-}"; shift 2 ;;
-    -h|--help) usage ;;
-    *) log_warn "Unknown arg: $1"; shift ;;
+    -i|--input)           INPUT="${2-}"; shift 2;;
+    -m|--mode)            MODE="${2-}"; shift 2;;
+    -g|--min-group-size)  MIN_GROUP="${2-}"; shift 2;;
+    -k|--keep)            KEEP="${2-}"; shift 2;;
+    -s|--scope)           SCOPE="${2-}"; shift 2;;
+    --signature)          SIGNATURE="${2-}"; shift 2;; # accepted but not used; for CLI compatibility
+    -h|--help) usage; exit 0;;
+    *) err "Unknown arg: $1"; usage; exit 2;;
   esac
 done
 
-if [[ -z "${HASHES_FILE:-}" ]]; then
-  HASHES_FILE="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
-fi
-[[ -f "${HASHES_FILE:-/nope}" ]] || { log_err "Hashes file not found."; pause; exit 1; }
+[ -n "${INPUT:-}" ] || { err "Missing --input FILE"; usage; exit 2; }
+[ -f "$INPUT" ] || { err "Input not found: $INPUT"; exit 2; }
+case "$MODE" in plan) : ;; *) err "Only --mode plan is supported"; exit 2;; esac
 
-# ─────────────────────────── Prologue ────────────────────────────────
-log_info "Using hashes file: $HASHES_FILE"
-# Quarantine line mirrors launcher style (informational only)
-if df_out=$(df -h "$ROOT_DIR" 2>/dev/null | awk 'NR==2{print $4" free on "$1" ("$6")"}'); then
-  log_info "Quarantine: $ROOT_DIR/quarantine-$(date +%F) — $df_out"
-fi
-log_info "Input: $HASHES_FILE"
-log_info "Mode: plan  | Min group size: $MIN_GROUP_SIZE | Scope: $SCOPE | Keep: $KEEP | Signature: $SIGNATURE"
-log_info "Using size_bytes from CSV/TSV (fast path)."
+DATE_TAG="$(date +%F)"
+PLAN="$LOGS_DIR/duplicate-folders-plan-$DATE_TAG.txt"
+TMP_BASE="$VAR_DIR/dupdirs.$$"
+TMP_FILES="$TMP_BASE.files.tsv"     # dir \t basename \t hash \t size
+TMP_SORTED="$TMP_BASE.sorted.tsv"   # sorted by dir, then basename/hash/size
+TMP_SIGS="$TMP_BASE.sigs.tsv"       # signature_string \t dir
+TMP_GROUPS="$TMP_BASE.groups.tsv"   # reclaim_bytes \t keep_dir \t delete_dir
 
-# ───────────────── Step 1: Build a simple index ─────────────────────
-# TSV columns: dir<TAB>relpath<TAB>size<TAB>hash
-# We auto-detect header columns (path, size_bytes, hash). Paths are assumed
-# to be comma-safe (Hasher default).
-log_work "Indexing files (fast path)…"
-awk -v OFS='\t' -v scope="$SCOPE" '
-  BEGIN{FS=","; P=0; S=0; H=0}
+trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" 2>/dev/null || true' EXIT INT TERM
+
+info "Input: $INPUT"
+info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP  | Signature: $SIGNATURE"
+info "Using size_bytes from CSV/TSV (fast path)."
+
+# 1) explode CSV into (dir, basename, hash, size). Header-aware; supports 4 or 5 columns.
+awk '
+  function rsplit_commas(s,   n,pos,i){ n=0; pos=0; while ( (i=index(substr(s,pos+1),",")) > 0 ){ pos+=i; n++; c[n]=pos } return n }
+  function unquote_path(p){ if (p ~ /^".*"$/){ sub(/^"/,"",p); sub(/"$/,"",p); gsub(/""/,"\"",p) } return p }
+  BEGIN{ NRrec=0 }
   NR==1{
-    for(i=1;i<=NF;i++){
-      f=tolower($i)
-      if(f ~ /(^|_)path($|_)/) P=i
-      else if(f ~ /size(_?bytes)?/) S=i
-      else if(f ~ /(^|_)hash($|_)/) H=i
-    }
-    if(!P){P=1} # fallbacks
-    next
+    line=$0; t=line; gsub(/[ \t\r\n]/,"",t);
+    if (t ~ /^path,/i){ has_header=1; next } else { has_header=0 }
   }
   {
-    p=$P
-    gsub(/^"+|"+$/,"",p)
-    # derive filename + parent directory
-    name=p; sub(/.*\//,"",name)
-    dir=p; sub(/\/[^/]+$/,"",dir); if(dir=="") dir="/"
-    size=(S? $S : 0)
-    hash=(H? $H : "")
-    if(scope=="shallow"){
-      print dir, name, size, hash
+    s=$0; n=rsplit_commas(s);
+    if (n<3) next;
+    if (n>=4){
+      c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n];
+      path=substr(s,1,c1-1);
+      size=substr(s,c1+1,c2-c1-1);
+      # mtime=substr(s,c2+1,c3-c2-1);
+      # algo =substr(s,c3+1,c4-c3-1);
+      hash=substr(s,c4+1);
     } else {
-      # emit for each ancestor so we can compare recursively
-      n=split(dir, parts, "/")
-      path_acc=""
-      for(i=1;i<=n;i++){
-        if(i==1 && parts[i]=="") { path_acc="/"; next }  # leading /
-        path_acc=(path_acc=="/" ? "/" parts[i] : path_acc "/" parts[i])
-        rel=p
-        sub("^" path_acc "/?", "", rel)
-        print path_acc, rel, size, hash
-      }
-      if(dir=="/"){ print "/", name, size, hash }
+      c1=c[n-2]; c2=c[n-1]; c3=c[n];
+      path=substr(s,1,c1-1);
+      size=substr(s,c1+1,c2-c1-1);
+      # algo=substr(s,c2+1,c3-c2-1);
+      hash=substr(s,c3+1);
     }
-  }
-' "$HASHES_FILE" > "$INDEX_TSV"
-
-total_lines=$(wc -l < "$INDEX_TSV" | tr -d ' ')
-log_work "indexing files 100% ($total_lines/$total_lines)"
-log_work "Sorting index..."
-LC_ALL=C sort -t $'\t' -k1,1 -k2,2 "$INDEX_TSV" > "$SORTED_TSV"
-log_ok  "Sorting complete."
-
-# ────────── Step 2: Group by normalized folder inventory ────────────
-# No process-substitution; pure pipes/redirections to avoid '>' parse faults.
-# Progress heartbeat every 15s.
-log_work "Scanning & grouping (this can take a while)…"
-{
-  echo "# duplicate-folders report"
-  echo "# generated: $(date -Is)"
-  echo "# source: $(basename "$HASHES_FILE")"
-  echo "# scope=$SCOPE signature=$SIGNATURE min_group_size=$MIN_GROUP_SIZE keep=$KEEP"
-  echo
-} > "$REPORT"
-
-awk -v FS='\t' -v OFS='\t' -v sig="$SIGNATURE" -v min="$MIN_GROUP_SIZE" -v total="$total_lines" '
-  function heartbeat(force){
-    now=systime()
-    if(force || now-last>=15){
-      pct = (processed>0 && total>0) ? int(processed*100/total) : 0
-      printf("[PROGRESS] Grouping: %d%% (%d/%d)\n", pct, processed, total) > "/dev/stderr"
-      last=now
-    }
-  }
-  function flush_prev() {
-    if(prev_dir=="") return
-    # sort keys to normalize inventory (order-insensitive)
-    n=asorti(keys, idx)
-    blob=""
-    for(i=1;i<=n;i++){ if(keys[idx[i]]!="") blob = blob keys[idx[i]] "\034" } # unit sep
-    dir_sig[prev_dir]=blob
-    delete keys
-  }
-  {
-    dir=$1; rel=$2; size=$3; hash=$4
-    k = (sig=="name") ? rel : (sig=="name+size" ? rel "|" size : rel "|" hash)
-    if(dir!=prev_dir){
-      flush_prev()
-      prev_dir=dir
-    }
-    keys[k]=k
-    processed++
-    heartbeat(0)
+    path=unquote_path(path);
+    gsub(/^[ \t]+|[ \t]+$/,"",hash);
+    gsub(/^[ \t]+|[ \t]+$/,"",size);
+    # derive dir and basename (avoid external dirname/basename for speed)
+    p=path; lastslash=match(p,/[^/]*$/); base=substr(p,lastslash); dir=substr(p,1,lastslash-2);
+    # escape tabs/newlines just in case
+    gsub(/\t/,"\\t",dir); gsub(/\n/," ",dir);
+    gsub(/\t/,"\\t",base); gsub(/\n/," ",base);
+    # ensure numeric size; unknown -> 0
+    if (size ~ /^[0-9]+$/) ; else size=0;
+    printf "%s\t%s\t%s\t%s\n", dir, base, hash, size;
+    NRrec++;
   }
   END{
-    flush_prev()
-    # invert: signature -> list of dirs
-    for(d in dir_sig){
-      s=dir_sig[d]
-      cnt[s]++
-      list[s] = list[s] d "\n"
-    }
-    groups=0
-    for(s in cnt){
-      if(cnt[s] >= min){
-        groups++
-        printf("GROUP %d (dirs=%d)\n", groups, cnt[s]) >> report
-        printf("%s\n", list[s]) >> report
-      }
-    }
-    heartbeat(1)
+    # print a progress hint on stderr to avoid polluting stdout
+    # but we write to a file via shell redirection anyway
   }
-' report="$REPORT" "$SORTED_TSV"
+' "$INPUT" > "$TMP_FILES"
 
-log_ok  "Report written: $REPORT"
-echo
-pause
+total_lines="$(wc -l < "$TMP_FILES" | tr -d ' ')"
+info "[WORK] indexing files 100% ($total_lines/$total_lines)"
+info "[WORK] Sorting index…"
+LC_ALL=C sort -t '	' -k1,1 -k2,2 -k3,3 -k4,4 "$TMP_FILES" > "$TMP_SORTED"
+ok "Sorting complete."
+
+# 2) Build per-directory signature string (sorted basename|hash|size list joined by '|')
+#    Then map signature_string -> directories
+awk -F '	' '
+  function flush_prev(){
+    if (curdir!=""){
+      # potential reclaim for a dir itself is not computed here (needs grouping)
+      printf "%s\t%s\n", sig, curdir;
+    }
+  }
+  {
+    d=$1; b=$2; h=$3; s=$4;
+    if (d!=curdir){
+      flush_prev();
+      curdir=d; sig="";
+    }
+    if (sig=="") sig=b "|" h "|" s; else sig=sig "|" b "|" h "|" s;
+  }
+  END{ flush_prev() }
+' "$TMP_SORTED" > "$TMP_SIGS"
+
+# 3) Group by identical signatures; choose keep dir by policy; compute reclaim = size_per_file * (count-1) * files_in_dir
+#    To compute reclaim, we need per-dir total size. Re-scan the sorted file to accumulate per-dir total bytes.
+awk -F '	' '
+  BEGIN{}
+  {
+    d=$1; s=$4+0;
+    if (d!=pd && pd!=""){ printf "%s\t%d\n", pd, sum; sum=0 }
+    sum+=s; pd=d;
+  }
+  END{ if (pd!="") printf "%s\t%d\n", pd, sum }
+' "$TMP_SORTED" > "$TMP_BASE.dirsize.tsv"
+
+# 3a) Now join SIGS (sig->dir) with dirsize (dir->size) to make lines: sig \t dir \t dir_total_size
+#     Use awk map (single pass load sizes)
+awk -F '	' '
+  FNR==NR { sz[$1]=$2; next }
+  { d=$2; printf "%s\t%s\t%d\n", $1, d, (d in sz ? sz[d] : 0) }
+' "$TMP_BASE.dirsize.tsv" "$TMP_SIGS" > "$TMP_BASE.sig_dir_size.tsv"
+
+# 4) Sort by signature then by dir; then collapse groups with count>=MIN_GROUP; choose keep by policy.
+LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MIN="$MIN_GROUP" -v KEEP="$KEEP" '
+  function choose_keep_idx(n,     i, best, bestlen){
+    if (KEEP=="shortest-path"){
+      best=1; bestlen=length(dir[1]);
+      for(i=2;i<=n;i++){ if (length(dir[i])<bestlen){ best=i; bestlen=length(dir[i]) } }
+      return best;
+    } else if (KEEP=="longest-path"){
+      best=1; bestlen=length(dir[1]);
+      for(i=2;i<=n;i++){ if (length(dir[i])>bestlen){ best=i; bestlen=length(dir[i]) } }
+      return best;
+    } else { # first-seen
+      return 1;
+    }
+  }
+  function reset_group(){ gsig=""; n=0 }
+  BEGIN{ reset_group() }
+  {
+    s=$1; d=$2; t=$3+0;
+    if (s!=gsig && gsig!=""){
+      if (n>=MIN){
+        keepi=choose_keep_idx(n);
+        for(i=1;i<=n;i++){ if (i!=keepi) printf "%d\t%s\t%s\n", total[i], dir[keepi], dir[i] }
+      }
+      reset_group();
+    }
+    if (s!=gsig){ gsig=s }
+    n++; dir[n]=d; total[n]=t;
+  }
+  END{
+    if (n>=MIN){
+      keepi=choose_keep_idx(n);
+      for(i=1;i<=n;i++){ if (i!=keepi) printf "%d\t%s\t%s\n", total[i], dir[keepi], dir[i] }
+    }
+  }
+' > "$TMP_GROUPS"
+
+# 5) Write plan file, sorted by descending reclaim-per-dir
+#    Here reclaim per delete_dir is simply its total size (we keep one exemplar).
+LC_ALL=C sort -nr -k1,1 "$TMP_GROUPS" > "$TMP_BASE.groups.sorted.tsv"
+
+# Pretty print summary and emit plan
+groups_count="$(wc -l < "$TMP_BASE.groups.sorted.tsv" | tr -d ' ')"
+if [ -z "$groups_count" ]; then groups_count=0; fi
+dupe_dirs=$groups_count
+
+# Sum potential reclaim (sum of delete_dir sizes)
+reclaim_bytes="$(awk -F '	' '{s+=$1} END{print s+0}' "$TMP_BASE.groups.sorted.tsv")"
+
+info "Found duplicate folder *pairs*: $dupe_dirs"
+printf "%s[INFO]%s Potential reclaim if applied: %.2f GiB\n" "$CINFO" "$C0" "$(awk 'BEGIN{print '"${reclaim_bytes}"'/1073741824}')" 
+
+# Emit plan file
+: > "$PLAN"
+while IFS='	' read -r sz keepdir deldir; do
+  printf "%s\n" "$deldir" >> "$PLAN"
+done < "$TMP_BASE.groups.sorted.tsv"
+
+ok "Plan written: $PLAN"
+exit 0
