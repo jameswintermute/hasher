@@ -109,7 +109,7 @@ error() { _log "ERROR" "$*"; }
 #   [logging]  level, background-interval, xtrace
 #   [exclusions]
 #              inherit-defaults=true|false
-#              exclude=PATTERN  (or bare line "PATTERN" with no '=')
+#              exclude=PATTERN  (or bare line "PATTERN" with no '=' )
 # Other sections/keys are ignored without warnings.
 load_config() {
   local f="$1"
@@ -357,16 +357,28 @@ build_file_list() {
 # ───────────────────────── CSV Helpers ─────────────────────
 csv_escape() { local s="$1"; s="${s//\"/\"\"}"; printf '"%s"' "$s"; }
 
+# Robust header guard: write or prepend header if missing
 write_csv_header() {
-  if [[ ! -s "$OUTPUT" ]]; then
-    printf 'path,size_bytes,mtime_epoch,algo,hash\n' > "$OUTPUT"
+  local f="$OUTPUT"
+  local dir; dir="$(dirname "$f")"
+  mkdir -p "$dir"
+  # brand-new or empty file → write header
+  if [[ ! -e "$f" || ! -s "$f" ]]; then
+    printf 'path,size_bytes,mtime_epoch,algo,hash\n' > "$f"
+    return
+  fi
+  # existing non-empty file → ensure first line is the header
+  local first; first="$(head -n1 "$f" 2>/dev/null || echo)"
+  if [[ "$first" != "path,size_bytes,mtime_epoch,algo,hash" ]]; then
+    local tmp="$f.tmp.$$"
+    { printf 'path,size_bytes,mtime_epoch,algo,hash\n'; cat "$f"; } > "$tmp" && mv -f -- "$tmp" "$f"
   fi
 }
 
 append_csv_row() {
   local path="$1" size="$2" mtime="$3" algo="$4" hash="$5"
   printf '%s,%s,%s,%s,%s\n' \
-    "$(csv_escape "$path")" "$size" "$mtime" "$ALGO" "$hash" >> "$OUTPUT"
+    "$(csv_escape "$path")" "$size" "$mtime" "$algo" "$hash" >> "$OUTPUT"
 }
 
 # ───────────────────────── Progress Tickers ────────────────
