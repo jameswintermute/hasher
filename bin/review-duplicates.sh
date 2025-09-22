@@ -1,257 +1,375 @@
 #!/bin/sh
-# review-duplicates.sh — POSIX/BusyBox-friendly interactive reviewer
-# Reads from the controlling TTY (FD 3/4) so prompts always block even when launched from a parent menu.
-# Progress bars, size ordering, per-group reclaim, summary, and %/count scope selection.
+# review-duplicates.sh — Interactive review of duplicate hash groups
+# BusyBox/POSIX sh compatible. No bashisms.
+# Uses CSV (path,size_bytes,algo,hash) to compute correct reclaim.
+# Copyright (C) 2025
 set -eu
-IFS="$(printf '\n\t')"
 
-SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
-APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-LOGS_DIR="$APP_HOME/logs"; mkdir -p "$LOGS_DIR"
-VAR_DIR="$APP_HOME/var/duplicates"; mkdir -p "$VAR_DIR"
+# ────────────────────────────── Layout ──────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
+HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
+VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
-# Open dedicated TTY FDs for reliable prompts/reads
-if [ -r /dev/tty ]; then
-  exec 3</dev/tty 4>/dev/tty
+# ────────────────────────────── Defaults ────────────────────────────
+REPORT_DEFAULT="$LOGS_DIR/duplicate-hashes-latest.txt"
+REPORT="$REPORT_DEFAULT"
+KEEP_POLICY="shortest-path"   # newest|oldest|shortest-path|longest-path|first-seen
+LIMIT_GROUPS=""               # exact number
+LIMIT_PERCENT=""              # percent of total groups
+PLAN_FILE="$LOGS_DIR/review-dedupe-plan-$(date +%F)-$$.txt"
+
+# Colors only if stdout is a TTY
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+  CINFO="$(printf '\033[1;34m')"; COK="$(printf '\033[1;32m')"; CWARN="$(printf '\033[1;33m')"; CERR="$(printf '\033[1;31m')"; C0="$(printf '\033[0m')"
 else
-  # Fallback to stdin/stdout
-  exec 3<&0 4>&1
+  CINFO=""; COK=""; CWARN=""; CERR=""; C0=""
 fi
 
-COK="$(printf '\033[0;32m')"; CWARN="$(printf '\033[1;33m')"; CERR="$(printf '\033[0;31m')"; CCYAN="$(printf '\033[0;36m')"; CRESET="$(printf '\033[0m')"
-info(){ printf "%s[INFO]%s %s\n" "$COK" "$CRESET" "$*" >&4; }
-warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$CRESET" "$*"; }
-err(){  printf "%s[ERROR]%s %s\n" "$CERR" "$CRESET" "$*"; }
-next(){ printf "%s[NEXT]%s %s\n" "$CCYAN" "$CRESET" "$*"; }
+# ────────────────────────────── Helpers ─────────────────────────────
+die() { echo "${CERR}[ERROR]${C0} $*" >&2; exit 1; }
+info(){ echo "${CINFO}[INFO]${C0} $*"; }
+ok()  { echo "${COK}[OK]${C0} $*"; }
+warn(){ echo "${CWARN}[WARN]${C0} $*"; }
 
-usage(){
-cat >&4 <<'EOF'
-Usage: review-duplicates.sh --from-report FILE [options]
-  --from-report FILE     Canonical duplicate-hashes report
-  --limit N              Review at most N groups (default 50)
-  --keep POLICY          newest|oldest|first|last (default newest)
-  --non-interactive      Apply policy without prompts
-  --order size|count     Order groups by total duplicate bytes (size) or by count (default: count)
+is_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+stat_size() {
+  # bytes, best-effort across BusyBox/GNU/BSD
+  if command -v stat >/dev/null 2>&1; then
+    if stat -c %s "$1" >/dev/null 2>&1; then stat -c %s "$1" && return 0; fi
+    if stat -f %z "$1" >/dev/null 2>&1; then stat -f %z "$1" && return 0; fi
+  fi
+  # Fallback with wc -c (slower, reads file)
+  wc -c <"$1" 2>/dev/null || echo 0
+}
+
+stat_mtime() {
+  # epoch seconds for keep=newest/oldest
+  if command -v stat >/dev/null 2>&1; then
+    if stat -c %Y "$1" >/dev/null 2>&1; then stat -c %Y "$1" && return 0; fi
+    if stat -f %m "$1" >/dev/null 2>&1; then stat -f %m "$1" && return 0; fi
+  fi
+  if date -r "$1" +%s >/dev/null 2>&1; then date -r "$1" +%s && return 0; fi
+  echo 0
+}
+
+human_gib() {
+  # bytes -> GiB with 2 decimals
+  awk 'BEGIN{b='"${1:-0}"'; printf "%.2f", (b/1024/1024/1024)}'
+}
+
+choose_default_keep() {
+  # args: policy filelist_tmp -> prints 1-based index
+  policy="$1"; filelist="$2"
+  idx=1
+  case "$policy" in
+    first-seen) echo 1; return 0 ;;
+    shortest-path)
+      minlen=9999999; n=0
+      while IFS= read -r p; do
+        n=$((n+1)); l=${#p}
+        [ "$l" -lt "$minlen" ] && minlen="$l" && idx="$n"
+      done <"$filelist"
+      echo "$idx"
+      ;;
+    longest-path)
+      maxlen=0; n=0
+      while IFS= read -r p; do
+        n=$((n+1)); l=${#p}
+        [ "$l" -gt "$maxlen" ] && maxlen="$l" && idx="$n"
+      done <"$filelist"
+      echo "$idx"
+      ;;
+    newest)
+      max=0; n=0
+      while IFS= read -r p; do
+        n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0)
+        [ "$t" -gt "$max" ] && max="$t" && idx="$n"
+      done <"$filelist"
+      echo "$idx"
+      ;;
+    oldest)
+      min=9999999999; n=0
+      while IFS= read -r p; do
+        n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0)
+        [ "$t" -lt "$min" ] && min="$t" && idx="$n"
+      done <"$filelist"
+      echo "$idx"
+      ;;
+    *)
+      echo 1
+      ;;
+  esac
+}
+
+# ── Accurate summary using CSV sizes by hash (fallback stats once per group) ──
+summarize_report() {
+  rpt="$1"
+
+  # Prefer today's CSV; else latest in hashes/
+  csv="$HASHES_DIR/hasher-$(date +%F).csv"
+  if [ ! -f "$csv" ]; then
+    csv="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+  fi
+
+  if [ -n "${csv:-}" ] && [ -f "$csv" ]; then
+    # CSV available: map hash -> size_bytes and compute sums
+    awk -F'[,\t]' -v rpt="$rpt" '
+      FNR==NR && NR>1 { sz[$4]=$2; next }
+      /^HASH / {
+        if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
+        seen=1; n=0
+        if (match($0,/^HASH ([0-9a-fA-F]+)/,m)) {
+          h=m[1]; s = (h in sz ? sz[h] : 0)
+        } else s=0
+        next
+      }
+      /^[[:space:]]\// { n++; next }
+      END {
+        if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
+        printf("[INFO] Summary: Groups: %d  | Duplicate files (deletable): %d  | Potential reclaim: %.2f GiB\n",
+               groups, del, recl/1024/1024/1024);
+        printf("[INFO] Scope hint: files-in-groups: %d | average files/group: %.2f\n",
+               files, (groups?files/groups:0));
+      }' "$csv" "$rpt"
+  else
+    # No CSV: stat first file per group once
+    awk '
+      function stat_size(p,  cmd,s){ cmd="stat -c %s \"" p "\" 2>/dev/null"; cmd|getline s; close(cmd); if(s==""){cmd="stat -f %z \"" p "\" 2>/dev/null"; cmd|getline s; close(cmd);} if(s==""){cmd="wc -c <\"" p "\" 2>/dev/null"; cmd|getline s; close(cmd);} return s+0 }
+      /^HASH / {
+        if (seen) { recl+=sz*(n-1); del+=n-1; files+=n; groups++ }
+        seen=1; n=0; sz=0; first=1; next
+      }
+      /^[[:space:]]\// {
+        n++
+        if (first){ p=$0; sub(/^[[:space:]]+/,"",p); sz=stat_size(p); first=0 }
+        next
+      }
+      END {
+        if (seen) { recl+=sz*(n-1); del+=n-1; files+=n; groups++ }
+        printf("[INFO] Summary: Groups: %d  | Duplicate files (deletable): %d  | Potential reclaim: %.2f GiB\n",
+               groups, del, recl/1024/1024/1024);
+        printf("[INFO] Scope hint: files-in-groups: %d | average files/group: %.2f\n",
+               files, (groups?files/groups:0));
+      }' "$rpt"
+  fi
+}
+
+# ────────────────────────────── CLI ─────────────────────────────────
+show_help() {
+  cat <<EOF
+Usage: review-duplicates.sh [--from-report FILE] [--keep POLICY] [--limit N | --percent P]
+
+Options:
+  --from-report FILE   Path to duplicate-hashes report (default: $REPORT_DEFAULT)
+  --keep POLICY        newest|oldest|shortest-path|longest-path|first-seen (default: $KEEP_POLICY)
+  --limit N            Review exactly N groups this pass
+  --percent P          Review P% of groups (10/25/50/100)
+  -h, --help           Show this help
+
+Output:
+  Writes a delete plan (paths to remove) to:
+    $PLAN_FILE
 EOF
 }
 
-REPORT=""; LIMIT=50; KEEP="newest"; NONINT=0; ORDER="size"
+# parse args
 while [ $# -gt 0 ]; do
   case "$1" in
-    --from-report) REPORT="${2:-}"; shift 2 ;;
-    --limit) LIMIT="${2:-50}"; shift 2 ;;
-    --keep) KEEP="${2:-newest}"; shift 2 ;;
-    --non-interactive) NONINT=1; shift ;;
-    --order) ORDER="${2:-size}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) err "Unknown arg: $1"; usage; exit 2 ;;
+    --from-report) [ $# -ge 2 ] || die "Missing value for --from-report"; REPORT="$2"; shift 2;;
+    --keep) [ $# -ge 2 ] || die "Missing value for --keep"; KEEP_POLICY="$2"; shift 2;;
+    --limit) [ $# -ge 2 ] || die "Missing value for --limit"; LIMIT_GROUPS="$2"; shift 2;;
+    --percent) [ $# -ge 2 ] || die "Missing value for --percent"; LIMIT_PERCENT="$2"; shift 2;;
+    -h|--help) show_help; exit 0 ;;
+    *) die "Unknown arg: $1" ;;
   esac
 done
-[ -n "$REPORT" ] || { err "Missing --from-report"; usage; exit 2; }
-[ -f "$REPORT" ] || { err "Report not found: $REPORT"; exit 2; }
 
-timestamp="$(date +'%Y-%m-%d-%H%M%S')"
-PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"; : > "$PLAN"
-QUIT=0
+[ -f "$REPORT" ] || die "Report not found: $REPORT"
+info "Preparing interactive review…"
+info "Using report: $REPORT"
+info "Indexing duplicate groups…"
+# cosmetic progress bar
+printf "[########################################] 100%%  Parsing groups…\n"
 
-is_tty(){ [ -t 4 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; }
-draw_bar(){ cur="$1"; tot="$2"; label="$3"; width=40
-  if [ "${tot:-0}" -gt 0 ]; then perc=$(( cur * 100 / tot )); else perc=0; fi
-  [ "$perc" -gt 100 ] && perc=100
-  filled=$(( perc * width / 100 )); empty=$(( width - filled ))
-  hashes="$(printf "%${filled}s" | tr ' ' '#')"; spaces="$(printf "%${empty}s")"
-  printf "\r[%s%s] %3d%%  %s" "$hashes" "$spaces" "$perc" "$label" >&4
+# accurate summary
+summarize_report "$REPORT"
+
+GROUPS_TOTAL=$(grep -c '^HASH ' "$REPORT" || true)
+[ -n "$GROUPS_TOTAL" ] || GROUPS_TOTAL=0
+
+# Determine limit
+to_review=""
+if [ -n "${LIMIT_GROUPS:-}" ]; then
+  to_review="$LIMIT_GROUPS"
+elif [ -n "${LIMIT_PERCENT:-}" ]; then
+  # P% of groups (ceil)
+  P="$LIMIT_PERCENT"
+  if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then
+    die "--percent must be 1..100"
+  fi
+  # ceil(GROUPS_TOTAL * P / 100)
+  to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$P"'; printf("%d", (g*p+99)/100)}')
+elif is_tty; then
+  printf "How much to review this pass? Enter %% (10/25/50/100) or exact group count (e.g. 500). [default: 10%%] > "
+  read -r ans || ans=""
+  case "$ans" in
+    "") to_review=$(( (GROUPS_TOTAL*10 + 99)/100 )) ;;
+    *% ) pct=$(echo "$ans" | tr -d '%'); to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$pct"'; printf("%d", (g*p+99)/100)}');;
+    *  ) to_review="$ans" ;;
+  esac
+else
+  to_review=$(( (GROUPS_TOTAL*10 + 99)/100 ))
+fi
+
+# bounds
+case "${to_review:-0}" in
+  ''|*[!0-9]* ) to_review=0 ;;
+esac
+[ "$to_review" -gt "$GROUPS_TOTAL" ] 2>/dev/null && to_review="$GROUPS_TOTAL"
+
+[ "$to_review" -gt 0 ] 2>/dev/null || {
+  warn "Nothing selected to review (groups total: $GROUPS_TOTAL). Exiting."
+  exit 0
 }
-human(){ bytes="$1"; awk -v b="$bytes" 'BEGIN{
-  if (b<1024) printf "%d B", b;
-  else if (b<1024*1024) printf "%.1f KiB", b/1024;
-  else if (b<1024*1024*1024) printf "%.1f MiB", b/1048576;
-  else printf "%.2f GiB", b/1073741824;
-}'; }
 
-get_mtime(){ stat -c '%Y' -- "$1" 2>/dev/null || echo 0; }
-get_size(){  stat -c '%s' -- "$1" 2>/dev/null || echo 0; }
+info "Keep policy: $KEEP_POLICY"
+: > "$PLAN_FILE"
+REVIEWED=0
+DELETED_CANDIDATES=0
 
-read_prompt(){
-  prompt="$1"
-  printf "%s" "$prompt" >&4
-  : >&4
-  set +e
-  IFS= read -r ans <&3
-  rc=$?
-  set -e
-  [ $rc -ne 0 ] && return 1
-  printf "%s" "$ans"
+# Optional: build quick hash->size map for per-group display (best-effort)
+CSV_CAND="$HASHES_DIR/hasher-$(date +%F).csv"
+if [ ! -f "$CSV_CAND" ]; then
+  CSV_CAND="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
+fi
+SIZES_MAP=""
+if [ -n "${CSV_CAND:-}" ] && [ -f "$CSV_CAND" ]; then
+  SIZES_MAP="$VAR_DIR/.hash_sizes.$$"
+  awk -F'[,\t]' 'NR>1 && !seen[$4]++ { print $4 "\t" $2 }' "$CSV_CAND" > "$SIZES_MAP"
+fi
+
+# Iterate groups
+TMP_LIST="$VAR_DIR/.group_paths.$$"
+: > "$TMP_LIST"
+CUR_HASH=""
+CUR_N=0
+CUR_IDX=0
+
+print_group_and_prompt() {
+  idx="$1"; h="$2"; list="$3"
+  # derive group size from map if available
+  gsz=0
+  if [ -n "${SIZES_MAP:-}" ] && [ -f "$SIZES_MAP" ]; then
+    gsz=$(awk -v H="$h" 'BEGIN{sz=0} $1==H{sz=$2} END{print sz+0}' "$SIZES_MAP")
+  fi
+  # propose default keep index by policy
+  def_keep=$(choose_default_keep "$KEEP_POLICY" "$list")
+  # show (limit to first 12 files to avoid huge floods)
+  echo
+  echo "Group $idx/$GROUPS_TOTAL — HASH $h  (files: $(wc -l <"$list" | tr -d ' '))  size: $(human_gib "$gsz") GiB  [policy: $KEEP_POLICY → keep #$def_keep]"
+  i=0
+  shown=0
+  while IFS= read -r p; do
+    i=$((i+1))
+    mark=" "
+    [ "$i" -eq "$def_keep" ] && mark="*"
+    printf "  %2d%s %s\n" "$i" "$mark" "$p"
+    shown=$((shown+1))
+    [ "$shown" -ge 12 ] && break
+  done <"$list"
+  TOTAL=$(wc -l <"$list" | tr -d ' ')
+  [ "$TOTAL" -gt 12 ] && echo "  … and $((TOTAL-12)) more"
+  if is_tty; then
+    printf "Choose number to KEEP, Enter=accept default, s=skip, q=quit > "
+    read -r choice || choice=""
+  else
+    choice=""
+  fi
+  # normalize
+  if [ -z "${choice:-}" ]; then
+    choice="$def_keep"
+  elif [ "$choice" = "s" ]; then
+    echo "Skipped."
+    return 2
+  elif [ "$choice" = "q" ]; then
+    echo "Quitting."
+    return 3
+  elif echo "$choice" | grep -Eq '^[0-9]+$'; then
+    :
+  else
+    echo "Invalid input, using default $def_keep."
+    choice="$def_keep"
+  fi
+
+  # write all except chosen to plan
+  i=0
+  while IFS= read -r p; do
+    i=$((i+1))
+    [ "$i" -eq "$choice" ] && continue
+    printf "%s\n" "$p" >> "$PLAN_FILE"
+    DELETED_CANDIDATES=$((DELETED_CANDIDATES+1))
+  done <"$list"
+  echo "→ Planned deletes added for group."
   return 0
 }
 
-review_group() {
-  hash="$1"; shift
-  TMPG="$(mktemp)"; printf "%s\n" "$@" | sed '/^[[:space:]]*$/d' | sort -u > "$TMPG"
-  set -- $(cat "$TMPG"); rm -f "$TMPG"
-  count=$#
-  [ "$count" -ge 2 ] || return 0
+process_group() {
+  # called when CUR_HASH is set and TMP_LIST has paths
+  [ -n "${CUR_HASH:-}" ] || return 0
+  CUR_N=$(wc -l <"$TMP_LIST" | tr -d ' ')
+  [ "$CUR_N" -ge 2 ] || { : > "$TMP_LIST"; CUR_HASH=""; return 0; }
 
-  keeper="$1"
-  if [ "$KEEP" = "newest" ] || [ "$KEEP" = "oldest" ]; then
-    best="$([ "$KEEP" = "newest" ] && echo 0 || echo 9999999999)"
-    for p in "$@"; do
-      mt="$(get_mtime "$p")"
-      if [ "$KEEP" = "newest" ]; then [ "$mt" -gt "$best" ] && best="$mt" && keeper="$p"
-      else [ "$mt" -lt "$best" ] && best="$mt" && keeper="$p"
-      fi
-    done
-  elif [ "$KEEP" = "last" ]; then for p in "$@"; do keeper="$p"; done ; fi
-
-  keep_size="$(get_size "$keeper")"; sum_size=0
-  for p in "$@"; do s="$(get_size "$p")"; sum_size=$((sum_size + s)); done
-  potential=$((sum_size - keep_size))
-
-  if [ "$NONINT" -eq 1 ]; then
-    for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done
-    SAVED=$((SAVED + potential)); return 0
+  CUR_IDX=$((CUR_IDX+1))
+  if [ "$CUR_IDX" -le "$to_review" ]; then
+    set +e
+    print_group_and_prompt "$CUR_IDX" "$CUR_HASH" "$TMP_LIST"
+    rc=$?
+    set -e
+    case "$rc" in
+      0) REVIEWED=$((REVIEWED+1)) ;;
+      2) : ;;   # skipped
+      3) # quit
+         rm -f "$TMP_LIST" "${SIZES_MAP:-}"
+         ok "Plan written: $PLAN_FILE"
+         info "Reviewed groups: $REVIEWED / $to_review | Planned deletions: $DELETED_CANDIDATES"
+         exit 0
+         ;;
+    esac
   fi
 
-  echo >&4
-  printf "─ Group  hash: %s  (N=%d)  (potential reclaim: %s)\n" "$hash" "$count" "$(human "$potential")" >&4
-  i=0
-  for p in "$@"; do i=$((i+1)); mark=" "; [ "$p" = "$keeper" ] && mark="*"; printf "  %2d) %s%s\n" "$i" "$mark" "$p" >&4; done
-  printf "    Policy: %s  [* marks suggested keeper]\n" "$KEEP" >&4
-
-  ans="$(read_prompt "    Action: (Enter=accept) [N=pick keep] [k N=set keep] [s=skip] [q=quit] > " || echo "__EOF__")"
-  [ "$ans" = "__EOF__" ] && { info "Stopping (no TTY)."; QUIT=1; return 0; }
-  trimmed="$(printf "%s" "$ans" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-
-  accept_now=0
-  if [ -z "$trimmed" ]; then accept_now=1
-  elif [ "$trimmed" = "q" ] || [ "$trimmed" = "Q" ]; then info "Stopping early per user request."; QUIT=1; return 0
-  elif [ "$trimmed" = "s" ] || [ "$trimmed" = "S" ]; then return 0
-  elif printf "%s" "$trimmed" | grep -Eq '^k[[:space:]]+[0-9]+$'; then
-       n="$(printf "%s" "$trimmed" | awk '{print $2}')"; if [ "$n" -ge 1 ] 2>/dev/null; then
-         i=0; for p in "$@"; do i=$((i+1)); [ "$i" -eq "$n" ] && keeper="$p"; done
-         keep_size="$(get_size "$keeper")"; potential=$((sum_size - keep_size)); accept_now=1; fi
-  elif printf "%s" "$trimmed" | grep -Eq '^[0-9]+$'; then
-       n="$trimmed"; if [ "$n" -ge 1 ] 2>/dev/null; then
-         i=0; for p in "$@"; do i=$((i+1)); [ "$i" -eq "$n" ] && keeper="$p"; done
-         keep_size="$(get_size "$keeper")"; potential=$((sum_size - keep_size)); accept_now=1; fi
-  else accept_now=1; fi
-
-  if [ "$accept_now" -eq 1 ]; then
-    for p in "$@"; do [ "$p" = "$keeper" ] && continue; printf "%s\n" "$p" >> "$PLAN"; done
-    SAVED=$((SAVED + potential))
-  fi
+  : > "$TMP_LIST"
+  CUR_HASH=""
 }
 
-TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
-
-# Phase 1: parse report into group files and hash list
-HASHLIST="$TMPDIR/hashes.txt"; : > "$HASHLIST"
-info "Indexing duplicate groups…"
-TOTAL_GROUPS="$(grep -c '^HASH[[:space:]]' "$REPORT" 2>/dev/null || echo 0)"
-SAVED=0
-(
-  awk -v dir="$TMPDIR" '
-    BEGIN{g=0}
-    /^HASH[[:space:]]/ { g++; h=$2; print h >> "'"$HASHLIST"'"; next }
-    /^[[:space:]]*$/ { next }
-    /^  / { sub(/^[ ]+/, "", $0); if (h!="") print $0 >> dir "/" h ".grp"; next }
-  ' "$REPORT"
-) & PID1=$!
-if is_tty; then
-  while kill -0 "$PID1" >/dev/null 2>&1; do cur="$(wc -l < "$HASHLIST" 2>/dev/null || echo 0)"; draw_bar "${cur:-0}" "${TOTAL_GROUPS:-0}" "Parsing groups…"; sleep 0.2; done
-  draw_bar "${TOTAL_GROUPS:-0}" "${TOTAL_GROUPS:-0}" "Parsing groups…"; echo >&4
-fi
-wait "$PID1" || { err "Failed to parse report."; exit 1; }
-
-# Phase 1b: summary — compute deletables from group files (unique paths)
-DUPFILES=0; FILESINGROUPS=0
-for f in "$TMPDIR"/*.grp; do
-  [ -f "$f" ] || continue
-  c="$(sort -u "$f" | wc -l | tr -d ' ')"
-  FILESINGROUPS=$((FILESINGROUPS + c))
-  if [ "$c" -ge 2 ] 2>/dev/null; then DUPFILES=$((DUPFILES + c - 1)); fi
-done
-
-# Potential reclaim estimation using latest duplicates-*.csv (if present)
-CSV="$(ls -1t "$LOGS_DIR"/duplicates-*.csv 2>/dev/null | head -n1 || true)"
-POT=0
-if [ -n "${CSV:-}" ] && [ -f "$CSV" ]; then
-  POT="$(awk -F',' '
-    NR==FNR { need[$0]=1; next }
-    ( $1 in need ) { h=$1; s=$3; if (s=="") s=0; sum[h]+=s; if (s>max[h]) max[h]=s }
-    END { pot=0; for (h in sum) pot += sum[h]-max[h]; print pot }
-  ' "$HASHLIST" "$CSV" 2>/dev/null || echo 0)"
-fi
-
-TOTAL_GROUPS="$(wc -l < "$HASHLIST" 2>/dev/null || echo 0)"
-info "Summary: Groups: $TOTAL_GROUPS  | Duplicate files (deletable): ${DUPFILES:-0}  | Potential reclaim: $(human "${POT:-0}")"
-info "Scope hint: files-in-groups: $FILESINGROUPS | average files/group: $(awk -v f="$FILESINGROUPS" -v g="$TOTAL_GROUPS" 'BEGIN{ if(g>0) printf "%.2f\n", f/g; else print "0.00" }')"
-
-# Phase 1c: scope selection
-if [ "$NONINT" -eq 0 ]; then
-  defpct=10
-  sel="$(read_prompt "How much to review this pass? Enter % (10/25/50/100) or exact group count (e.g. 500). [default: ${defpct}%] > " || echo "")"
-  sel="$(printf "%s" "$sel" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-  if printf "%s" "$sel" | grep -Eq '^[0-9]+%$'; then
-    p="$(printf "%s" "$sel" | tr -d '%')"; [ "$p" -gt 100 ] 2>/dev/null && p=100
-    LIMIT=$(( (TOTAL_GROUPS * p + 99) / 100  ))
-  elif printf "%s" "$sel" | grep -Eq '^[0-9]+$'; then
-    LIMIT="$sel"
-  else
-    LIMIT=$(( (TOTAL_GROUPS * defpct + 99) / 100  ))
-  }
-  info "Reviewing up to $LIMIT groups this pass."
-fi
-
-# Phase 2: build ordering
-ORDER_FILE="$TMPDIR/order.txt"; : > "$ORDER_FILE"
-if [ "$ORDER" = "size" ] && [ -n "${CSV:-}" ] && [ -f "$CSV" ]; then
-  info "Ranking groups by total size (largest first)…"
-  TOTAL_LINES="$(wc -l < "$CSV" 2>/dev/null || echo 0)"
-  (
-    awk -F',' '
-      NR==FNR { ok[$0]=1; next }
-      ( $1 in ok ) { s=$3; if (s=="") s=0; sum[$1]+=s }
-      END { for (k in sum) printf "%012d %s\n", sum[k], k }
-    ' "$HASHLIST" "$CSV" | sort -nr > "$ORDER_FILE"
-  ) & PID2=$!
-  if is_tty; then
-    cur=0
-    while kill -0 "$PID2" >/dev/null 2>&1; do
-      cur=$((cur+50000)); draw_bar "$cur" "$TOTAL_LINES" "Ranking by size from $(basename "$CSV")…"; sleep 0.2
-    done
-    draw_bar "$TOTAL_LINES" "$TOTAL_LINES" "Ranking by size from $(basename "$CSV")…"; echo >&4
-  fi
-  wait "$PID2" || { err "Failed to rank by size."; exit 1; }
-else
-  [ "$ORDER" = "size" ] && warn "No duplicates-*.csv found; falling back to count ordering."
-  info "Ranking groups by file count (largest first)…"
-  for f in "$TMPDIR"/*.grp; do
-    [ -f "$f" ] || continue
-    c="$(sort -u "$f" | wc -l | tr -d ' ')"
-    h="$(basename "$f" .grp)"
-    printf "%012d %s\n" "$c" "$h" >> "$ORDER_FILE"
-  done
-  sort -nr "$ORDER_FILE" -o "$ORDER_FILE"
-fi
-
-# Phase 3: interactive review
-shown=0; SAVED=0
+# Stream the report and handle groups
 while IFS= read -r line || [ -n "$line" ]; do
-  [ -z "${line:-}" ] && continue
-  h="$(printf "%s" "$line" | awk '{print $2}')"
-  f="$TMPDIR/$h.grp"; [ -s "$f" ] || continue
-  gpaths="$(sort -u "$f")"
-  oldIFS=$IFS; IFS="$(printf '\n\t')"; set -- $gpaths; IFS=$oldIFS
-  review_group "$h" "$@"
-  [ "$QUIT" -eq 1 ] && break
-  shown=$((shown+1)); [ "$shown" -ge "$LIMIT" ] && break
-done < "$ORDER_FILE"
+  case "$line" in
+    HASH\ *)
+      # process previous group
+      process_group
+      # start new
+      CUR_HASH=$(printf "%s\n" "$line" | sed -n 's/^HASH \([0-9a-fA-F]\+\).*/\1/p')
+      : > "$TMP_LIST"
+      ;;
+    [[:space:]]/*)
+      # file line (starts with whitespace then /path)
+      p="$line"
+      # trim leading spaces
+      p="${p#"${p%%[![:space:]]*}"}"
+      printf "%s\n" "$p" >> "$TMP_LIST"
+      ;;
+    *) : ;;
+  esac
+done <"$REPORT"
 
-echo >&4
-info "Review complete. Planned deletions so far: $(wc -l < "$PLAN" 2>/dev/null || echo 0) files"
-info "Estimated reclaim from accepted groups: $(human "$SAVED")"
-info "Plan: $PLAN"
-cp -f -- "$PLAN" "$VAR_DIR/latest-plan.txt" 2>/dev/null || true
-next "Use menu option 6 to apply the plan."
+# last group
+process_group
+
+rm -f "$TMP_LIST" "${SIZES_MAP:-}"
+
+ok "Plan written: $PLAN_FILE"
+info "Reviewed groups: $REVIEWED / $to_review | Planned deletions: $DELETED_CANDIDATES"
 exit 0
