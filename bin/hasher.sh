@@ -12,8 +12,11 @@ LC_ALL=C
 HASHES_DIR="hashes"
 LOGS_DIR="logs"
 ZERO_DIR="zero-length"
+# DATE_TAG is kept for human-facing daily reports
 DATE_TAG="$(date +'%Y-%m-%d')"
-OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+# CSV_TAG adds time (SMB-safe; no colon) to avoid same-day collisions
+CSV_TAG="$(date +'%F-%H%M')"
+OUTPUT="$HASHES_DIR/hasher-$CSV_TAG.csv"
 
 ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
 PATHFILE=""
@@ -199,8 +202,10 @@ load_config() {
   BACKGROUND_LOG="$LOGS_DIR/background.log"
 
   # re-derive default OUTPUT if still using default pattern or blank
-  if [[ "$OUTPUT" == "hashes/hasher-$DATE_TAG.csv" || -z "$OUTPUT" ]]; then
-    OUTPUT="$HASHES_DIR/hasher-$DATE_TAG.csv"
+  if [[ -z "$OUTPUT" \
+     || "$OUTPUT" == "hashes/hasher-$DATE_TAG.csv" \
+     || "$OUTPUT" == "hashes/hasher-$CSV_TAG.csv" ]]; then
+    OUTPUT="$HASHES_DIR/hasher-$CSV_TAG.csv"
   fi
 }
 
