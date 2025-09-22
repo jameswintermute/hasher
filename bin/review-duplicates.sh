@@ -91,7 +91,6 @@ build_sizes_map() {
       if (is) s=$is;
       if (h=="" || s=="") {
         # Heuristics: pick a hash-looking field + a numeric field
-        # (prefer the largest numeric as size_bytes)
         if (h=="") {
           for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{32,128}$/) { h=$i; break }
         }
@@ -224,6 +223,7 @@ done
 info "Preparing interactive review…"
 info "Using report: $REPORT"
 info "Indexing duplicate groups…"
+# cosmetic progress bar
 printf "[########################################] 100%%  Parsing groups…\n"
 
 # accurate summary
@@ -237,24 +237,35 @@ to_review=""
 if [ -n "${LIMIT_GROUPS:-}" ]; then
   to_review="$LIMIT_GROUPS"
 elif [ -n "${LIMIT_PERCENT:-}" ]; then
+  # P% of groups (ceil)
   P="$LIMIT_PERCENT"
-  if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then die "--percent must be 1..100"; fi
+  if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then
+    die "--percent must be 1..100"
+  fi
+  # ceil(GROUPS_TOTAL * P / 100)
   to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$P"'; printf("%d", (g*p+99)/100)}')
 elif is_tty; then
   printf "How much to review this pass? Enter %% (10/25/50/100) or exact group count (e.g. 500). [default: 10%%] > "
   read -r ans || ans=""
   case "$ans" in
     "") to_review=$(( (GROUPS_TOTAL*10 + 99)/100 )) ;;
-    *%) pct=$(echo "$ans" | tr -d '%'); to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$pct"'; printf("%d", (g*p+99)/100)}');;
-    *)  to_review="$ans" ;;
+    *% ) pct=$(echo "$ans" | tr -d '%'); to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$pct"'; printf("%d", (g*p+99)/100)}');;
+    *  ) to_review="$ans" ;;
   esac
 else
   to_review=$(( (GROUPS_TOTAL*10 + 99)/100 ))
 fi
 
-case "${to_review:-0}" in ''|*[!0-9]* ) to_review=0 ;; esac
+# bounds
+case "${to_review:-0}" in
+  ''|*[!0-9]* ) to_review=0 ;;
+esac
 [ "$to_review" -gt "$GROUPS_TOTAL" ] 2>/dev/null && to_review="$GROUPS_TOTAL"
-[ "$to_review" -gt 0 ] 2>/dev/null || { warn "Nothing selected to review (groups total: $GROUPS_TOTAL). Exiting."; exit 0; }
+
+[ "$to_review" -gt 0 ] 2>/dev/null || {
+  warn "Nothing selected to review (groups total: $GROUPS_TOTAL). Exiting."
+  exit 0
+}
 
 info "Keep policy: $KEEP_POLICY"
 : > "$PLAN_FILE"
