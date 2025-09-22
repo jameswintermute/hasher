@@ -36,7 +36,6 @@ warn(){ echo "${CWARN}[WARN]${C0} $*"; }
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
 
 stat_mtime() {
-  # epoch seconds for keep=newest/oldest
   if command -v stat >/dev/null 2>&1; then
     if stat -c %Y "$1" >/dev/null 2>&1; then stat -c %Y "$1" && return 0; fi
     if stat -f %m "$1" >/dev/null 2>&1; then stat -f %m "$1" && return 0; fi
@@ -48,7 +47,6 @@ stat_mtime() {
 human_gib() { awk 'BEGIN{b='"${1:-0}"'; printf "%.2f", (b/1024/1024/1024)}'; }
 
 choose_default_keep() {
-  # args: policy filelist_tmp -> prints 1-based index
   policy="$1"; filelist="$2"; idx=1
   case "$policy" in
     first-seen) echo 1; return 0 ;;
@@ -90,7 +88,6 @@ build_sizes_map() {
       if (ih) h=$ih;
       if (is) s=$is;
       if (h=="" || s=="") {
-        # Heuristics: pick a hash-looking field + a numeric field
         if (h=="") {
           for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{32,128}$/) { h=$i; break }
         }
@@ -106,20 +103,15 @@ build_sizes_map() {
     }' "$csv" > "$out"
 }
 
-# ── Accurate summary using CSV sizes by hash (fallback stats once per group) ──
 summarize_report() {
   rpt="$1"
-
-  # Prefer today's CSV; else latest in hashes/
   csv="$HASHES_DIR/hasher-$(date +%F).csv"
   if [ ! -f "$csv" ]; then
     csv="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
   fi
-
   if [ -n "${csv:-}" ] && [ -f "$csv" ]; then
     awk -F'[,\t]' -v rpt="$rpt" '
       FNR==1 {
-        # Detect header columns once
         ih=0; is=0;
         for (i=1;i<=NF;i++) {
           c=$i; gsub(/^"+|"+$/,"",c); c=tolower(c); gsub(/[[:space:]]/,"",c);
@@ -129,12 +121,10 @@ summarize_report() {
         next
       }
       FNR>1 && FILENAME!=rpt {
-        # Pass 1: CSV rows -> sz[hash]=size_bytes
         h=""; s="";
         if (ih) h=$ih;
         if (is) s=$is;
         if (h=="" || s=="") {
-          # Heuristics fallback
           if (h=="") { for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{32,128}$/) { h=$i; break } }
           if (s=="") {
             maxn=0; for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && ($i+0)>maxn) { maxn=$i+0 }
@@ -144,7 +134,6 @@ summarize_report() {
         if (h!="") sz[h]=s+0
         next
       }
-      # Pass 2: report
       FILENAME==rpt && /^HASH / {
         if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
         seen=1; n=0; s=0
@@ -160,7 +149,6 @@ summarize_report() {
                files, (groups?files/groups:0));
       }' "$csv" "$rpt"
   else
-    # No CSV: stat first file per group once
     awk '
       function stat_size(p,  cmd,s){
         cmd="stat -c %s \"" p "\" 2>/dev/null"; cmd|getline s; close(cmd);
@@ -187,33 +175,19 @@ summarize_report() {
   fi
 }
 
-# ────────────────────────────── CLI ─────────────────────────────────
 show_help() {
   cat <<EOF
 Usage: review-duplicates.sh [--from-report FILE] [--keep POLICY] [--limit N | --percent P] [--order MODE]
-
-Options:
-  --from-report FILE   Path to duplicate-hashes report (default: $REPORT_DEFAULT)
-  --keep POLICY        newest|oldest|shortest-path|longest-path|first-seen (default: $KEEP_POLICY)
-  --limit N            Review exactly N groups this pass
-  --percent P          Review P% of groups (10/25/50/100)
-  --order MODE         Accepted for compatibility (currently uses report order)
-  -h, --help           Show this help
-
-Output:
-  Writes a delete plan (paths to remove) to:
-    $PLAN_FILE
 EOF
 }
 
-# parse args
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-report) [ $# -ge 2 ] || die "Missing value for --from-report"; REPORT="$2"; shift 2;;
     --keep)        [ $# -ge 2 ] || die "Missing value for --keep";        KEEP_POLICY="$2"; shift 2;;
     --limit)       [ $# -ge 2 ] || die "Missing value for --limit";       LIMIT_GROUPS="$2"; shift 2;;
     --percent)     [ $# -ge 2 ] || die "Missing value for --percent";     LIMIT_PERCENT="$2"; shift 2;;
-    --order)       [ $# -ge 2 ] || die "Missing value for --order";       ORDER="$2"; shift 2;; # compatibility
+    --order)       [ $# -ge 2 ] || die "Missing value for --order";       ORDER="$2"; shift 2;;
     -h|--help) show_help; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
@@ -223,26 +197,21 @@ done
 info "Preparing interactive review…"
 info "Using report: $REPORT"
 info "Indexing duplicate groups…"
-# cosmetic progress bar
 printf "[########################################] 100%%  Parsing groups…\n"
 
-# accurate summary
 summarize_report "$REPORT"
 
 GROUPS_TOTAL=$(grep -c '^HASH ' "$REPORT" || true)
 [ -n "$GROUPS_TOTAL" ] || GROUPS_TOTAL=0
 
-# Determine limit
 to_review=""
 if [ -n "${LIMIT_GROUPS:-}" ]; then
   to_review="$LIMIT_GROUPS"
 elif [ -n "${LIMIT_PERCENT:-}" ]; then
-  # P% of groups (ceil)
   P="$LIMIT_PERCENT"
   if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then
     die "--percent must be 1..100"
   fi
-  # ceil(GROUPS_TOTAL * P / 100)
   to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$P"'; printf("%d", (g*p+99)/100)}')
 elif is_tty; then
   printf "How much to review this pass? Enter %% (10/25/50/100) or exact group count (e.g. 500). [default: 10%%] > "
@@ -256,7 +225,6 @@ else
   to_review=$(( (GROUPS_TOTAL*10 + 99)/100 ))
 fi
 
-# bounds
 case "${to_review:-0}" in
   ''|*[!0-9]* ) to_review=0 ;;
 esac
@@ -272,7 +240,6 @@ info "Keep policy: $KEEP_POLICY"
 REVIEWED=0
 DELETED_CANDIDATES=0
 
-# Build a header-aware hash->size map for per-group display
 CSV_CAND="$HASHES_DIR/hasher-$(date +%F).csv"
 if [ ! -f "$CSV_CAND" ]; then
   CSV_CAND="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
@@ -283,9 +250,20 @@ if [ -n "${CSV_CAND:-}" ] && [ -f "$CSV_CAND" ]; then
   build_sizes_map "$CSV_CAND" "$SIZES_MAP"
 fi
 
-# Iterate groups
 TMP_LIST="$VAR_DIR/.group_paths.$$"; : > "$TMP_LIST"
 CUR_HASH=""; CUR_IDX=0
+
+trim_ws() {
+  s="$1"
+  while [ -n "$s" ]; do
+    case "$s" in
+      " "* ) s="${s# }" ;;
+      "	"* ) s="${s#	}" ;;
+      * ) break ;;
+    esac
+  done
+  printf "%s" "$s"
+}
 
 print_group_and_prompt() {
   idx="$1"; h="$2"; list="$3"
@@ -344,7 +322,6 @@ process_group() {
   : > "$TMP_LIST"; CUR_HASH=""
 }
 
-# Stream the report and handle groups
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     HASH\ *)
@@ -352,10 +329,10 @@ while IFS= read -r line || [ -n "$line" ]; do
       CUR_HASH=$(printf "%s\n" "$line" | sed -n 's/^HASH \([0-9a-fA-F]\+\).*/\1/p')
       : > "$TMP_LIST"
       ;;
-    /*)  printf "%s\n" "$line" >> "$TMP_LIST" ;;                     # paths starting at column 1
-    [[:space:]]/*)
-      p="$line"; p="${p#"${p%%[![:space:]]*}"}"; printf "%s\n" "$p" >> "$TMP_LIST" ;;  # indented paths
-    *) : ;;
+    *)
+      t="$(trim_ws "$line")"
+      case "$t" in /*) printf "%s\n" "$t" >> "$TMP_LIST" ;; esac
+      ;;
   esac
 done <"$REPORT"
 
