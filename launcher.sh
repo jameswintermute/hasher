@@ -33,7 +33,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.4 - Sept 2025"
+  printf "\n%s\n" "      v1.0.3 - Sept 2025"
   printf "%s" "$CRESET"
   printf "\n"
 }
@@ -203,7 +203,7 @@ action_find_duplicate_folders(){
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
     "$BIN_DIR/find-duplicate-folders.sh" \
-      --hashes-file "$input" \
+      --input "$input" \
       --scope recursive --signature name+content \
       --min-group-size 2 --keep shortest-path || true
   else
