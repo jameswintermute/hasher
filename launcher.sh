@@ -33,7 +33,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.3 - Sept 2025"
+  printf "\n%s\n" "      v1.0.5 - Sept 2025"
   printf "%s" "$CRESET"
   printf "\n"
 }
