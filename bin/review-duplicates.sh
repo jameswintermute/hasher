@@ -1,15 +1,15 @@
 #!/bin/sh
 # review-duplicates.sh — Interactive review of duplicate hash groups
 # BusyBox/POSIX sh compatible. No bashisms.
-# Uses CSV (path,size_bytes,algo,hash) to compute correct reclaim.
+# Accurately computes reclaim using the hashes CSV by detecting header columns.
 set -eu
 
 # ────────────────────────────── Layout ──────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
+LOGS_DIR="$ROOT_DIR/logs";   mkdir -p "$LOGS_DIR"
 HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
-VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
+VAR_DIR="$ROOT_DIR/var";     mkdir -p "$VAR_DIR"
 
 # ────────────────────────────── Defaults ────────────────────────────
 REPORT_DEFAULT="$LOGS_DIR/duplicate-hashes-latest.txt"
@@ -35,16 +35,6 @@ warn(){ echo "${CWARN}[WARN]${C0} $*"; }
 
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
 
-stat_size() {
-  # bytes, best-effort across BusyBox/GNU/BSD
-  if command -v stat >/dev/null 2>&1; then
-    if stat -c %s "$1" >/dev/null 2>&1; then stat -c %s "$1" && return 0; fi
-    if stat -f %z "$1" >/dev/null 2>&1; then stat -f %z "$1" && return 0; fi
-  fi
-  # Fallback with wc -c (slower, reads file)
-  wc -c <"$1" 2>/dev/null || echo 0
-}
-
 stat_mtime() {
   # epoch seconds for keep=newest/oldest
   if command -v stat >/dev/null 2>&1; then
@@ -55,53 +45,66 @@ stat_mtime() {
   echo 0
 }
 
-human_gib() {
-  # bytes -> GiB with 2 decimals
-  awk 'BEGIN{b='"${1:-0}"'; printf "%.2f", (b/1024/1024/1024)}'
-}
+human_gib() { awk 'BEGIN{b='"${1:-0}"'; printf "%.2f", (b/1024/1024/1024)}'; }
 
 choose_default_keep() {
   # args: policy filelist_tmp -> prints 1-based index
-  policy="$1"; filelist="$2"
-  idx=1
+  policy="$1"; filelist="$2"; idx=1
   case "$policy" in
     first-seen) echo 1; return 0 ;;
     shortest-path)
       minlen=9999999; n=0
-      while IFS= read -r p; do
-        n=$((n+1)); l=${#p}
-        [ "$l" -lt "$minlen" ] && minlen="$l" && idx="$n"
-      done <"$filelist"
-      echo "$idx"
-      ;;
+      while IFS= read -r p; do n=$((n+1)); l=${#p}; [ "$l" -lt "$minlen" ] && minlen="$l" && idx="$n"; done <"$filelist"
+      echo "$idx" ;;
     longest-path)
       maxlen=0; n=0
-      while IFS= read -r p; do
-        n=$((n+1)); l=${#p}
-        [ "$l" -gt "$maxlen" ] && maxlen="$l" && idx="$n"
-      done <"$filelist"
-      echo "$idx"
-      ;;
+      while IFS= read -r p; do n=$((n+1)); l=${#p}; [ "$l" -gt "$maxlen" ] && maxlen="$l" && idx="$n"; done <"$filelist"
+      echo "$idx" ;;
     newest)
       max=0; n=0
-      while IFS= read -r p; do
-        n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0)
-        [ "$t" -gt "$max" ] && max="$t" && idx="$n"
-      done <"$filelist"
-      echo "$idx"
-      ;;
+      while IFS= read -r p; do n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0); [ "$t" -gt "$max" ] && max="$t" && idx="$n"; done <"$filelist"
+      echo "$idx" ;;
     oldest)
       min=9999999999; n=0
-      while IFS= read -r p; do
-        n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0)
-        [ "$t" -lt "$min" ] && min="$t" && idx="$n"
-      done <"$filelist"
-      echo "$idx"
-      ;;
-    *)
-      echo 1
-      ;;
+      while IFS= read -r p; do n=$((n+1)); t=$(stat_mtime "$p" 2>/dev/null || echo 0); [ "$t" -lt "$min" ] && min="$t" && idx="$n"; done <"$filelist"
+      echo "$idx" ;;
+    *) echo 1 ;;
   esac
+}
+
+# Header-aware size map builder: CSV -> "hash<TAB>size_bytes"
+build_sizes_map() {
+  csv="$1"; out="$2"
+  awk -F'[,\t]' '
+    NR==1 {
+      ih=0; is=0;
+      for (i=1;i<=NF;i++) {
+        c=$i; gsub(/^"+|"+$/,"",c); c=tolower(c); gsub(/[[:space:]]/,"",c);
+        if (c ~ /(^hash$|^digest$|^sha(1|256|512)$)/) ih=i;
+        if (c ~ /(^size(_?bytes)?$|^bytes$|^filesize$|^size$)/) is=i;
+      }
+      next
+    }
+    {
+      h=""; s="";
+      if (ih) h=$ih;
+      if (is) s=$is;
+      if (h=="" || s=="") {
+        # Heuristics: pick a hash-looking field + a numeric field
+        # (prefer the largest numeric as size_bytes)
+        if (h=="") {
+          for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{32,128}$/) { h=$i; break }
+        }
+        if (s=="") {
+          maxn=0
+          for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && ($i+0)>maxn) { maxn=$i+0 }
+          s=maxn
+        }
+      }
+      if (h!="") {
+        if (!(h in seen)) { printf "%s\t%d\n", h, s+0; seen[h]=1 }
+      }
+    }' "$csv" > "$out"
 }
 
 # ── Accurate summary using CSV sizes by hash (fallback stats once per group) ──
@@ -115,27 +118,50 @@ summarize_report() {
   fi
 
   if [ -n "${csv:-}" ] && [ -f "$csv" ]; then
-    # CSV available: map hash -> size_bytes and compute sums
     awk -F'[,\t]' -v rpt="$rpt" '
-      FNR==NR && NR>1 { sz[$4]=$2; next }
-      /^HASH / {
-        if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
-        seen=1; n=0
-        if (match($0,/^HASH ([0-9a-fA-F]+)/,m)) {
-          h=m[1]; s = (h in sz ? sz[h] : 0)
-        } else s=0
+      FNR==1 {
+        # Detect header columns once
+        ih=0; is=0;
+        for (i=1;i<=NF;i++) {
+          c=$i; gsub(/^"+|"+$/,"",c); c=tolower(c); gsub(/[[:space:]]/,"",c);
+          if (c ~ /(^hash$|^digest$|^sha(1|256|512)$)/) ih=i;
+          if (c ~ /(^size(_?bytes)?$|^bytes$|^filesize$|^size$)/) is=i;
+        }
         next
       }
-      /^[[:space:]]*\/[^\r\n]*/ { n++; next }   # ← accept with OR without leading spaces
+      FNR>1 && FILENAME!=rpt {
+        # Pass 1: CSV rows -> sz[hash]=size_bytes
+        h=""; s="";
+        if (ih) h=$ih;
+        if (is) s=$is;
+        if (h=="" || s=="") {
+          # Heuristics fallback
+          if (h=="") { for (i=1;i<=NF;i++) if ($i ~ /^[0-9a-fA-F]{32,128}$/) { h=$i; break } }
+          if (s=="") {
+            maxn=0; for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && ($i+0)>maxn) { maxn=$i+0 }
+            s=maxn
+          }
+        }
+        if (h!="") sz[h]=s+0
+        next
+      }
+      # Pass 2: report
+      FILENAME==rpt && /^HASH / {
+        if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
+        seen=1; n=0; s=0
+        if (match($0,/^HASH ([0-9a-fA-F]+)/,m)) { h=m[1]; if (h in sz) s=sz[h]; }
+        next
+      }
+      FILENAME==rpt && /^[[:space:]]*\/[^\r\n]*/ { n++; next }
       END {
         if (seen) { recl+=s*(n-1); del+=n-1; files+=n; groups++ }
         printf("[INFO] Summary: Groups: %d  | Duplicate files (deletable): %d  | Potential reclaim: %.2f GiB\n",
-               groups, del, recl/1024/1024/1024)
+               groups, del, recl/1024/1024/1024);
         printf("[INFO] Scope hint: files-in-groups: %d | average files/group: %.2f\n",
-               files, (groups?files/groups:0))
+               files, (groups?files/groups:0));
       }' "$csv" "$rpt"
   else
-    # No CSV: stat only the FIRST path of each group once (same hash => same size)
+    # No CSV: stat first file per group once
     awk '
       function stat_size(p,  cmd,s){
         cmd="stat -c %s \"" p "\" 2>/dev/null"; cmd|getline s; close(cmd);
@@ -155,9 +181,9 @@ summarize_report() {
       END {
         if (seen) { recl+=sz*(n-1); del+=n-1; files+=n; groups++ }
         printf("[INFO] Summary: Groups: %d  | Duplicate files (deletable): %d  | Potential reclaim: %.2f GiB\n",
-               groups, del, recl/1024/1024/1024)
+               groups, del, recl/1024/1024/1024);
         printf("[INFO] Scope hint: files-in-groups: %d | average files/group: %.2f\n",
-               files, (groups?files/groups:0))
+               files, (groups?files/groups:0));
       }' "$rpt"
   fi
 }
@@ -198,7 +224,6 @@ done
 info "Preparing interactive review…"
 info "Using report: $REPORT"
 info "Indexing duplicate groups…"
-# cosmetic progress bar
 printf "[########################################] 100%%  Parsing groups…\n"
 
 # accurate summary
@@ -212,42 +237,31 @@ to_review=""
 if [ -n "${LIMIT_GROUPS:-}" ]; then
   to_review="$LIMIT_GROUPS"
 elif [ -n "${LIMIT_PERCENT:-}" ]; then
-  # P% of groups (ceil)
   P="$LIMIT_PERCENT"
-  if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then
-    die "--percent must be 1..100"
-  fi
-  # ceil(GROUPS_TOTAL * P / 100)
+  if [ "$P" -lt 1 ] 2>/dev/null || [ "$P" -gt 100 ] 2>/dev/null; then die "--percent must be 1..100"; fi
   to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$P"'; printf("%d", (g*p+99)/100)}')
 elif is_tty; then
   printf "How much to review this pass? Enter %% (10/25/50/100) or exact group count (e.g. 500). [default: 10%%] > "
   read -r ans || ans=""
   case "$ans" in
     "") to_review=$(( (GROUPS_TOTAL*10 + 99)/100 )) ;;
-    *% ) pct=$(echo "$ans" | tr -d '%'); to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$pct"'; printf("%d", (g*p+99)/100)}');;
-    *  ) to_review="$ans" ;;
+    *%) pct=$(echo "$ans" | tr -d '%'); to_review=$(awk 'BEGIN{g='"$GROUPS_TOTAL"'; p='"$pct"'; printf("%d", (g*p+99)/100)}');;
+    *)  to_review="$ans" ;;
   esac
 else
   to_review=$(( (GROUPS_TOTAL*10 + 99)/100 ))
 fi
 
-# bounds
-case "${to_review:-0}" in
-  ''|*[!0-9]* ) to_review=0 ;;
-esac
+case "${to_review:-0}" in ''|*[!0-9]* ) to_review=0 ;; esac
 [ "$to_review" -gt "$GROUPS_TOTAL" ] 2>/dev/null && to_review="$GROUPS_TOTAL"
-
-[ "$to_review" -gt 0 ] 2>/dev/null || {
-  warn "Nothing selected to review (groups total: $GROUPS_TOTAL). Exiting."
-  exit 0
-}
+[ "$to_review" -gt 0 ] 2>/dev/null || { warn "Nothing selected to review (groups total: $GROUPS_TOTAL). Exiting."; exit 0; }
 
 info "Keep policy: $KEEP_POLICY"
 : > "$PLAN_FILE"
 REVIEWED=0
 DELETED_CANDIDATES=0
 
-# Optional: build quick hash->size map for per-group display (best-effort)
+# Build a header-aware hash->size map for per-group display
 CSV_CAND="$HASHES_DIR/hasher-$(date +%F).csv"
 if [ ! -f "$CSV_CAND" ]; then
   CSV_CAND="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
@@ -255,37 +269,27 @@ fi
 SIZES_MAP=""
 if [ -n "${CSV_CAND:-}" ] && [ -f "$CSV_CAND" ]; then
   SIZES_MAP="$VAR_DIR/.hash_sizes.$$"
-  awk -F'[,\t]' 'NR>1 && !seen[$4]++ { print $4 "\t" $2 }' "$CSV_CAND" > "$SIZES_MAP"
+  build_sizes_map "$CSV_CAND" "$SIZES_MAP"
 fi
 
 # Iterate groups
-TMP_LIST="$VAR_DIR/.group_paths.$$"
-: > "$TMP_LIST"
-CUR_HASH=""
-CUR_N=0
-CUR_IDX=0
+TMP_LIST="$VAR_DIR/.group_paths.$$"; : > "$TMP_LIST"
+CUR_HASH=""; CUR_IDX=0
 
 print_group_and_prompt() {
   idx="$1"; h="$2"; list="$3"
-  # derive group size from map if available
   gsz=0
   if [ -n "${SIZES_MAP:-}" ] && [ -f "$SIZES_MAP" ]; then
     gsz=$(awk -v H="$h" 'BEGIN{sz=0} $1==H{sz=$2} END{print sz+0}' "$SIZES_MAP")
   fi
-  # propose default keep index by policy
   def_keep=$(choose_default_keep "$KEEP_POLICY" "$list")
-  # show (limit to first 12 files to avoid huge floods)
   echo
   echo "Group $idx/$GROUPS_TOTAL — HASH $h  (files: $(wc -l <"$list" | tr -d ' '))  size: $(human_gib "$gsz") GiB  [policy: $KEEP_POLICY → keep #$def_keep]"
-  i=0
-  shown=0
+  i=0; shown=0
   while IFS= read -r p; do
-    i=$((i+1))
-    mark=" "
-    [ "$i" -eq "$def_keep" ] && mark="*"
+    i=$((i+1)); mark=" "; [ "$i" -eq "$def_keep" ] && mark="*"
     printf "  %2d%s %s\n" "$i" "$mark" "$p"
-    shown=$((shown+1))
-    [ "$shown" -ge 12 ] && break
+    shown=$((shown+1)); [ "$shown" -ge 12 ] && break
   done <"$list"
   TOTAL=$(wc -l <"$list" | tr -d ' ')
   [ "$TOTAL" -gt 12 ] && echo "  … and $((TOTAL-12)) more"
@@ -295,90 +299,57 @@ print_group_and_prompt() {
   else
     choice=""
   fi
-  # normalize
   if [ -z "${choice:-}" ]; then
     choice="$def_keep"
   elif [ "$choice" = "s" ]; then
-    echo "Skipped."
-    return 2
+    echo "Skipped."; return 2
   elif [ "$choice" = "q" ]; then
-    echo "Quitting."
-    return 3
-  elif echo "$choice" | grep -Eq '^[0-9]+$'; then
-    :
-  else
-    echo "Invalid input, using default $def_keep."
-    choice="$def_keep"
+    echo "Quitting."; return 3
+  elif echo "$choice" | grep -Eq '^[0-9]+$'; then : ; else
+    echo "Invalid input, using default $def_keep."; choice="$def_keep"
   fi
-
-  # write all except chosen to plan
   i=0
   while IFS= read -r p; do
-    i=$((i+1))
-    [ "$i" -eq "$choice" ] && continue
+    i=$((i+1)); [ "$i" -eq "$choice" ] && continue
     printf "%s\n" "$p" >> "$PLAN_FILE"
     DELETED_CANDIDATES=$((DELETED_CANDIDATES+1))
   done <"$list"
-  echo "→ Planned deletes added for group."
-  return 0
+  echo "→ Planned deletes added for group."; return 0
 }
 
 process_group() {
-  # called when CUR_HASH is set and TMP_LIST has paths
   [ -n "${CUR_HASH:-}" ] || return 0
-  CUR_N=$(wc -l <"$TMP_LIST" | tr -d ' ')
-  [ "$CUR_N" -ge 2 ] || { : > "$TMP_LIST"; CUR_HASH=""; return 0; }
-
+  COUNT=$(wc -l <"$TMP_LIST" | tr -d ' ')
+  [ "$COUNT" -ge 2 ] || { : > "$TMP_LIST"; CUR_HASH=""; return 0; }
   CUR_IDX=$((CUR_IDX+1))
   if [ "$CUR_IDX" -le "$to_review" ]; then
-    set +e
-    print_group_and_prompt "$CUR_IDX" "$CUR_HASH" "$TMP_LIST"
-    rc=$?
-    set -e
+    set +e; print_group_and_prompt "$CUR_IDX" "$CUR_HASH" "$TMP_LIST"; rc=$?; set -e
     case "$rc" in
       0) REVIEWED=$((REVIEWED+1)) ;;
-      2) : ;;   # skipped
-      3) # quit
-         rm -f "$TMP_LIST" "${SIZES_MAP:-}"
-         ok "Plan written: $PLAN_FILE"
-         info "Reviewed groups: $REVIEWED / $to_review | Planned deletions: $DELETED_CANDIDATES"
-         exit 0
-         ;;
+      2) : ;;
+      3) rm -f "$TMP_LIST" "${SIZES_MAP:-}"; ok "Plan written: $PLAN_FILE"; info "Reviewed groups: $REVIEWED / $to_review | Planned deletions: $DELETED_CANDIDATES"; exit 0 ;;
     esac
   fi
-
-  : > "$TMP_LIST"
-  CUR_HASH=""
+  : > "$TMP_LIST"; CUR_HASH=""
 }
 
 # Stream the report and handle groups
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     HASH\ *)
-      # process previous group
       process_group
-      # start new
       CUR_HASH=$(printf "%s\n" "$line" | sed -n 's/^HASH \([0-9a-fA-F]\+\).*/\1/p')
       : > "$TMP_LIST"
       ;;
-    /*)  # ← accept lines that start with a slash directly
-      printf "%s\n" "$line" >> "$TMP_LIST"
-      ;;
-    [[:space:]]/*) # ← keep compatibility with indented paths
-      p="$line"
-      # trim leading spaces
-      p="${p#"${p%%[![:space:]]*}"}"
-      printf "%s\n" "$p" >> "$TMP_LIST"
-      ;;
+    /*)  printf "%s\n" "$line" >> "$TMP_LIST" ;;                     # paths starting at column 1
+    [[:space:]]/*)
+      p="$line"; p="${p#"${p%%[![:space:]]*}"}"; printf "%s\n" "$p" >> "$TMP_LIST" ;;  # indented paths
     *) : ;;
   esac
 done <"$REPORT"
 
-# last group
 process_group
-
 rm -f "$TMP_LIST" "${SIZES_MAP:-}"
-
 ok "Plan written: $PLAN_FILE"
 info "Reviewed groups: $REVIEWED / $to_review | Planned deletions: $DELETED_CANDIDATES"
 exit 0
