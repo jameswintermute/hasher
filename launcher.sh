@@ -152,14 +152,12 @@ run_hasher_nohup() {
   fi
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
-  # Run with stdin from /dev/null to avoid 'cat -' Bad FD in child
   if [ -x "$script" ]; then
     nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   else
     nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   fi
 
-  # small delay then basic status
   sleep 1
   if tail -n 5 "$BACKGROUND_LOG" 2>/dev/null | grep -q 'Run-ID:'; then
     ok "Hasher launched."
@@ -203,6 +201,13 @@ action_find_duplicate_folders(){
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
     "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
+    plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+    if [ -n "$plan" ]; then
+      info "Plan saved to: $plan"
+      info "Review it first (cat/tail), then run option 6) Delete duplicates (apply plan)."
+    else
+      info "No folder plan found to suggest next steps."
+    fi
   else
     err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
@@ -226,7 +231,6 @@ action_find_duplicate_files(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Updated Option 4: robust wrapper to generate report if missing, then launch interactive review
 action_review_duplicates(){
   if [ -x "$BIN_DIR/launch-review.sh" ]; then
     "$BIN_DIR/launch-review.sh" || true
@@ -252,7 +256,6 @@ action_delete_zero_length(){
 action_apply_plan(){
   dup_var_dir="$VAR_DIR/duplicates"; mkdir -p "$dup_var_dir"
 
-  # Prefer FILE plan (from review-duplicates.sh)
   file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
   [ -z "$file_plan" ] && [ -f "$dup_var_dir/latest-plan.txt" ] && file_plan="$dup_var_dir/latest-plan.txt"
 
@@ -272,7 +275,6 @@ action_apply_plan(){
     return
   fi
 
-  # Fallback: FOLDER plan
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
   if [ -z "$plan" ]; then
     info "No folder plan found."
@@ -288,7 +290,6 @@ action_apply_plan(){
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
       fi
     ;;
-  end) ;;
   esac
   printf "Press Enter to continue... "; read -r _ || true
 }
@@ -320,15 +321,12 @@ action_system_check(){
   printf "Press Enter to continue... "; read -r _ || true;
 }
 
-# ────────────────────────────── Action 10 ──────────────────────────────
-# Clean cache dirs (@eaDir only) — safe & reversible (Synology will rebuild)
 action_clean_caches() {
   paths_file="$LOCAL_DIR/paths.txt"
   default_root="/volume1"
   listfile="$VAR_DIR/eadir-list-$(date +%s).txt"
   : > "$listfile"
 
-  # Resolve roots
   if [ -f "$paths_file" ]; then
     info "Using roots from $paths_file"
     while IFS= read -r line || [ -n "$line" ]; do
@@ -378,8 +376,6 @@ action_clean_caches() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# ────────────────────────────── Action 11 ──────────────────────────────
-# Delete common junk (delegates to bin/review-junk.sh or bin/delete-junk.sh)
 action_delete_junk(){
   junk_script=""
   if [ -x "$BIN_DIR/review-junk.sh" ]; then
@@ -420,7 +416,6 @@ action_delete_junk(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Menu loop
 while :; do
   clear 2>/dev/null || true
   header
