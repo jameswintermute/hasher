@@ -86,7 +86,7 @@ sample_files_quick() {
   total=0
   # shellcheck disable=SC2162
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in \#*|"") continue ;; esac
+    case "$line" in \#*|"" ) continue ;; esac
     [ -d "$line" ] || continue
     c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" || c=0
     total=$(( total + c ))
@@ -101,7 +101,7 @@ preflight_hashing() {
     roots=0; exist=0; missing=0
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       roots=$((roots+1))
       if [ -d "$line" ]; then exist=$((exist+1)); else missing=$((missing+1)); fi
     done < "$pfile"
@@ -145,7 +145,7 @@ run_hasher_nohup() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
@@ -182,7 +182,7 @@ run_hasher_interactive() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
@@ -202,10 +202,7 @@ action_find_duplicate_folders(){
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh" \
-      --input "$input" \
-      --scope recursive --signature name+content \
-      --min-group-size 2 --keep shortest-path || true
+    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --scope recursive --signature name+content       --min-group-size 2 --keep shortest-path || true
   else
     err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
@@ -335,7 +332,7 @@ action_clean_caches() {
   if [ -f "$paths_file" ]; then
     info "Using roots from $paths_file"
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       [ -d "$line" ] || { warn "Missing root: $line"; continue; }
       find "$line" -type d -name '@eaDir' -prune -print0 >> "$listfile"
     done < "$paths_file"
@@ -382,21 +379,44 @@ action_clean_caches() {
 }
 
 # ────────────────────────────── Action 11 ──────────────────────────────
-# Delete common junk (delegates to bin/delete-junk.sh)
+# Delete common junk (delegates to bin/review-junk.sh or bin/delete-junk.sh)
 action_delete_junk(){
-  if [ -x "$BIN_DIR/delete-junk.sh" ]; then
-    pfile="$(determine_paths_file)"; args=""
-    [ -n "$pfile" ] && args="$args --paths-file $pfile"
-    printf "Run in DRY-RUN first? [Y/n]: "; read -r ans || ans=""
-    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
-      n|no) ;;
-      *) args="$args --dry-run" ;;
-    esac
-    # shellcheck disable=SC2086
-    "$BIN_DIR/delete-junk.sh" $args || true
+  junk_script=""
+  if [ -x "$BIN_DIR/review-junk.sh" ]; then
+    junk_script="$BIN_DIR/review-junk.sh"
+  elif [ -x "$BIN_DIR/delete-junk.sh" ]; then
+    junk_script="$BIN_DIR/delete-junk.sh"
   else
-    err "$BIN_DIR/delete-junk.sh not found or not executable."
+    err "$BIN_DIR/review-junk.sh / delete-junk.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
   fi
+
+  pfile="$(determine_paths_file)"
+  args_base=""
+  [ -n "$pfile" ] && args_base="$args_base --paths-file $pfile"
+
+  printf "\n[Junk Cleaner]\n"
+  printf "  1) Scan / dry-run (recommended)\n"
+  printf "  2) Scan and delete (force)\n"
+  printf "  b) Back\n"
+  printf "Choose an option: "
+  read -r jc || jc=""
+  case "$jc" in
+    1)
+      # shellcheck disable=SC2086
+      "$junk_script" $args_base --dry-run || true
+      ;;
+    2)
+      # shellcheck disable=SC2086
+      "$junk_script" $args_base --force || true
+      ;;
+    b|B|"")
+      ;;
+    *)
+      printf "Unknown option.\n"
+      ;;
+  esac
   printf "Press Enter to continue... "; read -r _ || true
 }
 
