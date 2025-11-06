@@ -33,7 +33,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.5 - Sept 2025"
+  printf "\n%s\n" "      v1.0.6 - Oct 2025"
   printf "%s" "$CRESET"
   printf "\n"
 }
@@ -86,7 +86,7 @@ sample_files_quick() {
   total=0
   # shellcheck disable=SC2162
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in \#*|"") continue ;; esac
+    case "$line" in \#*|"" ) continue ;; esac
     [ -d "$line" ] || continue
     c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" || c=0
     total=$(( total + c ))
@@ -101,7 +101,7 @@ preflight_hashing() {
     roots=0; exist=0; missing=0
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       roots=$((roots+1))
       if [ -d "$line" ]; then exist=$((exist+1)); else missing=$((missing+1)); fi
     done < "$pfile"
@@ -145,21 +145,19 @@ run_hasher_nohup() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
   fi
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
-  # Run with stdin from /dev/null to avoid 'cat -' Bad FD in child
   if [ -x "$script" ]; then
     nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   else
     nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   fi
 
-  # small delay then basic status
   sleep 1
   if tail -n 5 "$BACKGROUND_LOG" 2>/dev/null | grep -q 'Run-ID:'; then
     ok "Hasher launched."
@@ -182,7 +180,7 @@ run_hasher_interactive() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
@@ -202,10 +200,14 @@ action_find_duplicate_folders(){
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh" \
-      --input "$input" \
-      --scope recursive --signature name+content \
-      --min-group-size 2 --keep shortest-path || true
+    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
+    plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+    if [ -n "$plan" ]; then
+      info "Plan saved to: $plan"
+      info "Review it first (cat/tail), then run option 6) Delete duplicates (apply plan)."
+    else
+      info "No folder plan found to suggest next steps."
+    fi
   else
     err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
@@ -229,7 +231,6 @@ action_find_duplicate_files(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Updated Option 4: robust wrapper to generate report if missing, then launch interactive review
 action_review_duplicates(){
   if [ -x "$BIN_DIR/launch-review.sh" ]; then
     "$BIN_DIR/launch-review.sh" || true
@@ -255,7 +256,6 @@ action_delete_zero_length(){
 action_apply_plan(){
   dup_var_dir="$VAR_DIR/duplicates"; mkdir -p "$dup_var_dir"
 
-  # Prefer FILE plan (from review-duplicates.sh)
   file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
   [ -z "$file_plan" ] && [ -f "$dup_var_dir/latest-plan.txt" ] && file_plan="$dup_var_dir/latest-plan.txt"
 
@@ -275,7 +275,6 @@ action_apply_plan(){
     return
   fi
 
-  # Fallback: FOLDER plan
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
   if [ -z "$plan" ]; then
     info "No folder plan found."
@@ -291,7 +290,6 @@ action_apply_plan(){
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
       fi
     ;;
-  end) ;;
   esac
   printf "Press Enter to continue... "; read -r _ || true
 }
@@ -323,19 +321,16 @@ action_system_check(){
   printf "Press Enter to continue... "; read -r _ || true;
 }
 
-# ────────────────────────────── Action 10 ──────────────────────────────
-# Clean cache dirs (@eaDir only) — safe & reversible (Synology will rebuild)
 action_clean_caches() {
   paths_file="$LOCAL_DIR/paths.txt"
   default_root="/volume1"
   listfile="$VAR_DIR/eadir-list-$(date +%s).txt"
   : > "$listfile"
 
-  # Resolve roots
   if [ -f "$paths_file" ]; then
     info "Using roots from $paths_file"
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"") continue ;; esac
+      case "$line" in \#*|"" ) continue ;; esac
       [ -d "$line" ] || { warn "Missing root: $line"; continue; }
       find "$line" -type d -name '@eaDir' -prune -print0 >> "$listfile"
     done < "$paths_file"
@@ -381,26 +376,46 @@ action_clean_caches() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# ────────────────────────────── Action 11 ──────────────────────────────
-# Delete common junk (delegates to bin/delete-junk.sh)
 action_delete_junk(){
-  if [ -x "$BIN_DIR/delete-junk.sh" ]; then
-    pfile="$(determine_paths_file)"; args=""
-    [ -n "$pfile" ] && args="$args --paths-file $pfile"
-    printf "Run in DRY-RUN first? [Y/n]: "; read -r ans || ans=""
-    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
-      n|no) ;;
-      *) args="$args --dry-run" ;;
-    esac
-    # shellcheck disable=SC2086
-    "$BIN_DIR/delete-junk.sh" $args || true
+  junk_script=""
+  if [ -x "$BIN_DIR/review-junk.sh" ]; then
+    junk_script="$BIN_DIR/review-junk.sh"
+  elif [ -x "$BIN_DIR/delete-junk.sh" ]; then
+    junk_script="$BIN_DIR/delete-junk.sh"
   else
-    err "$BIN_DIR/delete-junk.sh not found or not executable."
+    err "$BIN_DIR/review-junk.sh / delete-junk.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
   fi
+
+  pfile="$(determine_paths_file)"
+  args_base=""
+  [ -n "$pfile" ] && args_base="$args_base --paths-file $pfile"
+
+  printf "\n[Junk Cleaner]\n"
+  printf "  1) Scan / dry-run (recommended)\n"
+  printf "  2) Scan and delete (force)\n"
+  printf "  b) Back\n"
+  printf "Choose an option: "
+  read -r jc || jc=""
+  case "$jc" in
+    1)
+      # shellcheck disable=SC2086
+      "$junk_script" $args_base --dry-run || true
+      ;;
+    2)
+      # shellcheck disable=SC2086
+      "$junk_script" $args_base --force || true
+      ;;
+    b|B|"")
+      ;;
+    *)
+      printf "Unknown option.\n"
+      ;;
+  esac
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Menu loop
 while :; do
   clear 2>/dev/null || true
   header

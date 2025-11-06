@@ -91,32 +91,23 @@ awk '
       c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n];
       path=substr(s,1,c1-1);
       size=substr(s,c1+1,c2-c1-1);
-      # mtime=substr(s,c2+1,c3-c2-1);
-      # algo =substr(s,c3+1,c4-c3-1);
       hash=substr(s,c4+1);
     } else {
       c1=c[n-2]; c2=c[n-1]; c3=c[n];
       path=substr(s,1,c1-1);
       size=substr(s,c1+1,c2-c1-1);
-      # algo=substr(s,c2+1,c3-c2-1);
       hash=substr(s,c3+1);
     }
     path=unquote_path(path);
     gsub(/^[ \t]+|[ \t]+$/,"",hash);
     gsub(/^[ \t]+|[ \t]+$/,"",size);
-    # derive dir and basename (avoid external dirname/basename for speed)
+    # derive dir and basename
     p=path; lastslash=match(p,/[^/]*$/); base=substr(p,lastslash); dir=substr(p,1,lastslash-2);
-    # escape tabs/newlines just in case
     gsub(/\t/,"\\t",dir); gsub(/\n/," ",dir);
     gsub(/\t/,"\\t",base); gsub(/\n/," ",base);
-    # ensure numeric size; unknown -> 0
     if (size ~ /^[0-9]+$/) ; else size=0;
     printf "%s\t%s\t%s\t%s\n", dir, base, hash, size;
     NRrec++;
-  }
-  END{
-    # print a progress hint on stderr to avoid polluting stdout
-    # but we write to a file via shell redirection anyway
   }
 ' "$INPUT" > "$TMP_FILES"
 
@@ -126,13 +117,11 @@ info "[WORK] Sorting index…"
 LC_ALL=C sort -t '	' -k1,1 -k2,2 -k3,3 -k4,4 "$TMP_FILES" > "$TMP_SORTED"
 ok "Sorting complete."
 
-# 2) Build per-directory signature string (sorted basename|hash|size list joined by '|')
-#    Then map signature_string -> directories
+# 2) Build per-directory signature string
 awk -F '	' '
   function flush_prev(){
     if (curdir!=""){
-      # potential reclaim for a dir itself is not computed here (needs grouping)
-      printf "%s\t%s\n", sig, curdir;
+      printf("%s\t%s\n", sig, curdir);
     }
   }
   {
@@ -146,10 +135,8 @@ awk -F '	' '
   END{ flush_prev() }
 ' "$TMP_SORTED" > "$TMP_SIGS"
 
-# 3) Group by identical signatures; choose keep dir by policy; compute reclaim = size_per_file * (count-1) * files_in_dir
-#    To compute reclaim, we need per-dir total size. Re-scan the sorted file to accumulate per-dir total bytes.
+# 3) dir -> total size
 awk -F '	' '
-  BEGIN{}
   {
     d=$1; s=$4+0;
     if (d!=pd && pd!=""){ printf "%s\t%d\n", pd, sum; sum=0 }
@@ -158,14 +145,15 @@ awk -F '	' '
   END{ if (pd!="") printf "%s\t%d\n", pd, sum }
 ' "$TMP_SORTED" > "$TMP_BASE.dirsize.tsv"
 
-# 3a) Now join SIGS (sig->dir) with dirsize (dir->size) to make lines: sig \t dir \t dir_total_size
-#     Use awk map (single pass load sizes)
+# 3a) join sigs with dir sizes
 awk -F '	' '
   FNR==NR { sz[$1]=$2; next }
   { d=$2; printf "%s\t%s\t%d\n", $1, d, (d in sz ? sz[d] : 0) }
 ' "$TMP_BASE.dirsize.tsv" "$TMP_SIGS" > "$TMP_BASE.sig_dir_size.tsv"
 
-# 4) Sort by signature then by dir; then collapse groups with count>=MIN_GROUP; choose keep by policy.
+# 4) group by signature
+#    FIX 1: remove stray quote at the end of this pipeline
+#    FIX 2 (small): print a progress line to stderr every ~2000 records
 LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MIN="$MIN_GROUP" -v KEEP="$KEEP" '
   function choose_keep_idx(n,     i, best, bestlen){
     if (KEEP=="shortest-path"){
@@ -176,7 +164,7 @@ LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MI
       best=1; bestlen=length(dir[1]);
       for(i=2;i<=n;i++){ if (length(dir[i])>bestlen){ best=i; bestlen=length(dir[i]) } }
       return best;
-    } else { # first-seen
+    } else {
       return 1;
     }
   }
@@ -184,6 +172,12 @@ LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MI
   BEGIN{ reset_group() }
   {
     s=$1; d=$2; t=$3+0;
+
+    # tiny progress
+    if (NR % 2000 == 0) {
+      printf "[PROGRESS] grouped %d entries…\n", NR > "/dev/stderr"
+    }
+
     if (s!=gsig && gsig!=""){
       if (n>=MIN){
         keepi=choose_keep_idx(n);
@@ -202,22 +196,12 @@ LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MI
   }
 ' > "$TMP_GROUPS"
 
-# 5) Write plan file, sorted by descending reclaim-per-dir
-#    Here reclaim per delete_dir is simply its total size (we keep one exemplar).
+# 5) write plan
 LC_ALL=C sort -nr -k1,1 "$TMP_GROUPS" > "$TMP_BASE.groups.sorted.tsv"
 
-# Pretty print summary and emit plan
 groups_count="$(wc -l < "$TMP_BASE.groups.sorted.tsv" | tr -d ' ')"
-if [ -z "$groups_count" ]; then groups_count=0; fi
-dupe_dirs=$groups_count
+[ -n "$groups_count" ] || groups_count=0
 
-# Sum potential reclaim (sum of delete_dir sizes)
-reclaim_bytes="$(awk -F '	' '{s+=$1} END{print s+0}' "$TMP_BASE.groups.sorted.tsv")"
-
-info "Found duplicate folder *pairs*: $dupe_dirs"
-printf "%s[INFO]%s Potential reclaim if applied: %.2f GiB\n" "$CINFO" "$C0" "$(awk 'BEGIN{print '"${reclaim_bytes}"'/1073741824}')" 
-
-# Emit plan file
 : > "$PLAN"
 while IFS='	' read -r sz keepdir deldir; do
   printf "%s\n" "$deldir" >> "$PLAN"
