@@ -33,7 +33,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.5 - Sept 2025"
+  printf "\n%s\n" "      v1.0.6 - Oct 2025"
   printf "%s" "$CRESET"
   printf "\n"
 }
@@ -202,7 +202,7 @@ action_find_duplicate_folders(){
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --scope recursive --signature name+content       --min-group-size 2 --keep shortest-path || true
+    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
   else
     err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
   fi
