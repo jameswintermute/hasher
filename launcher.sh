@@ -33,9 +33,32 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.6 - Oct 2025"
+  printf "\n%s\n" "      v1.0.7 - Nov 2025"
   printf "%s" "$CRESET"
   printf "\n"
+}
+
+# --- NEW: Running Hasher detection ---
+is_hasher_running() {
+  # BusyBox-safe process check.
+  # We look for hasher processes but ignore the launcher itself.
+  if ps w 2>/dev/null | grep '[h]asher' | grep -v 'launcher.sh' >/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_no_running_hasher() {
+  if is_hasher_running; then
+    printf "%s[WARN]%s Hasher appears to be already running.\n" "$CWARN" "$CRESET"
+    printf "Start another run anyway? [y/N]: "
+    read -r ans || ans=""
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) return 0 ;;
+      *) printf "Aborting new hasher run.\n"; return 1 ;;
+    esac
+  fi
+  return 0
 }
 
 print_menu() {
@@ -125,6 +148,11 @@ find_hasher_script() {
 }
 
 run_hasher_nohup() {
+  # Concurrency guard
+  if ! ensure_no_running_hasher; then
+    return 0
+  fi
+
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
@@ -169,6 +197,11 @@ run_hasher_nohup() {
 }
 
 run_hasher_interactive() {
+  # Concurrency guard
+  if ! ensure_no_running_hasher; then
+    return 0
+  fi
+
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
@@ -190,9 +223,19 @@ run_hasher_interactive() {
   if [ -x "$script" ]; then "$@"; else sh "$@"; fi
 }
 
-action_check_status(){ info "Background log: $BACKGROUND_LOG"; [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."; printf "Press Enter to continue... "; read -r _ || true; }
-action_start_hashing(){ run_hasher_nohup; printf "Press Enter to continue... "; read -r _ || true; }
-action_custom_hashing(){ run_hasher_interactive; printf "Press Enter to continue... "; read -r _ || true; }
+action_check_status(){
+  info "Background log: $BACKGROUND_LOG"
+  [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+action_start_hashing(){
+  run_hasher_nohup
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+action_custom_hashing(){
+  run_hasher_interactive
+  printf "Press Enter to continue... "; read -r _ || true;
+}
 
 # Keep the rest of the actions as placeholders; they call existing bin scripts if present.
 action_find_duplicate_folders(){
