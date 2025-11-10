@@ -247,23 +247,53 @@ present_group(){
     while IFS= read -r fp; do i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"; done <"$ORDERED"
   fi
 
-  echo
-  echo "Choose which file to KEEP:"
-  echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
-  echo "  - s = skip group (decide later)"
-  echo "  - q = quit (plan so far is preserved)"
-  printf "Your choice: "
-  if [ -t 0 ]; then read ans; else read ans </dev/tty; fi
-
-  case "$ans" in
-    q|Q) echo; warn "Stopping early at group $reviewed. Plan saved: $PLAN_OUT"; exit 0 ;;
-    s|S|'') : ;;
-    *) case "$ans" in *[!0-9]*|'') echo "Invalid choice. Skipping group." ;;
-       *) choice="$ans"; j=0; while IFS= read -r fp; do j=$((j+1)); [ "$j" -ne "$choice" ] && printf "%s\n" "$fp" >> "$PLAN_OUT"; done <"$ORDERED";;
-       esac ;;
-  esac
-
   files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
+
+  # --- SAFER INPUT LOOP ---
+  while :; do
+    echo
+    echo "Choose which file to KEEP:"
+    echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
+    echo "  - s = skip group (decide later)"
+    echo "  - q = quit (plan so far is preserved)"
+    printf "Your choice: "
+    if [ -t 0 ]; then read ans; else read ans </dev/tty; fi
+
+    case "$ans" in
+      q|Q)
+        echo
+        warn "Stopping early at group $reviewed. Plan saved: $PLAN_OUT"
+        exit 0
+        ;;
+      s|S|"")
+        # skip group safely
+        break
+        ;;
+      *)
+        # must be numeric and within range
+        case "$ans" in *[!0-9]*|'')
+          printf "%s[WARN]%s Invalid choice, please enter 1-%d, s or q.\n" "$CERR" "$C0" "$files_in_group" >&2
+          ;;
+        *)
+          choice="$ans"
+          if [ "$choice" -lt 1 ] 2>/dev/null || [ "$choice" -gt "$files_in_group" ] 2>/dev/null; then
+            printf "%s[WARN]%s Invalid choice, please enter 1-%d, s or q.\n" "$CERR" "$C0" "$files_in_group" >&2
+          else
+            # valid choice → write others to plan
+            j=0
+            while IFS= read -r fp; do
+              j=$((j+1))
+              [ "$j" -ne "$choice" ] && printf "%s\n" "$fp" >> "$PLAN_OUT"
+            done <"$ORDERED"
+            break
+          fi
+          ;;
+        esac
+        ;;
+    esac
+  done
+  # --- END SAFER INPUT LOOP ---
+
   files_seen=$((files_seen + files_in_group))
   : >"$TMP_GROUP"; : >"$ORDERED"
 }
