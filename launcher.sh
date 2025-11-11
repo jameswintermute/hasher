@@ -255,7 +255,8 @@ action_view_logs_follow(){
     printf "Press Enter to continue... "; read -r _ || true;
     return
   fi
-  info "Following $BACKGROUND_LOG (Ctrl+C to stop)"
+  printf "%s[INFO]%s Following %s\n" "$CINFO" "$CRESET" "$BACKGROUND_LOG"
+  printf "%s%s(Ctrl+C to stop)%s\n" "$CWARN" "$(printf '\033[1m')" "$CRESET"
   # BusyBox tail usually supports -f
   tail -f "$BACKGROUND_LOG"
 }
