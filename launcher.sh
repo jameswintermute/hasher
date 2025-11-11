@@ -15,12 +15,7 @@ VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
 # Colors (only if stdout is a TTY)
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
-  CHEAD="$(printf '\033[1;35m')"
-  CINFO="$(printf '\033[1;34m')"
-  COK="$(printf '\033[1;32m')"
-  CWARN="$(printf '\033[1;33m')"
-  CERR="$(printf '\033[1;31m')"
-  CRESET="$(printf '\033[0m')"
+  CHEAD="$(printf '\033[1;35m')" ; CINFO="$(printf '\033[1;34m')" ; COK="$(printf '\033[1;32m')" ; CWARN="$(printf '\033[1;33m')" ; CERR="$(printf '\033[1;31m')" ; CRESET="$(printf '\033[0m')"
 else
   CHEAD=""; CINFO=""; COK=""; CWARN=""; CERR=""; CRESET=""
 fi
@@ -43,7 +38,7 @@ header() {
   printf "\n"
 }
 
-# --- Running Hasher detection ---
+# --- NEW: Running Hasher detection ---
 is_hasher_running() {
   # BusyBox-safe process check.
   # We look for hasher processes but ignore the launcher itself.
@@ -168,6 +163,7 @@ run_hasher_nohup() {
   efile="$(determine_excludes_file)"
 
   # Build argv in POSIX-safe way (set --)
+  # Start with the script path
   set -- "$script"
   # Always pass --pathfile if we have one
   if [ -n "$pfile" ]; then
@@ -183,7 +179,7 @@ run_hasher_nohup() {
     done < "$efile"
   fi
 
-  # Hard-exclude known recycle bins (NAS/Synology)
+  # Hard-exclude known recycle bins
   set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
@@ -226,7 +222,7 @@ run_hasher_interactive() {
     done < "$efile"
   fi
 
-  # Hard-exclude known recycle bins (NAS/Synology)
+  # Hard-exclude known recycle bins
   set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
 
   info "Running hasher interactively: $script"
@@ -238,12 +234,10 @@ action_check_status(){
   [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."
   printf "Press Enter to continue... "; read -r _ || true;
 }
-
 action_start_hashing(){
   run_hasher_nohup
   printf "Press Enter to continue... "; read -r _ || true;
 }
-
 action_custom_hashing(){
   run_hasher_interactive
   printf "Press Enter to continue... "; read -r _ || true;
@@ -256,8 +250,7 @@ action_view_logs_follow(){
     return
   fi
   printf "%s[INFO]%s Following %s\n" "$CINFO" "$CRESET" "$BACKGROUND_LOG"
-  printf "%s%s(Ctrl+C to stop)%s\n" "$CWARN" "$(printf '\033[1m')" "$CRESET"
-  # BusyBox tail usually supports -f
+  printf "%s\033[1m(Ctrl+C to stop)%s\n" "$CWARN" "$CRESET"
   tail -f "$BACKGROUND_LOG"
 }
 
@@ -267,12 +260,7 @@ action_find_duplicate_folders(){
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh" \
-      --input "$input" \
-      --mode plan \
-      --scope recursive \
-      --min-group-size 2 \
-      --keep shortest-path || true
+    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
     plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
     if [ -n "$plan" ]; then
       info "Plan saved to: $plan"
