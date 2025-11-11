@@ -33,15 +33,13 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.7 - Nov 2025"
+  printf "\n%s\n" "      v1.0.8 - Nov 2025"
   printf "%s" "$CRESET"
   printf "\n"
 }
 
-# --- NEW: Running Hasher detection ---
+# --- Running Hasher detection ---
 is_hasher_running() {
-  # BusyBox-safe process check.
-  # We look for hasher processes but ignore the launcher itself.
   if ps w 2>/dev/null | grep '[h]asher' | grep -v 'launcher.sh' >/dev/null; then
     return 0
   fi
@@ -63,7 +61,7 @@ ensure_no_running_hasher() {
 
 print_menu() {
   printf "%s\n" "### Stage 1 - Hash ###"
-  printf "%s\n" "  0) Check hashing status"
+  printf "%s\n" "  0) Check hashing status (static)"
   printf "%s\n" "  1) Start Hashing (NAS-safe defaults)"
   printf "%s\n" "  8) Advanced / Custom hashing"
   printf "\n"
@@ -80,14 +78,13 @@ print_menu() {
   printf "\n"
   printf "%s\n" "### Other ###"
   printf "%s\n" "  7) System check (deps & readiness)"
-  printf "%s\n" "  9) View logs (tail background.log)"
+  printf "%s\n" "  9) Follow logs (tail -f background.log)"
   printf "\n"
   printf "%s\n" "  q) Quit"
   printf "\n"
 }
 
 latest_hashes_csv() {
-  # shellcheck disable=SC2012
   f="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
   [ -n "${f:-}" ] && printf "%s" "$f" || printf ""
 }
@@ -107,7 +104,6 @@ sample_files_quick() {
   pfile="$1"
   [ -s "$pfile" ] || { printf "0"; return; }
   total=0
-  # shellcheck disable=SC2162
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in \#*|"" ) continue ;; esac
     [ -d "$line" ] || continue
@@ -122,7 +118,6 @@ preflight_hashing() {
   efile="$(determine_excludes_file)"
   if [ -n "$pfile" ]; then
     roots=0; exist=0; missing=0
-    # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"" ) continue ;; esac
       roots=$((roots+1))
@@ -141,14 +136,12 @@ find_hasher_script() {
   for c in "$ROOT_DIR/hasher.sh" "$BIN_DIR/hasher.sh" "$ROOT_DIR/scripts/hasher.sh" "$ROOT_DIR/tools/hasher.sh"; do
     [ -f "$c" ] && { printf "%s" "$c"; return 0; }
   done
-  # shellcheck disable=SC2010
   f="$(ls -1 "$BIN_DIR"/hasher*.sh 2>/dev/null | head -n1 || true)"
   [ -n "${f:-}" ] && { printf "%s" "$f"; return 0; }
   return 1
 }
 
 run_hasher_nohup() {
-  # Concurrency guard
   if ! ensure_no_running_hasher; then
     return 0
   fi
@@ -162,16 +155,11 @@ run_hasher_nohup() {
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
 
-  # Build argv in POSIX-safe way (set --)
-  # Start with the script path
   set -- "$script"
-  # Always pass --pathfile if we have one
   if [ -n "$pfile" ]; then
     set -- "$@" --pathfile "$pfile"
   fi
-  # Append --exclude for each normalized pattern
   if [ -n "$efile" ]; then
-    # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
@@ -197,11 +185,9 @@ run_hasher_nohup() {
 }
 
 run_hasher_interactive() {
-  # Concurrency guard
   if ! ensure_no_running_hasher; then
     return 0
   fi
-
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
@@ -211,7 +197,6 @@ run_hasher_interactive() {
   set -- "$script"
   if [ -n "$pfile" ]; then set -- "$@" --pathfile "$pfile"; fi
   if [ -n "$efile" ]; then
-    # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"" ) continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
@@ -228,22 +213,33 @@ action_check_status(){
   [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."
   printf "Press Enter to continue... "; read -r _ || true;
 }
+
 action_start_hashing(){
   run_hasher_nohup
   printf "Press Enter to continue... "; read -r _ || true;
 }
+
 action_custom_hashing(){
   run_hasher_interactive
   printf "Press Enter to continue... "; read -r _ || true;
 }
 
-# Keep the rest of the actions as placeholders; they call existing bin scripts if present.
+action_view_logs_follow(){
+  if [ ! -f "$BACKGROUND_LOG" ]; then
+    info "No background.log yet."
+    printf "Press Enter to continue... "; read -r _ || true;
+    return
+  fi
+  info "Following $BACKGROUND_LOG (Ctrl+C to stop)"
+  tail -f "$BACKGROUND_LOG"
+}
+
 action_find_duplicate_folders(){
   input="$(latest_hashes_csv)"
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
   if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
+    "$BIN_DIR/find-duplicate-folders.sh" --input "$input" --mode plan --scope recursive --min-group-size 2 --keep shortest-path || true
     plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
     if [ -n "$plan" ]; then
       info "Plan saved to: $plan"
@@ -257,7 +253,6 @@ action_find_duplicate_folders(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Updated Option 3: use wrapper with spinner + next steps
 action_find_duplicate_files(){
   if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
     "$BIN_DIR/run-find-duplicates.sh" || true
@@ -443,12 +438,10 @@ action_delete_junk(){
   read -r jc || jc=""
   case "$jc" in
     1)
-      # shellcheck disable=SC2086
-      "$junk_script" $args_base --dry-run || true
+      $junk_script $args_base --dry-run || true
       ;;
     2)
-      # shellcheck disable=SC2086
-      "$junk_script" $args_base --force || true
+      $junk_script $args_base --force || true
       ;;
     b|B|"")
       ;;
@@ -476,7 +469,7 @@ while :; do
     10) action_clean_caches ;;
     11) action_delete_junk ;;
     7) action_system_check ;;
-    9) action_check_status ;;
+    9) action_view_logs_follow ;;
     q|Q) echo "Bye."; exit 0 ;;
     *) echo "Unknown option: $choice" ; sleep 1 ;;
   esac
