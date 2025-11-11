@@ -13,28 +13,37 @@ LOCAL_DIR="$ROOT_DIR/local"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
-# Colors (only if stdout is a TTY)
+# ------------------------------------------------------------------
+# Standardized color palette (TTY-aware)
+# ------------------------------------------------------------------
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
-  CHEAD="$(printf '\033[1;35m')" ; CINFO="$(printf '\033[1;34m')" ; COK="$(printf '\033[1;32m')" ; CWARN="$(printf '\033[1;33m')" ; CERR="$(printf '\033[1;31m')" ; CRESET="$(printf '\033[0m')"
+  RED="$(printf '\033[31m')"
+  GRN="$(printf '\033[32m')"
+  YEL="$(printf '\033[33m')"
+  BLU="$(printf '\033[34m')"
+  MAG="$(printf '\033[35m')"
+  BOLD="$(printf '\033[1m')"
+  RST="$(printf '\033[0m')"
 else
-  CHEAD=""; CINFO=""; COK=""; CWARN=""; CERR=""; CRESET=""
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; BOLD=""; RST=""
 fi
 
-info(){ printf "%s[INFO]%s %s\n" "$CINFO" "$CRESET" "$*"; }
-ok(){   printf "%s[OK]%s %s\n"   "$COK"   "$CRESET" "$*"; }
-warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$CRESET" "$*"; }
-err(){  printf "%s[ERROR]%s %s\n" "$CERR"  "$CRESET" "$*"; }
+# keep original names but use standardized look
+info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
+ok(){    printf "%s[OK  ]%s %s\n"  "$BLU" "$RST" "$*"; }
+warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
+err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
 
 header() {
-  printf "%s" "$CHEAD"
+  printf "%s" "$MAG"
   printf "%s\n" " _   _           _               "
   printf "%s\n" "| | | | __ _ ___| |__   ___ _ __ "
   printf "%s\n" "| |_| |/ _' / __| '_ \ / _ \ '__|"
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.0.7 - Nov 2025"
-  printf "%s" "$CRESET"
+  printf "\n%s\n" "      v1.0.8.1 - Nov 2025"
+  printf "%s" "$RST"
   printf "\n"
 }
 
@@ -50,7 +59,7 @@ is_hasher_running() {
 
 ensure_no_running_hasher() {
   if is_hasher_running; then
-    printf "%s[WARN]%s Hasher appears to be already running.\n" "$CWARN" "$CRESET"
+    warn "Hasher appears to be already running."
     printf "Start another run anyway? [y/N]: "
     read -r ans || ans=""
     case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
@@ -63,13 +72,14 @@ ensure_no_running_hasher() {
 
 print_menu() {
   printf "%s\n" "### Stage 1 - Hash ###"
-  printf "%s\n" "  0) Check hashing status"
+  printf "%s\n" "  0) Check hashing status (static)"
   printf "%s\n" "  1) Start Hashing (NAS-safe defaults)"
   printf "%s\n" "  8) Advanced / Custom hashing"
   printf "\n"
   printf "%s\n" "### Stage 2 - Identify ###"
   printf "%s\n" "  2) Find duplicate folders"
   printf "%s\n" "  3) Find duplicate files"
+  printf "%s\n" " 12) Find file by HASH (lookup)   <-- NEW"
   printf "\n"
   printf "%s\n" "### Stage 3 - Clean up ###"
   printf "%s\n" "  4) Review duplicates (interactive)"
@@ -80,7 +90,7 @@ print_menu() {
   printf "\n"
   printf "%s\n" "### Other ###"
   printf "%s\n" "  7) System check (deps & readiness)"
-  printf "%s\n" "  9) View logs (tail background.log)"
+  printf "%s\n" "  9) Follow logs (tail -f background.log)"
   printf "\n"
   printf "%s\n" "  q) Quit"
   printf "\n"
@@ -163,13 +173,10 @@ run_hasher_nohup() {
   efile="$(determine_excludes_file)"
 
   # Build argv in POSIX-safe way (set --)
-  # Start with the script path
   set -- "$script"
-  # Always pass --pathfile if we have one
   if [ -n "$pfile" ]; then
     set -- "$@" --pathfile "$pfile"
   fi
-  # Append --exclude for each normalized pattern
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
@@ -178,6 +185,9 @@ run_hasher_nohup() {
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
   fi
+
+  # Hard-exclude known recycle bins
+  set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
   if [ -x "$script" ]; then
@@ -219,6 +229,9 @@ run_hasher_interactive() {
     done < "$efile"
   fi
 
+  # Hard-exclude known recycle bins
+  set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+
   info "Running hasher interactively: $script"
   if [ -x "$script" ]; then "$@"; else sh "$@"; fi
 }
@@ -235,6 +248,17 @@ action_start_hashing(){
 action_custom_hashing(){
   run_hasher_interactive
   printf "Press Enter to continue... "; read -r _ || true;
+}
+
+action_view_logs_follow(){
+  if [ ! -f "$BACKGROUND_LOG" ]; then
+    info "No background.log yet."
+    printf "Press Enter to continue... "; read -r _ || true;
+    return
+  fi
+  info "Following $BACKGROUND_LOG"
+  printf "%s(Ctrl+C to stop)%s\n" "$YEL" "$RST"
+  tail -f "$BACKGROUND_LOG"
 }
 
 # Keep the rest of the actions as placeholders; they call existing bin scripts if present.
@@ -459,6 +483,26 @@ action_delete_junk(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# NEW: find file by hash
+action_find_by_hash() {
+  printf "Enter SHA256 hash to look up: "
+  read -r HASHVAL || HASHVAL=""
+  if [ -z "$HASHVAL" ]; then
+    warn "No hash entered."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  if [ -x "$BIN_DIR/hash-check.sh" ] || [ -f "$BIN_DIR/hash-check.sh" ]; then
+    info "Looking up hash: $HASHVAL"
+    "$BIN_DIR/hash-check.sh" "$HASHVAL" || true
+  else
+    err "hash-check.sh not found in $BIN_DIR"
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# main loop
 while :; do
   clear 2>/dev/null || true
   header
@@ -470,13 +514,14 @@ while :; do
     8) action_custom_hashing ;;
     2) action_find_duplicate_folders ;;
     3) action_find_duplicate_files ;;
+    12) action_find_by_hash ;;
     4) action_review_duplicates ;;
     5) action_delete_zero_length ;;
     6) action_apply_plan ;;
     10) action_clean_caches ;;
     11) action_delete_junk ;;
     7) action_system_check ;;
-    9) action_check_status ;;
+    9) action_view_logs_follow ;;
     q|Q) echo "Bye."; exit 0 ;;
     *) echo "Unknown option: $choice" ; sleep 1 ;;
   esac
