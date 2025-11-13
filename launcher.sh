@@ -91,6 +91,7 @@ print_menu() {
   printf "%s\n" "### Other ###"
   printf "%s\n" "  7) System check (deps & readiness)"
   printf "%s\n" "  9) Follow logs (tail -f background.log)"
+  printf "%s\n" " 13) Stats & scheduling hints"
   printf "\n"
   printf "%s\n" "  q) Quit"
   printf "\n"
@@ -483,7 +484,7 @@ action_delete_junk(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# NEW: find file by hash
+# NEW: find file by hash with basic SHA256 validation
 action_find_by_hash() {
   printf "Enter SHA256 hash to look up: "
   read -r HASHVAL || HASHVAL=""
@@ -493,12 +494,71 @@ action_find_by_hash() {
     return
   fi
 
+  # Trim whitespace
+  clean_hash="$(printf "%s" "$HASHVAL" | tr -d '[:space:]')"
+
+  # Basic SHA256 sanity check: hex only, 64 chars
+  case "$clean_hash" in
+    [0-9a-fA-F]*)
+      len="$(printf "%s" "$clean_hash" | wc -c | tr -d ' ')"
+      if [ "$len" -ne 64 ] 2>/dev/null; then
+        warn "Input does not look like a 64-character SHA256 hash (got length $len)."
+        printf "Press Enter to continue... "; read -r _ || true
+        return
+      fi
+      ;;
+    *)
+      warn "Input does not look like a SHA256 hash (non-hex characters found)."
+      printf "Press Enter to continue... "; read -r _ || true
+      return
+      ;;
+  esac
+
   if [ -x "$BIN_DIR/hash-check.sh" ] || [ -f "$BIN_DIR/hash-check.sh" ]; then
-    info "Looking up hash: $HASHVAL"
-    "$BIN_DIR/hash-check.sh" "$HASHVAL" || true
+    info "Looking up hash: $clean_hash"
+    "$BIN_DIR/hash-check.sh" "$clean_hash" || true
   else
     err "hash-check.sh not found in $BIN_DIR"
   fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# NEW: Stats & cron helper
+action_stats_and_cron() {
+  info "Hasher usage stats (approximate):"
+
+  # Hash CSVs
+  csv_count=$(ls -1 "$HASHES_DIR"/hasher-*.csv 2>/dev/null | wc -l | tr -d ' ')
+  echo "  - Hash runs (CSV files): $csv_count"
+
+  latest_csv=$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)
+  if [ -n "$latest_csv" ]; then
+    echo "  - Latest hashes CSV: $latest_csv"
+  else
+    echo "  - Latest hashes CSV: (none yet)"
+  fi
+
+  dup_var_dir="$VAR_DIR/duplicates"
+  plan_count=$(ls -1 "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | wc -l | tr -d ' ')
+  echo "  - File dedupe plans created: $plan_count"
+
+  latest_plan=$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)
+  [ -z "$latest_plan" ] && latest_plan="$dup_var_dir/latest-plan.txt"
+  if [ -n "$latest_plan" ] && [ -f "$latest_plan" ]; then
+    echo "  - Latest file dedupe plan: $latest_plan"
+  fi
+
+  echo
+  echo "Example cron entries (templates only; adjust paths & options):"
+  echo
+  echo "  # Run hasher nightly at 02:00 using your preferred CLI flags"
+  echo "  # (example: replace <hasher_root_dir> and add your hasher.sh options)"
+  echo "  0 2 * * * cd <hasher_root_dir> && ./hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
+  echo
+  echo "  # Run junk cleaner weekly on Sundays at 03:00 in dry-run mode"
+  echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh --dry-run >> logs/cron-junk.log 2>&1"
+  echo
+  echo "Edit crontab with: crontab -e   (on the host where hasher.sh is installed)."
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -522,6 +582,7 @@ while :; do
     11) action_delete_junk ;;
     7) action_system_check ;;
     9) action_view_logs_follow ;;
+    13) action_stats_and_cron ;;
     q|Q) echo "Bye."; exit 0 ;;
     *) echo "Unknown option: $choice" ; sleep 1 ;;
   esac
