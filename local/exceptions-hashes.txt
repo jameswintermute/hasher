@@ -1,0 +1,2 @@
+# local/exceptions-hashes.txt
+# One SHA256 hash per line. Lines starting with '#' are ignored.
