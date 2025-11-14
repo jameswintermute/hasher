@@ -165,7 +165,7 @@ run_hasher_nohup() {
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
-  preflight_hashing()
+  preflight_hashing
   : >"$BACKGROUND_LOG" 2>/dev/null || true
 
   pfile="$(determine_paths_file)"
