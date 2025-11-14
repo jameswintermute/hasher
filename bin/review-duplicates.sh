@@ -1,310 +1,397 @@
 #!/bin/sh
 # review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
-# Hasher — NAS File Hasher & Duplicate Finder (GPLv3)
-# Internals optimized: capture selected groups in one pass, no re-scan per group
+# Hasher — NAS File Hasher & Duplicate Finder
+# Version: 1.0.9 (adds hash exceptions list & 'A' option)
+
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
-VAR_DIR="$ROOT_DIR/var";  mkdir -p "$VAR_DIR"
+# ---------------------------------------------------------------------------
+# Paths & setup
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
+APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-REPORT_DEFAULT="$LOGS_DIR/duplicate-hashes-latest.txt"
-RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-PLAN_DEFAULT="$LOGS_DIR/review-dedupe-plan-$(date +%F)-$RUN_ID.txt"
+BIN_DIR="$APP_HOME/bin"
+LOGS_DIR="$APP_HOME/logs"
+HASHES_DIR="$APP_HOME/hashes"
+VAR_DIR="$APP_HOME/var"
+DUP_VAR_DIR="$VAR_DIR/duplicates"
+LOCAL_DIR="$APP_HOME/local"
+EXCEPTIONS_FILE="$LOCAL_DIR/exceptions-hashes.txt"
 
-REPORT="$REPORT_DEFAULT"
-PLAN_OUT="$PLAN_DEFAULT"
-PROGRESS_EVERY=1
-SHOW_PROGRESS=1
-ORDER="size"  # size|sizesmall|name|newest|oldest|shortpath|longpath
+mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$VAR_DIR" "$DUP_VAR_DIR" "$LOCAL_DIR"
 
-is_tty() { [ -t 2 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; }
-if is_tty; then
-  C1="$(printf '\033[1;36m')"; C2="$(printf '\033[1;33m')"
-  COK="$(printf '\033[1;32m')" ; CERR="$(printf '\033[1;31m')"
-  CDIM="$(printf '\033[2m')"  ; C0="$(printf '\033[0m')"
+# ---------------------------------------------------------------------------
+# TTY-aware colours
+# ---------------------------------------------------------------------------
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+  RED="$(printf '\033[31m')"
+  GRN="$(printf '\033[32m')"
+  YEL="$(printf '\033[33m')"
+  BLU="$(printf '\033[34m')"
+  MAG="$(printf '\033[35m')"
+  CYAN="$(printf '\033[36m')"
+  BOLD="$(printf '\033[1m')"
+  RST="$(printf '\033[0m')"
 else
-  C1=""; C2=""; COK=""; CERR=""; CDIM=""; C0=""
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYAN=""; BOLD=""; RST=""
 fi
 
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [--from-report PATH] [--plan-out PATH] [--plan PATH]
-                        [--every N] [--no-progress]
-                        [--order size|sizesmall|name|newest|oldest|shortpath|longpath]
-Notes:
-  - Groups are shown by BIGGEST POTENTIAL SAVINGS first: (N-1)*size.
-  - Inside each group, default order is 'size' (largest first) and sizes are shown.
-  - You'll be asked how many groups or what percentage to review.
-EOF
+info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
+warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
+err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
+next(){  printf "%s[NEXT]%s %s\n" "$CYAN" "$RST" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+human_size() {
+  # Print human-readable size from bytes (integer).
+  b="$1"
+  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+
+  if [ "$b" -lt 1024 ] 2>/dev/null; then
+    printf "%s B" "$b"
+    return
+  fi
+
+  kb=$((b / 1024))
+  if [ "$kb" -lt 1024 ] 2>/dev/null; then
+    printf "%s KB" "$kb"
+    return
+  fi
+
+  mb=$((kb / 1024))
+  if [ "$mb" -lt 1024 ] 2>/dev/null; then
+    printf "%s MB" "$mb"
+    return
+  fi
+
+  gb=$((mb / 1024))
+  printf "%s GB" "$gb"
 }
 
-warn()  { printf "%s[WARN]%s %s\n"  "$C2"  "$C0" "$1" >&2; }
-info()  { printf "%s[INFO]%s %s\n"  "$COK" "$C0" "$1" >&2; }
-error() { printf "%s[ERROR]%s %s\n" "$CERR" "$C0" "$1" >&2; }
-
-# Args
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --from-report) REPORT="${2?}"; shift 2 ;;
-    --plan-out|--plan) PLAN_OUT="${2?}"; shift 2 ;;
-    --every) PROGRESS_EVERY="${2?}"; shift 2 ;;
-    --no-progress) SHOW_PROGRESS=0; shift ;;
-    --order) ORDER="${2?}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) warn "Ignoring unknown arg: $1"; shift ;;
+prompt_yn() {
+  msg="$1"
+  def="${2:-N}"
+  case "$def" in
+    Y|y) p=" [Y/n] " ;;
+    *)   p=" [y/N] " ;;
   esac
+  printf "%s%s" "$msg" "$p"
+  read -r a || a=""
+  [ -z "$a" ] && a="$def"
+  case "$a" in Y|y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+numeric_or_zero() {
+  v="$1"
+  case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+# Add a hash to the local exceptions list (idempotent)
+add_to_exceptions() {
+  hash="$1"
+  primary_size_bytes="$2"
+
+  touch "$EXCEPTIONS_FILE"
+
+  size_hr="$(human_size "$(numeric_or_zero "$primary_size_bytes")")"
+
+  echo
+  printf "You have selected to add this hash to your local exceptions list.\n"
+  printf "  Hash: %s\n" "$hash"
+  printf "  Example file size: %s\n" "$size_hr"
+  printf "You will no longer be prompted for this hash in future runs.\n"
+  if ! prompt_yn "Proceed and append to $(basename "$EXCEPTIONS_FILE")?" "N"; then
+    info "Not adding hash to exceptions list."
+    return 0
+  fi
+
+  if grep -q "^$hash\$" "$EXCEPTIONS_FILE" 2>/dev/null; then
+    info "Hash already present in exceptions list."
+  else
+    printf "%s\n" "$hash" >>"$EXCEPTIONS_FILE"
+    info "Hash added to exceptions list."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Args: we support
+#   --input PATH        duplicates-*.csv (hash|size|path)
+#   --from-report PATH  duplicate-hashes report that references the CSV
+#   --order size|none   group ordering (default: size)
+# ---------------------------------------------------------------------------
+
+INPUT_CSV=""
+REPORT_FILE=""
+ORDER="size"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input)
+      shift || true
+      INPUT_CSV="${1:-}"
+      ;;
+    --from-report)
+      shift || true
+      REPORT_FILE="${1:-}"
+      ;;
+    --order)
+      shift || true
+      ORDER="${1:-}"
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    -*)
+      err "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      # Backwards compatibility: allow a bare CSV/report path as positional
+      if [ -z "$INPUT_CSV" ] && [ -z "$REPORT_FILE" ]; then
+        # Decide whether this looks like a report or a CSV based on name
+        case "$1" in
+          *duplicate-hashes*.txt) REPORT_FILE="$1" ;;
+          *) INPUT_CSV="$1" ;;
+        esac
+      else
+        err "Unknown argument: $1"
+        exit 1
+      fi
+      ;;
+  esac
+  shift || true
 done
 
-case "$ORDER" in
-  size|sizesmall|name|newest|oldest|shortpath|longpath) : ;;
-  *) warn "Unknown --order '$ORDER' — falling back to 'size'"; ORDER="size" ;;
-esac
 
-[ -r "$REPORT" ] || { error "Report not found: $REPORT"; exit 1; }
-touch "$PLAN_OUT" 2>/dev/null || { error "Cannot write plan: $PLAN_OUT"; exit 1; }
-
-count_groups() { grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0; }
-htime(){ s="${1:-0}"; [ "$s" -ge 60 ] 2>/dev/null && { m=$((s/60)); r=$((s%60)); printf "%dm %02ds" "$m" "$r"; } || printf "%ds" "$s"; }
-
-_progress_bar() {
-  [ "$SHOW_PROGRESS" -eq 1 ] || return 0
-  is_tty || return 0
-  label="$1"; cur="$2"; total="$3"; started="$4"
-  [ "$total" -gt 0 ] || total=1
-  pct=$(( 100 * cur / total ))
-  now=$(date +%s); elapsed=$(( now - started ))
-  rem=$(( total - cur ))
-  [ "$cur" -gt 0 ] && eta=$(( elapsed * rem / cur )) || eta=0
-  barw=40; filled=$(( pct * barw / 100 ))
-  i=0; BAR=""; while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
-  while [ $i -lt $barw ]; do BAR="${BAR}-"; i=$((i+1)); done
-  printf "\r%s[%s]%s %3d%% [%s]  %d/%d  Elapsed %s  ETA %s    " \
-    "$C1" "$label" "$C0" "$pct" "$BAR" "$cur" "$total" "$(htime "$elapsed")" "$(htime "$eta")" >&2
-}
-
-progress_review() {
-  [ "$SHOW_PROGRESS" -eq 1 ] || return 0
-  is_tty || return 0
-  cur="$1"; total="$2"; files_seen="$3"; started="$4"
-  [ "$total" -gt 0 ] || total=1
-  pct=$(( 100 * cur / total ))
-  now=$(date +%s); elapsed=$(( now - started ))
-  rem=$(( total - cur ))
-  [ "$cur" -gt 0 ] && eta=$(( elapsed * rem / cur )) || eta=0
-  barw=40; filled=$(( pct * barw / 100 ))
-  i=0; BAR=""; while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
-  while [ $i -lt $barw ]; do BAR="${BAR}-"; i=$((i+1)); done
-  printf "\r%s[PROGRESS]%s %3d%% [%s]  Group %d/%d  Files %d  Elapsed %s  ETA %s    " \
-    "$C1" "$C0" "$pct" "$BAR" "$cur" "$total" "$files_seen" "$(htime "$elapsed")" "$(htime "$eta")" >&2
-}
-
-file_mtime(){ f="$1"; stat -c %Y "$f" 2>/dev/null && return 0 || true; busybox stat -c %Y "$f" 2>/dev/null && return 0 || true; stat -f %m "$f" 2>/dev/null && return 0 || true; date -r "$f" +%s 2>/dev/null && return 0 || true; echo 0; }
-file_size(){ f="$1"; stat -c %s "$f" 2>/dev/null && return 0 || true; busybox stat -c %s "$f" 2>/dev/null && return 0 || true; stat -f %z "$f" 2>/dev/null && return 0 || true; wc -c <"$f" 2>/dev/null | tr -d ' ' || echo 0; }
-path_len(){ printf "%s" "$1" | wc -c | tr -d ' '; }
-human_size(){ b="${1:-0}"; if [ "$b" -ge 1073741824 ] 2>/dev/null; then printf "%.1fG" "$(awk "BEGIN{print $b/1073741824}")"; elif [ "$b" -ge 1048576 ] 2>/dev/null; then printf "%.1fM" "$(awk "BEGIN{print $b/1048576}")"; elif [ "$b" -ge 1024 ] 2>/dev/null; then printf "%.1fK" "$(awk "BEGIN{print $b/1024}")"; else printf "%dB" "$b"; fi; }
-order_group(){
-  case "$ORDER" in
-    newest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
-    oldest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    size)      while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
-    sizesmall) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    shortpath) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    longpath)  while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
-    name|*)    sort;;
-  esac
-}
-ltrim(){ printf "%s" "$1" | sed 's/^[[:space:]]*//'; }
-
-info "Preparing interactive review…"
-info "Using report: $REPORT"
-info "Plan file: $PLAN_OUT"
-info "Order: $ORDER"
-
-TOTAL_GROUPS="$(count_groups)"
-[ "$TOTAL_GROUPS" -gt 0 ] || { warn "No groups found (no lines starting with 'HASH ')."; exit 0; }
-info "Found $TOTAL_GROUPS groups."
-
-# Scope prompt
-MAX_GROUPS="$TOTAL_GROUPS"
-echo
-echo "How many groups or what percentage to review?"
-echo "  - Enter a number (e.g., 250) or a percentage (e.g., 19%)"
-echo "  - Press Enter for ALL ($TOTAL_GROUPS groups)"
-printf "Review scope: "
-if [ -t 0 ]; then read scope; else read scope </dev/tty; fi
-case "${scope:-}" in
-  *%) pct="$(printf "%s" "$scope" | tr -d ' %')"; case "$pct" in *[!0-9]*|'') pct=100;; esac
-       [ "$pct" -lt 1 ] && pct=1; [ "$pct" -gt 100 ] && pct=100
-       MAX_GROUPS=$(( (TOTAL_GROUPS * pct + 99) / 100 ))
-       info "Will review ~${pct}%% → $MAX_GROUPS of $TOTAL_GROUPS groups.";;
-  '') info "Reviewing ALL $TOTAL_GROUPS groups."; MAX_GROUPS="$TOTAL_GROUPS";;
-  *)  case "$scope" in *[!0-9]* ) scope="$TOTAL_GROUPS";; esac
-       [ "$scope" -lt 1 ] && scope=1; [ "$scope" -gt "$TOTAL_GROUPS" ] && scope="$TOTAL_GROUPS"
-       MAX_GROUPS="$scope"; info "Will review first $MAX_GROUPS of $TOTAL_GROUPS groups.";;
-esac
-
-# PASS 1: index potential savings
-INDEX_FILE="$(mktemp "$VAR_DIR/revindex.XXXXXX")"
-trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" "$CAPDIR"/* 2>/dev/null || true; rmdir "$CAPDIR" 2>/dev/null || true' EXIT INT TERM
-
-gno=0; in_group=0; N=0; first_path=""
-grab_N(){ echo "$1" | sed -n 's/.*(N=\([0-9][0-9]*\)).*/\1/p'; }
-
-index_started="$(date +%s)"
-info "Indexing duplicate groups (potential savings)…"
-
-finish_group_index(){
-  if [ "$in_group" -eq 1 ] && [ -n "${first_path:-}" ]; then
-    sz="$(file_size "$first_path" 2>/dev/null || echo 0)"; [ -z "$N" ] && N=2; [ -z "$sz" ] && sz=0
-    pot=$(( ( ${N:-2} - 1 ) * ${sz:-0} ))
-    printf "%d\t%llu\t%d\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" >>"$INDEX_FILE"
+# Resolve CSV from report if needed
+if [ -z "$INPUT_CSV" ] && [ -n "$REPORT_FILE" ]; then
+  if [ ! -f "$REPORT_FILE" ]; then
+    err "Report file not found: $REPORT_FILE"
+    exit 1
   fi
+  # very simple convention: a line like CSV=/full/path/to/duplicates-*.csv
+  INPUT_CSV="$(grep '^CSV=' "$REPORT_FILE" 2>/dev/null | tail -n1 | sed 's/^CSV=//')"
+fi
+
+if [ -z "$INPUT_CSV" ]; then
+  # Try to guess latest duplicates CSV
+  INPUT_CSV="$(ls -1t "$LOGS_DIR"/duplicates-*.csv 2>/dev/null | head -n1 || true)"
+fi
+
+if [ -z "$INPUT_CSV" ] || [ ! -f "$INPUT_CSV" ]; then
+  err "Could not find duplicates CSV. Run 'find-duplicates.sh' (launcher menu option 3) first."
+  exit 1
+fi
+
+info "Using duplicates CSV: $INPUT_CSV"
+
+# Plan file path
+STAMP="$(date +%Y%m%d-%H%M%S)"
+PLAN_FILE="$LOGS_DIR/review-dedupe-plan-$STAMP.txt"
+info "Plan will be written to: $PLAN_FILE"
+: >"$PLAN_FILE"
+
+# Also record a "latest plan" pointer for the launcher
+LATEST_PLAN_LINK="$DUP_VAR_DIR/latest-plan.txt"
+# shellcheck disable=SC2174
+ln -sf "$PLAN_FILE" "$LATEST_PLAN_LINK" 2>/dev/null || {
+  # Fallback: copy path into a tiny file
+  printf "%s\n" "$PLAN_FILE" >"$LATEST_PLAN_LINK"
 }
 
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in
-    HASH\ *)
-      finish_group_index
-      gno=$((gno+1)); in_group=1; first_path=""; N="$(grab_N "$line")"; [ -z "$N" ] && N=2
-      _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"
-      ;;
-    *)
-      if [ "$in_group" -eq 1 ] && [ -z "${first_path:-}" ]; then
-        t="$(ltrim "$line")"; case "$t" in /*) first_path="$t" ;; esac
-      fi
-      ;;
-  esac
-done <"$REPORT"
-finish_group_index; _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"; printf "\n" >&2
+# Cleanup any previous temp group files
+rm -f "$DUP_VAR_DIR"/group-*.txt "$DUP_VAR_DIR"/group-meta-*.txt 2>/dev/null || true
 
-# Pick top MAX_GROUPS
-TOP_FILE="$(mktemp "$VAR_DIR/revtop.XXXXXX")"
-cat "$INDEX_FILE" | sort -nr -k2,2 | head -n "$MAX_GROUPS" >"$TOP_FILE" || true
-SELECTED_TOTAL="$(wc -l <"$TOP_FILE" | tr -d ' ')"
-[ "$SELECTED_TOTAL" -gt 0 ] || { warn "No groups selected after indexing."; exit 0; }
+META_FILE="$DUP_VAR_DIR/group-meta-$STAMP.txt"
+: >"$META_FILE"
 
-# Build a fast lookup (space-delimited) and per-group temp files dir
-SELECTED_MAP=" "
-CAPDIR="$(mktemp -d "$VAR_DIR/revcap.XXXXXX")"
-while IFS= read -r row; do
-  g="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
-  [ -n "$g" ] && SELECTED_MAP="$SELECTED_MAP$g "
-done <"$TOP_FILE"
+# ---------------------------------------------------------------------------
+# Build per-hash group files: group-HASH.txt with "size|path" lines
+# Expected INPUT_CSV lines: HASH|SIZE_BYTES|PATH
+# ---------------------------------------------------------------------------
 
-# PASS 2A: single linear pass to capture only selected groups to temp files
-cap_started="$(date +%s)"
-captured=0
-info "Capturing selected groups…"
-gno=0; in_group=0; cur_gno=0
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in
-    HASH\ *)
-      gno=$((gno+1)); in_group=0; cur_gno="$gno"
-      case " $SELECTED_MAP " in
-        *" $cur_gno "*) in_group=1; : >"$CAPDIR/$cur_gno"; captured=$((captured+1)) ;;
-        *) in_group=0 ;;
-      esac
-      _progress_bar "CAPTURE" "$captured" "$SELECTED_TOTAL" "$cap_started"
-      ;;
-    *)
-      if [ "$in_group" -eq 1 ]; then
-        t="$(ltrim "$line")"; case "$t" in /*) printf "%s\n" "$t" >>"$CAPDIR/$cur_gno" ;; esac
-      fi
-      ;;
-  esac
-done <"$REPORT"
-_progress_bar "CAPTURE" "$captured" "$SELECTED_TOTAL" "$cap_started"; printf "\n" >&2
+# shellcheck disable=SC2162
+while IFS='|' read -r hash size path _rest || [ -n "$hash" ]; do
+  [ -z "$hash" ] && continue
+  [ -z "$path" ] && continue
+  size_num="$(numeric_or_zero "$size")"
+  group_file="$DUP_VAR_DIR/group-$hash.txt"
+  printf "%s|%s\n" "$size_num" "$path" >>"$group_file"
+done <"$INPUT_CSV"
 
-# PASS 2B: present groups in savings-desc order using captured files
-START_TS="$(date +%s)"; files_seen=0; reviewed=0
-TMP_GROUP="$(mktemp "$VAR_DIR/revgrp.XXXXXX")"; ORDERED="$(mktemp "$VAR_DIR/revord.XXXXXX")"
+# Summarise each group for ordering
+for gf in "$DUP_VAR_DIR"/group-*.txt; do
+  [ -f "$gf" ] || continue
+  base="${gf##*/group-}"
+  hash="${base%.txt}"
 
-present_group(){
-  reviewed=$((reviewed+1))
-  progress_review "$reviewed" "$SELECTED_TOTAL" "$files_seen" "$START_TS"
+  total=0
+  maxsize=0
+  count=0
 
-  cp "$CAPDIR/$1" "$TMP_GROUP" 2>/dev/null || : >"$TMP_GROUP"
-  cat "$TMP_GROUP" | order_group >"$ORDERED" 2>/dev/null || cp "$TMP_GROUP" "$ORDERED"
+  # shellcheck disable=SC2162
+  while IFS='|' read -r size path || [ -n "$size" ]; do
+    [ -z "$path" ] && continue
+    sz="$(numeric_or_zero "$size")"
+    total=$((total + sz))
+    count=$((count + 1))
+    if [ "$sz" -gt "$maxsize" ] 2>/dev/null; then
+      maxsize="$sz"
+    fi
+  done <"$gf"
 
-  echo; echo
-  first="$(head -n1 "$ORDERED" 2>/dev/null || true)"
-  base_size=0; Nval=2
-  [ -n "$first" ] && base_size="$(file_size "$first" 2>/dev/null || echo 0)"
-  Nval="$(awk -v g="$1" -F'\t' '$1==g{print $3}' "$INDEX_FILE" 2>/dev/null | head -n1)"; [ -z "$Nval" ] && Nval=2
-  pot=$(( (Nval - 1) * base_size ))
-  printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n" \
-    "$C1" "$reviewed" "$SELECTED_TOTAL" "$C0" "$ORDER" "$(human_size "$pot")" "$Nval" "$(human_size "$base_size")"
+  [ "$count" -lt 2 ] && continue
 
-  i=0
-  if [ "$ORDER" = "size" ] || [ "$ORDER" = "sizesmall" ]; then
-    while IFS= read -r fp; do
-      i=$((i+1)); sz="$(file_size "$fp" 2>/dev/null || echo 0)"; hs="$(human_size "$sz")"
-      printf "  %2d) %-8s  %s\n" "$i" "[$hs]" "$fp"
-    done <"$ORDERED"
-  else
-    while IFS= read -r fp; do i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"; done <"$ORDERED"
+  # Savings if we keep one and delete the rest
+  savings=$((total - maxsize))
+  [ "$savings" -le 0 ] && continue
+
+  printf "%s|%s|%s|%s\n" "$hash" "$savings" "$count" "$gf" >>"$META_FILE"
+done
+
+if [ ! -s "$META_FILE" ]; then
+  warn "No duplicate groups with savings found. Nothing to review."
+  exit 0
+fi
+
+META_SORTED="$DUP_VAR_DIR/group-meta-sorted-$STAMP.txt"
+if [ "$ORDER" = "size" ]; then
+  # Sort by savings descending (field 2)
+  sort -t'|' -k2,2nr "$META_FILE" >"$META_SORTED"
+else
+  cp "$META_FILE" "$META_SORTED"
+fi
+
+# ---------------------------------------------------------------------------
+# Interactive per-group review
+# ---------------------------------------------------------------------------
+
+review_group() {
+  group_hash="$1"
+  group_file="$2"
+
+  idx=0
+  TOTAL_SAVINGS=0
+  PRIMARY_SIZE=0
+  PRIMARY_PATH=""
+
+  GROUP_IDX_TMP="$DUP_VAR_DIR/group-idx-$$.txt"
+  : >"$GROUP_IDX_TMP"
+
+  echo
+  printf "%s===== Duplicate group: HASH=%s =====%s\n" "$MAG" "$group_hash" "$RST"
+
+  # shellcheck disable=SC2162
+  while IFS='|' read -r size path || [ -n "$size" ]; do
+    [ -z "$path" ] && continue
+    idx=$((idx+1))
+
+    # Normalise size to safe integer
+    size_num="$(numeric_or_zero "$size")"
+
+    if [ "$idx" -eq 1 ]; then
+      PRIMARY_SIZE="$size_num"
+      PRIMARY_PATH="$path"
+    else
+      TOTAL_SAVINGS=$((TOTAL_SAVINGS + size_num))
+    fi
+
+    size_hr="$(human_size "$size_num")"
+    printf "  [%d] %s (%s)\n" "$idx" "$path" "$size_hr"
+    printf "%d|%s|%s\n" "$idx" "$size_num" "$path" >>"$GROUP_IDX_TMP"
+  done <"$group_file"
+
+  if [ "$idx" -lt 2 ]; then
+    info "Group has fewer than 2 files; skipping."
+    rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+    return 0
   fi
 
-  files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
+  savings_hr="$(human_size "$TOTAL_SAVINGS")"
+  primary_hr="$(human_size "$PRIMARY_SIZE")"
+  echo
+  printf "Potential space savings if all but one are deleted: %s\n" "$savings_hr"
+  printf "Primary candidate (index 1) size: %s\n" "$primary_hr"
+  echo
 
-  # --- SAFER INPUT LOOP ---
   while :; do
-    echo
-    echo "Choose which file to KEEP:"
-    echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
-    echo "  - s = skip group (decide later)"
-    echo "  - q = quit (plan so far is preserved)"
-    printf "Your choice: "
-    if [ -t 0 ]; then read ans; else read ans </dev/tty; fi
+    printf "Choose file index to KEEP, %ss%s, %sA%s=add hash to exceptions list, %sq%s=quit: " \
+      "$BOLD" "$RST" "$BOLD" "$RST" "$BOLD" "$RST"
+    read -r choice || { echo; choice="q"; }
 
-    case "$ans" in
+    case "$choice" in
       q|Q)
-        echo
-        warn "Stopping early at group $reviewed. Plan saved: $PLAN_OUT"
+        info "Quitting review."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
         exit 0
         ;;
-      s|S|"")
-        # skip group safely
-        break
+      s|S)
+        info "Skipping this group."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+        return 0
+        ;;
+      a|A)
+        add_to_exceptions "$group_hash" "$PRIMARY_SIZE"
+        info "Skipping this group after updating exceptions."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+        return 0
         ;;
       *)
-        # must be numeric and within range
-        case "$ans" in *[!0-9]*|'')
-          printf "%s[WARN]%s Invalid choice, please enter 1-%d, s or q.\n" "$CERR" "$C0" "$files_in_group" >&2
-          ;;
-        *)
-          choice="$ans"
-          if [ "$choice" -lt 1 ] 2>/dev/null || [ "$choice" -gt "$files_in_group" ] 2>/dev/null; then
-            printf "%s[WARN]%s Invalid choice, please enter 1-%d, s or q.\n" "$CERR" "$C0" "$files_in_group" >&2
-          else
-            # valid choice → write others to plan
-            j=0
-            while IFS= read -r fp; do
-              j=$((j+1))
-              [ "$j" -ne "$choice" ] && printf "%s\n" "$fp" >> "$PLAN_OUT"
-            done <"$ORDERED"
-            break
-          fi
-          ;;
-        esac
+        # must be a positive integer within range
+        case "$choice" in ''|*[!0-9]*) warn "Invalid selection. Enter a number, s, a or q."; continue ;; esac
+        keep_idx="$choice"
+        if [ "$keep_idx" -lt 1 ] || [ "$keep_idx" -gt "$idx" ]; then
+          warn "Selection out of range (1..$idx)."
+          continue
+        fi
         ;;
     esac
-  done
-  # --- END SAFER INPUT LOOP ---
 
-  files_seen=$((files_seen + files_in_group))
-  : >"$TMP_GROUP"; : >"$ORDERED"
+    # If we get here, we have a valid keep_idx
+    break
+  done
+
+  echo
+  next "Keeping index $keep_idx and queuing others for deletion in plan:"
+
+  # Walk index file and append non-kept paths to plan
+  # shellcheck disable=SC2162
+  while IFS='|' read -r idx size path || [ -n "$idx" ]; do
+    [ -z "$path" ] && continue
+    if [ "$idx" -eq "$keep_idx" ] 2>/dev/null; then
+      printf "  KEEP:    %s\n" "$path"
+    else
+      printf "  DELETE:  %s\n" "$path"
+      # Plan format: DELETE|PATH  (kept simple for apply-file-plan.sh)
+      printf "DELETE|%s\n" "$path" >>"$PLAN_FILE"
+    fi
+  done <"$GROUP_IDX_TMP"
+
+  rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+  echo
 }
 
-while IFS= read -r row; do
-  g="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
-  [ -s "$CAPDIR/$g" ] && present_group "$g"
-done <"$TOP_FILE"
+# ---------------------------------------------------------------------------
+# Main loop over groups
+# ---------------------------------------------------------------------------
 
-progress_review "$reviewed" "$SELECTED_TOTAL" "$files_seen" "$START_TS"
-echo; echo
-info "Interactive review complete."
-info "Plan saved to: $PLAN_OUT"
+# shellcheck disable=SC2162
+while IFS='|' read -r hash savings count gf || [ -n "$hash" ]; do
+  [ -z "$hash" ] && continue
+  [ ! -f "$gf" ] && continue
+
+  savings_hr="$(human_size "$(numeric_or_zero "$savings")")"
+  echo
+  printf "%s[GROUP]%s Hash=%s, files=%s, potential savings=%s\n" \
+    "$BLU" "$RST" "$hash" "$count" "$savings_hr"
+
+  review_group "$hash" "$gf"
+done <"$META_SORTED"
+
+info "Review complete. Plan saved to: $PLAN_FILE"
 exit 0
