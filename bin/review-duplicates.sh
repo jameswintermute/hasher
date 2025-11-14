@@ -2,234 +2,304 @@
 # review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
 # Hasher — NAS File Hasher & Duplicate Finder
 # Version: 1.0.9 (adds hash exceptions list & 'A' option)
-#
-# EXPECTED INPUT
-# ---------------
-# This script expects a CSV-like duplicates file with lines:
-#   HASH,SIZE_BYTES,ABSOLUTE_PATH
-# (No header, or header lines starting with '#'.)
-#
-# Groups are contiguous by HASH (i.e. all lines for a given hash sit together).
-# The duplicates generator is responsible for ordering groups (e.g. top-savings-first).
-#
-# PLAN OUTPUT
-# -----------
-# A plan file is written with one absolute path per line representing files to delete.
-# apply-file-plan.sh should be aligned with this format.
-#
-# NEW IN 1.0.9
-# ------------
-# - local/exceptions-hashes.txt: list of SHA256 hashes to NEVER be prompted for.
-# - Interactive option [A]: add current group hash to exceptions list.
-# - Groups whose hash is in the exceptions list are auto-kept & skipped.
 
 set -eu
 
 # ---------------------------------------------------------------------------
-# Resolve ROOT_DIR (repo root: parent of bin/)
+# Paths & setup
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd -P)"
+APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
-VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
-DUP_VAR_DIR="$VAR_DIR/duplicates"; mkdir -p "$DUP_VAR_DIR"
+BIN_DIR="$APP_HOME/bin"
+LOGS_DIR="$APP_HOME/logs"
+HASHES_DIR="$APP_HOME/hashes"
+VAR_DIR="$APP_HOME/var"
+DUP_VAR_DIR="$VAR_DIR/duplicates"
+LOCAL_DIR="$APP_HOME/local"
+EXCEPTIONS_FILE="$LOCAL_DIR/exceptions-hashes.txt"
 
-PLAN_FILE="$LOGS_DIR/review-dedupe-plan-$(date +%Y%m%d-%H%M%S).txt"
-LATEST_PLAN_SYMLINK="$DUP_VAR_DIR/latest-plan.txt"
-
-# Exceptions file: hashes we never want to be prompted for
-EXCEPTIONS_FILE="$ROOT_DIR/local/exceptions-hashes.txt"
-EXCEPTIONS_DIR="$(dirname "$EXCEPTIONS_FILE")"
-[ -d "$EXCEPTIONS_DIR" ] || mkdir -p "$EXCEPTIONS_DIR"
-[ -f "$EXCEPTIONS_FILE" ] || : >"$EXCEPTIONS_FILE"
+mkdir -p "$LOGS_DIR" "$HASHES_DIR" "$VAR_DIR" "$DUP_VAR_DIR" "$LOCAL_DIR"
 
 # ---------------------------------------------------------------------------
-# Optional TTY colours (BusyBox-safe)
+# TTY-aware colours
 # ---------------------------------------------------------------------------
-if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; then
-  RED="\033[31m"
-  GRN="\033[32m"
-  YEL="\033[33m"
-  BLU="\033[34m"
-  MAG="\033[35m"
-  BOLD="\033[1m"
-  RST="\033[0m"
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+  RED="$(printf '\033[31m')"
+  GRN="$(printf '\033[32m')"
+  YEL="$(printf '\033[33m')"
+  BLU="$(printf '\033[34m')"
+  MAG="$(printf '\033[35m')"
+  CYAN="$(printf '\033[36m')"
+  BOLD="$(printf '\033[1m')"
+  RST="$(printf '\033[0m')"
 else
-  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; BOLD=""; RST=""
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYAN=""; BOLD=""; RST=""
 fi
 
 info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
-ok(){    printf "%s[OK  ]%s %s\n"  "$BLU" "$RST" "$*"; }
-warn(){  printf "%s[WARN]%s %s\n" "$YEL" "$RST" "$*"; }
+warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
 err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
+next(){  printf "%s[NEXT]%s %s\n" "$CYAN" "$RST" "$*"; }
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 human_size() {
-  # $1 = size in bytes
-  bytes="$1"
-  if [ -z "${bytes:-}" ] || [ "$bytes" -lt 0 ] 2>/dev/null; then
-    echo "unknown"
+  # Print human-readable size from bytes (integer).
+  b="$1"
+  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+
+  if [ "$b" -lt 1024 ] 2>/dev/null; then
+    printf "%s B" "$b"
     return
   fi
 
-  kb=$((1024))
-  mb=$((1024 * 1024))
-  gb=$((1024 * 1024 * 1024))
-
-  if [ "$bytes" -ge "$gb" ] 2>/dev/null; then
-    int=$((bytes / gb))
-    frac=$(((bytes % gb) * 10 / gb))
-    echo "${int}.${frac} GB"
-  elif [ "$bytes" -ge "$mb" ] 2>/dev/null; then
-    int=$((bytes / mb))
-    frac=$(((bytes % mb) * 10 / mb))
-    echo "${int}.${frac} MB"
-  elif [ "$bytes" -ge "$kb" ] 2>/dev/null; then
-    int=$((bytes / kb))
-    frac=$(((bytes % kb) * 10 / kb))
-    echo "${int}.${frac} KB"
-  else
-    echo "${bytes} B"
+  kb=$((b / 1024))
+  if [ "$kb" -lt 1024 ] 2>/dev/null; then
+    printf "%s KB" "$kb"
+    return
   fi
+
+  mb=$((kb / 1024))
+  if [ "$mb" -lt 1024 ] 2>/dev/null; then
+    printf "%s MB" "$mb"
+    return
+  fi
+
+  gb=$((mb / 1024))
+  printf "%s GB" "$gb"
 }
 
-_normalise_hash_line() {
-  # $1 = line
-  case "$1" in
-    \#*|"") return 1 ;;
+prompt_yn() {
+  msg="$1"
+  def="${2:-N}"
+  case "$def" in
+    Y|y) p=" [Y/n] " ;;
+    *)   p=" [y/N] " ;;
   esac
-  # Trim to first field using awk (BusyBox-safe)
-  echo "$1" | awk '{print $1}'
+  printf "%s%s" "$msg" "$p"
+  read -r a || a=""
+  [ -z "$a" ] && a="$def"
+  case "$a" in Y|y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-hash_in_exceptions() {
-  # $1 = hash (cur_hash)
-  h="$1"
-  [ -f "$EXCEPTIONS_FILE" ] || return 1
-  # shellcheck disable=SC2162
-  while IFS= read -r line || [ -n "$line" ]; do
-    norm="$(_normalise_hash_line "$line")" || continue
-    [ "$norm" = "$h" ] && return 0
-  done <"$EXCEPTIONS_FILE"
-  return 1
+numeric_or_zero() {
+  v="$1"
+  case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
 }
 
-add_hash_to_exceptions() {
-  # $1 = hash, $2 = size bytes
-  h="$1"
-  size_bytes="${2:-0}"
-  size_hr="$(human_size "$size_bytes")"
+# Add a hash to the local exceptions list (idempotent)
+add_to_exceptions() {
+  hash="$1"
+  primary_size_bytes="$2"
 
-  printf "\nYou have selected to add the hash for this file to your local exceptions list.\n"
-  printf "The size of this file is %s.\n" "$size_hr"
-  printf "You will no longer be prompted for duplicates with this hash,\n"
-  printf "but you can manually remove it later by editing:\n"
-  printf "  %s\n\n" "$EXCEPTIONS_FILE"
-  printf "Proceed and add this hash to your exceptions list? [y/N]: "
+  touch "$EXCEPTIONS_FILE"
 
-  read -r ans || ans=""
-  case "$(echo "$ans" | tr '[:upper:]' '[:lower:]')" in
-    y|yes)
-      if hash_in_exceptions "$h"; then
-        info "Hash is already in exceptions list."
-      else
-        printf "%s\n" "$h" >>"$EXCEPTIONS_FILE"
-        ok "Hash added to exceptions. This group will be kept."
-      fi
-      return 0
-      ;;
-    *)
-      info "Not adding hash to exceptions."
-      return 1
-      ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
-# Determine input duplicates file
-# ---------------------------------------------------------------------------
-
-pick_duplicates_file() {
-  # 1) explicit arg
-  if [ "${1:-}" != "" ] && [ -f "$1" ]; then
-    printf "%s" "$1"
-    return 0
-  fi
-
-  # 2) known locations in var/duplicates
-  # shellcheck disable=SC2012
-  latest="$(ls -1t "$DUP_VAR_DIR"/duplicates-*.csv "$DUP_VAR_DIR"/duplicates-latest.csv 2>/dev/null | head -n1 || true)"
-  if [ -n "${latest:-}" ] && [ -f "$latest" ]; then
-    printf "%s" "$latest"
-    return 0
-  fi
-
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# Flush / handle one group of duplicates
-# ---------------------------------------------------------------------------
-# Uses global temp file GROUP_TMP containing lines: SIZE_BYTES|ABS_PATH
-# Variables:
-#   CUR_HASH
-# ---------------------------------------------------------------------------
-
-process_group() {
-  # no current hash => nothing to do
-  [ -n "${CUR_HASH:-}" ] || return 0
-  [ -f "$GROUP_TMP" ] || return 0
-
-  # If hash is in exceptions, keep all and skip
-  if hash_in_exceptions "$CUR_HASH"; then
-    info "Hash %s is in exceptions list; keeping all files in this group." "$CUR_HASH"
-    : >"$GROUP_TMP"
-    return 0
-  fi
-
-  # Build numbered listing and gather sizes
-  if [ ! -s "$GROUP_TMP" ]; then
-    : >"$GROUP_TMP"
-    return 0
-  fi
+  size_hr="$(human_size "$(numeric_or_zero "$primary_size_bytes")")"
 
   echo
-  printf "%s==== Duplicate group: HASH=%s ====%s\n" "$BOLD" "$CUR_HASH" "$RST"
+  printf "You have selected to add this hash to your local exceptions list.\n"
+  printf "  Hash: %s\n" "$hash"
+  printf "  Example file size: %s\n" "$size_hr"
+  printf "You will no longer be prompted for this hash in future runs.\n"
+  if ! prompt_yn "Proceed and append to $(basename "$EXCEPTIONS_FILE")?" "N"; then
+    info "Not adding hash to exceptions list."
+    return 0
+  fi
 
-  # Show candidate files
+  if grep -q "^$hash\$" "$EXCEPTIONS_FILE" 2>/dev/null; then
+    info "Hash already present in exceptions list."
+  else
+    printf "%s\n" "$hash" >>"$EXCEPTIONS_FILE"
+    info "Hash added to exceptions list."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Args: we support
+#   --input PATH        duplicates-*.csv (hash|size|path)
+#   --from-report PATH  duplicate-hashes report that references the CSV
+#   --order size|none   group ordering (default: size)
+# ---------------------------------------------------------------------------
+
+INPUT_CSV=""
+REPORT_FILE=""
+ORDER="size"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --input)
+      shift
+      INPUT_CSV="${1:-}"
+      ;;
+    --from-report)
+      shift
+      REPORT_FILE="${1:-}"
+      ;;
+    --order)
+      shift
+      ORDER="${1:-size}"
+      ;;
+    --help|-h)
+      cat <<EOF
+Usage: review-duplicates.sh [--input duplicates.csv] [--from-report report.txt] [--order size|none]
+
+Interactive duplicate reviewer (top-savings-first). Expected duplicates CSV format:
+  HASH|SIZE_BYTES|ABSOLUTE_PATH
+EOF
+      exit 0
+      ;;
+    *)
+      err "Unknown argument: $1"
+      exit 1
+      ;;
+  esac
+  shift || true
+done
+
+# Resolve CSV from report if needed
+if [ -z "$INPUT_CSV" ] && [ -n "$REPORT_FILE" ]; then
+  if [ ! -f "$REPORT_FILE" ]; then
+    err "Report file not found: $REPORT_FILE"
+    exit 1
+  fi
+  # very simple convention: a line like CSV=/full/path/to/duplicates-*.csv
+  INPUT_CSV="$(grep '^CSV=' "$REPORT_FILE" 2>/dev/null | tail -n1 | sed 's/^CSV=//')"
+fi
+
+if [ -z "$INPUT_CSV" ]; then
+  # Try to guess latest duplicates CSV
+  INPUT_CSV="$(ls -1t "$LOGS_DIR"/duplicates-*.csv 2>/dev/null | head -n1 || true)"
+fi
+
+if [ -z "$INPUT_CSV" ] || [ ! -f "$INPUT_CSV" ]; then
+  err "Could not find duplicates CSV. Run 'find-duplicates.sh' (launcher menu option 3) first."
+  exit 1
+fi
+
+info "Using duplicates CSV: $INPUT_CSV"
+
+# Plan file path
+STAMP="$(date +%Y%m%d-%H%M%S)"
+PLAN_FILE="$LOGS_DIR/review-dedupe-plan-$STAMP.txt"
+info "Plan will be written to: $PLAN_FILE"
+: >"$PLAN_FILE"
+
+# Also record a "latest plan" pointer for the launcher
+LATEST_PLAN_LINK="$DUP_VAR_DIR/latest-plan.txt"
+# shellcheck disable=SC2174
+ln -sf "$PLAN_FILE" "$LATEST_PLAN_LINK" 2>/dev/null || {
+  # Fallback: copy path into a tiny file
+  printf "%s\n" "$PLAN_FILE" >"$LATEST_PLAN_LINK"
+}
+
+# Cleanup any previous temp group files
+rm -f "$DUP_VAR_DIR"/group-*.txt "$DUP_VAR_DIR"/group-meta-*.txt 2>/dev/null || true
+
+META_FILE="$DUP_VAR_DIR/group-meta-$STAMP.txt"
+: >"$META_FILE"
+
+# ---------------------------------------------------------------------------
+# Build per-hash group files: group-HASH.txt with "size|path" lines
+# Expected INPUT_CSV lines: HASH|SIZE_BYTES|PATH
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2162
+while IFS='|' read -r hash size path _rest || [ -n "$hash" ]; do
+  [ -z "$hash" ] && continue
+  [ -z "$path" ] && continue
+  size_num="$(numeric_or_zero "$size")"
+  group_file="$DUP_VAR_DIR/group-$hash.txt"
+  printf "%s|%s\n" "$size_num" "$path" >>"$group_file"
+done <"$INPUT_CSV"
+
+# Summarise each group for ordering
+for gf in "$DUP_VAR_DIR"/group-*.txt; do
+  [ -f "$gf" ] || continue
+  base="${gf##*/group-}"
+  hash="${base%.txt}"
+
+  total=0
+  maxsize=0
+  count=0
+
+  # shellcheck disable=SC2162
+  while IFS='|' read -r size path || [ -n "$size" ]; do
+    [ -z "$path" ] && continue
+    sz="$(numeric_or_zero "$size")"
+    total=$((total + sz))
+    count=$((count + 1))
+    if [ "$sz" -gt "$maxsize" ] 2>/dev/null; then
+      maxsize="$sz"
+    fi
+  done <"$gf"
+
+  [ "$count" -lt 2 ] && continue
+
+  # Savings if we keep one and delete the rest
+  savings=$((total - maxsize))
+  [ "$savings" -le 0 ] && continue
+
+  printf "%s|%s|%s|%s\n" "$hash" "$savings" "$count" "$gf" >>"$META_FILE"
+done
+
+if [ ! -s "$META_FILE" ]; then
+  warn "No duplicate groups with savings found. Nothing to review."
+  exit 0
+fi
+
+META_SORTED="$DUP_VAR_DIR/group-meta-sorted-$STAMP.txt"
+if [ "$ORDER" = "size" ]; then
+  # Sort by savings descending (field 2)
+  sort -t'|' -k2,2nr "$META_FILE" >"$META_SORTED"
+else
+  cp "$META_FILE" "$META_SORTED"
+fi
+
+# ---------------------------------------------------------------------------
+# Interactive per-group review
+# ---------------------------------------------------------------------------
+
+review_group() {
+  group_hash="$1"
+  group_file="$2"
+
   idx=0
   TOTAL_SAVINGS=0
   PRIMARY_SIZE=0
   PRIMARY_PATH=""
 
-  # We will copy to a second file with index for later
   GROUP_IDX_TMP="$DUP_VAR_DIR/group-idx-$$.txt"
   : >"$GROUP_IDX_TMP"
+
+  echo
+  printf "%s===== Duplicate group: HASH=%s =====%s\n" "$MAG" "$group_hash" "$RST"
 
   # shellcheck disable=SC2162
   while IFS='|' read -r size path || [ -n "$size" ]; do
     [ -z "$path" ] && continue
     idx=$((idx+1))
 
+    # Normalise size to safe integer
+    size_num="$(numeric_or_zero "$size")"
+
     if [ "$idx" -eq 1 ]; then
-      PRIMARY_SIZE="$size"
+      PRIMARY_SIZE="$size_num"
       PRIMARY_PATH="$path"
     else
-      TOTAL_SAVINGS=$((TOTAL_SAVINGS + size))
+      TOTAL_SAVINGS=$((TOTAL_SAVINGS + size_num))
     fi
 
-    size_hr="$(human_size "$size")"
+    size_hr="$(human_size "$size_num")"
     printf "  [%d] %s (%s)\n" "$idx" "$path" "$size_hr"
-    printf "%d|%s|%s\n" "$idx" "$size" "$path" >>"$GROUP_IDX_TMP"
-  done <"$GROUP_TMP"
+    printf "%d|%s|%s\n" "$idx" "$size_num" "$path" >>"$GROUP_IDX_TMP"
+  done <"$group_file"
 
   if [ "$idx" -lt 2 ]; then
     info "Group has fewer than 2 files; skipping."
-    rm -f "$GROUP_TMP" "$GROUP_IDX_TMP" 2>/dev/null || true
+    rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
     return 0
   fi
 
@@ -238,130 +308,81 @@ process_group() {
   echo
   printf "Potential space savings if all but one are deleted: %s\n" "$savings_hr"
   printf "Primary candidate (index 1) size: %s\n" "$primary_hr"
+  echo
 
   while :; do
-    echo
-    printf "Choose the number to keep, or [s]kip, [A]dd hash to exceptions, [q]uit: "
-    read -r choice || choice=""
+    printf "Choose file index to KEEP, %ss%s, %sA%s=add hash to exceptions list, %sq%s=quit: " \
+      "$BOLD" "$RST" "$BOLD" "$RST" "$BOLD" "$RST"
+    read -r choice || { echo; choice="q"; }
+
     case "$choice" in
-      [0-9]*)
-        # validate index
-        sel="$choice"
-        # find selected entry and delete others
-        # shellcheck disable=SC2162
-        found=0
-        # Pass 1: confirm selection exists
-        while IFS='|' read -r idx size path || [ -n "$idx" ]; do
-          [ -z "$idx" ] && continue
-          if [ "$idx" -eq "$sel" ] 2>/dev/null; then
-            found=1
-            break
-          fi
-        done <"$GROUP_IDX_TMP"
-
-        if [ "$found" -eq 0 ]; then
-          warn "Invalid selection: $sel"
-          continue
-        fi
-
-        # Pass 2: write plan entries for all except selected index
-        # shellcheck disable=SC2162
-        while IFS='|' read -r idx size path || [ -n "$idx" ]; do
-          [ -z "$idx" ] && continue
-          if [ "$idx" -ne "$sel" ] 2>/dev/null; then
-            printf "%s\n" "$path" >>"$PLAN_FILE"
-          fi
-        done <"$GROUP_IDX_TMP"
-
-        ok "Recorded delete plan for group (kept index %s)." "$sel"
-        break
-        ;;
-      s|S)
-        info "Skipping this group (no plan entries written)."
-        break
-        ;;
-      a|A)
-        # Add hash to exceptions
-        if add_hash_to_exceptions "$CUR_HASH" "$PRIMARY_SIZE"; then
-          # treat as keep-all and move on
-          break
-        else
-          # user declined; re-prompt
-          continue
-        fi
-        ;;
       q|Q)
-        warn "Quitting review early. Plan so far: $PLAN_FILE"
-        rm -f "$GROUP_TMP" "$GROUP_IDX_TMP" 2>/dev/null || true
+        info "Quitting review."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
         exit 0
         ;;
+      s|S)
+        info "Skipping this group."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+        return 0
+        ;;
+      a|A)
+        add_to_exceptions "$group_hash" "$PRIMARY_SIZE"
+        info "Skipping this group after updating exceptions."
+        rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+        return 0
+        ;;
       *)
-        warn "Unknown choice: $choice"
+        # must be a positive integer within range
+        case "$choice" in ''|*[!0-9]*) warn "Invalid selection. Enter a number, s, a or q."; continue ;; esac
+        keep_idx="$choice"
+        if [ "$keep_idx" -lt 1 ] || [ "$keep_idx" -gt "$idx" ]; then
+          warn "Selection out of range (1..$idx)."
+          continue
+        fi
         ;;
     esac
+
+    # If we get here, we have a valid keep_idx
+    break
   done
 
-  rm -f "$GROUP_TMP" "$GROUP_IDX_TMP" 2>/dev/null || true
-  : >"$GROUP_TMP"
+  echo
+  next "Keeping index $keep_idx and queuing others for deletion in plan:"
+
+  # Walk index file and append non-kept paths to plan
+  # shellcheck disable=SC2162
+  while IFS='|' read -r idx size path || [ -n "$idx" ]; do
+    [ -z "$path" ] && continue
+    if [ "$idx" -eq "$keep_idx" ] 2>/dev/null; then
+      printf "  KEEP:    %s\n" "$path"
+    else
+      printf "  DELETE:  %s\n" "$path"
+      # Plan format: DELETE|PATH  (kept simple for apply-file-plan.sh)
+      printf "DELETE|%s\n" "$path" >>"$PLAN_FILE"
+    fi
+  done <"$GROUP_IDX_TMP"
+
+  rm -f "$GROUP_IDX_TMP" 2>/dev/null || true
+  echo
 }
 
 # ---------------------------------------------------------------------------
-# Main
+# Main loop over groups
 # ---------------------------------------------------------------------------
-
-INPUT_FILE="$(pick_duplicates_file "${1:-}")" || {
-  err "Could not find duplicates file. Pass path as first argument or ensure files in $DUP_VAR_DIR."
-  exit 1
-}
-
-info "Using duplicates file: $INPUT_FILE"
-info "Plan will be written to: $PLAN_FILE"
-
-GROUP_TMP="$DUP_VAR_DIR/group-$$.txt"
-: >"$GROUP_TMP"
-CUR_HASH=""
-CUR_SIZE_BYTES=0
 
 # shellcheck disable=SC2162
-while IFS=, read -r hash size path || [ -n "$hash" ]; do
-  case "$hash" in
-    \#*|"") continue ;;
-  esac
+while IFS='|' read -r hash savings count gf || [ -n "$hash" ]; do
+  [ -z "$hash" ] && continue
+  [ ! -f "$gf" ] && continue
 
-  # Trim whitespace from hash
-  hash_trimmed="$(echo "$hash" | awk '{print $1}')"
-  size_trimmed="$(echo "$size" | awk '{print $1}')"
+  savings_hr="$(human_size "$(numeric_or_zero "$savings")")"
+  echo
+  printf "%s[GROUP]%s Hash=%s, files=%s, potential savings=%s\n" \
+    "$BLU" "$RST" "$hash" "$count" "$savings_hr"
 
-  # New group?
-  if [ -n "$CUR_HASH" ] && [ "$hash_trimmed" != "$CUR_HASH" ]; then
-    process_group
-    CUR_HASH="$hash_trimmed"
-    CUR_SIZE_BYTES="$size_trimmed"
-    : >"$GROUP_TMP"
-  fi
+  review_group "$hash" "$gf"
+done <"$META_SORTED"
 
-  if [ -z "$CUR_HASH" ]; then
-    CUR_HASH="$hash_trimmed"
-    CUR_SIZE_BYTES="$size_trimmed"
-  fi
-
-  printf "%s|%s\n" "$size_trimmed" "$path" >>"$GROUP_TMP"
-
-done <"$INPUT_FILE"
-
-# Process final group
-process_group
-
-ok "Review complete. Plan saved to: $PLAN_FILE"
-
-# Update latest-plan symlink/copy for launcher/apply-plan helpers
-if [ -n "$PLAN_FILE" ] && [ -f "$PLAN_FILE" ]; then
-  # Prefer symlink if possible
-  if command -v ln >/dev/null 2>&1; then
-    ln -sf "$PLAN_FILE" "$LATEST_PLAN_SYMLINK" 2>/dev/null || cp -f "$PLAN_FILE" "$LATEST_PLAN_SYMLINK"
-  else
-    cp -f "$PLAN_FILE" "$LATEST_PLAN_SYMLINK" 2>/dev/null || true
-  fi
-fi
-
+info "Review complete. Plan saved to: $PLAN_FILE"
 exit 0
