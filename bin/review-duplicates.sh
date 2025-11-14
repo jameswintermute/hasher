@@ -131,33 +131,42 @@ ORDER="size"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --input)
-      shift
+      shift || true
       INPUT_CSV="${1:-}"
       ;;
     --from-report)
-      shift
+      shift || true
       REPORT_FILE="${1:-}"
       ;;
     --order)
-      shift
-      ORDER="${1:-size}"
+      shift || true
+      ORDER="${1:-}"
       ;;
     --help|-h)
-      cat <<EOF
-Usage: review-duplicates.sh [--input duplicates.csv] [--from-report report.txt] [--order size|none]
-
-Interactive duplicate reviewer (top-savings-first). Expected duplicates CSV format:
-  HASH|SIZE_BYTES|ABSOLUTE_PATH
-EOF
+      usage
       exit 0
       ;;
-    *)
-      err "Unknown argument: $1"
+    -*)
+      err "Unknown option: $1"
       exit 1
+      ;;
+    *)
+      # Backwards compatibility: allow a bare CSV/report path as positional
+      if [ -z "$INPUT_CSV" ] && [ -z "$REPORT_FILE" ]; then
+        # Decide whether this looks like a report or a CSV based on name
+        case "$1" in
+          *duplicate-hashes*.txt) REPORT_FILE="$1" ;;
+          *) INPUT_CSV="$1" ;;
+        esac
+      else
+        err "Unknown argument: $1"
+        exit 1
+      fi
       ;;
   esac
   shift || true
 done
+
 
 # Resolve CSV from report if needed
 if [ -z "$INPUT_CSV" ] && [ -n "$REPORT_FILE" ]; then
