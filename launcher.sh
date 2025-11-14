@@ -27,7 +27,6 @@ else
 fi
 
 info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
-ok(){    printf "%s[OK  ]%s %s\n"  "$BLU" "$RST" "$*"; }
 warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
 err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
 next(){  printf "%s[NEXT]%s %s\n" "$BLU" "$RST" "$*"; }
@@ -45,7 +44,7 @@ header() {
   printf "\n"
 }
 
-# --- NEW: Running Hasher detection ---
+# --- Running Hasher detection ---
 is_hasher_running() {
   # BusyBox-safe process check.
   # We look for hasher processes but ignore the launcher itself.
@@ -90,6 +89,7 @@ print_menu() {
   printf "%s\n" "  7) System check (deps & readiness)"
   printf "%s\n" "  9) Follow logs (tail -f background.log)"
   printf "%s\n" " 13) Stats & scheduling hints"
+  printf "%s\n" " 14) Clean internal working files (var/)"
   printf "\n"
   printf "%s\n" "  q) Quit"
   printf "\n"
@@ -165,7 +165,7 @@ run_hasher_nohup() {
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
-  preflight_hashing
+  preflight_hashing()
   : >"$BACKGROUND_LOG" 2>/dev/null || true
 
   pfile="$(determine_paths_file)"
@@ -197,7 +197,7 @@ run_hasher_nohup() {
 
   sleep 1
   if tail -n 5 "$BACKGROUND_LOG" 2>/dev/null | grep -q 'Run-ID:'; then
-    ok "Hasher launched."
+    next "Hasher launched."
   else
     warn "Hasher may not be running. Recent log:"
     tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
@@ -280,7 +280,7 @@ action_find_duplicate_folders(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Updated Option 3: use wrapper with spinner + next steps
+# Updated Option 3: use wrapper
 action_find_duplicate_files(){
   if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
     "$BIN_DIR/run-find-duplicates.sh" || true
@@ -560,6 +560,46 @@ action_stats_and_cron() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# NEW: Clean internal working files (var/)
+action_clean_internal() {
+  if [ ! -d "$VAR_DIR" ]; then
+    info "VAR dir not found: $VAR_DIR"
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  count=0
+  if find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null | head -n 1 >/dev/null; then
+    count=$(find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null | wc -l | tr -d ' ')
+  fi
+
+  info "Internal working dir: $VAR_DIR"
+  echo "  - Items that would be removed (files + dirs): $count"
+
+  if [ "$count" -eq 0 ] 2>/dev/null; then
+    info "Nothing to clean."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  printf "Delete ALL contents of %s (keeping the directory itself)? [y/N]: " "$VAR_DIR"
+  read -r ans || ans=""
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      # Remove everything under VAR_DIR but keep VAR_DIR
+      find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print0 2>/dev/null | while IFS= read -r -d '' item; do
+        rm -rf -- "$item" 2>/dev/null || true
+      done
+      info "Internal working files cleaned."
+      ;;
+    *)
+      info "Aborted."
+      ;;
+  esac
+
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
 # main loop
 while :; do
   clear 2>/dev/null || true
@@ -581,6 +621,7 @@ while :; do
     7) action_system_check ;;
     9) action_view_logs_follow ;;
     13) action_stats_and_cron ;;
+    14) action_clean_internal ;;
     q|Q) echo "Bye."; exit 0 ;;
     *) echo "Unknown option: $choice" ; sleep 1 ;;
   esac
