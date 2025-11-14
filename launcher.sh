@@ -13,9 +13,7 @@ LOCAL_DIR="$ROOT_DIR/local"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
-# ------------------------------------------------------------------
-# Standardized color palette (TTY-aware)
-# ------------------------------------------------------------------
+# TTY-aware colour palette (same style as launcher)
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
   RED="$(printf '\033[31m')"
   GRN="$(printf '\033[32m')"
@@ -28,11 +26,11 @@ else
   RED=""; GRN=""; YEL=""; BLU=""; MAG=""; BOLD=""; RST=""
 fi
 
-# keep original names but use standardized look
 info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
 ok(){    printf "%s[OK  ]%s %s\n"  "$BLU" "$RST" "$*"; }
 warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
 err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
+next(){  printf "%s[NEXT]%s %s\n" "$BLU" "$RST" "$*"; }
 
 header() {
   printf "%s" "$MAG"
