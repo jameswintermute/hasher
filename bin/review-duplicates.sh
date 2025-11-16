@@ -172,7 +172,7 @@ progress_review() {
   barw=40; filled=$(( pct * barw / 100 ))
   i=0; BAR=""; while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
   while [ $i -lt $barw ]; do BAR="${BAR}-"; i=$((i+1)); done
-  printf "\r%s[PROGRESS]%s %3d%% [%s]  Group %d/%d  Files %d  Elapsed %s  ETA %s    "     "$C1" "$C0" "$pct" "$BAR" "$cur" "$total" "$files_seen" "$(htime "$elapsed")" "$(htime "$eta")" >&2
+  printf "\r%s[PROGRESS]%s %3d%% [%s]  Group %d/%d  Reviewed total files: %d  Elapsed %s  ETA %s    "     "$C1" "$C0" "$pct" "$BAR" "$cur" "$total" "$files_seen" "$(htime "$elapsed")" "$(htime "$eta")" >&2
 }
 
 file_mtime(){
