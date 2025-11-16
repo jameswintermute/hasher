@@ -1,6 +1,9 @@
-#!/bin/sh
-# Minimal BusyBox-safe launcher for Hasher — correctly passes --pathfile/--exclude.
-# POSIX sh only: no arrays, no bashisms, nohup with </dev/null, no eval, no process substitution.
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
