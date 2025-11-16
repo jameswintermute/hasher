@@ -1,7 +1,8 @@
-#!/bin/sh
-# clean-logs.sh — tidy up old logs & scratch files
+#!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Version: 1.0.9
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
 set -eu
 
