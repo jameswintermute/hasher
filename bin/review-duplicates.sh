@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
@@ -370,7 +370,15 @@ present_group(){
     echo "  - D = delete ALL copies in this group"
     echo "  - q = quit (plan so far is preserved)"
     printf "Your choice: "
-    IFS= read -r choice || choice=""
+    if [ -t 0 ]; then
+      if ! IFS= read -r choice; then
+        choice="q"
+      fi
+    else
+      if ! IFS= read -r choice </dev/tty; then
+        choice="q"
+      fi
+    fi
 
     case "$choice" in
       [sS])
@@ -395,7 +403,15 @@ present_group(){
 
       [dD])
         printf "Please confirm that you wish to delete all copies of this file (this entire group) [y/N] "
-        IFS= read -r confirm || confirm=""
+        if [ -t 0 ]; then
+          if ! IFS= read -r confirm; then
+            confirm="n"
+          fi
+        else
+          if ! IFS= read -r confirm </dev/tty; then
+            confirm="n"
+          fi
+        fi
         case "$confirm" in
           [yY])
             while IFS= read -r fp; do
