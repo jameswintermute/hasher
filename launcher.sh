@@ -325,32 +325,42 @@ action_delete_zero_length(){
 action_apply_plan(){
   dup_var_dir="$VAR_DIR/duplicates"; mkdir -p "$dup_var_dir"
 
+  # Prefer latest FILE dedupe plan (from review-duplicates)
   file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
   [ -z "$file_plan" ] && [ -f "$dup_var_dir/latest-plan.txt" ] && file_plan="$dup_var_dir/latest-plan.txt"
 
   if [ -n "$file_plan" ]; then
     info "Found FILE delete plan: $file_plan"
-    printf "Apply FILE plan now (move files to quarantine)? [y/N]: "; read -r ans || ans=""
+    printf "Apply FILE plan now (move files to quarantine)? [y/N]: "
+    read -r ans || ans=""
     case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
       y|yes)
-        if [ -x "$BIN_DIR/apply-file-plan.sh" ]; then
+        if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+          "$BIN_DIR/delete-duplicates.sh" "$file_plan" || true
+        elif [ -x "$BIN_DIR/apply-file-plan.sh" ]; then
+          # Legacy fallback for older setups
           "$BIN_DIR/apply-file-plan.sh" --plan "$file_plan" --force || true
         else
-          err "$BIN_DIR/apply-file-plan.sh not found or not executable."
+          err "Neither $BIN_DIR/delete-duplicates.sh nor $BIN_DIR/apply-file-plan.sh found or executable."
         fi
-      ;;
+        ;;
+      *)
+        info "Skipped applying file plan."
+        ;;
     esac
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
 
+  # If no FILE plan, fall back to FOLDER plan
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
   if [ -z "$plan" ]; then
-    info "No folder plan found."
+    info "No file or folder plan found."
     printf "Press Enter to continue... "; read -r _ || true; return
   fi
   info "Found FOLDER plan: $plan"
-  printf "Apply FOLDER plan now (move directories to quarantine)? [y/N]: "; read -r ans || ans=""
+  printf "Apply FOLDER plan now (move directories to quarantine)? [y/N]: "
+  read -r ans || ans=""
   case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
     y|yes)
       if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
@@ -358,7 +368,10 @@ action_apply_plan(){
       else
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
       fi
-    ;;
+      ;;
+    *)
+      info "Skipped applying folder plan."
+      ;;
   esac
   printf "Press Enter to continue... "; read -r _ || true
 }
