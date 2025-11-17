@@ -15,12 +15,9 @@ QUAR_DIR="$ROOT_DIR/quarantine";  mkdir -p "$QUAR_DIR"
 
 PLAN_FILE="${1:-}"
 
-info()  { printf "[INFO] %s
-"  "$1" >&2; }
-warn()  { printf "[WARN] %s
-"  "$1" >&2; }
-error() { printf "[ERROR] %s
-" "$1" >&2; }
+info()  { printf "[INFO] %s\n"  "$1" >&2; }
+warn()  { printf "[WARN] %s\n"  "$1" >&2; }
+error() { printf "[ERROR] %s\n" "$1" >&2; }
 
 if [ -z "$PLAN_FILE" ]; then
   # fall back to latest review plan if not explicitly given
@@ -43,7 +40,8 @@ fi
 existing=0
 missing=0
 
-while IFS= read -r line; do
+# shellcheck disable=SC2162
+while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     DEL\|*)
       path=${line#DEL|}
@@ -69,7 +67,8 @@ info "Plan summary: $TOTAL_DEL DEL entries; $existing currently exist, $missing 
 moves_ok=0
 moves_fail=0
 
-while IFS= read -r line; do
+# shellcheck disable=SC2162
+while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     DEL\|*)
       src=${line#DEL|}
