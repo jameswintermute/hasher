@@ -58,6 +58,23 @@ if [[ -z "$CONFIG_FILE" && -f "./hasher.conf" ]]; then
   CONFIG_FILE="./hasher.conf"
 fi
 
+# ───────────────────────── Human-friendly time ─────────────
+human_dur() {
+  local s="${1:-0}"
+  case "$s" in
+    ''|*[!0-9]*) s=0 ;;
+  esac
+  local h=$((s/3600))
+  local m=$(((s%3600)/60))
+  if (( h > 0 )); then
+    printf "%dh %02dm" "$h" "$m"
+  elif (( m > 0 )); then
+    printf "%dm" "$m"
+  else
+    printf "%ds" "$s"
+  fi
+}
+
 # ───────────────────────── Run ID ──────────────────────────
 if command -v uuidgen >/dev/null 2>&1; then
   RUN_ID="$(uuidgen)"
@@ -420,10 +437,12 @@ start_hash_progress() {
       else
         pct=0; eta=0
       fi
-      printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
+      printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)\n' \
         "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$done" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
-        $((eta/3600)) $((eta%3600/60)) $((eta%60)) >> "$BACKGROUND_LOG"
+        "$(human_dur "$elapsed")" \
+        $((eta/3600)) $((eta%3600/60)) $((eta%60)) \
+        "$(human_dur "$eta")" >> "$BACKGROUND_LOG"
     done
   ) &
   hash_progress_pid=$!
@@ -460,10 +479,12 @@ start_zero_progress() {
       else
         pct=0; eta=0
       fi
-      printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d eta=%02d:%02d:%02d\n' \
+      printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)\n' \
         "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$count" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
-        $((eta/3600)) $((eta%3600/60)) $((eta%60)) >> "$BACKGROUND_LOG"
+        "$(human_dur "$elapsed")" \
+        $((eta/3600)) $((eta%3600/60)) $((eta%60)) \
+        "$(human_dur "$eta")" >> "$BACKGROUND_LOG"
     done
   ) &
   zero_progress_pid=$!

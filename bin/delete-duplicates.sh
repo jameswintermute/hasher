@@ -1,124 +1,97 @@
-#!/bin/bash
+#!/bin/sh
+# delete-duplicates.sh — apply file delete plan (move to quarantine)
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 
-# delete-duplicates.sh — act on a review PLAN (delete or quarantine duplicate files)
-# - Reads a plan file (one absolute path per line) created by review-duplicates.sh
-# - Defaults to DRY-RUN; use --force to actually delete or move
-# - CRLF-safe, skips blanks and comments
-# - Layout-aware via bin/lib_paths.sh
-set -Eeuo pipefail
-IFS=$'\n\t'; LC_ALL=C
+set -eu
 
-# Path/layout discovery
-. "$(dirname "$0")/lib_paths.sh" 2>/dev/null || true
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+LOGS_DIR="$ROOT_DIR/logs";        mkdir -p "$LOGS_DIR"
+VAR_DIR="$ROOT_DIR/var";          mkdir -p "$VAR_DIR"
+QUAR_DIR="$ROOT_DIR/quarantine";  mkdir -p "$QUAR_DIR"
 
-ts(){ date +"%Y-%m-%d %H:%M:%S"; }
-if [ -r /proc/sys/kernel/random/uuid ]; then RUN_ID="$(cat /proc/sys/kernel/random/uuid)"; else RUN_ID="$(date +%s)-$$-$RANDOM"; fi
-log(){ printf "[%s] [RUN %s] [%s] %s\n" "$(ts)" "$RUN_ID" "$1" "$2"; }
-log_info(){ log "INFO" "$*"; }; log_warn(){ log "WARN" "$*"; }; log_error(){ log "ERROR" "$*"; }
+PLAN_FILE="${1:-}"
 
-PLAN_FILE=""; FORCE=false; QUARANTINE_DIR=""
+info()  { printf "[INFO] %s\n"  "$1" >&2; }
+warn()  { printf "[WARN] %s\n"  "$1" >&2; }
+error() { printf "[ERROR] %s\n" "$1" >&2; }
 
-usage(){
-  cat <<'EOF'
-Usage: delete-duplicates.sh --from-plan <file> [--force] [--quarantine DIR]
+if [ -z "$PLAN_FILE" ]; then
+  # fall back to latest review plan if not explicitly given
+  PLAN_FILE="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+fi
 
-Options:
-  --from-plan FILE     Path to plan file with one filesystem path per line
-  --force              Execute actions (delete/quarantine). Default is dry-run
-  --quarantine DIR     Move files to DIR instead of deleting (tree is preserved below DIR)
+[ -n "${PLAN_FILE:-}" ] || { warn "No review dedupe plan file found."; exit 0; }
+[ -r "$PLAN_FILE" ] || { error "Plan file not readable: $PLAN_FILE"; exit 1; }
 
-Notes:
-  - Plan lines that are blank or start with # are ignored.
-  - On quarantine, the original directory structure is preserved under DIR.
-  - All actions/errors are logged to logs/delete-duplicates-YYYY-MM-DD.log
-EOF
-}
+info "Using FILE delete plan: $PLAN_FILE"
 
-while [ $# -gt 0 ]; do
-  case "${1:-}" in
-    --from-plan) PLAN_FILE="${2:-}"; shift ;;
-    --force) FORCE=true ;;
-    --quarantine) QUARANTINE_DIR="${2:-}"; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) log_error "Unknown argument: $1"; usage; exit 2 ;;
-  esac
-  shift || true
-done
-
-[ -n "$PLAN_FILE" ] || { log_error "Missing --from-plan"; exit 2; }
-[ -r "$PLAN_FILE" ] || { log_error "Plan file not readable: $PLAN_FILE"; exit 2; }
-
-mkdir -p "$LOG_DIR"
-SUMMARY_LOG="$LOG_DIR/delete-duplicates-$(date +'%Y-%m-%d').log"
-VERIFIED_PLAN="$LOG_DIR/verified-duplicates-$(date +'%Y-%m-%d')-${RUN_ID}.txt"
-: > "$VERIFIED_PLAN"
-
-log_info "Plan: $PLAN_FILE"
-log_info "Summary log: $SUMMARY_LOG"
-[ -n "$QUARANTINE_DIR" ] && log_info "Quarantine dir: $QUARANTINE_DIR"
-
-# Verification pass
-has_crlf=false; grep -q $'\r' "$PLAN_FILE" && has_crlf=true
-considered=0; missing=0; not_regular=0; verified=0
-
-while IFS= read -r raw || [ -n "$raw" ]; do
-  line="${raw%$'\r'}"
-  [ -z "$line" ] && continue
-  case "$line" in \#*) continue ;; esac
-  considered=$((considered+1))
-  if [ ! -e "$line" ]; then missing=$((missing+1)); continue; fi
-  if [ ! -f "$line" ]; then not_regular=$((not_regular+1)); continue; fi
-  printf '%s\n' "$line" >> "$VERIFIED_PLAN"
-  verified=$((verified+1))
-done < "$PLAN_FILE"
-
-$has_crlf && log_warn "Plan has CRLF line endings; handled during read. To normalise: sed -i 's/\r$//' "$PLAN_FILE""
-
-log_info "Verification complete."
-log_info "  • Considered: $considered"
-log_info "  • Missing: $missing"
-log_info "  • Not regular files: $not_regular"
-log_info "  • Verified (will act on): $verified"
-log_info "Verified plan file: $VERIFIED_PLAN"
-
-if ! $FORCE; then
-  printf "[DRY-RUN SUMMARY]\n"
-  printf "  Files that would be acted on: %s\n" "$verified"
-  printf "  To execute delete:    ./bin/delete-duplicates.sh --from-plan "%s" --force\n" "$PLAN_FILE"
-  printf "  To quarantine to dir: ./bin/delete-duplicates.sh --from-plan "%s" --force --quarantine "var/quarantine/$(date +%F)"\n" "$PLAN_FILE"
+# Count DEL entries
+TOTAL_DEL=$(grep -c '^DEL|' "$PLAN_FILE" 2>/dev/null || true)
+if [ "$TOTAL_DEL" -eq 0 ]; then
+  warn "No DEL entries found in plan (nothing to do)."
   exit 0
 fi
 
-# Ensure quarantine dir if used
-if [ -n "$QUARANTINE_DIR" ]; then mkdir -p "$QUARANTINE_DIR"; fi
+# Pass 1: count existing vs missing
+existing=0
+missing=0
 
-# Execute
-acted=0; errs=0
-while IFS= read -r path || [ -n "$path" ]; do
-  [ -z "$path" ] && continue
-  if [ -n "$QUARANTINE_DIR" ]; then
-    # Preserve tree under quarantine dir
-    clean="${path#/}"                             # strip leading slashes
-    dest="${QUARANTINE_DIR%/}/$clean"
-    dest_dir="$(dirname -- "$dest")"
-    mkdir -p -- "$dest_dir"
-    if mv -f -- "$path" "$dest" 2>>"$SUMMARY_LOG"; then
-      log_info "Quarantined: $path -> $dest"; acted=$((acted+1))
-    else
-      log_error "Failed to quarantine: $path"; errs=$((errs+1))
-    fi
-  else
-    if rm -f -- "$path" 2>>"$SUMMARY_LOG"; then
-      log_info "Deleted: $path"; acted=$((acted+1))
-    else
-      log_error "Failed to delete: $path"; errs=$((errs+1))
-    fi
-  fi
-done < "$VERIFIED_PLAN"
+# shellcheck disable=SC2162
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    DEL\|*)
+      path=${line#DEL|}
+      [ -z "$path" ] && continue
+      if [ -e "$path" ]; then
+        existing=$((existing+1))
+      else
+        missing=$((missing+1))
+      fi
+      ;;
+  esac
+done <"$PLAN_FILE"
 
-log_info "Execution complete. Acted on: $acted, errors: $errs"
+if [ "$existing" -eq 0 ]; then
+  warn "No existing files in plan (nothing to do)."
+  exit 0
+fi
+
+info "Plan summary: $TOTAL_DEL DEL entries; $existing currently exist, $missing already missing."
+
+# Quarantine layout: mirror full path under $QUAR_DIR
+# e.g. /volume1/foo/bar.jpg -> $QUAR_DIR/volume1/foo/bar.jpg
+moves_ok=0
+moves_fail=0
+
+# shellcheck disable=SC2162
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    DEL\|*)
+      src=${line#DEL|}
+      [ -z "$src" ] && continue
+      [ -e "$src" ] || continue
+
+      # Build destination path
+      case "$src" in
+        /*) dest="$QUAR_DIR$src" ;;
+        *)  dest="$QUAR_DIR/$src" ;;
+      esac
+      dest_dir=$(dirname "$dest")
+      mkdir -p "$dest_dir"
+
+      if mv -n -- "$src" "$dest"; then
+        moves_ok=$((moves_ok+1))
+      else
+        warn "Failed to move: $src"
+        moves_fail=$((moves_fail+1))
+      fi
+      ;;
+  esac
+done <"$PLAN_FILE"
+
+info "Move complete: $moves_ok files moved to quarantine ($QUAR_DIR); $moves_fail failures."
 exit 0

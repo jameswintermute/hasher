@@ -1,14 +1,15 @@
 #!/bin/sh
-# review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
-# Hasher — NAS File Hasher & Duplicate Finder (GPLv3)
-# Internals optimized: capture selected groups in one pass, no re-scan per group
-# v1.0.9: adds hash exceptions list & 'A' option
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
-VAR_DIR="$ROOT_DIR/var";  mkdir -p "$VAR_DIR"
+LOGS_DIR="$ROOT_DIR/logs";   mkdir -p "$LOGS_DIR"
+VAR_DIR="$ROOT_DIR/var";     mkdir -p "$VAR_DIR"
 LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 EXCEPTIONS_FILE="$LOCAL_DIR/exceptions-hashes.txt"
 
@@ -63,7 +64,9 @@ htime(){
 clean_exceptions_file() {
   EXC_CLEAN="$VAR_DIR/exceptions-cleaned-$$.txt"
   if [ -f "$EXCEPTIONS_FILE" ]; then
-    grep -v '^[[:space:]]*#' "$EXCEPTIONS_FILE" 2>/dev/null       | sed 's/[[:space:]]//g'       | sed '/^$/d' >"$EXC_CLEAN" || true
+    grep -v '^[[:space:]]*#' "$EXCEPTIONS_FILE" 2>/dev/null \
+      | sed 's/[[:space:]]//g' \
+      | sed '/^$/d' >"$EXC_CLEAN" || true
   else
     : >"$EXC_CLEAN"
   fi
@@ -108,7 +111,8 @@ add_to_exceptions() {
 
   printf "Proceed and append to %s? [y/N] " "$(basename "$EXCEPTIONS_FILE")"
   if [ -t 0 ]; then read ans; else read ans </dev/tty; fi
-  case "$ans" in Y|y|yes|YES)
+  case "$ans" in
+    Y|y|yes|YES)
       if grep -qxF "$hash" "$EXCEPTIONS_FILE" 2>/dev/null; then
         info "Hash already present in exceptions list."
       else
@@ -155,9 +159,12 @@ _progress_bar() {
   rem=$(( total - cur ))
   [ "$cur" -gt 0 ] && eta=$(( elapsed * rem / cur )) || eta=0
   barw=40; filled=$(( pct * barw / 100 ))
-  i=0; BAR=""; while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
+  i=0; BAR=""
+  while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
   while [ $i -lt $barw ]; do BAR="${BAR}-"; i=$((i+1)); done
-  printf "\r%s[%s]%s %3d%% [%s]  %d/%d  Elapsed %s  ETA %s    "     "$C1" "$label" "$C0" "$pct" "$BAR" "$cur" "$total" "$(htime "$elapsed")" "$(htime "$eta")" >&2
+  printf "\r%s[%s]%s %3d%% [%s]  %d/%d  Elapsed %s  ETA %s    " \
+    "$C1" "$label" "$C0" "$pct" "$BAR" "$cur" "$total" \
+    "$(htime "$elapsed")" "$(htime "$eta")" >&2
 }
 
 progress_review() {
@@ -170,9 +177,12 @@ progress_review() {
   rem=$(( total - cur ))
   [ "$cur" -gt 0 ] && eta=$(( elapsed * rem / cur )) || eta=0
   barw=40; filled=$(( pct * barw / 100 ))
-  i=0; BAR=""; while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
+  i=0; BAR=""
+  while [ $i -lt $filled ]; do BAR="${BAR}#"; i=$((i+1)); done
   while [ $i -lt $barw ]; do BAR="${BAR}-"; i=$((i+1)); done
-  printf "\r%s[PROGRESS]%s %3d%% [%s]  Group %d/%d  Reviewed total files: %d  Elapsed %s  ETA %s    "     "$C1" "$C0" "$pct" "$BAR" "$cur" "$total" "$files_seen" "$(htime "$elapsed")" "$(htime "$eta")" >&2
+  printf "\r%s[PROGRESS]%s %3d%% [%s]  Group %d/%d  Reviewed total files: %d  Elapsed %s  ETA %s    " \
+    "$C1" "$C0" "$pct" "$BAR" "$cur" "$total" "$files_seen" \
+    "$(htime "$elapsed")" "$(htime "$eta")" >&2
 }
 
 file_mtime(){
@@ -230,7 +240,7 @@ case "${scope:-}" in
   '') info "Reviewing ALL $TOTAL_GROUPS groups."; MAX_GROUPS="$TOTAL_GROUPS";;
   *)  case "$scope" in *[!0-9]* ) scope="$TOTAL_GROUPS";; esac
        [ "$scope" -lt 1 ] && scope=1; [ "$scope" -gt "$TOTAL_GROUPS" ] && scope="$TOTAL_GROUPS"
-       MAX_GROUPS="$scope"; info "Will review first $MAX_GROUPS of $TOTAL_GROUPS groups.";; 
+       MAX_GROUPS="$scope"; info "Will review first $MAX_GROUPS of $TOTAL_GROUPS groups.";;
 esac
 
 # Prepare cleaned exceptions list
@@ -332,7 +342,9 @@ present_group(){
   Nval="$(awk -v g="$gno" -F'\t' '$1==g{print $3}' "$INDEX_FILE" 2>/dev/null | head -n1)"; [ -z "$Nval" ] && Nval=2
   group_hash="$(awk -v g="$gno" -F'\t' '$1==g{print $5}' "$INDEX_FILE" 2>/dev/null | head -n1)"
   pot=$(( (Nval - 1) * base_size ))
-  printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n"     "$C1" "$reviewed" "$SELECTED_TOTAL" "$C0" "$ORDER" "$(human_size "$pot")" "$Nval" "$(human_size "$base_size")"
+  printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n" \
+    "$C1" "$reviewed" "$SELECTED_TOTAL" "$C0" "$ORDER" \
+    "$(human_size "$pot")" "$Nval" "$(human_size "$base_size")"
 
   i=0
   if [ "$ORDER" = "size" ] || [ "$ORDER" = "sizesmall" ]; then
@@ -341,10 +353,12 @@ present_group(){
       printf "  %2d) %-8s  %s\n" "$i" "[$hs]" "$fp"
     done <"$ORDERED"
   else
-    while IFS= read -r fp; do i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"; done <"$ORDERED"
+    while IFS= read -r fp; do
+      i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"; done <"$ORDERED"
   fi
 
   files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
+  [ "$files_in_group" -gt 0 ] || return 0
 
   # --- SAFER INPUT LOOP ---
   while :; do
@@ -353,48 +367,92 @@ present_group(){
     echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
     echo "  - s = skip group (decide later)"
     echo "  - A = add this hash to exceptions list and skip this group"
+    echo "  - D = delete ALL copies in this group"
     echo "  - q = quit (plan so far is preserved)"
     printf "Your choice: "
-    if [ -t 0 ]; then read ans; else read ans </dev/tty; fi
+    if [ -t 0 ]; then
+      if ! IFS= read -r choice; then
+        choice="q"
+      fi
+    else
+      if ! IFS= read -r choice </dev/tty; then
+        choice="q"
+      fi
+    fi
 
-    case "$ans" in
-      q|Q)
+    case "$choice" in
+      [sS])
+        echo "   -> Skipping this group."
+        break
+        ;;
+
+      [aA])
+        add_to_exceptions "$group_hash" "$base_size"
+        echo "   -> Group skipped; hash added to exceptions list."
+        break
+        ;;
+
+      [qQ])
         echo
-        warn "Stopping early at group $reviewed. Plan saved: $PLAN_OUT"
+        info "Quitting interactive review early (plan so far is preserved)."
+        progress_review "$reviewed" "$SELECTED_TOTAL" "$files_seen" "$START_TS"
+        echo; echo
+        info "Plan saved to: $PLAN_OUT"
         exit 0
         ;;
-      s|S|"")
-        # skip group safely
-        break
-        ;;
-      a|A)
-        if [ -n "$group_hash" ]; then
-          add_to_exceptions "$group_hash" "$base_size"
-        else
-          warn "Cannot determine hash for this group; not adding to exceptions."
-        fi
-        # After updating exceptions, skip this group (no deletions queued)
-        break
-        ;;
-      *)
-        # must be numeric and within range
-        case "$ans" in *[!0-9]*|'')
-          printf "%s[WARN]%s Invalid choice, please enter 1-%d, s, A or q.\n" "$CERR" "$C0" "$files_in_group" >&2
-          ;;
-        *)
-          choice="$ans"
-          if [ "$choice" -lt 1 ] 2>/dev/null || [ "$choice" -gt "$files_in_group" ] 2>/dev/null; then
-            printf "%s[WARN]%s Invalid choice, please enter 1-%d, s, A or q.\n" "$CERR" "$C0" "$files_in_group" >&2
-          else
-            # valid choice → write others to plan
-            j=0
-            while IFS= read -r fp; do
-              j=$((j+1))
-              [ "$j" -ne "$choice" ] && printf "%s\n" "$fp" >> "$PLAN_OUT"
-            done <"$ORDERED"
-            break
+
+      [dD])
+        printf "Please confirm that you wish to delete all copies of this file (this entire group) [y/N] "
+        if [ -t 0 ]; then
+          if ! IFS= read -r confirm; then
+            confirm="n"
           fi
-          ;;
+        else
+          if ! IFS= read -r confirm </dev/tty; then
+            confirm="n"
+          fi
+        fi
+        case "$confirm" in
+          [yY])
+            while IFS= read -r fp; do
+              [ -z "$fp" ] && continue
+              printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+            done <"$ORDERED"
+            echo "   -> All copies in this group have been marked for deletion in the plan."
+            break
+            ;;
+          *)
+            echo "   -> Delete-all cancelled; please choose again."
+            ;;
+        esac
+        ;;
+
+      *)
+        # numeric choice – must be between 1 and $files_in_group
+        case "$choice" in
+          ''|*[!0-9]*)
+            echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, D, q."
+            ;;
+          *)
+            sel="$choice"
+            if [ "$sel" -lt 1 ] || [ "$sel" -gt "$files_in_group" ]; then
+              echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, D, q."
+            else
+              # KEEP selected index, DELETE others
+              idx=0
+              while IFS= read -r fp; do
+                [ -z "$fp" ] && continue
+                idx=$((idx+1))
+                if [ "$idx" -eq "$sel" ]; then
+                  printf "KEEP|%s\n" "$fp" >>"$PLAN_OUT"
+                else
+                  printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+                fi
+              done <"$ORDERED"
+              echo "   -> Choice recorded: keeping #$sel, others marked for deletion."
+              break
+            fi
+            ;;
         esac
         ;;
     esac
