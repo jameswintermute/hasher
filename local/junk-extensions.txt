@@ -1,0 +1,6 @@
+# These file extensions are junk and will be deleted via the delete junk menu item
+# They are hashed for record keeping but not subject to deduplication review
+# Examples are below, temporary media type files:
+#.AAE  
+#.LRV
+#.THM
