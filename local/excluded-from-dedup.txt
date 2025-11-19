@@ -1,3 +1,6 @@
-# Files that are hashed but excluded from deduplication review:
-#*.js
-#*.css
+# local/excluded-from-dedup.txt — extensions hidden from duplicate review
+# One extension per line, without leading dot, case-insensitive.
+# These files ARE hashed and included in stats, but never shown in review-duplicates.
+# Use this for functional assets where deduplication is risky.
+css
+js
