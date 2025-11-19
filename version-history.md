@@ -59,3 +59,4 @@ Contact: **jameswintermute@protonmail.ch**
 - Parallel hashing
 - JSON output mode
 - Metadata extraction
+
