@@ -1,5 +1,6 @@
+# These files are excluded from hashing and deduplication
+# Intention is recycling bin or temporary files only
 # local/excludes.txt — one glob per line (case-insensitive)
-*.tmp
 *.part
 *.bak
 */Cache/*
