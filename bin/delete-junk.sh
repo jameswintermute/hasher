@@ -1,163 +1,179 @@
-\
-    #!/bin/sh
-    # Hasher — NAS File Hasher & Duplicate Finder
-    # delete-junk.sh — BusyBox/POSIX; robust --paths-file handling
-    # SAFETY: Never remove '#recycle' folders, only their contents (when --include-recycle).
-    set -eu
+#!/bin/sh
+# delete-junk.sh — find and delete junk files based on local/junk-extensions.txt
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
-    ROOT="$(cd -- "$(dirname "$0")/.." && pwd -P)"
-    LOGS="$ROOT/logs"; mkdir -p "$LOGS"
+set -eu
 
-    PATHS_FILE=""
-    INCLUDE_RECYCLE=0
-    ACTION="verify"
-    QUAR=""
-    DATE_TAG="$(date +%F)"
-    OUTDIR="$ROOT/var/junk/quarantine-$DATE_TAG"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+LOGS_DIR="$ROOT_DIR/logs";   mkdir -p "$LOGS_DIR"
+VAR_DIR="$ROOT_DIR/var";     mkdir -p "$VAR_DIR"
+LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 
-    # parse args
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --paths-file) PATHS_FILE="${2:-}"; shift ;;
-        --include-recycle) INCLUDE_RECYCLE=1 ;;
-        --verify-only) ACTION="verify" ;;
-        --dry-run)     ACTION="dry" ;;
-        --force)       ACTION="force" ;;
-        --quarantine)  ACTION="quarantine"; QUAR="${2:-}"; shift ;;
-        -h|--help)
-          echo "Usage: $0 [--paths-file FILE] [--include-recycle] [--verify-only|--dry-run|--force|--quarantine DIR]"; exit 0 ;;
-        *) echo "Unknown arg: $1" >&2; exit 2 ;;
-      esac
-      shift || true
-    done
+JUNK_FILE="$LOCAL_DIR/junk-extensions.txt"
+PATHS_FILE="$LOCAL_DIR/paths.txt"
 
-    # resolve paths file
-    if [ -z "$PATHS_FILE" ]; then
-      if [ -f "$ROOT/local/paths.txt" ]; then PATHS_FILE="$ROOT/local/paths.txt"
-      elif [ -f "$ROOT/paths.txt" ]; then PATHS_FILE="$ROOT/paths.txt"
-      else
-        echo "[ERROR] No paths file found (local/paths.txt or ./paths.txt). Create one." >&2
-        exit 1
-      fi
-    fi
-    [ -r "$PATHS_FILE" ] || { echo "[ERROR] Cannot read paths file: $PATHS_FILE" >&2; exit 1; }
+is_tty() { [ -t 2 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; }
 
-    # read roots (pure sh): strip CR, trim spaces, drop comments/blanks
-    ROOTS_TMP="$(mktemp)"
-    # shellcheck disable=SC2162
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in *"$'\r'") line="${line%$'\r'}";; esac
-      # trim leading spaces
-      while [ "${line# }" != "$line" ]; do line="${line# }"; done
-      # trim trailing spaces
-      while [ "${line% }" != "$line" ]; do line="${line% }"; done
-      case "$line" in ""|'#'*) continue;; esac
-      printf '%s\n' "$line" >> "$ROOTS_TMP"
-    done < "$PATHS_FILE"
+if is_tty; then
+  C1="$(printf '\033[1;36m')"; C2="$(printf '\033[1;33m')"
+  COK="$(printf '\033[1;32m')" ; CERR="$(printf '\033[1;31m')"
+  CDIM="$(printf '\033[2m')"  ; C0="$(printf '\033[0m')"
+else
+  C1=""; C2=""; COK=""; CERR=""; CDIM=""; C0=""
+fi
 
-    FILES_NUL="$(mktemp)"
-    DIRS_NUL="$(mktemp)"
-    RECYCLE_NUL="$(mktemp)"
-    count_roots=0
-    warned=0
+info()  { printf "%s[INFO]%s %s\n"  "$COK" "$C0" "$1" >&2; }
+warn()  { printf "%s[WARN]%s %s\n"  "$C2" "$C0" "$1" >&2; }
+error() { printf "%s[ERROR]%s %s\n" "$CERR" "$C0" "$1" >&2; }
 
-    # Build lists
-    # shellcheck disable=SC2162
-    while IFS= read -r root || [ -n "$root" ]; do
-      [ -z "$root" ] && continue
-      if [ -d "$root" ] || [ -f "$root" ]; then
-        count_roots=$((count_roots+1))
-        # junk files
-        find "$root" -type f \( -name 'Thumbs.db' -o -name '.DS_Store' -o -name 'Desktop.ini' -o -name '._*' \) -print0 >> "$FILES_NUL" 2>/dev/null || true
-        # junk dirs (safe set)
-        find "$root" -type d \( -name '@eaDir' -o -name '.AppleDouble' -o -name '.Spotlight-V100' -o -name '.Trashes' \) -print0 >> "$DIRS_NUL" 2>/dev/null || true
-        # recycle contents (if opted-in) — DO NOT include the folder itself
-        if [ "$INCLUDE_RECYCLE" -eq 1 ]; then
-          # collect '#recycle' directories
-          find "$root" -type d -name '#recycle' -print0 >> "$RECYCLE_NUL" 2>/dev/null || true
-        fi
-      else
-        echo "[WARN] Path not found (skipped): $root" >&2
-        warned=1
-      fi
-    done < "$ROOTS_TMP"
+human_size(){
+  b="${1:-0}"
+  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+  if [ "$b" -ge 1073741824 ] 2>/dev/null; then
+    printf "%.1fG" "$(awk "BEGIN{print $b/1073741824}")"
+  elif [ "$b" -ge 1048576 ] 2>/dev/null; then
+    printf "%.1fM" "$(awk "BEGIN{print $b/1048576}")"
+  elif [ "$b" -ge 1024 ] 2>/dev/null; then
+    printf "%.1fK" "$(awk "BEGIN{print $b/1024}")"
+  else
+    printf "%dB" "$b"
+  fi
+}
 
-    # Expand recycle contents into FILES_NUL & DIRS_NUL (mindepth 1)
-    if [ "$INCLUDE_RECYCLE" -eq 1 ]; then
-      # shellcheck disable=SC2162
-      while IFS= read -r -d '' rdir; do
-        find "$rdir" -mindepth 1 -type f -print0 >> "$FILES_NUL" 2>/dev/null || true
-        find "$rdir" -mindepth 1 -type d -print0 >> "$DIRS_NUL" 2>/dev/null || true
-      done < "$RECYCLE_NUL"
-    fi
+file_size(){
+  f="$1"
+  stat -c %s "$f" 2>/dev/null && return 0 || true
+  busybox stat -c %s "$f" 2>/dev/null && return 0 || true
+  stat -f %z "$f" 2>/dev/null && return 0 || true
+  wc -c <"$f" 2>/dev/null | tr -d ' ' || echo 0
+}
 
-    if [ "$count_roots" -eq 0 ]; then
-      echo "[ERROR] No valid roots to scan." >&2
-      rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
-      exit 1
-    fi
+[ -r "$JUNK_FILE" ]  || { error "Junk list not found or not readable: $JUNK_FILE"; exit 1; }
+[ -r "$PATHS_FILE" ] || { error "Paths file not found or not readable: $PATHS_FILE"; exit 1; }
 
-    files_count="$(tr -cd '\0' < "$FILES_NUL" | wc -c | tr -d ' ' || echo 0)"
-    dirs_count="$(tr -cd '\0' < "$DIRS_NUL" | wc -c | tr -d ' ' || echo 0)"
+info "Using junk list: $JUNK_FILE"
+info "Scanning paths from: $PATHS_FILE"
 
-    echo "[INFO] Roots: $count_roots  | Junk files: $files_count  | Junk dirs: $dirs_count"
-    [ "$warned" -eq 1 ] && echo "[INFO] Some listed roots were missing (see warnings above)."
+CANDIDATES="$(mktemp "$VAR_DIR/junk-candidates.XXXXXX")"
+trap 'rm -f "$CANDIDATES" 2>/dev/null || true' EXIT INT TERM
 
-    if [ "$ACTION" = "verify" ] || [ "$ACTION" = "dry" ]; then
-      echo "[INFO] Dry-run / verify mode — no changes will be made."
-      echo "Sample files:"
-      tr '\0' '\n' < "$FILES_NUL" | head -n 20 || true
-      echo "Sample dirs:"
-      tr '\0' '\n' < "$DIRS_NUL" | head -n 20 || true
-      rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
-      exit 0
-    fi
+# Build candidate list
+while IFS= read -r root || [ -n "$root" ]; do
+  case "$root" in
+    ''|\#*) continue ;;
+  esac
+  if [ ! -d "$root" ]; then
+    warn "Path does not exist or is not a directory: $root"
+    continue
+  fi
 
-    LOG_DEL="$LOGS/junk-deletions-$(date +%Y%m%d-%H%M%S).log"
-    touch "$LOG_DEL"
+  # For each rule in junk-extensions.txt
+  while IFS= read -r rule || [ -n "$rule" ]; do
+    # Strip comments and whitespace
+    cleaned="$(printf '%s\n' "$rule" | sed 's/#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$cleaned" ] && continue
 
-    if [ "$ACTION" = "quarantine" ]; then
-      [ -n "$QUAR" ] || QUAR="$OUTDIR"
-      mkdir -p "$QUAR"
-      echo "[INFO] Quarantine: $QUAR"
-    fi
+    case "$cleaned" in
+      *.*)
+        # Treat as BASENAME (e.g., Thumbs.db, .DS_Store, Desktop.ini)
+        find "$root" -type f -iname "$cleaned" -print 2>/dev/null >>"$CANDIDATES" || true
+        ;;
+      *)
+        # Treat as EXTENSION (no dot) → *.EXT
+        find "$root" -type f -iname "*.$cleaned" -print 2>/dev/null >>"$CANDIDATES" || true
+        ;;
+    esac
+  done <"$JUNK_FILE"
 
-    deleted=0
-    moved=0
+done <"$PATHS_FILE"
 
-    # Preserve relative layout within a base
-    move_preserve() {
-      src="$1"; base="$2"; dest="$3"
-      case "$src" in "$base"/*) rel="${src#$base/}" ;; *) rel="$(basename "$src")" ;; esac
-      dest_path="$dest/$rel"
-      mkdir -p "$(dirname "$dest_path")" 2>/dev/null || true
-      mv -f -- "$src" "$dest_path" && moved=$((moved+1)) && echo "$src -> $dest_path" >> "$LOG_DEL"
-    }
+# Deduplicate
+if [ -s "$CANDIDATES" ]; then
+  SORTED="$(mktemp "$VAR_DIR/junk-candidates-sorted.XXXXXX")"
+  sort -u "$CANDIDATES" >"$SORTED" 2>/dev/null || cp "$CANDIDATES" "$SORTED"
+  mv "$SORTED" "$CANDIDATES"
+fi
 
-    # files
-    while IFS= read -r -d '' f; do
-      if [ "$ACTION" = "force" ]; then
-        rm -f -- "$f" && deleted=$((deleted+1)) && echo "DEL $f" >> "$LOG_DEL"
-      else
-        base=""
-        while IFS= read -r r || [ -n "$r" ]; do case "$f" in "$r"/*) base="$r"; break;; esac; done < "$ROOTS_TMP"
-        move_preserve "$f" "${base:-$ROOT}" "$QUAR"
-      fi
-    done < "$FILES_NUL"
+TOTAL_FILES=0
+[ -s "$CANDIDATES" ] && TOTAL_FILES="$(wc -l <"$CANDIDATES" | tr -d ' ' || echo 0)"
 
-    # dirs (after files) — never delete/move '#recycle' itself
-    while IFS= read -r -d '' d; do
-      case "$d" in *"/#recycle") continue;; esac
-      if [ "$ACTION" = "force" ]; then
-        rm -rf -- "$d" && deleted=$((deleted+1)) && echo "RMDIR $d" >> "$LOG_DEL"
-      else
-        base=""
-        while IFS= read -r r || [ -n "$r" ]; do case "$d" in "$r"/*) base="$r"; break;; esac; done < "$ROOTS_TMP"
-        move_preserve "$d" "${base:-$ROOT}" "$QUAR"
-      fi
-    done < "$DIRS_NUL"
+if [ "$TOTAL_FILES" -eq 0 ]; then
+  info "No junk files found based on $JUNK_FILE."
+  exit 0
+fi
 
-    echo "[INFO] Completed. Deleted: $deleted  Moved: $moved"
-    echo "[INFO] Log: $LOG_DEL"
+# Compute total size
+TOTAL_BYTES=0
+while IFS= read -r f || [ -n "$f" ]; do
+  [ -z "$f" ] && continue
+  sz="$(file_size "$f" 2>/dev/null || echo 0)"
+  case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  TOTAL_BYTES=$((TOTAL_BYTES + sz))
+done <"$CANDIDATES"
 
-    rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
+TOTAL_HR="$(human_size "$TOTAL_BYTES")"
+
+echo
+info "Junk candidates found: $TOTAL_FILES files, total size ~ $TOTAL_HR."
+
+# Preview output
+if [ "$TOTAL_FILES" -le 25 ]; then
+  echo
+  echo "The following files are marked as junk and can be deleted:"
+  echo "---------------------------------------------------------"
+  cat "$CANDIDATES"
+  echo "---------------------------------------------------------"
+else
+  RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+  LIST_FILE="$LOGS_DIR/junk-candidates-$RUN_ID.txt"
+  cp "$CANDIDATES" "$LIST_FILE"
+  echo
+  info "The list is long ($TOTAL_FILES files)."
+  info "Full candidate list saved to: $LIST_FILE"
+  echo "For a quick preview, you can run:"
+  echo "  head -n 50 \"$LIST_FILE\""
+fi
+
+echo
+printf "Proceed to DELETE these %d junk files (~%s)? [y/N] " "$TOTAL_FILES" "$TOTAL_HR"
+if [ -t 0 ]; then
+  if ! IFS= read -r ans; then ans="n"; fi
+else
+  if ! IFS= read -r ans </dev/tty; then ans="n"; fi
+fi
+
+case "$ans" in
+  y|Y|yes|YES)
+    ;;
+  *)
+    echo
+    info "Aborting. No files were deleted."
+    exit 0
+    ;;
+esac
+
+echo
+info "Deleting junk files…"
+
+DELETED=0
+FAILED=0
+while IFS= read -r f || [ -n "$f" ]; do
+  [ -z "$f" ] && continue
+  if rm -f -- "$f" 2>/dev/null; then
+    DELETED=$((DELETED + 1))
+  else
+    FAILED=$((FAILED + 1))
+    warn "Failed to delete: $f"
+  fi
+done <"$CANDIDATES"
+
+echo
+info "Junk deletion complete."
+info "Deleted: $DELETED files."
+[ "$FAILED" -gt 0 ] && warn "Failed to delete: $FAILED files (see messages above)."
+
+exit 0
