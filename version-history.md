@@ -2,61 +2,93 @@
 
 Contact: **jameswintermute@protonmail.ch**
 
-## 2022-12-14 — v0.0.1
-- Initial prototype (SANS DFIR training)
-- Basic recursive hashing
-- CSV output only
-- No dedupe or cleanup
-- **Used SHA-1 hashing** in early versions (2022–2024)
+---
 
-## 2023–2024 — v0.x.x Series
-- Foundation building
-- Multi-directory traversal
-- Introduced paths.txt
-- Improved CSV metadata
-- Basic duplicate grouping
-- **Legacy note:** SHA-1 was still used. Old CSVs require conversion to SHA256 format.
+## 2022‑12‑14 — v0.0.1  
+Initial prototype  
+- Created as a SANS DFIR exercise  
+- Single-script SHA‑1 hashing  
+- Basic CSV output  
+- No dedupe logic  
 
-## 2025-03 to 2025-07 — v1.0.0
-- First structured release
-- Repo reorganised
-- New coloured launcher
-- Background hashing
-- Dedupe plan + quarantine model
+---
 
-## 2025-08 — v1.0.5 – v1.0.8
-- Interactive duplicate reviewer
-- Ordering modes, progress bars
-- Folder-level dedupe
-- Zero-length cleaner
-- Legacy CSV converter
+## 2023–2024 — v0.x.x Series  
+Foundation era  
+- Multi-root hashing introduced  
+- `paths.txt` added  
+- Improved CSV structure  
+- Early duplicate grouping  
+- **Legacy note:** hashing was SHA‑1; later converted to SHA256-compatible format  
 
-## 2025-09 — v1.0.9
-- Hash exceptions list
-- Safe numeric input loop
-- Run-ID stamping
-- Improved progress
+---
 
-## 2025-10 — v1.1.0–v1.1.2
-- Faster hashing
-- System check
-- Log follower
-- Improved @eaDir cleaner
-- Initial junk support
+## 2025‑03 → 2025‑07 — v1.0.0  
+First structured release  
+- Full repo reorganisation (`bin/`, `logs/`, `local/`)  
+- New launcher  
+- Background hashing (nohup-safe)  
+- File/folder dedupe model  
+- Quarantine workflow  
 
-## 2025-11 — v1.1.3
-- Junk + exception overhaul
-- New junk cleaner (size column + top10)
-- Menu/launcher improvements
-- SHA256 lookup tool
-- Concurrency guard
-- Cleaned config
-- Stats + cron templates
+---
 
-## Future
-- Enhanced stats (GB saved)
-- Dedup analytics
-- Parallel hashing
-- JSON output mode
-- Metadata extraction
+## 2025‑08 — v1.0.5 – v1.0.8  
+Feature expansion  
+- Interactive duplicate reviewer  
+- Order modes, ETA, progress bars  
+- Zero-length scanner  
+- Folder dedupe pipeline  
+- Legacy CSV converter  
 
+---
+
+## 2025‑09 — v1.0.9  
+Safety + exceptions  
+- Hash exceptions list (`local/exceptions-hashes.txt`)  
+- “A = add to exceptions” in review  
+- Safer numeric input loop  
+- Run-ID stamping  
+
+---
+
+## 2025‑10 — v1.1.0 – v1.1.2  
+Performance & stability  
+- Faster hashing on BusyBox  
+- System check module  
+- Log follower  
+- Improved @eaDir cleaner  
+- Initial junk cleaner  
+
+---
+
+## 2025‑11 — v1.1.3  
+Junk + exception overhaul  
+- `excluded-from-dedup.txt` model  
+- Junk cleaner with size columns  
+- Menu consolidation  
+- SHA256 lookup tool  
+- Concurrency guard for hash runs  
+- Config cleanup  
+- Stats & cron templates  
+
+---
+
+## 2025‑11 — v1.1.4  
+**Milestone release — production-proven**  
+- Full pipeline validated on real NAS  
+- Successfully deduped **19,000+ files** safely  
+- Review‑duplicates hardened with size fallback + “??” handling  
+- Better warnings for unreachable paths  
+- Large-scale junk cleanups validated  
+- README and documentation rewritten for GitHub  
+- Project now considered *stable & production ready*
+
+---
+
+## Future Roadmap  
+- Lifetime GB‑saved metrics  
+- Dedup analytics export  
+- Parallel hashing engine  
+- JSON structured output  
+- Optional metadata extraction  
