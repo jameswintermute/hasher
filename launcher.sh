@@ -42,7 +42,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.2 - Nov 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.3 - Nov 2025. James Wintermute"
   printf "%s" "$RST"
   printf "\n"
 }
@@ -71,31 +71,33 @@ ensure_no_running_hasher() {
 }
 
 print_menu() {
-  printf "%s\n" "### Stage 1 - Hash ###"
-  printf "%s\n" "  0) Check hashing status (static)"
-  printf "%s\n" "  1) Start Hashing (NAS-safe defaults)"
-  printf "%s\n" "  8) Advanced / Custom hashing"
-  printf "\n"
-  printf "%s\n" "### Stage 2 - Identify ###"
-  printf "%s\n" "  2) Find duplicate folders"
-  printf "%s\n" "  3) Find duplicate files"
-  printf "%s\n" " 12) Find file by HASH (lookup)   <-- NEW"
-  printf "\n"
-  printf "%s\n" "### Stage 3 - Clean up ###"
-  printf "%s\n" "  4) Review duplicates (interactive)"
-  printf "%s\n" "  5) Delete zero-length files"
-  printf "%s\n" "  6) Delete duplicates (apply plan)"
-  printf "%s\n" "  10) Clean cache files & @eaDir (safe)"
-  printf "%s\n" "  11) Delete junk (Thumbs.db, .DS_Store, @eaDir, etc.)"
-  printf "\n"
-  printf "%s\n" "### Other ###"
-  printf "%s\n" "  7) System check (deps & readiness)"
-  printf "%s\n" "  9) Follow logs (tail -f background.log)"
-  printf "%s\n" " 13) Stats & scheduling hints"
-  printf "%s\n" " 14) Clean internal working files (var/)"
-  printf "\n"
-  printf "%s\n" "  q) Quit"
-  printf "\n"
+  echo
+  echo "### Stage 1 - Hash ###"
+  echo "  0) Check hashing status (static)"
+  echo "  1) Start Hashing (NAS-safe defaults)"
+  echo "  8) Advanced / Custom hashing"
+  echo
+  echo "### Stage 2 - Identify ###"
+  echo "  2) Find duplicate folders"
+  echo "  3) Find duplicate files"
+  echo " 12) Find file by HASH (lookup)"
+  echo
+  echo "### Stage 3 - Clean up ###"
+  echo "  4) Review duplicates (interactive)"
+  echo "  5) Delete zero-length files"
+  echo "  6) Delete duplicates (apply plan)"
+  echo " 10) Clean cache files & @eaDir (safe)"
+  echo " 11) Delete junk (uses local/junk-extensions.txt)"
+  echo
+  echo "### Other ###"
+  echo "  7) System check (deps & readiness)"
+  echo "  9) Follow logs (tail -f background.log)"
+  echo " 13) Stats & scheduling hints"
+  echo " 14) Clean internal working files (var/)"
+  echo
+  echo "  q) Quit"
+  echo
+  printf "Select an option: "
 }
 
 latest_hashes_csv() {
@@ -121,7 +123,7 @@ sample_files_quick() {
   total=0
   # shellcheck disable=SC2162
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in \#*|"" ) continue ;; esac
+    case "$line" in \#*|"") continue ;; esac
     [ -d "$line" ] || continue
     c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" || c=0
     total=$(( total + c ))
@@ -136,7 +138,7 @@ preflight_hashing() {
     roots=0; exist=0; missing=0
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"" ) continue ;; esac
+      case "$line" in \#*|"") continue ;; esac
       roots=$((roots+1))
       if [ -d "$line" ]; then exist=$((exist+1)); else missing=$((missing+1)); fi
     done < "$pfile"
@@ -182,7 +184,7 @@ run_hasher_nohup() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"" ) continue ;; esac
+      case "$line" in \#*|"") continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
@@ -225,7 +227,7 @@ run_hasher_interactive() {
   if [ -n "$efile" ]; then
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"" ) continue ;; esac
+      case "$line" in \#*|"") continue ;; esac
       pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
@@ -378,11 +380,11 @@ action_apply_plan(){
 
 action_system_check(){
   info "System check:"
-  command -v awk >/dev/null && echo "  - awk: OK" || echo "  - awk: MISSING"
+  command -v awk  >/dev/null && echo "  - awk:  OK" || echo "  - awk:  MISSING"
   command -v sort >/dev/null && echo "  - sort: OK" || echo "  - sort: MISSING"
-  command -v cksum >/dev/null && echo "  - cksum: OK"|| echo "  - cksum: MISSING"
+  command -v cksum>/dev/null && echo "  - cksum:OK" || echo "  - cksum:MISSING"
   command -v stat >/dev/null && echo "  - stat: OK" || echo "  - stat: MISSING"
-  command -v df >/dev/null && echo "  - df:   OK" || echo "  - df:   MISSING"
+  command -v df   >/dev/null && echo "  - df:   OK" || echo "  - df:   MISSING"
   echo "  - Logs dir:    $LOGS_DIR"
   echo "  - Hashes dir:  $HASHES_DIR"
   echo "  - Bin dir:     $BIN_DIR"
@@ -412,7 +414,7 @@ action_clean_caches() {
   if [ -f "$paths_file" ]; then
     info "Using roots from $paths_file"
     while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in \#*|"" ) continue ;; esac
+      case "$line" in \#*|"") continue ;; esac
       [ -d "$line" ] || { warn "Missing root: $line"; continue; }
       find "$line" -type d -name '@eaDir' -prune -print0 >> "$listfile"
     done < "$paths_file"
@@ -459,42 +461,25 @@ action_clean_caches() {
 }
 
 action_delete_junk(){
-  junk_script=""
-  if [ -x "$BIN_DIR/review-junk.sh" ]; then
-    junk_script="$BIN_DIR/review-junk.sh"
-  elif [ -x "$BIN_DIR/delete-junk.sh" ]; then
-    junk_script="$BIN_DIR/delete-junk.sh"
-  else
-    err "$BIN_DIR/review-junk.sh / delete-junk.sh not found or not executable."
+  if [ ! -x "$BIN_DIR/delete-junk.sh" ]; then
+    err "$BIN_DIR/delete-junk.sh not found or not executable."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
 
-  pfile="$(determine_paths_file)"
-  args_base=""
-  [ -n "$pfile" ] && args_base="$args_base --paths-file $pfile"
+  echo
+  echo ">>> Delete junk files"
+  echo "    - Using rules from: local/junk-extensions.txt"
+  echo "    - Matches both extensions (e.g. AAE, LRV, THM)"
+  echo "      and common junk basenames (Thumbs.db, .DS_Store, Desktop.ini)"
+  echo
+  echo "The script will:"
+  echo "  - Scan your configured paths (local/paths.txt)"
+  echo "  - Show a preview of junk files and total size"
+  echo "  - Ask for confirmation before deleting anything"
+  echo
 
-  printf "\n[Junk Cleaner]\n"
-  printf "  1) Scan / dry-run (recommended)\n"
-  printf "  2) Scan and delete (force)\n"
-  printf "  b) Back\n"
-  printf "Choose an option: "
-  read -r jc || jc=""
-  case "$jc" in
-    1)
-      # shellcheck disable=SC2086
-      "$junk_script" $args_base --dry-run || true
-      ;;
-    2)
-      # shellcheck disable=SC2086
-      "$junk_script" $args_base --force || true
-      ;;
-    b|B|"")
-      ;;
-    *)
-      printf "Unknown option.\n"
-      ;;
-  esac
+  "$BIN_DIR/delete-junk.sh"
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -569,8 +554,8 @@ action_stats_and_cron() {
   echo "  # (example: replace <hasher_root_dir> and add your hasher.sh options)"
   echo "  0 2 * * * cd <hasher_root_dir> && ./hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
   echo
-  echo "  # Run junk cleaner weekly on Sundays at 03:00 in dry-run mode"
-  echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh --dry-run >> logs/cron-junk.log 2>&1"
+  echo "  # Run junk cleaner weekly on Sundays at 03:00 (interactive, not ideal for cron as-is)"
+  echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh >> logs/cron-junk.log 2>&1"
   echo
   echo "Edit crontab with: crontab -e   (on the host where hasher.sh is installed)."
   printf "Press Enter to continue... "; read -r _ || true
@@ -621,24 +606,31 @@ while :; do
   clear 2>/dev/null || true
   header
   print_menu
-  printf "Choose an option: "; read -r choice || { echo; exit 0; }
+  read -r choice || { echo; exit 0; }
+
   case "${choice:-}" in
-    0) action_check_status ;;
-    1) action_start_hashing ;;
-    8) action_custom_hashing ;;
-    2) action_find_duplicate_folders ;;
-    3) action_find_duplicate_files ;;
+    0)  action_check_status ;;
+    1)  action_start_hashing ;;
+    8)  action_custom_hashing ;;
+    2)  action_find_duplicate_folders ;;
+    3)  action_find_duplicate_files ;;
     12) action_find_by_hash ;;
-    4) action_review_duplicates ;;
-    5) action_delete_zero_length ;;
-    6) action_apply_plan ;;
+    4)  action_review_duplicates ;;
+    5)  action_delete_zero_length ;;
+    6)  action_apply_plan ;;
     10) action_clean_caches ;;
     11) action_delete_junk ;;
-    7) action_system_check ;;
-    9) action_view_logs_follow ;;
+    7)  action_system_check ;;
+    9)  action_view_logs_follow ;;
     13) action_stats_and_cron ;;
     14) action_clean_internal ;;
-    q|Q) echo "Bye."; exit 0 ;;
-    *) echo "Unknown option: $choice" ; sleep 1 ;;
+    q|Q)
+        echo "Bye."
+        exit 0
+        ;;
+    *)
+        echo "Unknown option: $choice"
+        sleep 1
+        ;;
   esac
 done

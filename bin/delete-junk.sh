@@ -1,163 +1,125 @@
-\
-    #!/bin/sh
-    # Hasher — NAS File Hasher & Duplicate Finder
-    # delete-junk.sh — BusyBox/POSIX; robust --paths-file handling
-    # SAFETY: Never remove '#recycle' folders, only their contents (when --include-recycle).
-    set -eu
+#!/bin/sh
+# delete-junk.sh — scan/delete junk files based on local/junk-extensions.txt
+# BusyBox + POSIX compatible
+set -eu
 
-    ROOT="$(cd -- "$(dirname "$0")/.." && pwd -P)"
-    LOGS="$ROOT/logs"; mkdir -p "$LOGS"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
+LOCAL="$ROOT_DIR/local"
+PATHS_FILE="$LOCAL/paths.txt"
+JUNK_FILE="$LOCAL/junk-extensions.txt"
+LOGS="$ROOT_DIR/logs"; mkdir -p "$LOGS"
+LISTFILE="$LOGS/junk-candidates-$(date +%F-%H%M%S)-$$.txt"
 
-    PATHS_FILE=""
-    INCLUDE_RECYCLE=0
-    ACTION="verify"
-    QUAR=""
-    DATE_TAG="$(date +%F)"
-    OUTDIR="$ROOT/var/junk/quarantine-$DATE_TAG"
+human_size() {
+  b="$1"
+  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+  if [ "$b" -ge 1073741824 ] 2>/dev/null; then
+    awk "BEGIN{printf \"%.1fG\", $b/1073741824}"
+  elif [ "$b" -ge 1048576 ] 2>/dev/null; then
+    awk "BEGIN{printf \"%.1fM\", $b/1048576}"
+  elif [ "$b" -ge 1024 ] 2>/dev/null; then
+    awk "BEGIN{printf \"%.1fK\", $b/1024}"
+  else
+    printf "%dB" "$b"
+  fi
+}
 
-    # parse args
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --paths-file) PATHS_FILE="${2:-}"; shift ;;
-        --include-recycle) INCLUDE_RECYCLE=1 ;;
-        --verify-only) ACTION="verify" ;;
-        --dry-run)     ACTION="dry" ;;
-        --force)       ACTION="force" ;;
-        --quarantine)  ACTION="quarantine"; QUAR="${2:-}"; shift ;;
-        -h|--help)
-          echo "Usage: $0 [--paths-file FILE] [--include-recycle] [--verify-only|--dry-run|--force|--quarantine DIR]"; exit 0 ;;
-        *) echo "Unknown arg: $1" >&2; exit 2 ;;
-      esac
-      shift || true
-    done
+# read flags
+DRY=0 FORCE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --force)  FORCE=1 ;;
+    --paths-file) PATHS_FILE="$2"; shift ;;
+  esac
+  shift
+done
 
-    # resolve paths file
-    if [ -z "$PATHS_FILE" ]; then
-      if [ -f "$ROOT/local/paths.txt" ]; then PATHS_FILE="$ROOT/local/paths.txt"
-      elif [ -f "$ROOT/paths.txt" ]; then PATHS_FILE="$ROOT/paths.txt"
-      else
-        echo "[ERROR] No paths file found (local/paths.txt or ./paths.txt). Create one." >&2
-        exit 1
-      fi
-    fi
-    [ -r "$PATHS_FILE" ] || { echo "[ERROR] Cannot read paths file: $PATHS_FILE" >&2; exit 1; }
+[ -s "$JUNK_FILE" ] || { echo "[ERR] junk list not found"; exit 1; }
+[ -s "$PATHS_FILE" ] || { echo "[ERR] paths file not found"; exit 1; }
 
-    # read roots (pure sh): strip CR, trim spaces, drop comments/blanks
-    ROOTS_TMP="$(mktemp)"
-    # shellcheck disable=SC2162
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in *"$'\r'") line="${line%$'\r'}";; esac
-      # trim leading spaces
-      while [ "${line# }" != "$line" ]; do line="${line# }"; done
-      # trim trailing spaces
-      while [ "${line% }" != "$line" ]; do line="${line% }"; done
-      case "$line" in ""|'#'*) continue;; esac
-      printf '%s\n' "$line" >> "$ROOTS_TMP"
-    done < "$PATHS_FILE"
+echo "[INFO] Using junk list: $JUNK_FILE"
+echo "[INFO] Scanning paths from: $PATHS_FILE"
 
-    FILES_NUL="$(mktemp)"
-    DIRS_NUL="$(mktemp)"
-    RECYCLE_NUL="$(mktemp)"
-    count_roots=0
-    warned=0
+# Build candidates
+: > "$LISTFILE"
+while IFS= read -r root || [ -n "$root" ]; do
+  case "$root" in \#*|"") continue ;; esac
+  [ -d "$root" ] || continue
+  while IFS= read -r rule || [ -n "$rule" ]; do
+    rule_clean="$(printf "%s" "$rule" | sed 's/#.*$//' | xargs)"
+    [ -z "$rule_clean" ] && continue
+    case "$rule_clean" in
+      *.*)
+        find "$root" -type f -iname "$rule_clean" -print0 2>/dev/null
+        ;;
+      *)
+        find "$root" -type f -iname "*.$rule_clean" -print0 2>/dev/null
+        ;;
+    esac
+  done < "$JUNK_FILE"
+done < "$PATHS_FILE" | tr '\0' '\n' | sort -u > "$LISTFILE"
 
-    # Build lists
-    # shellcheck disable=SC2162
-    while IFS= read -r root || [ -n "$root" ]; do
-      [ -z "$root" ] && continue
-      if [ -d "$root" ] || [ -f "$root" ]; then
-        count_roots=$((count_roots+1))
-        # junk files
-        find "$root" -type f \( -name 'Thumbs.db' -o -name '.DS_Store' -o -name 'Desktop.ini' -o -name '._*' \) -print0 >> "$FILES_NUL" 2>/dev/null || true
-        # junk dirs (safe set)
-        find "$root" -type d \( -name '@eaDir' -o -name '.AppleDouble' -o -name '.Spotlight-V100' -o -name '.Trashes' \) -print0 >> "$DIRS_NUL" 2>/dev/null || true
-        # recycle contents (if opted-in) — DO NOT include the folder itself
-        if [ "$INCLUDE_RECYCLE" -eq 1 ]; then
-          # collect '#recycle' directories
-          find "$root" -type d -name '#recycle' -print0 >> "$RECYCLE_NUL" 2>/dev/null || true
-        fi
-      else
-        echo "[WARN] Path not found (skipped): $root" >&2
-        warned=1
-      fi
-    done < "$ROOTS_TMP"
+count=$(wc -l < "$LISTFILE" | tr -d ' ')
+[ "$count" -eq 0 ] && { echo "[INFO] No junk files found."; exit 0; }
 
-    # Expand recycle contents into FILES_NUL & DIRS_NUL (mindepth 1)
-    if [ "$INCLUDE_RECYCLE" -eq 1 ]; then
-      # shellcheck disable=SC2162
-      while IFS= read -r -d '' rdir; do
-        find "$rdir" -mindepth 1 -type f -print0 >> "$FILES_NUL" 2>/dev/null || true
-        find "$rdir" -mindepth 1 -type d -print0 >> "$DIRS_NUL" 2>/dev/null || true
-      done < "$RECYCLE_NUL"
-    fi
+# Collect sizes
+TMP="$LISTFILE.sizes"
+: > "$TMP"
+total=0
+while IFS= read -r f; do
+  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  total=$((total + sz))
+  printf "%s\t%s\n" "$sz" "$f" >> "$TMP"
+done < "$LISTFILE"
 
-    if [ "$count_roots" -eq 0 ]; then
-      echo "[ERROR] No valid roots to scan." >&2
-      rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
-      exit 1
-    fi
+total_hr=$(human_size "$total")
+echo "[INFO] Junk candidates found: $count files, total size ~ $total_hr."
 
-    files_count="$(tr -cd '\0' < "$FILES_NUL" | wc -c | tr -d ' ' || echo 0)"
-    dirs_count="$(tr -cd '\0' < "$DIRS_NUL" | wc -c | tr -d ' ' || echo 0)"
+if [ "$count" -le 25 ]; then
+  echo
+  echo "The following files are marked as junk and can be deleted:"
+  echo "( sizes are approximate )"
+  echo "---------------------------------------------------------"
+  printf "   %s  %s\n" "Size" "Path"
+  printf "--------  ---------------------------------------------------------------\n"
+  sort -nr -k1,1 "$TMP" | while IFS=$(printf '\t') read -r s p; do
+    printf "%8s  %s\n" "$(human_size "$s")" "$p"
+  done
+  printf "--------  ---------------------------------------------------------------\n"
+  echo "Total: $count files, ~$total_hr"
+  echo "---------------------------------------------------------"
+else
+  echo
+  echo "[INFO] List is long ($count files). Showing top 10 by size:"
+  printf "   %s  %s\n" "Size" "Path"
+  printf "--------  ---------------------------------------------------------------\n"
+  sort -nr -k1,1 "$TMP" | head -n 10 | while IFS=$(printf '\t') read -r s p; do
+    printf "%8s  %s\n" "$(human_size "$s")" "$p"
+  done
+  printf "--------  ---------------------------------------------------------------\n"
+  echo
+  echo "Full list saved to: $LISTFILE"
+fi
 
-    echo "[INFO] Roots: $count_roots  | Junk files: $files_count  | Junk dirs: $dirs_count"
-    [ "$warned" -eq 1 ] && echo "[INFO] Some listed roots were missing (see warnings above)."
+# confirm
+if [ "$DRY" -eq 1 ]; then
+  echo "[INFO] Dry run only. No deletions performed."
+  exit 0
+fi
 
-    if [ "$ACTION" = "verify" ] || [ "$ACTION" = "dry" ]; then
-      echo "[INFO] Dry-run / verify mode — no changes will be made."
-      echo "Sample files:"
-      tr '\0' '\n' < "$FILES_NUL" | head -n 20 || true
-      echo "Sample dirs:"
-      tr '\0' '\n' < "$DIRS_NUL" | head -n 20 || true
-      rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
-      exit 0
-    fi
+if [ "$FORCE" -eq 0 ]; then
+  printf "Proceed to DELETE these %s junk files (~%s)? [y/N] " "$count" "$total_hr"
+  read ans
+  case "$ans" in y|Y|yes|YES) ;; *) echo "[INFO] Aborted."; exit 0 ;; esac
+fi
 
-    LOG_DEL="$LOGS/junk-deletions-$(date +%Y%m%d-%H%M%S).log"
-    touch "$LOG_DEL"
+echo "[INFO] Deleting junk files…"
+del=0
+while IFS=$(printf '\t') read -r s p; do
+  rm -f -- "$p" 2>/dev/null || true
+  del=$((del + 1))
+done < "$TMP"
 
-    if [ "$ACTION" = "quarantine" ]; then
-      [ -n "$QUAR" ] || QUAR="$OUTDIR"
-      mkdir -p "$QUAR"
-      echo "[INFO] Quarantine: $QUAR"
-    fi
-
-    deleted=0
-    moved=0
-
-    # Preserve relative layout within a base
-    move_preserve() {
-      src="$1"; base="$2"; dest="$3"
-      case "$src" in "$base"/*) rel="${src#$base/}" ;; *) rel="$(basename "$src")" ;; esac
-      dest_path="$dest/$rel"
-      mkdir -p "$(dirname "$dest_path")" 2>/dev/null || true
-      mv -f -- "$src" "$dest_path" && moved=$((moved+1)) && echo "$src -> $dest_path" >> "$LOG_DEL"
-    }
-
-    # files
-    while IFS= read -r -d '' f; do
-      if [ "$ACTION" = "force" ]; then
-        rm -f -- "$f" && deleted=$((deleted+1)) && echo "DEL $f" >> "$LOG_DEL"
-      else
-        base=""
-        while IFS= read -r r || [ -n "$r" ]; do case "$f" in "$r"/*) base="$r"; break;; esac; done < "$ROOTS_TMP"
-        move_preserve "$f" "${base:-$ROOT}" "$QUAR"
-      fi
-    done < "$FILES_NUL"
-
-    # dirs (after files) — never delete/move '#recycle' itself
-    while IFS= read -r -d '' d; do
-      case "$d" in *"/#recycle") continue;; esac
-      if [ "$ACTION" = "force" ]; then
-        rm -rf -- "$d" && deleted=$((deleted+1)) && echo "RMDIR $d" >> "$LOG_DEL"
-      else
-        base=""
-        while IFS= read -r r || [ -n "$r" ]; do case "$d" in "$r"/*) base="$r"; break;; esac; done < "$ROOTS_TMP"
-        move_preserve "$d" "${base:-$ROOT}" "$QUAR"
-      fi
-    done < "$DIRS_NUL"
-
-    echo "[INFO] Completed. Deleted: $deleted  Moved: $moved"
-    echo "[INFO] Log: $LOG_DEL"
-
-    rm -f "$ROOTS_TMP" "$FILES_NUL" "$DIRS_NUL" "$RECYCLE_NUL"
+echo "[INFO] Junk deletion complete."
+echo "[INFO] Deleted: $del files."
