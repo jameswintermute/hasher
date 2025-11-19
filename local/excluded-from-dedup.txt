@@ -2,6 +2,6 @@
 # One extension per line, without leading dot, case-insensitive.
 # These files ARE hashed and included in stats, but never shown in review-duplicates.
 # Use this for functional assets where deduplication is risky.
-css
-js
-php
+#css
+#js
+#php
