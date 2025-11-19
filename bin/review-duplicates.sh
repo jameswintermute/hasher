@@ -3,6 +3,7 @@
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
+# Version: 1.1.3 — adds extension-based exclusions from duplicate review.
 
 set -eu
 
@@ -12,6 +13,7 @@ LOGS_DIR="$ROOT_DIR/logs";   mkdir -p "$LOGS_DIR"
 VAR_DIR="$ROOT_DIR/var";     mkdir -p "$VAR_DIR"
 LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 EXCEPTIONS_FILE="$LOCAL_DIR/exceptions-hashes.txt"
+EXCLUDE_DEDUP_EXT_FILE="$LOCAL_DIR/excluded-from-dedup.txt"
 
 REPORT_DEFAULT="$LOGS_DIR/duplicate-hashes-latest.txt"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
@@ -60,7 +62,7 @@ htime(){
   fi
 }
 
-# Exceptions handling
+# Exceptions handling (hash-based)
 clean_exceptions_file() {
   EXC_CLEAN="$VAR_DIR/exceptions-cleaned-$$.txt"
   if [ -f "$EXCEPTIONS_FILE" ]; then
@@ -126,6 +128,41 @@ add_to_exceptions() {
   esac
 }
 
+# ───────────────── Extension-based "ignore from dedup" ─────────────────
+
+EXCLUDE_DEDUP_EXT=""
+
+load_excluded_from_dedup() {
+  EXCLUDE_DEDUP_EXT=""
+  if [ -f "$EXCLUDE_DEDUP_EXT_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        ''|\#*) continue ;;
+      esac
+      ext_lc=$(printf '%s\n' "$line" | tr 'A-Z' 'a-z')
+      EXCLUDE_DEDUP_EXT="${EXCLUDE_DEDUP_EXT} ${ext_lc}"
+    done <"$EXCLUDE_DEDUP_EXT_FILE"
+  fi
+}
+
+is_excluded_from_dedup() {
+  # $1 = file path; returns 0 if extension should be hidden from review
+  path="$1"
+  base=${path##*/}
+
+  case "$base" in
+    *.*) ext=${base##*.} ;;
+    *)   return 1 ;;  # no extension → not excluded
+  esac
+
+  ext_lc=$(printf '%s\n' "$ext" | tr 'A-Z' 'a-z')
+
+  for e in $EXCLUDE_DEDUP_EXT; do
+    [ "$ext_lc" = "$e" ] && return 0
+  done
+  return 1
+}
+
 # Args
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -146,6 +183,9 @@ esac
 
 [ -r "$REPORT" ] || { error "Report not found: $REPORT"; exit 1; }
 touch "$PLAN_OUT" 2>/dev/null || { error "Cannot write plan: $PLAN_OUT"; exit 1; }
+
+# Load extension-based exclusions (if any)
+load_excluded_from_dedup
 
 count_groups() { grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0; }
 
@@ -333,6 +373,26 @@ present_group(){
   progress_review "$reviewed" "$SELECTED_TOTAL" "$files_seen" "$START_TS"
 
   cp "$CAPDIR/$gno" "$TMP_GROUP" 2>/dev/null || : >"$TMP_GROUP"
+
+  # Apply extension-based filtering for duplicate review
+  : >"$ORDERED"
+  while IFS= read -r fp; do
+    [ -z "$fp" ] && continue
+    if is_excluded_from_dedup "$fp"; then
+      continue
+    fi
+    printf "%s\n" "$fp" >>"$ORDERED"
+  done <"$TMP_GROUP"
+  cp "$ORDERED" "$TMP_GROUP"
+
+  # If group is empty after filtering, skip it
+  if [ ! -s "$TMP_GROUP" ]; then
+    echo
+    echo "   -> Skipping group $gno (all files excluded by extension rules for duplicate review)."
+    : >"$TMP_GROUP"; : >"$ORDERED"
+    return 0
+  fi
+
   cat "$TMP_GROUP" | order_group >"$ORDERED" 2>/dev/null || cp "$TMP_GROUP" "$ORDERED"
 
   echo; echo
@@ -358,7 +418,13 @@ present_group(){
   fi
 
   files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
-  [ "$files_in_group" -gt 0 ] || return 0
+  if [ "$files_in_group" -lt 2 ]; then
+    echo
+    echo "   -> Skipping group $gno (only $files_in_group file remains after extension-based filters)."
+    files_seen=$((files_seen + files_in_group))
+    : >"$TMP_GROUP"; : >"$ORDERED"
+    return 0
+  fi
 
   # --- SAFER INPUT LOOP ---
   while :; do
