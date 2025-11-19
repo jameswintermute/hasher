@@ -1,10 +1,8 @@
 #!/bin/sh
+# review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
 # Hasher — NAS File Hasher & Duplicate Finder
-# Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
-# This program comes with ABSOLUTELY NO WARRANTY.
-# Version: 1.1.3 — adds extension-based exclusions from duplicate review.
-
+# Version: 1.1.3 (hash exceptions, safer input, size '??' when stat fails)
+#
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -13,7 +11,6 @@ LOGS_DIR="$ROOT_DIR/logs";   mkdir -p "$LOGS_DIR"
 VAR_DIR="$ROOT_DIR/var";     mkdir -p "$VAR_DIR"
 LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 EXCEPTIONS_FILE="$LOCAL_DIR/exceptions-hashes.txt"
-EXCLUDE_DEDUP_EXT_FILE="$LOCAL_DIR/excluded-from-dedup.txt"
 
 REPORT_DEFAULT="$LOGS_DIR/duplicate-hashes-latest.txt"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
@@ -62,7 +59,10 @@ htime(){
   fi
 }
 
-# Exceptions handling (hash-based)
+# Global flag: have we warned about size lookup issues?
+SIZE_WARNED=0
+
+# Exceptions handling
 clean_exceptions_file() {
   EXC_CLEAN="$VAR_DIR/exceptions-cleaned-$$.txt"
   if [ -f "$EXCEPTIONS_FILE" ]; then
@@ -84,7 +84,10 @@ hash_is_exception() {
 
 human_size(){
   b="${1:-0}"
-  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+  case "$b" in
+    -1) printf "??"; return 0 ;;  # unknown / could not stat
+    ''|*[!0-9]*) b=0 ;;
+  esac
   if [ "$b" -ge 1073741824 ] 2>/dev/null; then
     printf "%.1fG" "$(awk "BEGIN{print $b/1073741824}")"
   elif [ "$b" -ge 1048576 ] 2>/dev/null; then
@@ -128,41 +131,6 @@ add_to_exceptions() {
   esac
 }
 
-# ───────────────── Extension-based "ignore from dedup" ─────────────────
-
-EXCLUDE_DEDUP_EXT=""
-
-load_excluded_from_dedup() {
-  EXCLUDE_DEDUP_EXT=""
-  if [ -f "$EXCLUDE_DEDUP_EXT_FILE" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        ''|\#*) continue ;;
-      esac
-      ext_lc=$(printf '%s\n' "$line" | tr 'A-Z' 'a-z')
-      EXCLUDE_DEDUP_EXT="${EXCLUDE_DEDUP_EXT} ${ext_lc}"
-    done <"$EXCLUDE_DEDUP_EXT_FILE"
-  fi
-}
-
-is_excluded_from_dedup() {
-  # $1 = file path; returns 0 if extension should be hidden from review
-  path="$1"
-  base=${path##*/}
-
-  case "$base" in
-    *.*) ext=${base##*.} ;;
-    *)   return 1 ;;  # no extension → not excluded
-  esac
-
-  ext_lc=$(printf '%s\n' "$ext" | tr 'A-Z' 'a-z')
-
-  for e in $EXCLUDE_DEDUP_EXT; do
-    [ "$ext_lc" = "$e" ] && return 0
-  done
-  return 1
-}
-
 # Args
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -183,9 +151,6 @@ esac
 
 [ -r "$REPORT" ] || { error "Report not found: $REPORT"; exit 1; }
 touch "$PLAN_OUT" 2>/dev/null || { error "Cannot write plan: $PLAN_OUT"; exit 1; }
-
-# Load extension-based exclusions (if any)
-load_excluded_from_dedup
 
 count_groups() { grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0; }
 
@@ -233,13 +198,27 @@ file_mtime(){
   date -r "$f" +%s 2>/dev/null && return 0 || true
   echo 0
 }
+
 file_size(){
   f="$1"
-  stat -c %s "$f" 2>/dev/null && return 0 || true
-  busybox stat -c %s "$f" 2>/dev/null && return 0 || true
-  stat -f %z "$f" 2>/dev/null && return 0 || true
-  wc -c <"$f" 2>/dev/null | tr -d ' ' || echo 0
+  sz=""
+  sz="$(stat -c %s "$f" 2>/dev/null || true)"
+  [ -z "$sz" ] && sz="$(busybox stat -c %s "$f" 2>/dev/null || true)"
+  [ -z "$sz" ] && sz="$(stat -f %z "$f" 2>/dev/null || true)"
+  if [ -z "$sz" ]; then
+    # wc -c fallback
+    sz="$(wc -c <"$f" 2>/dev/null | tr -d ' ' || true)"
+  fi
+  if [ -z "$sz" ]; then
+    sz="-1"
+    if [ "$SIZE_WARNED" -eq 0 ]; then
+      warn "Unable to stat some files (e.g. $f); sizes will show as '??' and potential savings may be approximate."
+      SIZE_WARNED=1
+    fi
+  fi
+  printf "%s" "$sz"
 }
+
 path_len(){ printf "%s" "$1" | wc -c | tr -d ' '; }
 
 order_group(){
@@ -288,9 +267,9 @@ EXC_CLEAN="$(clean_exceptions_file)"
 
 # PASS 1: index potential savings
 INDEX_FILE="$(mktemp "$VAR_DIR/revindex.XXXXXX")"
-# We will also include hash in column 5 so we can use it later
-trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" "$CAPDIR"/* "$EXC_CLEAN" 2>/dev/null || true; rmdir "$CAPDIR" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" 2>/dev/null || true; rm -rf "$CAPDIR" 2>/dev/null || true; rm -f "$EXC_CLEAN" 2>/dev/null || true' EXIT INT TERM
 
+# We will also include hash in column 5 so we can use it later
 gno=0; in_group=0; N=0; first_path=""; CUR_HASH=""
 grab_N(){ echo "$1" | sed -n 's/.*(N=\([0-9][0-9]*\)).*/\1/p'; }
 grab_hash(){ echo "$1" | awk '{print $2}'; }
@@ -300,13 +279,17 @@ info "Indexing duplicate groups (potential savings)…"
 
 finish_group_index(){
   if [ "$in_group" -eq 1 ] && [ -n "${first_path:-}" ] && ! hash_is_exception "$CUR_HASH" "$EXC_CLEAN"; then
-    sz="$(file_size "$first_path" 2>/dev/null || echo 0)"; [ -z "$N" ] && N=2; [ -z "$sz" ] && sz=0
-    pot=$(( ( ${N:-2} - 1 ) * ${sz:-0} ))
-    # fields: group_no, potential_bytes, N, first_path, hash
-    printf "%d\t%llu\t%d\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" >>"$INDEX_FILE"
+    sz="$(file_size "$first_path" 2>/dev/null || echo -1)"
+    [ -z "$N" ] && N=2
+    # If size lookup failed, treat as 0 for potential calculation
+    case "$sz" in ''|-1|*[!0-9]*) sz_calc=0 ;; *) sz_calc="$sz" ;; esac
+    pot=$(( ( ${N:-2} - 1 ) * ${sz_calc:-0} ))
+    # fields: group_no, potential_bytes, N, first_path, hash, base_size
+    printf "%d\t%llu\t%d\t%s\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" "$sz" >>"$INDEX_FILE"
   fi
 }
 
+# shellcheck disable=SC2162
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     HASH\ *)
@@ -334,7 +317,8 @@ SELECTED_TOTAL="$(wc -l <"$TOP_FILE" | tr -d ' ')"
 # Build a fast lookup (space-delimited) and per-group temp files dir
 SELECTED_MAP=" "
 CAPDIR="$(mktemp -d "$VAR_DIR/revcap.XXXXXX")"
-while IFS= read -r row; do
+# shellcheck disable=SC2162
+while IFS= read -r row || [ -n "$row" ]; do
   g="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
   [ -n "$g" ] && SELECTED_MAP="$SELECTED_MAP$g "
 done <"$TOP_FILE"
@@ -344,6 +328,7 @@ cap_started="$(date +%s)"
 captured=0
 info "Capturing selected groups…"
 gno=0; in_group=0; cur_gno=0
+# shellcheck disable=SC2162
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     HASH\ *)
@@ -373,58 +358,42 @@ present_group(){
   progress_review "$reviewed" "$SELECTED_TOTAL" "$files_seen" "$START_TS"
 
   cp "$CAPDIR/$gno" "$TMP_GROUP" 2>/dev/null || : >"$TMP_GROUP"
-
-  # Apply extension-based filtering for duplicate review
-  : >"$ORDERED"
-  while IFS= read -r fp; do
-    [ -z "$fp" ] && continue
-    if is_excluded_from_dedup "$fp"; then
-      continue
-    fi
-    printf "%s\n" "$fp" >>"$ORDERED"
-  done <"$TMP_GROUP"
-  cp "$ORDERED" "$TMP_GROUP"
-
-  # If group is empty after filtering, skip it
-  if [ ! -s "$TMP_GROUP" ]; then
-    echo
-    echo "   -> Skipping group $gno (all files excluded by extension rules for duplicate review)."
-    : >"$TMP_GROUP"; : >"$ORDERED"
-    return 0
-  fi
-
   cat "$TMP_GROUP" | order_group >"$ORDERED" 2>/dev/null || cp "$TMP_GROUP" "$ORDERED"
 
   echo; echo
   first="$(head -n1 "$ORDERED" 2>/dev/null || true)"
   base_size=0; Nval=2; group_hash=""
-  [ -n "$first" ] && base_size="$(file_size "$first" 2>/dev/null || echo 0)"
+  if [ -n "$first" ]; then
+    # Prefer size recorded in INDEX_FILE; fall back to fresh stat
+    base_size="$(awk -v g="$gno" -F'\t' '$1==g{print $6}' "$INDEX_FILE" 2>/dev/null | head -n1)"
+    case "$base_size" in ''|-1) base_size="$(file_size "$first" 2>/dev/null || echo -1)" ;; esac
+  fi
   Nval="$(awk -v g="$gno" -F'\t' '$1==g{print $3}' "$INDEX_FILE" 2>/dev/null | head -n1)"; [ -z "$Nval" ] && Nval=2
   group_hash="$(awk -v g="$gno" -F'\t' '$1==g{print $5}' "$INDEX_FILE" 2>/dev/null | head -n1)"
-  pot=$(( (Nval - 1) * base_size ))
+  # Potential savings calculation treats unknown size as 0
+  case "$base_size" in ''|-1|*[!0-9]*) pot=0 ;; *) pot=$(( (Nval - 1) * base_size )) ;; esac
   printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n" \
     "$C1" "$reviewed" "$SELECTED_TOTAL" "$C0" "$ORDER" \
     "$(human_size "$pot")" "$Nval" "$(human_size "$base_size")"
 
   i=0
   if [ "$ORDER" = "size" ] || [ "$ORDER" = "sizesmall" ]; then
-    while IFS= read -r fp; do
-      i=$((i+1)); sz="$(file_size "$fp" 2>/dev/null || echo 0)"; hs="$(human_size "$sz")"
+    # shellcheck disable=SC2162
+    while IFS= read -r fp || [ -n "$fp" ]; do
+      i=$((i+1))
+      sz="$(file_size "$fp" 2>/dev/null || echo -1)"
+      hs="$(human_size "$sz")"
       printf "  %2d) %-8s  %s\n" "$i" "[$hs]" "$fp"
     done <"$ORDERED"
   else
-    while IFS= read -r fp; do
-      i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"; done <"$ORDERED"
+    # shellcheck disable=SC2162
+    while IFS= read -r fp || [ -n "$fp" ]; do
+      i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"
+    done <"$ORDERED"
   fi
 
   files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
-  if [ "$files_in_group" -lt 2 ]; then
-    echo
-    echo "   -> Skipping group $gno (only $files_in_group file remains after extension-based filters)."
-    files_seen=$((files_seen + files_in_group))
-    : >"$TMP_GROUP"; : >"$ORDERED"
-    return 0
-  fi
+  [ "$files_in_group" -gt 0 ] || return 0
 
   # --- SAFER INPUT LOOP ---
   while :; do
@@ -480,7 +449,8 @@ present_group(){
         fi
         case "$confirm" in
           [yY])
-            while IFS= read -r fp; do
+            # shellcheck disable=SC2162
+            while IFS= read -r fp || [ -n "$fp" ]; do
               [ -z "$fp" ] && continue
               printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
             done <"$ORDERED"
@@ -506,7 +476,8 @@ present_group(){
             else
               # KEEP selected index, DELETE others
               idx=0
-              while IFS= read -r fp; do
+              # shellcheck disable=SC2162
+              while IFS= read -r fp || [ -n "$fp" ]; do
                 [ -z "$fp" ] && continue
                 idx=$((idx+1))
                 if [ "$idx" -eq "$sel" ]; then
@@ -529,7 +500,8 @@ present_group(){
   : >"$TMP_GROUP"; : >"$ORDERED"
 }
 
-while IFS= read -r row; do
+# shellcheck disable=SC2162
+while IFS= read -r row || [ -n "$row" ]; do
   g="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
   [ -s "$CAPDIR/$g" ] && present_group "$g"
 done <"$TOP_FILE"
