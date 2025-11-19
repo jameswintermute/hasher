@@ -4,3 +4,4 @@
 # Use this for functional assets where deduplication is risky.
 css
 js
+php
