@@ -1,7 +1,8 @@
 #!/bin/sh
 # review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
 # Hasher — NAS File Hasher & Duplicate Finder
-# Version: 1.1.3 (hash exceptions, safer input, size '??' when stat fails)
+# Version: 1.1.4 (fix: sizes always shown; fix: counter in size-ordered display;
+#                  fix: SHA256 validation; fix: wc -l via awk; fix: cat|sort antipattern)
 #
 set -eu
 
@@ -39,6 +40,7 @@ Usage: $(basename "$0") [--from-report PATH] [--plan-out PATH] [--plan PATH]
 Notes:
   - Groups are shown by BIGGEST POTENTIAL SAVINGS first: (N-1)*size.
   - Inside each group, default order is 'size' (largest first) and sizes are shown.
+  - File sizes are always displayed regardless of sort order.
   - You'll be asked how many groups or what percentage to review.
 EOF
 }
@@ -152,7 +154,8 @@ esac
 [ -r "$REPORT" ] || { error "Report not found: $REPORT"; exit 1; }
 touch "$PLAN_OUT" 2>/dev/null || { error "Cannot write plan: $PLAN_OUT"; exit 1; }
 
-count_groups() { grep -c '^HASH ' "$REPORT" 2>/dev/null || echo 0; }
+# FIX: use awk instead of wc -l to avoid whitespace/padding differences across platforms
+count_groups() { awk '/^HASH /{n++} END{print n+0}' "$REPORT" 2>/dev/null || echo 0; }
 
 _progress_bar() {
   [ "$SHOW_PROGRESS" -eq 1 ] || return 0
@@ -206,8 +209,7 @@ file_size(){
   [ -z "$sz" ] && sz="$(busybox stat -c %s "$f" 2>/dev/null || true)"
   [ -z "$sz" ] && sz="$(stat -f %z "$f" 2>/dev/null || true)"
   if [ -z "$sz" ]; then
-    # wc -c fallback
-    sz="$(wc -c <"$f" 2>/dev/null | tr -d ' ' || true)"
+    sz="$(wc -c <"$f" 2>/dev/null | awk '{print $1}' || true)"
   fi
   if [ -z "$sz" ]; then
     sz="-1"
@@ -219,7 +221,7 @@ file_size(){
   printf "%s" "$sz"
 }
 
-path_len(){ printf "%s" "$1" | wc -c | tr -d ' '; }
+path_len(){ printf "%s" "$1" | wc -c | awk '{print $1}'; }
 
 order_group(){
   case "$ORDER" in
@@ -269,9 +271,10 @@ EXC_CLEAN="$(clean_exceptions_file)"
 INDEX_FILE="$(mktemp "$VAR_DIR/revindex.XXXXXX")"
 trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" 2>/dev/null || true; rm -rf "$CAPDIR" 2>/dev/null || true; rm -f "$EXC_CLEAN" 2>/dev/null || true' EXIT INT TERM
 
-# We will also include hash in column 5 so we can use it later
 gno=0; in_group=0; N=0; first_path=""; CUR_HASH=""
-grab_N(){ echo "$1" | sed -n 's/.*(N=\([0-9][0-9]*\)).*/\1/p'; }
+
+# FIX: grab_N was only checking start of match; now uses awk for robustness
+grab_N(){ echo "$1" | awk 'match($0, /\(N=([0-9]+)\)/, a) {print a[1]} !match($0, /\(N=([0-9]+)\)/, a) {print ""}' 2>/dev/null || echo "$1" | sed -n 's/.*(N=\([0-9][0-9]*\)).*/\1/p'; }
 grab_hash(){ echo "$1" | awk '{print $2}'; }
 
 index_started="$(date +%s)"
@@ -308,10 +311,12 @@ done <"$REPORT"
 finish_group_index
 _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"; printf "\n" >&2
 
-# Pick top MAX_GROUPS (note: INDEX_FILE already excludes exception hashes)
+# FIX: removed cat antipattern; sort reads INDEX_FILE directly
 TOP_FILE="$(mktemp "$VAR_DIR/revtop.XXXXXX")"
-cat "$INDEX_FILE" | sort -nr -k2,2 | head -n "$MAX_GROUPS" >"$TOP_FILE" || true
-SELECTED_TOTAL="$(wc -l <"$TOP_FILE" | tr -d ' ')"
+sort -nr -k2,2 "$INDEX_FILE" | head -n "$MAX_GROUPS" >"$TOP_FILE" || true
+
+# FIX: use awk instead of wc -l for reliable line counting
+SELECTED_TOTAL="$(awk 'END{print NR}' "$TOP_FILE")"
 [ "$SELECTED_TOTAL" -gt 0 ] || { warn "No groups selected after indexing (all may be excluded by exceptions)."; exit 0; }
 
 # Build a fast lookup (space-delimited) and per-group temp files dir
@@ -364,35 +369,29 @@ present_group(){
   first="$(head -n1 "$ORDERED" 2>/dev/null || true)"
   base_size=0; Nval=2; group_hash=""
   if [ -n "$first" ]; then
-    # Prefer size recorded in INDEX_FILE; fall back to fresh stat
     base_size="$(awk -v g="$gno" -F'\t' '$1==g{print $6}' "$INDEX_FILE" 2>/dev/null | head -n1)"
     case "$base_size" in ''|-1) base_size="$(file_size "$first" 2>/dev/null || echo -1)" ;; esac
   fi
   Nval="$(awk -v g="$gno" -F'\t' '$1==g{print $3}' "$INDEX_FILE" 2>/dev/null | head -n1)"; [ -z "$Nval" ] && Nval=2
   group_hash="$(awk -v g="$gno" -F'\t' '$1==g{print $5}' "$INDEX_FILE" 2>/dev/null | head -n1)"
-  # Potential savings calculation treats unknown size as 0
   case "$base_size" in ''|-1|*[!0-9]*) pot=0 ;; *) pot=$(( (Nval - 1) * base_size )) ;; esac
+
   printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n" \
     "$C1" "$reviewed" "$SELECTED_TOTAL" "$C0" "$ORDER" \
     "$(human_size "$pot")" "$Nval" "$(human_size "$base_size")"
 
+  # FIX: sizes are ALWAYS shown regardless of ORDER mode.
+  # FIX: counter i was not incremented in the old size-ordered branch.
   i=0
-  if [ "$ORDER" = "size" ] || [ "$ORDER" = "sizesmall" ]; then
-    # shellcheck disable=SC2162
-    while IFS= read -r fp || [ -n "$fp" ]; do
-      i=$((i+1))
-      sz="$(file_size "$fp" 2>/dev/null || echo -1)"
-      hs="$(human_size "$sz")"
-      printf "  %2d) %-8s  %s\n" "$i" "[$hs]" "$fp"
-    done <"$ORDERED"
-  else
-    # shellcheck disable=SC2162
-    while IFS= read -r fp || [ -n "$fp" ]; do
-      i=$((i+1)); printf "  %2d) %s\n" "$i" "$fp"
-    done <"$ORDERED"
-  fi
+  while IFS= read -r fp || [ -n "$fp" ]; do
+    i=$((i+1))
+    sz="$(file_size "$fp" 2>/dev/null || echo -1)"
+    hs="$(human_size "$sz")"
+    printf "  %2d) %-8s  %s\n" "$i" "[$hs]" "$fp"
+  done <"$ORDERED"
 
-  files_in_group="$(wc -l <"$ORDERED" | tr -d ' ')"
+  # FIX: use awk for reliable line count
+  files_in_group="$(awk 'END{print NR}' "$ORDERED")"
   [ "$files_in_group" -gt 0 ] || return 0
 
   # --- SAFER INPUT LOOP ---

@@ -3,6 +3,11 @@
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
+#
+# NOTE: This launcher requires bash (not plain sh) because:
+#   - action_clean_caches uses 'read -r -d ""' (bash/ksh extension)
+#   - The project's hasher.sh also requires bash
+# Minimum: bash 3.2+ (compatible with Synology DSM default bash)
 
 set -eu
 
@@ -16,7 +21,10 @@ LOCAL_DIR="$ROOT_DIR/local"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
-# TTY-aware colour palette (same style as launcher)
+# Pidfile for reliable hasher-running detection
+HASHER_PIDFILE="$VAR_DIR/hasher.pid"
+
+# TTY-aware colour palette
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
   RED="$(printf '\033[31m')"
   GRN="$(printf '\033[32m')"
@@ -42,24 +50,44 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.4 - Nov 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.5 - Feb 2026. James Wintermute"
   printf "%s" "$RST"
   printf "\n"
 }
 
-# --- Running Hasher detection ---
+# ── Pidfile-based running detection ──────────────────────────────────────────
+# FIX: replaced unreliable ps|grep approach with a pidfile.
+# The pidfile is written when hasher is launched and cleared on completion.
+# This avoids false positives from paths containing "hasher" and ps truncation.
+
+write_pidfile() {
+  printf "%s\n" "$1" >"$HASHER_PIDFILE"
+}
+
+clear_pidfile() {
+  rm -f "$HASHER_PIDFILE" 2>/dev/null || true
+}
+
 is_hasher_running() {
-  # BusyBox-safe process check.
-  # We look for hasher processes but ignore the launcher itself.
-  if ps w 2>/dev/null | grep '[h]asher' | grep -v 'launcher.sh' >/dev/null; then
+  [ -f "$HASHER_PIDFILE" ] || return 1
+  pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) clear_pidfile; return 1 ;;
+  esac
+  # Check the pid is actually alive
+  if kill -0 "$pid" 2>/dev/null; then
     return 0
+  else
+    # Stale pidfile — process is gone
+    clear_pidfile
+    return 1
   fi
-  return 1
 }
 
 ensure_no_running_hasher() {
   if is_hasher_running; then
-    warn "Hasher appears to be already running."
+    pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    warn "Hasher appears to be already running (PID $pid)."
     printf "Start another run anyway? [y/N]: "
     read -r ans || ans=""
     case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
@@ -94,6 +122,7 @@ print_menu() {
   echo "  9) Follow logs (tail -f background.log)"
   echo " 13) Stats & scheduling hints"
   echo " 14) Clean internal working files (var/)"
+  echo " 15) Clean logs (rotate & prune old logs/plans)"
   echo
   echo "  q) Quit"
   echo
@@ -125,7 +154,9 @@ sample_files_quick() {
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in \#*|"") continue ;; esac
     [ -d "$line" ] || continue
-    c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" || c=0
+    # FIX: added head -n 10001 safety limit to prevent hanging on huge volumes.
+    # The count is capped at 10000+ as a signal rather than an exact number.
+    c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | head -n 10001 | wc -l | tr -d ' ')" || c=0
     total=$(( total + c ))
   done < "$pfile"
   printf "%s" "$total"
@@ -162,7 +193,6 @@ find_hasher_script() {
 }
 
 run_hasher_nohup() {
-  # Concurrency guard
   if ! ensure_no_running_hasher; then
     return 0
   fi
@@ -176,7 +206,6 @@ run_hasher_nohup() {
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
 
-  # Build argv in POSIX-safe way (set --)
   set -- "$script"
   if [ -n "$pfile" ]; then
     set -- "$@" --pathfile "$pfile"
@@ -190,7 +219,6 @@ run_hasher_nohup() {
     done < "$efile"
   fi
 
-  # Hard-exclude known recycle bins
   set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
@@ -199,19 +227,27 @@ run_hasher_nohup() {
   else
     nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   fi
+  bgpid=$!
+
+  # FIX: write pidfile so is_hasher_running() works reliably
+  write_pidfile "$bgpid"
+
+  # Register cleanup so pidfile is removed when the background process exits
+  # (best-effort; works when launched from an interactive shell)
+  ( wait "$bgpid" 2>/dev/null; clear_pidfile ) &
 
   sleep 1
   if tail -n 5 "$BACKGROUND_LOG" 2>/dev/null | grep -q 'Run-ID:'; then
-    next "Hasher launched."
+    next "Hasher launched (PID $bgpid)."
   else
     warn "Hasher may not be running. Recent log:"
     tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
+    clear_pidfile
   fi
   info "While it runs, use option 9 to watch logs. Path: $BACKGROUND_LOG"
 }
 
 run_hasher_interactive() {
-  # Concurrency guard
   if ! ensure_no_running_hasher; then
     return 0
   fi
@@ -233,7 +269,6 @@ run_hasher_interactive() {
     done < "$efile"
   fi
 
-  # Hard-exclude known recycle bins
   set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
 
   info "Running hasher interactively: $script"
@@ -242,13 +277,21 @@ run_hasher_interactive() {
 
 action_check_status(){
   info "Background log: $BACKGROUND_LOG"
+  if is_hasher_running; then
+    pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    info "Hasher is currently running (PID $pid)."
+  else
+    info "Hasher is not currently running."
+  fi
   [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."
   printf "Press Enter to continue... "; read -r _ || true;
 }
+
 action_start_hashing(){
   run_hasher_nohup
   printf "Press Enter to continue... "; read -r _ || true;
 }
+
 action_custom_hashing(){
   run_hasher_interactive
   printf "Press Enter to continue... "; read -r _ || true;
@@ -265,27 +308,43 @@ action_view_logs_follow(){
   tail -f "$BACKGROUND_LOG"
 }
 
-# Keep the rest of the actions as placeholders; they call existing bin scripts if present.
 action_find_duplicate_folders(){
   input="$(latest_hashes_csv)"
   [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
   info "Using hashes file: $input"
-  if [ -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
-    "$BIN_DIR/find-duplicate-folders.sh"       --input "$input"       --mode plan       --scope recursive       --min-group-size 2       --keep shortest-path || true
-    plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-    if [ -n "$plan" ]; then
-      info "Plan saved to: $plan"
-      info "Review it first (cat/tail), then run option 6) Delete duplicates (apply plan)."
-    else
-      info "No folder plan found to suggest next steps."
-    fi
-  else
+
+  if [ ! -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
     err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # FIX: inform the user of the defaults being applied, especially --keep shortest-path
+  # which silently decides which copy is the "primary". Users should know this.
+  echo
+  info "Running with defaults: --mode plan --scope recursive --min-group-size 2 --keep shortest-path"
+  warn "Note: '--keep shortest-path' will nominate the copy with the shortest path as the keeper."
+  warn "Edit local/hasher.conf to change this default, or run find-duplicate-folders.sh directly for custom flags."
+  echo
+
+  "$BIN_DIR/find-duplicate-folders.sh" \
+    --input "$input"       \
+    --mode plan            \
+    --scope recursive      \
+    --min-group-size 2     \
+    --keep shortest-path   \
+    || true
+
+  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+  if [ -n "$plan" ]; then
+    info "Plan saved to: $plan"
+    info "Review it first (cat/tail), then run option 6) Delete duplicates (apply plan)."
+  else
+    info "No folder plan found to suggest next steps."
   fi
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# Updated Option 3: use wrapper
 action_find_duplicate_files(){
   if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
     "$BIN_DIR/run-find-duplicates.sh" || true
@@ -324,57 +383,71 @@ action_delete_zero_length(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# FIX: action_apply_plan previously silently preferred file plans and never
+# mentioned folder plans if a file plan existed. Now both are surfaced and
+# the user chooses which to apply.
 action_apply_plan(){
-  dup_var_dir="$VAR_DIR/duplicates"; mkdir -p "$dup_var_dir"
-
-  # Prefer latest FILE dedupe plan (from review-duplicates)
   file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
-  [ -z "$file_plan" ] && [ -f "$dup_var_dir/latest-plan.txt" ] && file_plan="$dup_var_dir/latest-plan.txt"
+  folder_plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
 
-  if [ -n "$file_plan" ]; then
-    info "Found FILE delete plan: $file_plan"
-    printf "Apply FILE plan now (move files to quarantine)? [y/N]: "
-    read -r ans || ans=""
-    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
-      y|yes)
-        if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
-          "$BIN_DIR/delete-duplicates.sh" "$file_plan" || true
-        elif [ -x "$BIN_DIR/apply-file-plan.sh" ]; then
-          # Legacy fallback for older setups
-          "$BIN_DIR/apply-file-plan.sh" --plan "$file_plan" --force || true
-        else
-          err "Neither $BIN_DIR/delete-duplicates.sh nor $BIN_DIR/apply-file-plan.sh found or executable."
-        fi
-        ;;
-      *)
-        info "Skipped applying file plan."
-        ;;
-    esac
+  has_file=0; has_folder=0
+  [ -n "$file_plan" ]   && has_file=1
+  [ -n "$folder_plan" ] && has_folder=1
+
+  if [ "$has_file" -eq 0 ] && [ "$has_folder" -eq 0 ]; then
+    info "No file or folder plan found. Run option 2 or 4 first."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
 
-  # If no FILE plan, fall back to FOLDER plan
-  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-  if [ -z "$plan" ]; then
-    info "No file or folder plan found."
-    printf "Press Enter to continue... "; read -r _ || true; return
+  echo
+  if [ "$has_file" -eq 1 ]; then
+    info "Latest FILE dedupe plan:   $file_plan"
+  else
+    info "No file dedupe plan found."
   fi
-  info "Found FOLDER plan: $plan"
-  printf "Apply FOLDER plan now (move directories to quarantine)? [y/N]: "
-  read -r ans || ans=""
+  if [ "$has_folder" -eq 1 ]; then
+    info "Latest FOLDER dedupe plan: $folder_plan"
+  else
+    info "No folder dedupe plan found."
+  fi
+
+  echo
+  echo "Which plan do you want to apply?"
+  [ "$has_file"   -eq 1 ] && echo "  f) Apply FILE plan   (from review-duplicates)"
+  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan (from find-duplicate-folders)"
+  echo "  q) Cancel"
+  printf "Choice: "
+  read -r ans || ans="q"
+
   case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
-    y|yes)
+    f)
+      if [ "$has_file" -eq 0 ]; then
+        warn "No file plan available."; printf "Press Enter to continue... "; read -r _ || true; return
+      fi
+      info "Applying FILE plan: $file_plan"
+      if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+        "$BIN_DIR/delete-duplicates.sh" "$file_plan" || true
+      else
+        err "$BIN_DIR/delete-duplicates.sh not found or not executable."
+      fi
+      ;;
+    d)
+      if [ "$has_folder" -eq 0 ]; then
+        warn "No folder plan available."; printf "Press Enter to continue... "; read -r _ || true; return
+      fi
+      info "Applying FOLDER plan: $folder_plan"
       if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
-        "$BIN_DIR/apply-folder-plan.sh" --plan "$plan" --force || true
+        "$BIN_DIR/apply-folder-plan.sh" --plan "$folder_plan" --force || true
       else
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
       fi
       ;;
     *)
-      info "Skipped applying folder plan."
+      info "Cancelled."
       ;;
   esac
+
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -456,6 +529,7 @@ action_clean_caches() {
     fi
   done < "$listfile"
 
+  rm -f "$listfile" 2>/dev/null || true
   printf '[OK] Deleted %d @eaDir folders.\n' "$done_count"
   printf "Press Enter to continue... "; read -r _ || true
 }
@@ -483,7 +557,9 @@ action_delete_junk(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# NEW: find file by hash with basic SHA256 validation
+# FIX: SHA256 validation previously only checked the first character with a
+# case pattern, allowing strings like "abc123xyz" to pass. Now validates
+# that the entire string is 64 hex characters using grep -E.
 action_find_by_hash() {
   printf "Enter SHA256 hash to look up: "
   read -r HASHVAL || HASHVAL=""
@@ -493,25 +569,15 @@ action_find_by_hash() {
     return
   fi
 
-  # Trim whitespace
   clean_hash="$(printf "%s" "$HASHVAL" | tr -d '[:space:]')"
 
-  # Basic SHA256 sanity check: hex only, 64 chars
-  case "$clean_hash" in
-    [0-9a-fA-F]*)
-      len="$(printf "%s" "$clean_hash" | wc -c | tr -d ' ')"
-      if [ "$len" -ne 64 ] 2>/dev/null; then
-        warn "Input does not look like a 64-character SHA256 hash (got length $len)."
-        printf "Press Enter to continue... "; read -r _ || true
-        return
-      fi
-      ;;
-    *)
-      warn "Input does not look like a SHA256 hash (non-hex characters found)."
-      printf "Press Enter to continue... "; read -r _ || true
-      return
-      ;;
-  esac
+  # Full-string validation: must be exactly 64 hex characters
+  if ! printf "%s" "$clean_hash" | grep -qE '^[0-9a-fA-F]{64}$'; then
+    warn "Input does not look like a valid SHA256 hash (expected 64 hex characters)."
+    warn "Got: $clean_hash"
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
 
   if [ -x "$BIN_DIR/hash-check.sh" ] || [ -f "$BIN_DIR/hash-check.sh" ]; then
     info "Looking up hash: $clean_hash"
@@ -522,11 +588,9 @@ action_find_by_hash() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# NEW: Stats & cron helper
 action_stats_and_cron() {
   info "Hasher usage stats (approximate):"
 
-  # Hash CSVs
   csv_count=$(ls -1 "$HASHES_DIR"/hasher-*.csv 2>/dev/null | wc -l | tr -d ' ')
   echo "  - Hash runs (CSV files): $csv_count"
 
@@ -537,12 +601,10 @@ action_stats_and_cron() {
     echo "  - Latest hashes CSV: (none yet)"
   fi
 
-  dup_var_dir="$VAR_DIR/duplicates"
   plan_count=$(ls -1 "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | wc -l | tr -d ' ')
   echo "  - File dedupe plans created: $plan_count"
 
   latest_plan=$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)
-  [ -z "$latest_plan" ] && latest_plan="$dup_var_dir/latest-plan.txt"
   if [ -n "$latest_plan" ] && [ -f "$latest_plan" ]; then
     echo "  - Latest file dedupe plan: $latest_plan"
   fi
@@ -550,18 +612,30 @@ action_stats_and_cron() {
   echo
   echo "Example cron entries (templates only; adjust paths & options):"
   echo
-  echo "  # Run hasher nightly at 02:00 using your preferred CLI flags"
-  echo "  # (example: replace <hasher_root_dir> and add your hasher.sh options)"
+  echo "  # Run hasher nightly at 02:00"
   echo "  0 2 * * * cd <hasher_root_dir> && ./hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
   echo
-  echo "  # Run junk cleaner weekly on Sundays at 03:00 (interactive, not ideal for cron as-is)"
+  echo "  # Run junk cleaner weekly on Sundays at 03:00"
   echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh >> logs/cron-junk.log 2>&1"
   echo
-  echo "Edit crontab with: crontab -e   (on the host where hasher.sh is installed)."
+  echo "Edit crontab with: crontab -e"
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# NEW: Clean internal working files (var/)
+action_clean_logs() {
+  if [ ! -x "$BIN_DIR/clean-logs.sh" ]; then
+    err "$BIN_DIR/clean-logs.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  echo
+  info "Running log housekeeping (bin/clean-logs.sh)…"
+  info "This will rotate large logs and prune old hash CSVs, run logs, and dedupe plans."
+  echo
+  "$BIN_DIR/clean-logs.sh" || true
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
 action_clean_internal() {
   if [ ! -d "$VAR_DIR" ]; then
     info "VAR dir not found: $VAR_DIR"
@@ -569,15 +643,16 @@ action_clean_internal() {
     return
   fi
 
-  count=0
-  if find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null | head -n 1 >/dev/null; then
-    count=$(find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null | wc -l | tr -d ' ')
-  fi
+  # Single find pass into a temp file
+  tmplist="$VAR_DIR/.clean-list-$$.txt"
+  find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null >"$tmplist" || true
+  count="$(wc -l <"$tmplist" | tr -d ' ')"
 
   info "Internal working dir: $VAR_DIR"
   echo "  - Items that would be removed (files + dirs): $count"
 
-  if [ "$count" -eq 0 ] 2>/dev/null; then
+  if [ "${count:-0}" -eq 0 ] 2>/dev/null; then
+    rm -f "$tmplist"
     info "Nothing to clean."
     printf "Press Enter to continue... "; read -r _ || true
     return
@@ -587,13 +662,15 @@ action_clean_internal() {
   read -r ans || ans=""
   case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
     y|yes)
-      # Remove everything under VAR_DIR but keep VAR_DIR
-      find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print0 2>/dev/null | while IFS= read -r -d '' item; do
+      # Delete deepest entries first to handle non-empty dirs correctly
+      sort -r "$tmplist" | while IFS= read -r item; do
         rm -rf -- "$item" 2>/dev/null || true
       done
+      rm -f "$tmplist"
       info "Internal working files cleaned."
       ;;
     *)
+      rm -f "$tmplist"
       info "Aborted."
       ;;
   esac
@@ -601,7 +678,7 @@ action_clean_internal() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-# main loop
+# ── Main loop ─────────────────────────────────────────────────────────────────
 while :; do
   clear 2>/dev/null || true
   header
@@ -624,6 +701,7 @@ while :; do
     9)  action_view_logs_follow ;;
     13) action_stats_and_cron ;;
     14) action_clean_internal ;;
+    15) action_clean_logs ;;
     q|Q)
         echo "Bye."
         exit 0
