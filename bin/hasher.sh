@@ -8,10 +8,19 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
 
+# ───────────────────────── Root dir ────────────────────────
+# FIX: all dirs were relative ("hashes", "logs", "zero-length") which broke
+# direct CLI calls from outside the repo root. Now all paths are anchored
+# to ROOT_DIR so hasher.sh works correctly regardless of working directory.
+ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
 # ───────────────────────── Constants ───────────────────────
-HASHES_DIR="hashes"
-LOGS_DIR="logs"
-ZERO_DIR="zero-length"
+HASHES_DIR="$ROOT_DIR/hashes"
+LOGS_DIR="$ROOT_DIR/logs"
+VAR_DIR="$ROOT_DIR/var"
+# FIX: ZERO_DIR moved from repo root into var/ to consolidate working files
+ZERO_DIR="$VAR_DIR/zero-length"
+
 # DATE_TAG is kept for human-facing daily reports
 DATE_TAG="$(date +'%Y-%m-%d')"
 # CSV_TAG adds time (SMB-safe; no colon) to avoid same-day collisions
@@ -53,9 +62,11 @@ if (( "$#" > 0 )); then
     i=$((i+1))
   done
 fi
-# Auto-load ./hasher.conf if present and no --config provided
-if [[ -z "$CONFIG_FILE" && -f "./hasher.conf" ]]; then
-  CONFIG_FILE="./hasher.conf"
+# Auto-load local/hasher.conf if present and no --config provided
+if [[ -z "$CONFIG_FILE" && -f "$ROOT_DIR/local/hasher.conf" ]]; then
+  CONFIG_FILE="$ROOT_DIR/local/hasher.conf"
+elif [[ -z "$CONFIG_FILE" && -f "$ROOT_DIR/default/hasher.conf" ]]; then
+  CONFIG_FILE="$ROOT_DIR/default/hasher.conf"
 fi
 
 # ───────────────────────── Human-friendly time ─────────────
@@ -84,14 +95,15 @@ else
   RUN_ID="$(date +%s)-$$"
 fi
 
-# Derived paths (will be reconciled by load_config if config changes dirs)
+# Derived paths
 MAIN_LOG="$LOGS_DIR/hasher.log"
 RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
-FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
+# FIX: FILES_LIST moved from logs/ to var/ — it's a working/temp file, not a log
+FILES_LIST="$VAR_DIR/files-$RUN_ID.lst"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 
 # ───────────────────────── Setup dirs ──────────────────────
-mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$ZERO_DIR"
+mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$VAR_DIR" "$ZERO_DIR"
 
 # ───────────────────────── Logging ─────────────────────────
 _log() {
@@ -99,19 +111,16 @@ _log() {
   local msg="$*"
   local ts; ts="$(date +'%Y-%m-%d %H:%M:%S')"
   local line="[$ts] [RUN $RUN_ID] [$lvl] $msg"
-  # console
   case "$lvl" in
     INFO)  echo -e "${GREEN}$line${NC}";;
     WARN)  echo -e "${YELLOW}$line${NC}";;
     ERROR) echo -e "${RED}$line${NC}";;
     *)     echo "$line";;
   esac
-  # logs
   printf '%s\n' "$line" >> "$MAIN_LOG"
   printf '%s\n' "$line" >> "$RUN_LOG"
 }
 
-# extra: write directly to background.log (no color)
 bglog() {
   local lvl="$1"; shift
   local msg="$*"
@@ -136,22 +145,18 @@ load_config() {
   [[ -f "$f" ]] || { warn "Config not found: $f (ignoring)"; return; }
 
   local section=""
-  local inherit_defaults="true"
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
-    # trim
     local line="${raw#"${raw%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "${line:0:1}" == "#" || "${line:0:1}" == ";" ]] && continue
 
-    # section?
     if [[ "$line" =~ ^\[[^][]+\]$ ]]; then
       section="${line:1:${#line}-2}"
       section="$(printf '%s' "$section" | tr '[:upper:]' '[:lower:]')"
       continue
     fi
 
-    # key=value or bare value
     local key val
     if [[ "$line" == *"="* ]]; then
       key="${line%%=*}"; val="${line#*=}"
@@ -212,16 +217,16 @@ load_config() {
   done < "$f"
 
   # reconcile paths after possible dir changes
-  mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$ZERO_DIR"
+  mkdir -p "$HASHES_DIR" "$LOGS_DIR" "$VAR_DIR" "$ZERO_DIR"
   MAIN_LOG="$LOGS_DIR/hasher.log"
   RUN_LOG="$LOGS_DIR/hasher-$RUN_ID.log"
-  FILES_LIST="$LOGS_DIR/files-$RUN_ID.lst"
+  FILES_LIST="$VAR_DIR/files-$RUN_ID.lst"
   BACKGROUND_LOG="$LOGS_DIR/background.log"
 
   # re-derive default OUTPUT if still using default pattern or blank
   if [[ -z "$OUTPUT" \
-     || "$OUTPUT" == "hashes/hasher-$DATE_TAG.csv" \
-     || "$OUTPUT" == "hashes/hasher-$CSV_TAG.csv" ]]; then
+     || "$OUTPUT" == "$ROOT_DIR/hashes/hasher-$DATE_TAG.csv" \
+     || "$OUTPUT" == "$ROOT_DIR/hashes/hasher-$CSV_TAG.csv" ]]; then
     OUTPUT="$HASHES_DIR/hasher-$CSV_TAG.csv"
   fi
 }
@@ -245,13 +250,13 @@ Options:
   --interval N       Progress update interval seconds (default: $PROGRESS_INTERVAL).
   --exclude P        Extra exclude pattern(s). Repeatable. (Literal substring match)
   --zero-length-only Scan and output zero-length file list only, then exit (no hashing).
-  --config FILE      Load settings from FILE (default: ./hasher.conf if present).
+  --config FILE      Load settings from FILE (default: local/hasher.conf if present).
   --help             Show this help.
 
 Behavior:
   * Writes CSV with header to: \$OUTPUT (unless --zero-length-only)
   * Logs: $MAIN_LOG (global), $RUN_LOG (per run), progress to $BACKGROUND_LOG
-  * Creates file list at: $FILES_LIST
+  * Working files: $VAR_DIR
 EOF
 }
 
@@ -265,8 +270,8 @@ while [[ $# -gt 0 ]]; do
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
-    --config)   CONFIG_FILE="${2:-}"; shift ;;  # kept to allow nohup propagation
-    --child)    IS_CHILD=true ;;                # internal
+    --config)   CONFIG_FILE="${2:-}"; shift ;;
+    --child)    IS_CHILD=true ;;
     -h|--help)  usage; exit 0 ;;
     *) error "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -379,17 +384,14 @@ build_file_list() {
 # ───────────────────────── CSV Helpers ─────────────────────
 csv_escape() { local s="$1"; s="${s//\"/\"\"}"; printf '"%s"' "$s"; }
 
-# Robust header guard: write or prepend header if missing
 write_csv_header() {
   local f="$OUTPUT"
   local dir; dir="$(dirname "$f")"
   mkdir -p "$dir"
-  # brand-new or empty file → write header
   if [[ ! -e "$f" || ! -s "$f" ]]; then
     printf 'path,size_bytes,mtime_epoch,algo,hash\n' > "$f"
     return
   fi
-  # existing non-empty file → ensure first line is the header
   local first; first="$(head -n1 "$f" 2>/dev/null || echo)"
   if [[ "$first" != "path,size_bytes,mtime_epoch,algo,hash" ]]; then
     local tmp="$f.tmp.$$"
@@ -457,7 +459,8 @@ stop_hash_progress() {
 
 start_zero_progress() {
   T_START=$(date +%s)
-  ZERO_PROGRESS_FILE="$LOGS_DIR/zero-scan-$RUN_ID.count"
+  # FIX: ZERO_PROGRESS_FILE moved from logs/ to var/ — it's a transient counter, not a log
+  ZERO_PROGRESS_FILE="$VAR_DIR/zero-scan-$RUN_ID.count"
   echo 0 > "$ZERO_PROGRESS_FILE"
   (
     local total=0 count=0 now elapsed eta pct
@@ -498,10 +501,11 @@ stop_zero_progress() {
   [[ -n "$ZERO_PROGRESS_FILE" ]] && rm -f -- "$ZERO_PROGRESS_FILE" 2>/dev/null || true
 }
 
-# Clean shutdown
 cleanup() {
   stop_hash_progress
   stop_zero_progress
+  # Clean up any leftover working files for this run
+  rm -f -- "$FILES_LIST" "$FILES_LIST.tmp" "$FILES_LIST.stdin.tmp" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -515,11 +519,11 @@ main() {
   [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
   info "Config: ${PATHFILE:+pathfile=$PATHFILE} | Algo: $ALGO | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"
   info "Output CSV: $OUTPUT"
+  info "Working dir: $VAR_DIR"
   $ZERO_LENGTH_ONLY && info "Mode: ZERO-LENGTH-ONLY (no hashing)"
 
   build_file_list
 
-  # Count total
   if [[ -s "$FILES_LIST" ]]; then
     TOTAL=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
   else
@@ -556,16 +560,16 @@ main() {
     info  "  • Report: $out"
 
     bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
-    bglog INFO "NEXT: Review (dry-run): ./delete-zero-length.sh \"$out\""
-    bglog INFO "NEXT: Delete: ./delete-zero-length.sh \"$out\" --force  |  Quarantine: ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+    bglog INFO "NEXT: Review (dry-run): bin/delete-zero-length.sh \"$out\""
+    bglog INFO "NEXT: Delete: bin/delete-zero-length.sh \"$out\" --force"
 
     echo
     echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
     echo "  1) Review or delete zero-length files (dry-run first):"
-    echo "       ./delete-zero-length.sh \"$out\""
+    echo "       bin/delete-zero-length.sh \"$out\""
     echo "  2) Execute deletion safely (or move to quarantine):"
-    echo "       ./delete-zero-length.sh \"$out\" --force"
-    echo "       ./delete-zero-length.sh \"$out\" --force --quarantine \"$ZERO_DIR/quarantine-$DATE_TAG\""
+    echo "       bin/delete-zero-length.sh \"$out\" --force"
+    echo "       bin/delete-zero-length.sh \"$out\" --force --quarantine \"$VAR_DIR/quarantine-$DATE_TAG\""
     echo
     return
   fi
@@ -624,14 +628,11 @@ post_run_reports() {
   local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
   local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
 
-  # CSV-safe: split each data line from the RIGHT by four commas to get
-  # PATH,SIZE,MTIME,ALGO,HASH (only PATH may contain commas).
   if [[ -f "$csv" ]]; then
     awk '
-      NR==1 { next } # skip header
+      NR==1 { next }
       {
         s=$0
-        # collect comma positions
         n=0; pos=0
         while ( (i=index(substr(s,pos+1),",")) > 0 ) {
           pos += i; n++; c[n]=pos
@@ -640,25 +641,18 @@ post_run_reports() {
         c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n]
         path = substr(s,1,c1-1)
         size = substr(s,c1+1,c2-c1-1)
-        # mtime = substr(s,c2+1,c3-c2-1)   # not needed here
-        # algo  = substr(s,c3+1,c4-c3-1)   # not needed here
-        # hash  = substr(s,c4+1)           # not needed here
-        # unquote path if quoted; unescape doubled quotes
         if (path ~ /^".*"$/) { sub(/^"/,"",path); sub(/"$/,"",path); gsub(/""/,"\"",path) }
         if (size+0==0) print path
-        # clear c[] for next record
         for (k=1;k<=n;k++) delete c[k]
       }
     ' "$csv" > "$zero_txt" || true
   fi
 
-  # Duplicate groups by HASH, with member file list (CSV-safe right split again)
   awk '
     BEGIN{ OFS="," }
     NR==1 { next }
     {
       s=$0
-      # collect comma positions
       n=0; pos=0
       while ( (i=index(substr(s,pos+1),",")) > 0 ) {
         pos += i; n++; c[n]=pos
@@ -675,7 +669,6 @@ post_run_reports() {
         cnt[hash]++; files[hash]=files[hash]"\n"path
       }
 
-      # clear c[] for next record
       for (k=1;k<=n;k++) delete c[k]
     }
     END{
@@ -703,19 +696,14 @@ post_run_reports() {
   info "  • Duplicate groups: $dupe_groups (files involved: $dupe_files) (see: $dupes_txt)"
   echo
   echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
-  echo "  1) Review duplicates interactively:"
-  echo "       ./review-duplicates.sh --from-report \"$dupes_txt\" --keep newest"
-  echo "  2) Remove zero-length files (dry-run first):"
-  echo "       ./delete-zero-length.sh \"$zero_txt\"           # dry-run"
-  echo "       ./delete-zero-length.sh \"$zero_txt\" --force   # actually delete or move"
-  echo "  3) Duplicates (review then act):"
-  echo "       ./find-duplicates.sh"
-  echo "       ./review-duplicates.sh --from-report \"$dupes_txt\" --keep newest"
-  echo "       # Dry-run action on your latest reviewed plan:"
-  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\""
-  echo "       # Execute (move to quarantine or delete):"
-  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force --quarantine \"quarantine-$DATE_TAG\""
-  echo "       ./delete-duplicates.sh --from-plan \"$(ls -1t logs/review-dedupe-plan-*.txt | head -n1)\" --force"
+  echo "  1) Find duplicate folders (highest value, lowest risk):"
+  echo "       bin/find-duplicate-folders.sh --input \"$csv\""
+  echo "  2) Find and review duplicate files:"
+  echo "       bin/find-duplicates.sh --input \"$csv\""
+  echo "       bin/review-duplicates.sh --from-report \"$dupes_txt\""
+  echo "  3) Remove zero-length files (dry-run first):"
+  echo "       bin/delete-zero-length.sh \"$zero_txt\""
+  echo "       bin/delete-zero-length.sh \"$zero_txt\" --force"
   echo
 }
 
