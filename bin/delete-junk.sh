@@ -1,6 +1,9 @@
-#!/bin/sh
-# delete-junk.sh — scan/delete junk files based on local/junk-extensions.txt
-# BusyBox + POSIX compatible
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"

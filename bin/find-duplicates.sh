@@ -1,9 +1,9 @@
-#!/usr/bin/env bash
-# find-duplicates.sh — robust duplicate grouper (BusyBox/GNU friendly)
-# - De-duplicates identical (hash,path) rows from the hasher CSV
-# - Groups by hash; emits canonical report + summary + flat CSV
-# - Avoids bash arrays/mapfile pitfalls under `set -e` by using a single awk pass
-# License: GPLv3
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 

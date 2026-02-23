@@ -1,9 +1,8 @@
-#!/usr/bin/env bash
-# du-summary.sh — print a concise summary after find-duplicates
-# Minimal, self-contained helper. Call with:
-#   ./bin/du-summary.sh "<OUTDIR>" "<INPUT_CSV>"
-# Example:
-#   ./bin/du-summary.sh "logs/du-2025-09-16-202246" "hashes/hasher-2025-09-15.csv"
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
 set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
