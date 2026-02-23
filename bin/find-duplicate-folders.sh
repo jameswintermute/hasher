@@ -1,17 +1,9 @@
-#!/bin/sh
-# find-duplicate-folders.sh — identify duplicate folders and write a plan
-# POSIX / BusyBox sh compatible. No bashisms.
-# Signature logic: for each directory, build a sorted list of "basename|hash|size".
-# Directories with identical signatures are duplicates.
-#
-# Usage: find-duplicate-folders.sh --input <hashes.csv> [--mode plan] [--min-group-size N] [--keep POLICY]
-#   -i, --input FILE         CSV/TSV with columns: path,size_bytes,algo,hash  (mtime optional)
-#   -m, --mode MODE          Only 'plan' is supported [default: plan]
-#   -g, --min-group-size N   Minimum duplicate dirs in a group [default: 2]
-#   -k, --keep POLICY        shortest-path|longest-path|first-seen [default: shortest-path]
-#   -s, --scope SCOPE        Informational label [default: recursive]
-#   --signature SIG          Accepted for compatibility; currently fixed to name+content
-#   -h, --help               Show help
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 
 # layout

@@ -1,9 +1,8 @@
-#!/bin/sh
-# launch-review.sh — Option 4 helper (POSIX/BusyBox-safe) for interactive review
-# Hasher v1.1.5:
-# - Uses logs/duplicate-hashes-latest.txt (canonical report from find-duplicates.sh)
-# - Orchestrates generating duplicates report if missing, then calls review-duplicates.sh
-# FIX: pass --from-report flag correctly (was passing bare positional arg which was silently ignored)
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
 set -eu
 

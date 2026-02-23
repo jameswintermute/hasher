@@ -1,9 +1,9 @@
-#!/bin/sh
-# review-duplicates.sh — top-savings-first interactive reviewer (streaming, BusyBox-safe)
+#!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
-# Version: 1.1.4 (fix: sizes always shown; fix: counter in size-ordered display;
-#                  fix: SHA256 validation; fix: wc -l via awk; fix: cat|sort antipattern)
-#
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"

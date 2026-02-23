@@ -1,5 +1,9 @@
-#!/bin/sh
-# run-find-duplicates.sh — Option 3 helper (POSIX/BusyBox-safe)
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+
 set -eu
 IFS="$(printf '\n\t')"
 

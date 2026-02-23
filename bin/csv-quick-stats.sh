@@ -1,8 +1,8 @@
-#!/bin/sh
-# csv-quick-stats.sh — sanity-check a Hasher CSV (header-aware, paths with commas OK)
-# Prints: total records, unique paths, unique hashes (content), unique (basename+hash) keys.
-# Usage: ./csv-quick-stats.sh hashes/hasher-YYYY-MM-DD.csv
-set -eu
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
 
 CSV="${1:-}"
 [ -n "$CSV" ] || { echo "Usage: $0 FILE.csv" >&2; exit 2; }

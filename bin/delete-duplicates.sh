@@ -1,5 +1,4 @@
-#!/bin/sh
-# delete-duplicates.sh — apply file delete plan (move to quarantine)
+#!/bin/bash
 # Hasher — NAS File Hasher & Duplicate Finder
 # Copyright (C) 2025 James Wintermute
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
