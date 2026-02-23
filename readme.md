@@ -24,7 +24,7 @@ nano local/paths.txt   # add directories to scan
 **Notes**
 - The launcher is menu-driven; no flags on the launcher itself.  
 - Direct hashing: `bin/hasher.sh --pathfile local/paths.txt`.  
-- **Run duplicate-folder detection before duplicate-file detection** for fastest wins.
+- **Run duplicate-folder detection before duplicate-file detection** — folders subsume many files at once, giving faster wins with lower risk than file-level review.
 
 ---
 
@@ -88,7 +88,7 @@ bin/find-duplicate-folders.sh --input hashes/<hashfile>.csv --mode plan
 Produces:
 - `logs/duplicate-folders-plan-*.txt`
 
-This is the **highest-value and lowest-risk** dedupe stage.
+This is the **highest-value and lowest-risk** dedupe stage. Matching an entire folder tree in one pass removes far more redundancy than file-by-file review.
 
 ---
 
@@ -135,8 +135,10 @@ Outputs:
 ## 6) Apply file-level dedupe plan
 
 ```bash
-bin/delete-duplicates.sh --from-plan <plan> --force
+bin/apply-file-plan.sh --from-plan <plan> --force
 ```
+
+> **Note:** `bin/delete-duplicates.sh` is an alias/wrapper for the same operation — both scripts apply a file-level dedupe plan produced in step 5. Use whichever you prefer.
 
 Supports:
 - `--quarantine <dir>`  
@@ -300,15 +302,14 @@ CLI flags > local/hasher.conf > default/hasher.conf > excludes.txt > built-ins
 
 # 🩺 Troubleshooting
 
-**Sizes show as “??” in duplicate review**  
+**Sizes show as "??" in duplicate review**  
 → The system running `review-duplicates.sh` cannot stat NAS paths.  
 Run reviews directly on the NAS (SSH).
 
 **CSV appears corrupted**  
 → Fix CRLF endings:
 ```bash
-sed -i 's/
-$//' file.csv
+sed -i 's/\r$//' file.csv
 ```
 
 **Duplicate plan seems incomplete**  
