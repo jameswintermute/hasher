@@ -130,14 +130,23 @@ idx=0; ok=0; fail=0; removed=0
 while IFS= read -r src; do
   [ -z "$src" ] && continue
   idx=$((idx+1))
-  base="$(basename -- "$src")"
   if [ "$DELETE_METADATA" = true ] && printf '%s\n' "$src" | grep -Eq '/(@eaDir|\.AppleDouble)(/|$)'; then
     work "($idx/$COUNT) delete metadata: $src"
     if rm -rf -- "$src" 2>>"$LOG_FILE"; then removed=$((removed+1)); ok "deleted"; else warn "delete failed — see log"; fail=$((fail+1)); fi
     continue
   fi
-  dest="$DEST_ROOT/$base"
-  [ -e "$dest" ] && dest="${dest}-$(date +%s)"
+  # Build a unique destination slot using the full source path, not just
+  # the basename.  Multiple sibling dirs named e.g. "RAW" would otherwise
+  # collide in the flat quarantine root, causing every mv after the first
+  # to fail with "Directory not empty".
+  #
+  # Strategy: strip the leading '/' and replace every remaining '/' with
+  # '__' to produce a flat, collision-free name that still encodes the
+  # full original path.  e.g.
+  #   /volume1/James/Photos/Switzerland/RAW  →  volume1__James__Photos__Switzerland__RAW
+  #   /volume1/James/Photos/Rhinefall/RAW    →  volume1__James__Photos__Rhinefall__RAW
+  slot="$(printf '%s\n' "$src" | sed 's|^/||; s|/|__|g')"
+  dest="$DEST_ROOT/$slot"
   work "($idx/$COUNT) $src -> $dest"
   if mv -- "$src" "$dest" 2>>"$LOG_FILE"; then ok "moved"; else warn "move failed — see log"; fail=$((fail+1)); fi
 done < "$PLAN_FILE"
