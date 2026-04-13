@@ -96,6 +96,20 @@ Junk + exception overhaul
 - Standardised file header applied to all 16 shell scripts: `#!/bin/bash` shebang, project name, copyright, licence, and warranty disclaimer in a consistent 5-line block. Previously scripts used a mix of `#!/bin/sh`, `#!/usr/bin/env bash`, inconsistent or missing copyright lines, and script-specific comments appearing before the copyright block.
 
 ---
+## 2026‑04 — v1.1.6
+**apply-folder-plan: collision-proof quarantine naming** *(assisted by Claude/Anthropic)*
+
+### Bug fix
+- **`apply-folder-plan.sh`** — destination slot now derived from the full
+  source path (leading `/` stripped, remaining `/` replaced with `__`) rather
+  than just `basename`.  Previously, multiple sibling directories sharing the
+  same name (e.g. several `RAW/` subdirectories under different parent paths)
+  would collide in the flat quarantine root: the first `mv` succeeded, then
+  every subsequent `mv` of a same-named dir failed with
+  `Directory not empty`.  The flattened-path scheme makes every destination
+  unique regardless of basename, so all planned moves now succeed.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
