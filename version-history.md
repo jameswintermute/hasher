@@ -110,6 +110,22 @@ Junk + exception overhaul
   unique regardless of basename, so all planned moves now succeed.
 
 ---
+## 2026‑04 — v1.1.7
+**Auto-dedup: non-interactive keep-shortest-path mode** *(assisted by Claude/Anthropic)*
+
+### New feature
+- **`bin/auto-dedup.sh`** — new script that generates a dedup plan for all
+  duplicate groups without any interactive prompts.  For each group, a single
+  copy is selected to keep according to the chosen strategy; all others are
+  written as `DEL|path` entries in a plan file compatible with
+  `delete-duplicates.sh`.  Keep strategies: `shortest-path` (default),
+  `longest-path`, `newest`, `oldest`.  Respects `local/exceptions-hashes.txt`.
+  Supports `--dry-run` to preview decisions without writing a plan file.
+- **`bin/launcher.sh`** — option 16 added under Stage 3 (Clean up):
+  "Auto-dedup (keep shortest path — no prompts)".  Presents a brief strategy
+  selector before calling `auto-dedup.sh`.  Version string bumped to v1.1.7.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
