@@ -112,6 +112,7 @@ print_menu() {
   echo
   echo "### Stage 3 - Clean up ###"
   echo "  4) Review duplicates (interactive)"
+  echo " 16) Auto-dedup (keep shortest path — no prompts)"
   echo "  5) Delete zero-length files"
   echo "  6) Delete duplicates (apply plan)"
   echo " 10) Clean cache files & @eaDir (safe)"
@@ -678,6 +679,49 @@ action_clean_internal() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+action_auto_dedup() {
+  if [ ! -x "$BIN_DIR/auto-dedup.sh" ]; then
+    err "$BIN_DIR/auto-dedup.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  echo
+  echo ">>> Auto-dedup — keep shortest path"
+  echo
+  echo "This will automatically generate a dedup plan for ALL duplicate groups"
+  echo "without interactive review. The strategy is: for each group, the copy"
+  echo "with the SHORTEST file path is kept; all others are marked for deletion."
+  echo
+  echo "No files are moved yet — a plan file is written to logs/."
+  echo "Review it with:  cat <plan-file> | grep '^DEL' | head -50"
+  echo "Apply it with:   option 6 (Delete duplicates / apply plan)"
+  echo
+
+  # Optional: allow choosing a different strategy
+  echo "Keep strategy:"
+  echo "  1) shortest-path  (default — recommended for dedupe after backup copies)"
+  echo "  2) longest-path"
+  echo "  3) newest"
+  echo "  4) oldest"
+  printf "Strategy [1]: "
+  read -r strat_choice || strat_choice="1"
+  case "${strat_choice:-1}" in
+    2) KEEP="longest-path" ;;
+    3) KEEP="newest" ;;
+    4) KEEP="oldest" ;;
+    *) KEEP="shortest-path" ;;
+  esac
+
+  echo
+  info "Running auto-dedup with strategy: $KEEP"
+  echo
+
+  "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" || true
+
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while :; do
   clear 2>/dev/null || true
@@ -693,6 +737,7 @@ while :; do
     3)  action_find_duplicate_files ;;
     12) action_find_by_hash ;;
     4)  action_review_duplicates ;;
+    16) action_auto_dedup ;;
     5)  action_delete_zero_length ;;
     6)  action_apply_plan ;;
     10) action_clean_caches ;;
