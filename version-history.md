@@ -132,3 +132,16 @@ Junk + exception overhaul
 - Parallel hashing engine  
 - JSON structured output  
 - Optional metadata extraction
+
+## 2026‑04 — v1.1.8
+**README rewrite + apply-plan UX fix** *(assisted by Claude/Anthropic)*
+
+### Changes
+- **`readme.md`** — full rewrite: stale script references removed, correct clone
+  URL, current launcher menu reproduced, recommended workflows for both
+  auto-dedup (option 16) and interactive review (option 4), plan file format
+  documented, troubleshooting entry added for option 6 / auto-dedup plan
+  detection, cross-reference to hasher-py added.
+- **`bin/launcher.sh`** — version string bumped to v1.1.8.
+
+---

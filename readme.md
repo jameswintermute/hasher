@@ -1,247 +1,172 @@
-# NAS File Hasher & Duplicate Finder
+# Hasher — NAS File Hasher & Duplicate Finder
 
-Robust hashing + duplicate discovery + safe cleanup tooling for NAS environments (Synology DSM friendly).
+Robust hashing, duplicate discovery, and safe cleanup tooling for NAS environments.  
+Synology DSM / BusyBox compatible. Pure shell — no dependencies beyond standard tools.
 
-> **Safety-first design:** everything is a *candidate at scan time* until re-verified immediately before action.  
-> All deletion flows support **dry-run**, **confirmation**, and usually **quarantine-first**.
+> **Safety-first design:** all deletion flows use quarantine-first, dry-run support,
+> and explicit confirmation. Nothing is deleted without a plan file you can review first.
 
 ---
 
-## 🚀 Quickstart (recommended)
+## Quickstart
 
 ```bash
-git clone https://github.com/yourusername/hasher.git
+git clone https://github.com/jameswintermute/hasher.git
 cd hasher
 
-chmod +x launcher.sh
-chmod +x bin/*.sh
+chmod +x launcher.sh bin/*.sh
 
-nano local/paths.txt   # add directories to scan
+nano local/paths.txt   # add the directories you want to scan
 
 ./launcher.sh          # menu-driven launcher
 ```
 
-**Notes**
-- The launcher is menu-driven; no flags on the launcher itself.  
-- Direct hashing: `bin/hasher.sh --pathfile local/paths.txt`.  
-- **Run duplicate-folder detection before duplicate-file detection** — folders subsume many files at once, giving faster wins with lower risk than file-level review.
+---
+
+## About
+
+A project by **James Wintermute** — jameswintermute@protonmail.ch  
+Started Dec 2022. Current version: **v1.1.8**  
+For full history see: `version-history.md`
 
 ---
 
-## ℹ️ About
+## Purpose
 
-A project by **James Wintermute**  
-Contact: **jameswintermute@protonmail.ch**
+Hasher helps protect and maintain NAS-stored data by:
 
-Originally started in **Dec 2022**, now a fully featured NAS dedupe & hygiene suite.
-
-👉 For full history see: **version-history.md**
-
----
-
-## 🎯 Purpose
-
-Hasher helps protect NAS-stored data by:
-
-- Generating cryptographic hashes (sha256 default)  
-- Detecting silent corruption (bitrot, ransomware, filesystem drift)  
-- Verifying backup rotation integrity  
-- Finding duplicate folders (exact tree-level matches)  
-- Finding duplicate files (deep review)  
-- Safely applying dedupe plans with quarantine  
-- Identifying zero-length files  
-- Cleaning junk / system artefacts  
-- Maintaining long-term NAS hygiene  
+- Generating SHA-256 hashes of all files
+- Detecting duplicate folders (entire tree-level matches)
+- Detecting duplicate files (hash-level matches)
+- Applying dedupe plans safely via quarantine
+- Non-interactive auto-dedup for large-scale cleanup
+- Identifying and removing zero-length files
+- Cleaning junk and OS artefacts (Thumbs.db, .DS_Store, etc.)
+- Maintaining long-term NAS hygiene
 
 ---
 
-## 🧩 Requirements
+## Requirements
 
-- BusyBox / Synology DSM compatible  
-- Pure POSIX `sh`  
-- Uses standard tools: `awk`, `sort`, `stat`, `find`, `rm`, `mv`  
-- Recommended: install under the same volume you scan (e.g., `/volume1/hasher`)  
+- Synology DSM or any BusyBox Linux environment
+- Standard tools: `bash`, `awk`, `sort`, `stat`, `find`, `mv`, `rm`
+- Recommended install location: same volume you scan (e.g. `/volume1/hasher`)
 
 ---
 
-# 🧭 Usage (Happy Path)
+## Launcher Menu
 
-## 1) Start hashing
+```
+### Stage 1 - Hash ###
+  0) Check hashing status
+  1) Start Hashing (NAS-safe, background)
+  8) Advanced / Custom hashing
+
+### Stage 2 - Identify ###
+  2) Find duplicate folders
+  3) Find duplicate files
+ 12) Find file by HASH (lookup)
+
+### Stage 3 - Clean up ###
+  4) Review duplicates (interactive, per-group)
+ 16) Auto-dedup (keep shortest path — no prompts)
+  5) Delete zero-length files
+  6) Delete duplicates (apply plan)
+ 10) Clean cache files & @eaDir
+ 11) Delete junk (local/junk-extensions.txt)
+
+### Other ###
+  7) System check
+  9) Follow logs
+ 13) Stats & scheduling hints
+ 14) Clean internal working files (var/)
+ 15) Clean logs
+```
+
+---
+
+## Recommended Workflow
+
+### For large volumes — use auto-dedup (option 16)
+
+When you have hundreds or thousands of duplicate groups and don't need
+per-group review, option 16 handles the entire process in one step:
+
+1. Run **option 1** — hash all files
+2. Run **option 3** — find duplicate files
+3. Run **option 16** — auto-dedup (generates plan + offers to apply immediately)
+
+Option 16 keeps the copy with the **shortest file path** in each duplicate group
+and quarantines all others. You can also choose longest-path, newest, or oldest.
+
+### For careful review — use interactive mode (option 4)
+
+When you want to inspect each group before deciding:
+
+1. Run **option 1** — hash all files
+2. Run **option 2** — find duplicate *folders* first (highest value, lowest risk)
+3. Run **option 6** → `d` — apply folder plan
+4. Run **option 3** — find duplicate files
+5. Run **option 4** — interactive review, group by group
+6. Run **option 6** → `f` — apply file plan
+
+> Run folder-dedupe before file-dedupe — matching an entire directory tree in
+> one pass removes far more redundancy than file-by-file review.
+
+---
+
+## Plan Files
+
+All dedup operations produce a plain-text plan file in `logs/` before anything
+is moved. You can review it before applying:
 
 ```bash
-./launcher.sh  # Option 1
+# See what would be deleted:
+cat logs/auto-dedup-plan-*.txt | grep '^DEL' | head -50
+
+# Count deletions:
+cat logs/auto-dedup-plan-*.txt | grep -c '^DEL'
+
+# Apply via launcher option 6, or directly:
+bin/delete-duplicates.sh logs/auto-dedup-plan-TIMESTAMP.txt
 ```
 
-Outputs:
-- `hashes/hasher-YYYY-MM-DD.csv`  
-- `logs/background.log`  
-- Zero-length candidates → `zero-length/`
+Plan file format:
+```
+KEEP|/volume1/James/Photos/IMG_001.jpg
+DEL|/volume1/James/Backup/Photos/IMG_001.jpg
+DEL|/volume1/James/Archive/Photos/IMG_001.jpg
+```
+
+Files marked `DEL` are moved to quarantine, not permanently deleted.
 
 ---
 
-## 2) Find duplicate folders (first pass)
+## Configuration
 
-```bash
-bin/find-duplicate-folders.sh --input hashes/<hashfile>.csv --mode plan
+```
+default/hasher.conf         — defaults (do not edit)
+local/hasher.conf           — your overrides
+local/paths.txt             — scan roots, one per line
+local/excludes.txt          — find exclusion patterns
+local/exceptions-hashes.txt — hashes excluded from dedup
+local/excluded-from-dedup.txt — path prefixes excluded from dedup
+local/junk-extensions.txt   — rules for junk file cleanup
 ```
 
-Produces:
-- `logs/duplicate-folders-plan-*.txt`
-
-This is the **highest-value and lowest-risk** dedupe stage. Matching an entire folder tree in one pass removes far more redundancy than file-by-file review.
+Precedence: `CLI flags > local/hasher.conf > default/hasher.conf`
 
 ---
 
-## 3) Apply duplicate-folder plan
-
-```bash
-bin/apply-folder-plan.sh --plan logs/duplicate-folders-plan-*.txt --force
-```
-
-Folders are moved to quarantine unless configured otherwise.
-
----
-
-## 4) Find duplicate files
-
-```bash
-bin/find-duplicates.sh --input hashes/<hashfile>.csv
-```
-
-Generates:
-- `logs/YYYY-MM-DD-duplicate-hashes.txt`
-
----
-
-## 5) Review duplicate files (interactive)
-
-```bash
-bin/review-duplicates.sh --from-report logs/<report>.txt
-```
-
-Features:
-- Keep-one-delete-rest  
-- Sorting orders (size, sizesmall, name, mtime)  
-- Exception skip list (`local/exceptions-hashes.txt`)  
-- Progress bars & ETA  
-- Safe numeric input  
-- BusyBox compatible  
-
-Outputs:
-- `logs/review-dedupe-plan-*.txt`
-
----
-
-## 6) Apply file-level dedupe plan
-
-```bash
-bin/apply-file-plan.sh --from-plan <plan> --force
-```
-
-> **Note:** `bin/delete-duplicates.sh` is an alias/wrapper for the same operation — both scripts apply a file-level dedupe plan produced in step 5. Use whichever you prefer.
-
-Supports:
-- `--quarantine <dir>`  
-- Multi-pass verify  
-- Dry-run before destructive action  
-
----
-
-## 7) Zero-length cleanup
-
-```bash
-bin/delete-zero-length.sh --verify-only
-bin/delete-zero-length.sh --force
-```
-
----
-
-## 8) Junk cleanup
-
-```bash
-bin/delete-junk.sh --paths-file local/paths.txt --dry-run
-```
-
-Uses:
-```
-local/junk-extensions.txt
-```
-Shows preview with sizes, totals, and top offenders.
-
----
-
-## 9) SHA256 hash lookup
-
-```bash
-bin/hash-check.sh <sha256>
-```
-
-Locate all matching files across scanned volumes.
-
----
-
-## 10) Stats & cron helper (Launcher option 13)
-
-Shows:
-- Hash run count  
-- Latest CSV  
-- Dedupe plan count  
-- Cron template examples  
-
----
-
-## 11) Clean internal working files
-
-Launcher → Option 14:
-
-Deletes everything under:
-```
-var/
-```
-
-…but leaves hashes + logs intact.
-
----
-
-# ⚙️ Configuration
-
-Hasher uses an override hierarchy:
+## Directory Structure
 
 ```
-default/hasher.conf
-local/hasher.conf
-local/paths.txt
-local/excludes.txt
-local/exceptions-hashes.txt
-local/junk-extensions.txt
-```
-
-Typical fields:
-
-```ini
-EXCLUDES_FILE=local/excludes.txt
-LOW_VALUE_THRESHOLD_BYTES=0
-ZERO_APPLY_EXCLUDES=false
-QUARANTINE_DIR="/volume1/hasher/quarantine-$(date +%F)"
-```
-
-Precedence:
-
-```
-CLI flags > local/hasher.conf > default/hasher.conf > excludes.txt > built-ins
-```
-
----
-
-# 📂 Directory Structure (Live Layout)
-
-```
+hasher/
 ├── bin/
-│   ├── apply-file-plan.sh
+│   ├── auto-dedup.sh           — non-interactive dedup (v1.1.7+)
 │   ├── apply-folder-plan.sh
 │   ├── check-deps.sh
 │   ├── clean-logs.sh
-│   ├── csv-dedupe-by-path.sh
 │   ├── csv-quick-stats.sh
 │   ├── delete-duplicates.sh
 │   ├── delete-junk.sh
@@ -252,18 +177,14 @@ CLI flags > local/hasher.conf > default/hasher.conf > excludes.txt > built-ins
 │   ├── hash-check.sh
 │   ├── hasher.sh
 │   ├── launch-review.sh
-│   ├── lib_paths.sh
-│   ├── review-batch.sh
 │   ├── review-duplicates.sh
 │   ├── review-junk.sh
-│   ├── review-latest.sh
-│   ├── run-find-duplicates.sh
-│   └── schedule-hasher.sh
+│   └── run-find-duplicates.sh
 │
 ├── default/
 │   └── hasher.conf
 │
-├── local/
+├── local/                      — your config (gitignored)
 │   ├── exceptions-hashes.txt
 │   ├── excluded-from-dedup.txt
 │   ├── excludes.txt
@@ -271,59 +192,52 @@ CLI flags > local/hasher.conf > default/hasher.conf > excludes.txt > built-ins
 │   ├── junk-extensions.txt
 │   └── paths.txt
 │
-├── logs/
-│   └── .gitignore
-│
-├── var/
-│   └── .gitignore
-│
-├── hashes/          # generated at runtime
-├── zero-length/     # generated at runtime
+├── logs/                       — plan files and reports (gitignored)
+├── hashes/                     — hash CSVs (gitignored)
+├── var/                        — working files (gitignored)
+├── quarantine/                 — files moved by delete-duplicates.sh
 │
 ├── launcher.sh
 ├── LICENSE
-├── .gitignore
 ├── README.md
 └── version-history.md
 ```
 
 ---
 
-# 🛡️ Safety Model
+## Safety Model
 
-- All destructive actions require explicit `--force`  
-- All plans re-verify paths before removal  
-- Quarantine-first deletion where possible  
-- Extensive dry-run support  
-- CRLF-safe path handling  
-- BusyBox-tested execution paths  
+- Plans are written and reviewable before anything is moved
+- `delete-duplicates.sh` moves files to quarantine — not permanent deletion
+- `apply-folder-plan.sh` uses collision-proof quarantine naming (v1.1.6+)
+- Exceptions list prevents re-flagging known-safe duplicates
+- All scripts re-verify paths immediately before acting
 
 ---
 
-# 🩺 Troubleshooting
+## Troubleshooting
 
-**Sizes show as "??" in duplicate review**  
-→ The system running `review-duplicates.sh` cannot stat NAS paths.  
-Run reviews directly on the NAS (SSH).
+**Sizes show as `??` in duplicate review**  
+Run `review-duplicates.sh` directly on the NAS via SSH — it cannot stat remote paths.
 
 **CSV appears corrupted**  
-→ Fix CRLF endings:
-```bash
-sed -i 's/\r$//' file.csv
-```
+Fix line endings: `sed -i 's/\r$//' hashes/*.csv`
 
-**Duplicate plan seems incomplete**  
-→ Always run folder-dedupe before file-dedupe.
+**Auto-dedup processed 0 groups**  
+Check that `logs/duplicate-hashes-latest.txt` exists. Run option 3 first.
 
----
-
-# 📜 License
-
-GPLv3.
+**Option 6 can't find the auto-dedup plan**  
+Upgrade to v1.1.8 — earlier versions only looked for `review-dedupe-plan-*.txt`.
 
 ---
 
-# 📚 Related Reading
+## License
 
-Facebook — Silent Data Corruption  
-https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/
+GNU GPLv3 — see LICENSE.
+
+---
+
+## Related
+
+- [hasher-py](https://github.com/jameswintermute/hasher-py) — laptop-side web UI for reviewing duplicate groups interactively, built on the same CSV and plan file formats
+- [Facebook — Silent Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/)
