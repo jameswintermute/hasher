@@ -388,22 +388,39 @@ action_delete_zero_length(){
 # mentioned folder plans if a file plan existed. Now both are surfaced and
 # the user chooses which to apply.
 action_apply_plan(){
-  file_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  # Collect latest plan of each type: review-duplicates, auto-dedup, folder
+  review_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  auto_plan="$(ls -1t "$LOGS_DIR"/auto-dedup-plan-*.txt 2>/dev/null | head -n1 || true)"
   folder_plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+
+  # Use the newest file plan between review and auto-dedup
+  file_plan=""; _plan_src=""
+  if [ -n "$review_plan" ] && [ -n "$auto_plan" ]; then
+    if [ "$review_plan" -nt "$auto_plan" ]; then
+      file_plan="$review_plan"; _plan_src="interactive review"
+    else
+      file_plan="$auto_plan"; _plan_src="auto-dedup"
+    fi
+  elif [ -n "$review_plan" ]; then
+    file_plan="$review_plan"; _plan_src="interactive review"
+  elif [ -n "$auto_plan" ]; then
+    file_plan="$auto_plan"; _plan_src="auto-dedup"
+  fi
 
   has_file=0; has_folder=0
   [ -n "$file_plan" ]   && has_file=1
   [ -n "$folder_plan" ] && has_folder=1
 
   if [ "$has_file" -eq 0 ] && [ "$has_folder" -eq 0 ]; then
-    info "No file or folder plan found. Run option 2 or 4 first."
+    info "No plan found. Run option 3+4 (interactive review) or 16 (auto-dedup) first."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
 
   echo
   if [ "$has_file" -eq 1 ]; then
-    info "Latest FILE dedupe plan:   $file_plan"
+    info "Latest FILE dedupe plan ($_plan_src):"
+    info "  $file_plan"
   else
     info "No file dedupe plan found."
   fi
@@ -415,8 +432,8 @@ action_apply_plan(){
 
   echo
   echo "Which plan do you want to apply?"
-  [ "$has_file"   -eq 1 ] && echo "  f) Apply FILE plan   (from review-duplicates)"
-  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan (from find-duplicate-folders)"
+  [ "$has_file"   -eq 1 ] && echo "  f) Apply FILE plan   ($_plan_src)"
+  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan (find-duplicate-folders)"
   echo "  q) Cancel"
   printf "Choice: "
   read -r ans || ans="q"
@@ -718,6 +735,29 @@ action_auto_dedup() {
   echo
 
   "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" || true
+
+  # Offer to apply the plan immediately
+  echo
+  plan_file="$(ls -1t "$LOGS_DIR"/auto-dedup-plan-*.txt 2>/dev/null | head -n1 || true)"
+  if [ -n "$plan_file" ] && [ -s "$plan_file" ]; then
+    del_count="$(grep -c '^DEL|' "$plan_file" 2>/dev/null || echo 0)"
+    echo "Plan contains $del_count file(s) marked for quarantine."
+    printf "Apply this plan now? [y/N] "
+    read -r _apply || _apply="n"
+    case "$(printf '%s' "$_apply" | tr '[:upper:]' '[:lower:]')" in
+      y|yes)
+        info "Applying plan: $plan_file"
+        if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+          "$BIN_DIR/delete-duplicates.sh" "$plan_file" || true
+        else
+          err "$BIN_DIR/delete-duplicates.sh not found or not executable."
+        fi
+        ;;
+      *)
+        info "Plan not applied. Use option 6 to apply when ready."
+        ;;
+    esac
+  fi
 
   printf "Press Enter to continue... "; read -r _ || true
 }
