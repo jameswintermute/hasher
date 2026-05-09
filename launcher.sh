@@ -18,11 +18,21 @@ LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
 HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
 BIN_DIR="$ROOT_DIR/bin"
 LOCAL_DIR="$ROOT_DIR/local"
+LIB_DIR="$ROOT_DIR/lib"
 BACKGROUND_LOG="$LOGS_DIR/background.log"
 VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 
 # Pidfile for reliable hasher-running detection
 HASHER_PIDFILE="$VAR_DIR/hasher.pid"
+
+# FIX (v1.1.9): source the host-detection helper so the launcher and
+# everything it spawns can apply host-appropriate defaults (excludes,
+# quarantine roots, scan fallbacks). The lib is POSIX-sh-safe so
+# sourcing under bash 3.2 is fine.
+if [ -r "$LIB_DIR/host-detect.sh" ]; then
+  . "$LIB_DIR/host-detect.sh"
+  detect_host
+fi
 
 # TTY-aware colour palette
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
@@ -50,7 +60,12 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.8 - Apr 2026. James Wintermute"
+  printf "\n%s\n" "      v1.1.9 - May 2026. James Wintermute"
+  # FIX (v1.1.9): show the detected host class so the user sees at a
+  # glance which set of host-aware defaults will apply.
+  if command -v host_pretty_label >/dev/null 2>&1; then
+    printf "%s\n" "      Host: $(host_pretty_label)"
+  fi
   printf "%s" "$RST"
   printf "\n"
 }
@@ -220,7 +235,20 @@ run_hasher_nohup() {
     done < "$efile"
   fi
 
-  set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  # FIX (v1.1.9): host-aware default excludes instead of a fixed
+  # Synology-only set. host_default_excludes() returns one pattern per
+  # line, including OS-specific noise dirs (Spotlight/.fseventsd on mac,
+  # @eaDir/@tmp on Synology, etc.). Falls back to the legacy hardcoded
+  # set if the host-detect lib isn't sourced for any reason.
+  if command -v host_default_excludes >/dev/null 2>&1; then
+    while IFS= read -r pat; do
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done <<EOF
+$(host_default_excludes)
+EOF
+  else
+    set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  fi
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
   if [ -x "$script" ]; then
@@ -270,7 +298,16 @@ run_hasher_interactive() {
     done < "$efile"
   fi
 
-  set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  # FIX (v1.1.9): host-aware default excludes (see run_hasher_nohup).
+  if command -v host_default_excludes >/dev/null 2>&1; then
+    while IFS= read -r pat; do
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done <<EOF
+$(host_default_excludes)
+EOF
+  else
+    set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  fi
 
   info "Running hasher interactively: $script"
   if [ -x "$script" ]; then "$@"; else sh "$@"; fi
@@ -498,7 +535,12 @@ action_system_check(){
 
 action_clean_caches() {
   paths_file="$LOCAL_DIR/paths.txt"
-  default_root="/volume1"
+  # FIX (v1.1.9): host-aware default scan root instead of hardcoded /volume1
+  if command -v host_default_scan_root >/dev/null 2>&1; then
+    default_root="$(host_default_scan_root)"
+  else
+    default_root="/volume1"
+  fi
   listfile="$VAR_DIR/eadir-list-$(date +%s).txt"
   : > "$listfile"
 

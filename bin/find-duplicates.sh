@@ -192,15 +192,34 @@ info "Flat CSV:         $OUT_CSV"
 info "Group summary:    $OUT_GROUPS"
 
 if [[ "$MODE" == "bulk" ]]; then
-  # Optional: build a naive plan (keep shortest path)
+  # Build a naive plan honouring KEEP_STRATEGY.
+  # FIX (v1.1.9): emit KEEP|path / DEL|path lines so delete-duplicates.sh
+  # actually consumes the plan. Previously this wrote bare paths and
+  # delete-duplicates.sh silently ignored every entry (it only acts on
+  # lines matching '^DEL|').
   : > "$OUT_PLAN"
-  awk -F',' '
-    { h=$1; p=$2; len=length(p); paths[h,++idx[h]]=p; if (!best[h] || len<bestlen[h]) { best[h]=p; bestlen[h]=len } }
+  awk -F',' -v strategy="$KEEP_STRATEGY" '
+    {
+      h=$1; p=$2;
+      paths[h,++idx[h]]=p
+      len=length(p)
+      if (!has_best[h]) {
+        best[h]=p; bestlen[h]=len; has_best[h]=1
+      } else if (strategy=="longest-path") {
+        if (len > bestlen[h]) { best[h]=p; bestlen[h]=len }
+      } else {
+        # default: shortest-path (also covers any unrecognised value;
+        # mtime-based strategies need stat() and live in auto-dedup.sh)
+        if (len < bestlen[h]) { best[h]=p; bestlen[h]=len }
+      }
+    }
     END {
       for (h in idx) {
         if (idx[h] >= 2) {
           k=best[h]
-          for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) print p }
+          # Emit KEEP first, then DEL for every other path in the group
+          printf "KEEP|%s\n", k
+          for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) printf "DEL|%s\n", p }
         }
       }
     }
@@ -209,6 +228,7 @@ if [[ "$MODE" == "bulk" ]]; then
     info "Auto delete plan: $OUT_PLAN"
     cp -f "$OUT_PLAN" "$VAR_DIR/latest-plan.txt"
     info "Latest plan copied to: $VAR_DIR/latest-plan.txt"
+    info "Apply with: bin/delete-duplicates.sh \"$OUT_PLAN\""
   else
     warn "Bulk mode produced no deletable items (unexpected)."
   fi

@@ -54,7 +54,15 @@ resolve_quarantine_dir() {
   local val
   val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
   if [ -z "$val" ]; then
-    val="$ROOT_DIR/quarantine-$(date +%F)"
+    # FIX (v1.1.9): host-aware fallback instead of hardcoded repo-root path.
+    # On Synology, prefer /volume1/hasher/quarantine-DATE; elsewhere stay
+    # under the repo so we never assume a NAS-only path exists.
+    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+      . "$ROOT_DIR/lib/host-detect.sh"
+      val="$(default_quarantine_root)"
+    else
+      val="$ROOT_DIR/quarantine-$(date +%F)"
+    fi
   else
     val="${val//\$\((date +%F)\)/$(date +%F)}"
     val="${val//\$(date +%F)/$(date +%F)}"
@@ -87,7 +95,9 @@ if [ "$MODE" = "csv" ]; then
 fi
 
 # Collect candidate paths into a tmp list
-TMP_LIST="$(mktemp -t zero-list.XXXXXX)"
+# FIX (v1.1.9): explicit TMPDIR-based form is portable across BSD/GNU mktemp
+# (BSD mktemp's '-t' semantics differ from GNU's).
+TMP_LIST="$(mktemp "${TMPDIR:-/tmp}/zero-list.XXXXXX")"
 cleanup(){ rm -f -- "$TMP_LIST" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -116,7 +126,16 @@ else
       find "$pth" -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
     done < "$SCOPE_FILE"
   else
-    find /volume1 -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
+    # FIX (v1.1.9): host-aware fallback. /volume1 is Synology-only; on
+    # macOS or generic Linux it doesn't exist and find returns nothing.
+    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+      . "$ROOT_DIR/lib/host-detect.sh"
+      SCAN_ROOT="$(host_default_scan_root)"
+    else
+      SCAN_ROOT="/volume1"   # legacy default if lib missing
+    fi
+    warn "No paths file found; scanning $SCAN_ROOT (override with --input or local/paths.txt)"
+    find "$SCAN_ROOT" -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
   fi
 fi
 
@@ -134,7 +153,12 @@ if ! $FORCE; then
   else
     read -r -p "Delete $COUNT zero-length files now? [y/N]: " a || a=""
   fi
-  case "${a,,}" in y|yes) ;; *) echo "Aborted."; exit 0;; esac
+  # FIX (v1.1.9): use tr-based lowercasing instead of bash-4 ${var,,}
+  # so this script parses on Synology DSM bash 3.2 and macOS /bin/bash 3.2.
+  case "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) ;;
+    *) echo "Aborted."; exit 0;;
+  esac
 fi
 
 # Prepare quarantine if needed
@@ -159,8 +183,15 @@ while IFS= read -r f; do
     continue
   fi
   if $QUARANTINE; then
-    base="$(basename -- "$f")"
-    tgt="$DEST/$base"
+    # FIX (v1.1.9): build the destination from the full source path,
+    # not just basename. Two empty files at /dirA/empty.log and
+    # /dirB/empty.log would otherwise both target $DEST/empty.log
+    # and the second mv would silently overwrite the first (or fail).
+    # Same fix pattern as apply-folder-plan.sh (v1.1.6): strip leading
+    # '/' and replace remaining '/' with '__' to encode the full path
+    # in a flat, collision-free name.
+    slot="$(printf '%s' "$f" | sed 's|^/||; s|/|__|g')"
+    tgt="$DEST/$slot"
     if mv -- "$f" "$tgt" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
   else
     if rm -f -- "$f" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
