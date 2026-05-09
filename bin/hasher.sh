@@ -50,6 +50,73 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# ───────────────────────── Platform Shims ──────────────────
+# Detect BSD stat (macOS) vs GNU stat (Linux/BusyBox/Synology)
+# and sha256sum vs shasum -a 256, so hasher runs on both platforms
+# without requiring GNU coreutils to be installed via Brew.
+if stat -c "%s" /dev/null >/dev/null 2>&1; then
+  # GNU stat (Linux, BusyBox, Synology DSM)
+  _stat_size()  { stat -c "%s" -- "$1"; }
+  _stat_mtime() { stat -c "%Y" -- "$1"; }
+else
+  # BSD stat (macOS)
+  _stat_size()  { stat -f "%z" -- "$1"; }
+  _stat_mtime() { stat -f "%m" -- "$1"; }
+fi
+
+# Detect sha256sum vs shasum (macOS ships shasum, not sha256sum)
+_resolve_hash_cmd() {
+  local algo="$1"
+  case "$algo" in
+    sha256)
+      if command -v sha256sum >/dev/null 2>&1; then
+        echo "sha256sum"
+      elif command -v shasum >/dev/null 2>&1; then
+        echo "shasum -a 256"
+      else
+        echo ""
+      fi
+      ;;
+    sha1)
+      if command -v sha1sum >/dev/null 2>&1; then
+        echo "sha1sum"
+      elif command -v shasum >/dev/null 2>&1; then
+        echo "shasum -a 1"
+      else
+        echo ""
+      fi
+      ;;
+    sha512)
+      if command -v sha512sum >/dev/null 2>&1; then
+        echo "sha512sum"
+      elif command -v shasum >/dev/null 2>&1; then
+        echo "shasum -a 512"
+      else
+        echo ""
+      fi
+      ;;
+    md5)
+      if command -v md5sum >/dev/null 2>&1; then
+        echo "md5sum"
+      elif command -v md5 >/dev/null 2>&1; then
+        echo "md5 -r"   # macOS md5 with -r gives same "hash  path" format
+      else
+        echo ""
+      fi
+      ;;
+    blake2)
+      if command -v b2sum >/dev/null 2>&1; then
+        echo "b2sum"
+      else
+        echo ""
+      fi
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
 # ───────────────────────── Pre-scan for --config ───────────
 if (( "$#" > 0 )); then
   i=1
@@ -295,22 +362,18 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
 fi
 
 # ───────────────────────── Hash Tool Map ───────────────────
-hash_cmd=""
-case "$ALGO" in
-  sha256) hash_cmd="sha256sum" ;;
-  sha1)   hash_cmd="sha1sum"   ;;
-  sha512) hash_cmd="sha512sum" ;;
-  md5)    hash_cmd="md5sum"    ;;
-  blake2)
-    if command -v b2sum >/dev/null 2>&1; then
-      hash_cmd="b2sum"
-    else
-      error "blake2 requested but 'b2sum' not found"; exit 1
-    fi
-    ;;
-  *) error "Unsupported --algo '$ALGO'"; exit 1 ;;
-esac
-command -v "$hash_cmd" >/dev/null 2>&1 || { error "Required tool '$hash_cmd' not found in PATH"; exit 1; }
+# Use platform-aware resolver (supports both GNU and BSD/macOS toolchains)
+hash_cmd_str="$(_resolve_hash_cmd "$ALGO")"
+if [[ -z "$hash_cmd_str" ]]; then
+  case "$ALGO" in
+    blake2) error "blake2 requested but 'b2sum' not found in PATH"; exit 1 ;;
+    *)      error "No hash tool found for algo '$ALGO' (tried sha256sum, shasum, md5sum, md5)"; exit 1 ;;
+  esac
+fi
+# Split into array so multi-word commands (e.g. "shasum -a 256") work correctly
+read -ra hash_cmd <<< "$hash_cmd_str"
+# Verify the resolved command is actually callable
+command -v "${hash_cmd[0]}" >/dev/null 2>&1 || { error "Hash tool '${hash_cmd[0]}' not found in PATH"; exit 1; }
 
 # ───────────────────────── Build File List ─────────────────
 build_file_list() {
@@ -583,8 +646,8 @@ main() {
 
   while IFS= read -r -d '' f; do
     local size mtime
-    size=$(stat -c%s -- "$f" 2>/dev/null || echo -1)
-    mtime=$(stat -c%Y -- "$f" 2>/dev/null || echo -1)
+    size=$(_stat_size "$f" 2>/dev/null || echo -1)
+    mtime=$(_stat_mtime "$f" 2>/dev/null || echo -1)
 
     if [[ "$size" -lt 0 || "$mtime" -lt 0 ]]; then
       warn "Stat failed: $f"
@@ -594,7 +657,7 @@ main() {
     fi
 
     local line hash
-    if ! line=$("$hash_cmd" -- "$f" 2>/dev/null); then
+    if ! line=$("${hash_cmd[@]}" -- "$f" 2>/dev/null); then
       warn "Hash failed: $f"
       FAIL=$((FAIL+1))
       DONE=$((DONE+1))
