@@ -126,13 +126,6 @@ Junk + exception overhaul
   selector before calling `auto-dedup.sh`.  Version string bumped to v1.1.7.
 
 ---
-## Future Roadmap  
-- Lifetime GB‑saved metrics  
-- Dedup analytics export  
-- Parallel hashing engine  
-- JSON structured output  
-- Optional metadata extraction
-
 ## 2026‑04 — v1.1.8
 **README rewrite + apply-plan UX fix** *(assisted by Claude/Anthropic)*
 
@@ -143,5 +136,112 @@ Junk + exception overhaul
   documented, troubleshooting entry added for option 6 / auto-dedup plan
   detection, cross-reference to hasher-py added.
 - **`bin/launcher.sh`** — version string bumped to v1.1.8.
+
+---
+## 2026‑05 — v1.1.9
+**Cross-platform hardening + plan-format fix** *(assisted by Claude/Anthropic — Opus 4.7)*
+
+### Critical bug fixes
+
+- **`bin/find-duplicates.sh`** — `--mode bulk` now produces a plan file
+  compatible with `delete-duplicates.sh`. Previously bulk mode wrote
+  bare paths (one per line) but `delete-duplicates.sh` only acts on
+  lines matching `^DEL|`, so the apply step silently treated every plan
+  as empty and exited with `"No DEL entries found in plan (nothing to
+  do)"`. Now emits proper `KEEP|path` and `DEL|path` markers, honouring
+  the `--keep-strategy` flag (`shortest-path` default, `longest-path`
+  also supported in awk; mtime-based strategies remain in
+  `auto-dedup.sh` because they need stat()).
+
+- **`bin/delete-zero-length.sh`** — quarantine mode no longer collides
+  on duplicate basenames. Previously `mv` used `basename "$f"` as the
+  destination, so two empty files with the same name in different
+  directories (e.g. `/dirA/empty.log` and `/dirB/empty.log`) would
+  overwrite each other in the flat quarantine root. Same fix pattern
+  as v1.1.6 applied to `apply-folder-plan.sh`: strip leading `/` and
+  replace remaining `/` with `__`, encoding the full path in a flat
+  collision-free name.
+
+- **`bin/apply-folder-plan.sh`, `bin/delete-zero-length.sh`** — replaced
+  bash-4-only `${var,,}` parameter expansion with portable
+  `tr '[:upper:]' '[:lower:]'`. `${var,,}` is a parse error (not just
+  a runtime error) on bash 3.2, which means the affected scripts would
+  not start at all on stock Synology DSM (default bash 3.2.57) or on
+  macOS `/bin/bash` (frozen at 3.2.57). The same scripts already used
+  the portable idiom elsewhere; this restores consistency.
+
+### Cross-platform / host-awareness
+
+- **`lib/host-detect.sh`** — new POSIX-sh-safe sourceable helper.
+  Detects `synology` / `macos` / `linux` / `unknown` and exposes:
+    - `default_quarantine_root` — Synology gets
+      `/volume1/hasher/quarantine-DATE`; everywhere else gets
+      `<repo>/quarantine-DATE`. No more dead `/volume1` paths on Macs.
+    - `host_default_excludes` — adds OS-specific noise dirs to the
+      hasher excludes: `@eaDir/@tmp/@SynoFinder-log` on Synology;
+      `.Spotlight-V100/.Trashes/.fseventsd/.DocumentRevisions-V100/`
+      `.TemporaryItems/.DS_Store/.AppleDouble` on macOS.
+    - `host_default_scan_root` — sensible fallback when no `paths.txt`
+      exists: `/volume1` on Synology, `$HOME` on macOS/Linux.
+    - `host_pretty_label` — shown in the launcher header.
+
+- **`launcher.sh`** — sources `lib/host-detect.sh`, prints the detected
+  host in the header, replaces the hardcoded
+  `--exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"`
+  with `host_default_excludes` output (covers the legacy three plus
+  host-specific additions), and replaces the `default_root="/volume1"`
+  in `action_clean_caches` with `host_default_scan_root`.
+
+- **`bin/delete-zero-length.sh`** — `--scan` mode no longer hardcodes
+  `find /volume1 …` as the fallback when no paths file exists. Uses
+  `host_default_scan_root` instead, so on macOS or generic Linux the
+  fallback is `$HOME` rather than a non-existent path that returns no
+  results silently.
+
+- **`bin/apply-folder-plan.sh`** — quarantine fallback now uses
+  `default_quarantine_root` from the host-detect lib.
+
+- **mktemp portability** — `bin/delete-zero-length.sh` now uses the
+  `mktemp "${TMPDIR:-/tmp}/zero-list.XXXXXX"` form, which behaves the
+  same way on GNU mktemp (Linux/Synology/BusyBox) and BSD mktemp
+  (macOS); the previous `mktemp -t zero-list.XXXXXX` form has subtly
+  different semantics between the two implementations.
+
+### Stale code removed
+
+The following files were marked as removed in the v1.1.5 release notes
+but had been reintroduced or never actually deleted:
+
+- `bin/launcher.sh` — out-of-date v1.1.5 copy of the launcher; missing
+  option 16 (auto-dedup) and the multi-source plan resolution. Anyone
+  who ran `bin/launcher.sh` instead of `./launcher.sh` got a stale
+  menu silently.
+- `bin/review-batch.sh` — circular self-reference per v1.1.5 audit;
+  also used bash-4 `${RESUME,,}` which would prevent it from running
+  on Synology DSM or macOS regardless.
+- `bin/review-latest.sh` — thin wrapper superseded by `launch-review.sh`.
+
+### Other consistency fixes
+
+- **`bin/check-deps.sh`** — directory check updated from
+  `$ROOT_DIR/zero-length` to `$ROOT_DIR/var/zero-length` (the former
+  was relocated in v1.1.5 but this script's check was missed and
+  recreated an empty stale dir at the repo root every system check).
+  Also now reports the detected host class.
+
+- **`default/hasher.conf`** — version bumped from `v1.0.0` (eight
+  versions stale) to `v1.1.9`. The hardcoded
+  `QUARANTINE_DIR="/volume1/hasher/quarantine-$(date +%F)"` is now
+  commented out by default — the host-detect lib derives a sensible
+  default per host. Users who want the legacy Synology path can
+  uncomment one line.
+
+---
+## Future Roadmap  
+- Lifetime GB‑saved metrics  
+- Dedup analytics export  
+- Parallel hashing engine  
+- JSON structured output  
+- Optional metadata extraction
 
 ---

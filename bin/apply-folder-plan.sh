@@ -69,7 +69,15 @@ resolve_quarantine_dir() {
   local val
   val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
   if [ -z "$val" ]; then
-    val="$ROOT_DIR/quarantine-$(date +%F)"
+    # FIX (v1.1.9): host-aware fallback. /volume1 (the historical default
+    # baked into default/hasher.conf) is Synology-only; on macOS or
+    # generic Linux fall back to the repo-local quarantine instead.
+    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+      . "$ROOT_DIR/lib/host-detect.sh"
+      val="$(default_quarantine_root)"
+    else
+      val="$ROOT_DIR/quarantine-$(date +%F)"
+    fi
   else
     val="${val//\$\((date +%F)\)/$(date +%F)}"
     val="${val//\$(date +%F)/$(date +%F)}"
@@ -94,7 +102,10 @@ META_COUNT="$(grep -Ec '/(@eaDir|\.AppleDouble)(/|$)' "$PLAN_FILE" || true)"
 if [ "${META_COUNT:-0}" -gt 0 ] && ! $DELETE_METADATA; then
   printf "%s" "$(printf "%b[INFO]%b " "$CINFO" "$CRESET")"
   read -r -p "Found $META_COUNT metadata cache dirs in plan (@eaDir, .AppleDouble). Delete them instead of moving? [y/N]: " reply || reply=""
-  case "${reply,,}" in y|yes) DELETE_METADATA=true;; esac
+  # FIX (v1.1.9): bash-3.2-compatible lowercasing
+  case "$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) DELETE_METADATA=true;;
+  esac
 fi
 
 # du estimate
@@ -117,7 +128,8 @@ if ! $FORCE; then
   printf "%s" "$(printf "%b[INFO]%b " "$CINFO" "$CRESET")"
   printf "Proceed to %s directories into:\n  %s\n[y/N]: " "$([ "$DELETE_METADATA" = true ] && echo "move+delete" || echo "move")" "$DEST_ROOT"
   read -r reply || reply=""
-  case "${reply,,}" in
+  # FIX (v1.1.9): bash-3.2-compatible lowercasing
+  case "$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')" in
     y|yes) ;;
     *) echo "Aborted."; exit 0;;
   esac

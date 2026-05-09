@@ -30,7 +30,7 @@ ok()   { printf "%s[OK]%s     %s\n"   "$GRN" "$RST" "$1"; }
 warn() { printf "%s[WARN]%s   %s\n"   "$YEL" "$RST" "$1"; }
 err()  { printf "%s[ERROR]%s  %s\n"   "$RED" "$RST" "$1"; }
 
-mkdir -p "$ROOT_DIR/logs" "$ROOT_DIR/hashes" "$ROOT_DIR/zero-length" 2>/dev/null || true
+mkdir -p "$ROOT_DIR/logs" "$ROOT_DIR/hashes" "$ROOT_DIR/var/zero-length" 2>/dev/null || true
 
 echo "${CYN}System check (deps & readiness)…${RST}"
 
@@ -38,6 +38,14 @@ echo "${CYN}System check (deps & readiness)…${RST}"
 UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
 UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
 echo "Platform: $UNAME_S ($UNAME_M)"
+
+# FIX (v1.1.9): show the detected hasher host class so users can see
+# at a glance whether host-aware defaults will kick in.
+if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+  . "$ROOT_DIR/lib/host-detect.sh"
+  detect_host
+  echo "Hasher host: $(host_pretty_label) ($HASHER_HOST)"
+fi
 
 # CPU cores
 CORES=""
@@ -58,9 +66,12 @@ fi
 
 echo
 echo "Directories:"
-[ -d "$ROOT_DIR/logs" ]         && ok "logs/ present"         || warn "logs/ missing"
-[ -d "$ROOT_DIR/hashes" ]       && ok "hashes/ present"       || warn "hashes/ missing"
-[ -d "$ROOT_DIR/zero-length" ]  && ok "zero-length/ present"  || warn "zero-length/ missing"
+[ -d "$ROOT_DIR/logs" ]               && ok "logs/ present"             || warn "logs/ missing"
+[ -d "$ROOT_DIR/hashes" ]             && ok "hashes/ present"           || warn "hashes/ missing"
+# FIX (v1.1.9): zero-length/ was relocated to var/zero-length/ in v1.1.5;
+# this script's check was never updated and would create a stale empty
+# zero-length/ at the repo root every run.
+[ -d "$ROOT_DIR/var/zero-length" ]    && ok "var/zero-length/ present"  || warn "var/zero-length/ missing"
 
 echo
 echo "Required tools:"
