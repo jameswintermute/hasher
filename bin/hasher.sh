@@ -352,11 +352,12 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
   args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" )
-  # FIX (v1.1.10): bash-3.2-safe expansion. On bash 3.2 (Synology DSM,
-  # macOS /bin/bash) ${arr[@]} on an empty array trips set -u; ${arr[@]:-}
-  # is the portable form. Bash 4.4+ relaxed this so the same code works
-  # silently on Linux but blew up here.
-  for ex in "${EXTRA_EXCLUDES[@]:-}"; do args+=( --exclude "$ex" ); done
+  # FIX (v1.1.10): "${arr[@]}" on an empty array errors under set -u in
+  # bash 3.2 (Apple's stock /bin/bash) and 4.0–4.3. The :- guard is the
+  # portable form for safe-on-empty array iteration. Same fix as line ~425.
+  for ex in "${EXTRA_EXCLUDES[@]:-}"; do
+    [[ -n "$ex" ]] && args+=( --exclude "$ex" )
+  done
   $ZERO_LENGTH_ONLY && args+=( --zero-length-only )
 
   nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
@@ -383,15 +384,14 @@ command -v "${hash_cmd[0]}" >/dev/null 2>&1 || { error "Hash tool '${hash_cmd[0]
 build_file_list() {
   : > "$FILES_LIST"
   local had_input=false
-  # FIX (v1.1.10): track whether the user listed any roots and how many
-  # actually existed. Previously a pathfile listing only missing/unmounted
-  # roots produced "Discovered 0 files" and exited 0 — a successful run
-  # with no work, which the launcher reported as "may not be running".
-  # We now exit non-zero with a clear, actionable error in that case so
-  # the launcher can surface it instead of pretending all is well.
-  local roots_listed=0
-  local roots_existed=0
-  local roots_missing=()
+  # FIX (v1.1.10): track how many pathfile entries actually resolved to
+  # something on disk. Previously, if every path in paths.txt was missing
+  # (e.g. the external disk wasn't mounted), each one warned, the script
+  # continued, found 0 files post-exclude, and reported "Hashed 0/0" as
+  # if it had succeeded. That looked like a hang or a silent failure.
+  # We now exit non-zero with a clear message when no paths were valid.
+  local pathfile_seen=0     # non-blank, non-comment lines in paths.txt
+  local pathfile_valid=0    # of those, how many were a readable dir or file
 
   if [[ -n "$PATHFILE" ]]; then
     if [[ ! -r "$PATHFILE" ]]; then
@@ -400,16 +400,29 @@ build_file_list() {
     while IFS= read -r raw || [[ -n "$raw" ]]; do
       local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
       [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
-      roots_listed=$((roots_listed + 1))
+      pathfile_seen=$((pathfile_seen + 1))
       if [[ -d "$path" ]]; then
-        roots_existed=$((roots_existed + 1))
-        find "$path" -type f -print0 2>/dev/null
+        # FIX (v1.1.11): find can return non-zero on paths that pass [[ -d ]]
+        # but can't actually be walked. The most common trigger is the macOS
+        # phantom-mount-point pattern: an unmounted external volume leaves
+        # an empty stub directory under /Volumes/ that satisfies [[ -d ]]
+        # but I/O-errors when find descends into it. BSD find also returns
+        # 1 on permission-denied subtrees. Without the '|| true' guard,
+        # set -e kills the script silently with no error reaching the log
+        # — which is exactly what users have hit. The 2>/dev/null suppresses
+        # the noise on stderr; we capture failure into a flag and warn.
+        local find_status=0
+        find "$path" -type f -print0 2>/dev/null || find_status=$?
+        if [[ "$find_status" -ne 0 ]]; then
+          warn "find failed on '$path' (exit $find_status) — possibly an unmounted volume stub or unreadable subtree. Skipping."
+        else
+          pathfile_valid=$((pathfile_valid + 1))
+        fi
       elif [[ -f "$path" ]]; then
-        roots_existed=$((roots_existed + 1))
         printf '%s\0' "$path"
+        pathfile_valid=$((pathfile_valid + 1))
       else
         warn "Path does not exist: $path"
-        roots_missing+=("$path")
       fi
     done < "$PATHFILE" >> "$FILES_LIST".tmp
     had_input=true
@@ -435,22 +448,14 @@ build_file_list() {
     error "No input paths provided. Use --pathfile or pipe paths."; exit 2
   fi
 
-  # FIX (v1.1.10): if a pathfile was provided and listed at least one
-  # root, but none of those roots resolved on disk, fail loudly. This
-  # is almost always a mounting problem (external disk not connected,
-  # NAS share unmounted, path renamed) and silently producing an empty
-  # CSV is the wrong behaviour — it looks like a successful run.
-  if [[ -n "$PATHFILE" ]] && (( roots_listed > 0 && roots_existed == 0 )); then
-    error "No readable roots found. Listed $roots_listed path(s) in $PATHFILE; none exist on disk."
-    error "Missing path(s):"
-    local mp
-    for mp in "${roots_missing[@]:-}"; do
-      [ -n "$mp" ] && error "  - $mp"
-    done
-    error "Common causes:"
-    error "  - External disk not mounted (check 'ls /Volumes' on macOS, 'mount' on Linux)"
-    error "  - NAS share offline or path renamed"
-    error "  - Typo in $PATHFILE (case matters on macOS volume names)"
+  # FIX (v1.1.10): fail loudly when paths.txt was provided but every path
+  # listed in it is missing or unreadable. Stdin-piped invocations bypass
+  # this check (we can't tell a legitimately-empty stream from an
+  # all-missing one, and stdin is the advanced path).
+  if [[ "$pathfile_seen" -gt 0 && "$pathfile_valid" -eq 0 ]]; then
+    error "All $pathfile_seen path(s) listed in '$PATHFILE' are missing or unreadable."
+    error "Common causes: external drive not mounted, typo in volume name, NAS share not connected."
+    error "Check 'ls /Volumes' (macOS), 'ls /mnt' or 'ls /media' (Linux), or 'ls /volume1' (Synology)."
     exit 3
   fi
 
@@ -458,17 +463,16 @@ build_file_list() {
   [[ -s "$FILES_LIST".tmp ]] && pre_count=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
 
   # Apply excludes (literal substring match)
-  # FIX (v1.1.10): bash-3.2-safe expansion (see note above on EXTRA_EXCLUDES).
-  # Both arrays can be empty (DEFAULT_EXCLUDES if config has defaultexcludes=0;
-  # EXTRA_EXCLUDES if no --exclude flags were passed), so both need :-.
-  local patterns=("${DEFAULT_EXCLUDES[@]:-}" "${EXTRA_EXCLUDES[@]:-}")
-  # Drop any empty slots that the :- expansion may have introduced when
-  # both arrays were empty (otherwise awk gets a phantom empty pattern).
-  local cleaned=(); local _p
-  for _p in "${patterns[@]:-}"; do
-    [ -n "$_p" ] && cleaned+=("$_p")
+  # FIX (v1.1.10): "${EXTRA_EXCLUDES[@]}" raises 'unbound variable' under
+  # set -u on bash 3.2 (Apple stock /bin/bash, Synology DSM) when the
+  # array is empty, even though the array IS declared at top of file.
+  # The :- guard makes empty-array expansion safe. The trailing filter
+  # then drops the empty-string sentinel that the :- expansion produces.
+  local raw_patterns=("${DEFAULT_EXCLUDES[@]:-}" "${EXTRA_EXCLUDES[@]:-}")
+  local patterns=()
+  for _p in "${raw_patterns[@]}"; do
+    [[ -n "$_p" ]] && patterns+=("$_p")
   done
-  patterns=("${cleaned[@]:-}")
   if (( ${#patterns[@]} > 0 )); then
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
       BEGIN{ for(i=1;i<=N;i++){ pat[i]=ARGV[i]; ARGV[i]="" } }
