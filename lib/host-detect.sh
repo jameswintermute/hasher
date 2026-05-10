@@ -78,6 +78,11 @@ host_default_excludes() {
     macos)
       # Spotlight, Time Machine, Trash, FSEvents, document revisions, etc.
       # These dirs can hold tens of thousands of small ephemeral files.
+      # FIX (v1.1.10): removed 'Icon\r' — the launcher passes excludes as
+      # literal substrings to awk index() match, which can't represent a
+      # carriage-return byte cleanly. Custom-folder Icon files are rare
+      # enough that hashing them is harmless; better to leave them in
+      # the catalog than emit a pattern that just adds noise.
       printf '%s\n' \
         '.Spotlight-V100' \
         '.Trashes' \
@@ -87,8 +92,7 @@ host_default_excludes() {
         '.DS_Store' \
         '.AppleDouble' \
         '.AppleDB' \
-        '.AppleDesktop' \
-        'Icon\r'
+        '.AppleDesktop'
       ;;
     linux)
       # Generic Linux: nothing OS-specific worth force-excluding.
