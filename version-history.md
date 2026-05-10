@@ -351,6 +351,55 @@ not fire because the path in question *did* satisfy `[[ -d ]]` — but
   to v1.1.11.
 
 ---
+## 2026‑05 — v1.1.12
+**BSD awk portability: find-duplicate-folders works on macOS** *(assisted by Claude/Anthropic — Opus 4.7)*
+
+Patches an awk portability issue uncovered while running option 2
+(Find duplicate folders) on macOS. Symptom: hard awk crash with
+`extra ] at source line 27` and `nonterminated character class [^`
+the moment the embedded awk program tried to parse the regex that
+extracts basename and directory from a path. Worked on GNU awk
+(Synology BusyBox, Linux); failed on BSD awk (macOS stock
+`/usr/bin/awk`, one-true-awk lineage).
+
+### Bug fixes
+
+- **`bin/find-duplicate-folders.sh`** — the regex `/[^/]*$/` (match
+  the trailing path segment with no slashes) contains a literal `/`
+  inside a character class inside a `/.../`-delimited regex. BSD awk
+  parses the inner `/` as end-of-regex and chokes on the remainder
+  as broken syntax. GNU awk and mawk both accept it. The POSIX-
+  portable form is to escape the inner slash: `/[^\/]*$/`. Single
+  character change, no semantic difference. Verified to produce
+  identical results on GNU awk; now also works on macOS BSD awk.
+
+- **`bin/find-duplicate-folders.sh`** — same script had
+  `/^path,/i` for case-insensitive header detection. The trailing
+  `i` flag is Perl/grep flavour; neither GNU nor BSD awk supports
+  it. The expression has been silently always-false in production
+  (any CSV with the literal lowercase `path,` header still worked,
+  because the regex matched literally; uppercase headers would
+  have been treated as data rows). Replaced with the portable
+  idiom `tolower(t) ~ /^path,/` which does what was intended.
+
+### Other
+
+- **`launcher.sh`, `default/hasher.conf`** — version strings bumped
+  to v1.1.12.
+
+### Pattern recognition
+
+This is the fourth round of cross-platform portability fixes since
+v1.1.9. The pattern is consistent: code written assuming GNU/Linux
+userland behaviour, tripping on macOS's older BSD-derived equivalents.
+v1.1.9 was bash 4 `${var,,}`; v1.1.10 was bash 3.2 array-under-`set -u`;
+v1.1.11 was `find` exit-code under `set -e`; v1.1.12 is BSD awk regex
+character classes and case flags. Scripts not yet exercised on macOS
+in real-world testing (review-duplicates, delete-junk, delete-zero-
+length when called against large trees) may still hold similar latent
+issues.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
