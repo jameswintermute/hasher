@@ -237,6 +237,66 @@ but had been reintroduced or never actually deleted:
   uncomment one line.
 
 ---
+## 2026‑05 — v1.1.10
+**macOS readiness: bash-3.2 nounset fix + fail-loudly on missing roots** *(assisted by Claude/Anthropic — Opus 4.7)*
+
+### Critical bug fixes
+
+- **`bin/hasher.sh`** — fixed `EXTRA_EXCLUDES[@]: unbound variable`
+  crash on bash 3.2 (Synology DSM, macOS `/bin/bash`) when the script
+  was invoked without any `--exclude` flags. Bash 4.4+ silently
+  tolerates `${empty_array[@]}` under `set -u`; bash 3.2 treats it as
+  a nounset error and aborts mid-run. Both `EXTRA_EXCLUDES[@]` and
+  `DEFAULT_EXCLUDES[@]` (which can also be empty when
+  `defaultexcludes=0` in config) now use the portable `${arr[@]:-}`
+  form. Empty slots introduced by the `:-` expansion are filtered
+  out before being passed to awk so the exclude filter remains
+  byte-exact.
+
+- **`bin/hasher.sh`** — fail loudly when no listed roots exist on disk.
+  Previously a `paths.txt` listing only missing/unmounted paths
+  produced a silent "Discovered 0 files" successful run with an empty
+  CSV. Now exits non-zero with a clear, actionable error listing each
+  missing path and the most common causes (disk not mounted, NAS
+  share offline, typo in paths.txt — case matters on macOS volume
+  names). New exit code 3 distinguishes "no readable roots" from
+  exit 2 ("no input paths provided at all").
+
+- **`launcher.sh`** — preflight gate. Both `run_hasher_nohup` and
+  `run_hasher_interactive` now refuse to spawn `hasher.sh` when
+  preflight detects all listed roots are missing. Previously the
+  launcher always spawned, then either hit the bash-3.2 nounset
+  crash or completed silently, with the "Hasher may not be running"
+  warning misleadingly reported on legitimate config errors.
+
+- **`launcher.sh`** — post-spawn detection now handles fast
+  completions. Previously the check was `tail -n 5 logs/background.log
+  | grep -q 'Run-ID:'`; on a fast/empty run hasher.sh can complete in
+  well under the launcher's 1-second sleep, scrolling Run-ID off the
+  tail. The check now scans the whole log and recognises three states:
+  still running ("Run-ID" present, "Run complete" absent), finished
+  cleanly ("Run complete" present), or genuinely failed (neither).
+  No more false-positive "may not be running" on successful runs.
+
+### Other fixes
+
+- **`lib/host-detect.sh`** — removed `'Icon\r'` from the macOS exclude
+  set. The launcher passes excludes as literal substrings to an awk
+  `index()` match, which can't represent a carriage-return byte
+  cleanly through the read-loop pipeline. Custom-folder Icon files
+  are rare enough that hashing them is harmless; better to leave
+  them in the catalog than emit a pattern that just adds noise to
+  every run.
+
+### Notes
+
+This release was driven by macOS testing on macOS 26.4.1 with
+`/bin/bash` 3.2.57. The preflight + fail-loudly changes apply
+equally to Synology and Linux: any time `paths.txt` lists roots
+that aren't currently mounted, the user will now get an immediate,
+actionable error rather than a phantom successful run.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
