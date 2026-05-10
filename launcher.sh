@@ -60,7 +60,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.10 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.1.11 - May 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -181,11 +181,6 @@ sample_files_quick() {
 preflight_hashing() {
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
-  # FIX (v1.1.10): preflight now returns non-zero when there are
-  # roots listed but none exist, so callers can refuse to spawn.
-  # Previous behaviour spawned hasher.sh which would either crash on
-  # bash-3.2 + set -u or complete silently with 0 files — both bad UX.
-  PREFLIGHT_OK=true
   if [ -n "$pfile" ]; then
     roots=0; exist=0; missing=0
     # shellcheck disable=SC2162
@@ -197,21 +192,10 @@ preflight_hashing() {
     info "Paths file: $pfile"
     info "Roots listed: $roots (existing: $exist, missing: $missing)"
     info "Quick sample (depth≤2): at least $(sample_files_quick "$pfile") files to scan (lower-bound)."
-    if [ "$roots" -gt 0 ] && [ "$exist" -eq 0 ]; then
-      err "All $roots listed root(s) are missing on disk. Refusing to start hashing."
-      err "Common causes:"
-      err "  - External disk not mounted (try: ls /Volumes  or  mount)"
-      err "  - NAS share offline or path renamed"
-      err "  - Typo in $pfile (case matters on macOS volume names)"
-      err "Edit $pfile to point at paths that exist, then try again."
-      PREFLIGHT_OK=false
-    fi
   else
     warn "No paths file found (local/paths.txt or ./paths.txt)."
-    PREFLIGHT_OK=false
   fi
   if [ -n "$efile" ]; then info "Excludes file: $efile"; fi
-  $PREFLIGHT_OK
 }
 
 find_hasher_script() {
@@ -232,14 +216,7 @@ run_hasher_nohup() {
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
-  # FIX (v1.1.10): refuse to spawn when preflight fails (no readable
-  # roots, missing paths file, etc.). Previously the launcher always
-  # spawned hasher.sh and let it sort itself out, which on macOS led
-  # to confusing "Hasher may not be running" warnings on legitimate
-  # configuration errors.
-  if ! preflight_hashing; then
-    return 1
-  fi
+  preflight_hashing
   : >"$BACKGROUND_LOG" 2>/dev/null || true
 
   pfile="$(determine_paths_file)"
@@ -289,24 +266,33 @@ EOF
   ( wait "$bgpid" 2>/dev/null; clear_pidfile ) &
 
   sleep 1
-  # FIX (v1.1.10): the previous check was tail -n 5 | grep -q 'Run-ID:'.
-  # On a fast/empty run (e.g. a tiny path, or paths that resolve to no
-  # files), hasher.sh can complete in well under a second; by the time
-  # this check runs, "Run-ID:" has scrolled off the last 5 lines and
-  # the launcher reports "Hasher may not be running" on a successful
-  # run. Now we look at the whole log: if we see Run-ID we know it
-  # started, and if we also see "Run complete" or "Completed." we
-  # know it finished. Either way the run is real, not a phantom.
-  log_has_runid=false
-  log_has_complete=false
-  if grep -q 'Run-ID:' "$BACKGROUND_LOG" 2>/dev/null; then log_has_runid=true; fi
-  if grep -qE 'Run complete|^.*\[INFO\] Completed\.' "$BACKGROUND_LOG" 2>/dev/null; then log_has_complete=true; fi
-
-  if $log_has_complete; then
-    next "Hasher run completed (PID $bgpid). Summary written to $BACKGROUND_LOG."
-    clear_pidfile
-  elif $log_has_runid; then
-    next "Hasher launched (PID $bgpid)."
+  # FIX (v1.1.10): the previous check was 'tail -n 5 | grep Run-ID:'.
+  # On a fast/zero-file run (e.g. external disk not mounted, missing path)
+  # hasher.sh completes in well under a second; by the time we tail, the
+  # log has scrolled past Run-ID into the recommended-next-steps block,
+  # the grep fails, and the launcher warns "Hasher may not be running"
+  # for a process that already finished cleanly. We now look at the whole
+  # background log (limited to the last 200 lines), and treat either
+  # 'Run-ID:' (still running) OR 'Run complete' / 'Hashed' (already done)
+  # as success. We also detect the new "all paths missing" exit and
+  # surface it as a hard error rather than a confusing warning.
+  if tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+       | grep -qE 'Run-ID:|Run complete|Hashed [0-9]+/[0-9]+ files'; then
+    if tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+         | grep -qE 'are missing or unreadable|No input paths provided'; then
+      err "Hasher exited with a path error. Recent log:"
+      tail -n 30 "$BACKGROUND_LOG" 2>/dev/null || true
+      err "Edit local/paths.txt and confirm those paths exist before retrying."
+      clear_pidfile
+    elif tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+           | grep -qE 'Hashed 0/0 files'; then
+      warn "Hasher completed but processed 0 files. Recent log:"
+      tail -n 20 "$BACKGROUND_LOG" 2>/dev/null || true
+      warn "Common causes: paths.txt empty, all paths excluded, or disk not mounted."
+      clear_pidfile
+    else
+      next "Hasher launched (PID $bgpid)."
+    fi
   else
     warn "Hasher may not be running. Recent log:"
     tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
@@ -322,13 +308,6 @@ run_hasher_interactive() {
 
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
-
-  # FIX (v1.1.10): same preflight gate as run_hasher_nohup so the
-  # interactive path also fails loudly on missing/unmounted roots
-  # rather than spawning hasher.sh into a guaranteed empty run.
-  if ! preflight_hashing; then
-    return 1
-  fi
 
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
