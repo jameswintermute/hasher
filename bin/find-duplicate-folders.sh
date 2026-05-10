@@ -74,7 +74,11 @@ awk '
   BEGIN{ NRrec=0 }
   NR==1{
     line=$0; t=line; gsub(/[ \t\r\n]/,"",t);
-    if (t ~ /^path,/i){ has_header=1; next } else { has_header=0 }
+    # FIX (v1.1.12): /^path,/i is invalid awk — the trailing 'i' flag is
+    # Perl/grep flavour, neither GNU nor BSD awk support it, so this test
+    # was silently always-false. Use tolower() for portable case-insensitive
+    # header detection.
+    if (tolower(t) ~ /^path,/){ has_header=1; next } else { has_header=0 }
   }
   {
     s=$0; n=rsplit_commas(s);
@@ -94,7 +98,15 @@ awk '
     gsub(/^[ \t]+|[ \t]+$/,"",hash);
     gsub(/^[ \t]+|[ \t]+$/,"",size);
     # derive dir and basename
-    p=path; lastslash=match(p,/[^/]*$/); base=substr(p,lastslash); dir=substr(p,1,lastslash-2);
+    # FIX (v1.1.12): the regex /[^/]*$/ contains a literal forward slash
+    # inside a character class inside a /.../-delimited regex. BSD awk
+    # (macOS stock /usr/bin/awk, "one-true-awk" lineage) parses the inner
+    # / as the end-of-regex delimiter and then chokes on the remainder:
+    #   awk: extra ] at source line 27
+    #   awk: nonterminated character class [^
+    # GNU awk accepts it. Escaping the slash with a backslash is the
+    # POSIX-portable form and works in BSD awk, GNU awk, and mawk.
+    p=path; lastslash=match(p,/[^\/]*$/); base=substr(p,lastslash); dir=substr(p,1,lastslash-2);
     gsub(/\t/,"\\t",dir); gsub(/\n/," ",dir);
     gsub(/\t/,"\\t",base); gsub(/\n/," ",base);
     if (size ~ /^[0-9]+$/) ; else size=0;
