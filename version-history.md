@@ -238,63 +238,117 @@ but had been reintroduced or never actually deleted:
 
 ---
 ## 2026‑05 — v1.1.10
-**macOS readiness: bash-3.2 nounset fix + fail-loudly on missing roots** *(assisted by Claude/Anthropic — Opus 4.7)*
+**macOS hardening: fail-loud on missing paths + bash 3.2 array safety** *(assisted by Claude/Anthropic — Opus 4.7)*
 
-### Critical bug fixes
+Patches issues uncovered during real-world macOS testing of v1.1.9.
+Symptom: hasher.sh appeared to "silently fail" when run against a
+mount point that wasn't actually mounted (e.g. external USB disk
+plugged in but not yet mounted by Finder). Investigation found three
+distinct issues, all addressed here.
 
-- **`bin/hasher.sh`** — fixed `EXTRA_EXCLUDES[@]: unbound variable`
-  crash on bash 3.2 (Synology DSM, macOS `/bin/bash`) when the script
-  was invoked without any `--exclude` flags. Bash 4.4+ silently
-  tolerates `${empty_array[@]}` under `set -u`; bash 3.2 treats it as
-  a nounset error and aborts mid-run. Both `EXTRA_EXCLUDES[@]` and
-  `DEFAULT_EXCLUDES[@]` (which can also be empty when
-  `defaultexcludes=0` in config) now use the portable `${arr[@]:-}`
-  form. Empty slots introduced by the `:-` expansion are filtered
-  out before being passed to awk so the exclude filter remains
-  byte-exact.
+### Bug fixes
 
-- **`bin/hasher.sh`** — fail loudly when no listed roots exist on disk.
-  Previously a `paths.txt` listing only missing/unmounted paths
-  produced a silent "Discovered 0 files" successful run with an empty
-  CSV. Now exits non-zero with a clear, actionable error listing each
-  missing path and the most common causes (disk not mounted, NAS
-  share offline, typo in paths.txt — case matters on macOS volume
-  names). New exit code 3 distinguishes "no readable roots" from
-  exit 2 ("no input paths provided at all").
+- **`bin/hasher.sh`** — array-expansion safety under `set -u`. The line
+  `local patterns=("${DEFAULT_EXCLUDES[@]}" "${EXTRA_EXCLUDES[@]}")`
+  raised `EXTRA_EXCLUDES[@]: unbound variable` and aborted hasher.sh
+  whenever it was invoked with no `--exclude` flags. This is a known
+  bash 3.2/4.0–4.3 quirk: `${arr[@]}` on an empty (but declared) array
+  is treated as unbound under `nounset`. The launcher always passes
+  several `--exclude` flags so it never tripped this; direct
+  invocations of `bin/hasher.sh` did. Fixed by adding the `:-` guard
+  (`"${arr[@]:-}"`) and filtering the empty-string sentinel that
+  produces. Apple's stock `/bin/bash` is permanently 3.2.57; same
+  applies on Synology DSM.
 
-- **`launcher.sh`** — preflight gate. Both `run_hasher_nohup` and
-  `run_hasher_interactive` now refuse to spawn `hasher.sh` when
-  preflight detects all listed roots are missing. Previously the
-  launcher always spawned, then either hit the bash-3.2 nounset
-  crash or completed silently, with the "Hasher may not be running"
-  warning misleadingly reported on legitimate config errors.
+- **`bin/hasher.sh`** — fail-loud when all paths are missing.
+  Previously, if every path in `local/paths.txt` referred to something
+  that didn't exist (the use case: external drive not mounted, NAS
+  share offline, typo in volume name), each one warned, the script
+  continued, found 0 files post-exclude, and reported
+  `"Hashed 0/0 files"` as if it had succeeded. That looked
+  indistinguishable from a hang or a silent failure. Hasher.sh now
+  tracks how many paths.txt entries were valid and exits with code 3
+  and a clear error message ("All N path(s) listed in paths.txt are
+  missing or unreadable") if none resolved. Stdin-piped invocations
+  are exempt (we can't tell a legitimately-empty stream from an
+  all-missing one).
 
-- **`launcher.sh`** — post-spawn detection now handles fast
-  completions. Previously the check was `tail -n 5 logs/background.log
-  | grep -q 'Run-ID:'`; on a fast/empty run hasher.sh can complete in
-  well under the launcher's 1-second sleep, scrolling Run-ID off the
-  tail. The check now scans the whole log and recognises three states:
-  still running ("Run-ID" present, "Run complete" absent), finished
-  cleanly ("Run complete" present), or genuinely failed (neither).
-  No more false-positive "may not be running" on successful runs.
+- **`launcher.sh`** — robust post-spawn detection. The previous check
+  was `tail -n 5 logs/background.log | grep -q 'Run-ID:'` after a
+  1-second sleep. On a fast or zero-file run (which now includes the
+  new "all paths missing" exit above), hasher.sh completes in well
+  under a second; by the time the launcher tails, the log has
+  scrolled past the Run-ID line into the recommended-next-steps
+  block, the grep fails, and the launcher warns "Hasher may not be
+  running" for a process that already finished cleanly. Now searches
+  the last 200 log lines for Run-ID *or* Run-complete markers, and
+  also detects the new path-error exit and surfaces it as a hard
+  error with the offending paths listed.
 
-### Other fixes
+- **`launcher.sh`** — explicit warning on zero-file completion. When
+  hasher.sh runs but produces a 0/0 result (e.g. all files were
+  excluded, or paths.txt was empty), the launcher now displays a
+  clear warning rather than letting the user think the run succeeded
+  silently.
 
-- **`lib/host-detect.sh`** — removed `'Icon\r'` from the macOS exclude
-  set. The launcher passes excludes as literal substrings to an awk
-  `index()` match, which can't represent a carriage-return byte
-  cleanly through the read-loop pipeline. Custom-folder Icon files
-  are rare enough that hashing them is harmless; better to leave
-  them in the catalog than emit a pattern that just adds noise to
-  every run.
+### Cosmetic fixes
 
-### Notes
+- **`lib/host-detect.sh`** — removed the broken `'Icon\r'` macOS
+  exclude pattern. Intent had been to skip macOS's custom-folder-icon
+  metadata files (literally named `Icon` followed by a CR byte), but
+  the current `--exclude` framework does literal substring match on
+  cooked path strings and can't match a CR byte through shell quoting.
+  The pattern was passing through as the four literal characters
+  `\`, `r`, etc., never matching anything. Excluding by `Icon` alone
+  would over-match (any path containing the substring 'Icon'
+  anywhere). Better to leave these in the catalog and let the dedup
+  pipeline handle them naturally.
 
-This release was driven by macOS testing on macOS 26.4.1 with
-`/bin/bash` 3.2.57. The preflight + fail-loudly changes apply
-equally to Synology and Linux: any time `paths.txt` lists roots
-that aren't currently mounted, the user will now get an immediate,
-actionable error rather than a phantom successful run.
+- **`launcher.sh`, `default/hasher.conf`** — version strings bumped to
+  v1.1.10.
+
+---
+## 2026‑05 — v1.1.11
+**find-failure resilience: don't let one bad path kill the run** *(assisted by Claude/Anthropic — Opus 4.7)*
+
+Patches a real-world silent-death bug uncovered during further macOS
+testing of v1.1.10. Symptom: hasher.sh died silently with no error
+message between the "Working dir:" log line and any subsequent output,
+exiting with status 1, leaving no diagnostic trail in
+`logs/background.log`. The v1.1.10 fail-loud-on-missing-paths fix did
+not fire because the path in question *did* satisfy `[[ -d ]]` — but
+`find` couldn't actually walk it.
+
+### Bug fix
+
+- **`bin/hasher.sh`** — `find "$path" -type f -print0` previously had
+  no failure handling. Under `set -e`, any non-zero exit from `find`
+  (most commonly: I/O error descending into an unmounted volume stub,
+  or permission denied on a subtree) terminated the entire script
+  silently — no error log line, no warning, no exit-trap diagnostic.
+  This was particularly brutal on macOS 26 where failed external
+  volume mounts leave empty stub directories under `/Volumes/` that
+  satisfy `[[ -d ]]` but cause `find` to error on descent (the
+  filesystem is technically present in the VFS but has no mounted
+  backing storage).
+
+  Now wraps the `find` call in a status-capturing idiom
+  (`find ... || find_status=$?`) that converts find's non-zero exit
+  into a logged WARN rather than a script-killing error. The path
+  is treated as invalid for the purposes of the "all paths missing"
+  check, so a paths.txt where every entry triggers a find failure
+  still produces the v1.1.10 fail-loud exit code 3 rather than
+  silent death.
+
+  Affects any host where a path can be `-d` true but unreadable.
+  macOS phantom mount points are the most common trigger; permission-
+  denied subtrees on locked-down Linux/Synology shares are the
+  second most common.
+
+### Other
+
+- **`launcher.sh`, `default/hasher.conf`** — version strings bumped
+  to v1.1.11.
 
 ---
 ## Future Roadmap  
