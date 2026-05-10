@@ -352,7 +352,11 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
   args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" )
-  for ex in "${EXTRA_EXCLUDES[@]}"; do args+=( --exclude "$ex" ); done
+  # FIX (v1.1.10): bash-3.2-safe expansion. On bash 3.2 (Synology DSM,
+  # macOS /bin/bash) ${arr[@]} on an empty array trips set -u; ${arr[@]:-}
+  # is the portable form. Bash 4.4+ relaxed this so the same code works
+  # silently on Linux but blew up here.
+  for ex in "${EXTRA_EXCLUDES[@]:-}"; do args+=( --exclude "$ex" ); done
   $ZERO_LENGTH_ONLY && args+=( --zero-length-only )
 
   nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
@@ -379,6 +383,15 @@ command -v "${hash_cmd[0]}" >/dev/null 2>&1 || { error "Hash tool '${hash_cmd[0]
 build_file_list() {
   : > "$FILES_LIST"
   local had_input=false
+  # FIX (v1.1.10): track whether the user listed any roots and how many
+  # actually existed. Previously a pathfile listing only missing/unmounted
+  # roots produced "Discovered 0 files" and exited 0 — a successful run
+  # with no work, which the launcher reported as "may not be running".
+  # We now exit non-zero with a clear, actionable error in that case so
+  # the launcher can surface it instead of pretending all is well.
+  local roots_listed=0
+  local roots_existed=0
+  local roots_missing=()
 
   if [[ -n "$PATHFILE" ]]; then
     if [[ ! -r "$PATHFILE" ]]; then
@@ -387,12 +400,16 @@ build_file_list() {
     while IFS= read -r raw || [[ -n "$raw" ]]; do
       local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
       [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
+      roots_listed=$((roots_listed + 1))
       if [[ -d "$path" ]]; then
+        roots_existed=$((roots_existed + 1))
         find "$path" -type f -print0 2>/dev/null
       elif [[ -f "$path" ]]; then
+        roots_existed=$((roots_existed + 1))
         printf '%s\0' "$path"
       else
         warn "Path does not exist: $path"
+        roots_missing+=("$path")
       fi
     done < "$PATHFILE" >> "$FILES_LIST".tmp
     had_input=true
@@ -418,11 +435,40 @@ build_file_list() {
     error "No input paths provided. Use --pathfile or pipe paths."; exit 2
   fi
 
+  # FIX (v1.1.10): if a pathfile was provided and listed at least one
+  # root, but none of those roots resolved on disk, fail loudly. This
+  # is almost always a mounting problem (external disk not connected,
+  # NAS share unmounted, path renamed) and silently producing an empty
+  # CSV is the wrong behaviour — it looks like a successful run.
+  if [[ -n "$PATHFILE" ]] && (( roots_listed > 0 && roots_existed == 0 )); then
+    error "No readable roots found. Listed $roots_listed path(s) in $PATHFILE; none exist on disk."
+    error "Missing path(s):"
+    local mp
+    for mp in "${roots_missing[@]:-}"; do
+      [ -n "$mp" ] && error "  - $mp"
+    done
+    error "Common causes:"
+    error "  - External disk not mounted (check 'ls /Volumes' on macOS, 'mount' on Linux)"
+    error "  - NAS share offline or path renamed"
+    error "  - Typo in $PATHFILE (case matters on macOS volume names)"
+    exit 3
+  fi
+
   local pre_count=0
   [[ -s "$FILES_LIST".tmp ]] && pre_count=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
 
   # Apply excludes (literal substring match)
-  local patterns=("${DEFAULT_EXCLUDES[@]}" "${EXTRA_EXCLUDES[@]}")
+  # FIX (v1.1.10): bash-3.2-safe expansion (see note above on EXTRA_EXCLUDES).
+  # Both arrays can be empty (DEFAULT_EXCLUDES if config has defaultexcludes=0;
+  # EXTRA_EXCLUDES if no --exclude flags were passed), so both need :-.
+  local patterns=("${DEFAULT_EXCLUDES[@]:-}" "${EXTRA_EXCLUDES[@]:-}")
+  # Drop any empty slots that the :- expansion may have introduced when
+  # both arrays were empty (otherwise awk gets a phantom empty pattern).
+  local cleaned=(); local _p
+  for _p in "${patterns[@]:-}"; do
+    [ -n "$_p" ] && cleaned+=("$_p")
+  done
+  patterns=("${cleaned[@]:-}")
   if (( ${#patterns[@]} > 0 )); then
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
       BEGIN{ for(i=1;i<=N;i++){ pat[i]=ARGV[i]; ARGV[i]="" } }
