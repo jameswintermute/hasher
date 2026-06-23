@@ -400,6 +400,109 @@ length when called against large trees) may still hold similar latent
 issues.
 
 ---
+## 2026‑06 — v1.1.13
+**Menu refresh + interactive folder-plan reviewer + scope statement** *(assisted by Claude/Anthropic — Opus 4.7)*
+
+The menu numbering had accumulated history rather than design — options
+were added one at a time, each grabbing the next free number, until 0, 1,
+8, 16, 5, 6, 10, 11 sat side-by-side with no logic to them. This release
+rebuilds the menu around workflow order, adds letter shortcuts for meta
+and infrequent operations, and ships a new interactive reviewer for
+folder-dedup plans.
+
+### New: interactive folder-plan reviewer (`bin/review-folder-plan.sh`)
+
+Folder dedup previously produced a plan and prompted the user to run
+option 6 (apply). The apply step asked "proceed? y/N" without showing
+*what* it was about to do — totals only, no per-group context, no way
+to spot-check. Users had to trust the plan blind.
+
+The new reviewer (menu option `r`, or auto-launched at the end of option
+3) walks the user through each duplicate-folder group:
+
+- Shows KEEP and DEL directories with file counts and sample filenames
+- Allows per-group decisions: accept, skip, swap keeper, or quit early
+- `[d]` option shows the full file-by-file listing for the group
+  (paged through `less` if available)
+- `[a]` option applies the last decision to all remaining groups
+  (e.g. "I've eyeballed the first 5; rubber-stamp the rest with yes")
+  with a confirmation prompt
+- Verbose per-group decision logging plus an end-of-review summary
+  totalling decisions by type
+- Writes a reviewed plan to
+  `logs/duplicate-folders-plan-reviewed-DATETIME.txt`, preserving the
+  original raw plan for audit
+
+The reviewer's plan output is compatible with the existing
+`apply-folder-plan.sh` — one directory per line, all listed get
+quarantined, the unlisted entry per group is the implicit keeper.
+
+### New: groups TSV sidecar
+
+`bin/find-duplicate-folders.sh` now persists the per-group decision
+context as `logs/duplicate-folders-groups-DATE.tsv` alongside the plan.
+This is what the reviewer consumes; it has the keeper+del pairings and
+reclaim sizes that the raw plan format lacks.
+
+### Menu rewrite
+
+Numbers reserved for the core workflow, in workflow order:
+
+```
+Stage 1 — Hash:    1   (a, s for variants)
+Stage 2 — Identify: 2, 3   (f for hash lookup)
+Stage 3 — Clean:    4, 5, 6, 7, 8, 9   (r for folder review)
+Other:              d, l, t, v, c, q
+```
+
+Notable changes from the old menu:
+
+- Option **2** now means "find duplicate FILES" (was option 3); option
+  **3** means "find duplicate FOLDERS" (was option 2). The workflow
+  recommendation puts files first because that's the more common task;
+  folder dedup is the higher-leverage option but used less often.
+- Option **5** is now auto-dedup (was option 16). Plain `5` reads better
+  than `16` and groups it with the other clean-up options.
+- Option **0** ("Check hashing status") is now letter **s**.
+- Option **7** ("System check") is now letter **d** (diagnostics; `?`
+  was rejected because users hit it expecting "help").
+- Options 9–15 dropped — replaced with letter shortcuts grouped under
+  Other: `l` (follow logs), `t` (stats & cron), `v` (clean var/),
+  `c` (clean logs).
+
+### Apply step: prefer reviewed plans, warn on raw
+
+`launcher.sh` action_apply_plan now distinguishes between raw and
+reviewed folder plans. If both exist, the reviewed one is preferred
+automatically. If only a raw plan exists, applying it triggers an
+explicit "this plan has NOT been reviewed, proceed without review?"
+confirmation prompt. The intent is to make review the natural path
+without forcing it.
+
+### README rewrite
+
+A new **Scope** section near the top makes the project's narrow remit
+explicit:
+
+> Hasher is a content-integrity tool. It catalogues files by SHA-256
+> hash, identifies duplicates, removes them safely (quarantine-first),
+> and produces a CSV that other tools can use for downstream analysis
+> — including silent-deletion detection. Hasher is deliberately narrow.
+> Workflow tooling that consumes Hasher's CSV is out of scope and
+> belongs in separate projects.
+
+The launcher menu, directory tree, and workflow recommendations have all
+been updated to match v1.1.13.
+
+### Other
+
+- **`default/hasher.conf`** — version bumped to v1.1.13. (This also
+  catches the v1.1.11 and v1.1.12 conf bumps that were missed at the
+  time, restoring sync between conf and launcher version strings.)
+- Helper scripts (`auto-dedup.sh`, `launch-review.sh`,
+  `run-find-duplicates.sh`) updated to reference the new option numbers.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
