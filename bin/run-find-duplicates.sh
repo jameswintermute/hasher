@@ -58,5 +58,5 @@ if [ -n "${report:-}" ] && [ -s "$report" ]; then
   fi
 else
   warn "Did not locate a canonical report after processing."
-  next "Run option 3 again or check logs; then use option 4 to review if a report exists."
+  next "Run option 2 again or check logs; then use option 4 to review if a report exists."
 fi
