@@ -81,7 +81,7 @@ if [ -z "${report:-}" ] || [ ! -s "$report" ]; then
       fi
       report="$(latest_canon_report || true)"
     else
-      next "Run menu option 3 first (Find duplicate files), then re-run option 4."
+      next "Run menu option 2 first (Find duplicate files), then re-run option 4."
       exit 0
     fi
   else
