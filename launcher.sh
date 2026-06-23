@@ -25,6 +25,16 @@ VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
 # Pidfile for reliable hasher-running detection
 HASHER_PIDFILE="$VAR_DIR/hasher.pid"
 
+# v1.2.0: parallel hashing worker count, persisted across launcher sessions
+# in var/jobs.conf. 1 = serial (default). The performance menu ('p') edits it.
+HASHER_JOBS_FILE="$VAR_DIR/jobs.conf"
+HASHER_JOBS=1
+if [ -r "$HASHER_JOBS_FILE" ]; then
+  _j="$(head -n1 "$HASHER_JOBS_FILE" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$_j" ] && [ "$_j" -ge 1 ] 2>/dev/null && HASHER_JOBS="$_j"
+fi
+export HASHER_JOBS
+
 # FIX (v1.1.9): source the host-detection helper so the launcher and
 # everything it spawns can apply host-appropriate defaults (excludes,
 # quarantine roots, scan fallbacks). The lib is POSIX-sh-safe so
@@ -60,7 +70,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.13 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.2.0 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -119,6 +129,7 @@ print_menu() {
   echo "   1) Start hashing (NAS-safe defaults)"
   echo "   a) Advanced / custom hashing"
   echo "   s) Hashing status"
+  echo "   p) Performance settings (parallel hashing)"
   echo
   echo "${BOLD}Stage 2 — Identify${RST}"
   echo "   2) Find duplicate files"
@@ -252,6 +263,11 @@ EOF
   fi
 
   info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
+  # v1.2.0: pass parallel-jobs setting if configured
+  if [ -n "${HASHER_JOBS:-}" ] && [ "${HASHER_JOBS:-1}" -gt 1 ] 2>/dev/null; then
+    set -- "$@" --jobs "$HASHER_JOBS"
+    info "Parallel hashing: $HASHER_JOBS workers."
+  fi
   if [ -x "$script" ]; then
     nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   else
@@ -336,6 +352,11 @@ EOF
   fi
 
   info "Running hasher interactively: $script"
+  # v1.2.0: pass parallel-jobs setting if configured
+  if [ -n "${HASHER_JOBS:-}" ] && [ "${HASHER_JOBS:-1}" -gt 1 ] 2>/dev/null; then
+    set -- "$@" --jobs "$HASHER_JOBS"
+    info "Parallel hashing: $HASHER_JOBS workers."
+  fi
   if [ -x "$script" ]; then "$@"; else sh "$@"; fi
 }
 
@@ -359,6 +380,65 @@ action_start_hashing(){
 action_custom_hashing(){
   run_hasher_interactive
   printf "Press Enter to continue... "; read -r _ || true;
+}
+
+# v1.2.0: performance settings — parallel hashing worker count
+action_performance_settings(){
+  # Detect a sensible recommended value: cores capped at 4
+  cores=1
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || echo 1)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  fi
+  case "$cores" in ''|*[!0-9]*) cores=1 ;; esac
+  recommended="$cores"
+  [ "$recommended" -gt 4 ] && recommended=4
+
+  echo
+  echo "${BOLD}Performance — parallel hashing${RST}"
+  echo
+  echo "Hashing can run multiple workers in parallel. More workers speed up"
+  echo "large runs on multi-core systems and SSD / SHR arrays. On a single"
+  echo "spinning HDD, too many workers cause seek thrashing — keep it low (1-2)."
+  echo
+  echo "  Detected CPU cores : $cores"
+  echo "  Recommended (safe) : $recommended"
+  echo "  Current setting    : $HASHER_JOBS worker(s)$([ "$HASHER_JOBS" -eq 1 ] && echo '  (serial)')"
+  echo
+  echo "  1) Serial (1 worker)        — safest, original behaviour"
+  echo "  2) Recommended ($recommended workers) — balanced default for most NAS units"
+  echo "  3) Aggressive ($cores workers)        — full cores; SSD/SHD arrays only"
+  echo "  4) Custom value"
+  echo "  q) Back (no change)"
+  echo
+  printf "Choice: "
+  read -r pc || pc="q"
+  case "$pc" in
+    1) HASHER_JOBS=1 ;;
+    2) HASHER_JOBS="$recommended" ;;
+    3) HASHER_JOBS="$cores" ;;
+    4)
+      printf "Enter worker count (1-%s): " "$cores"
+      read -r cv || cv=""
+      cv="$(printf '%s' "$cv" | tr -cd '0-9')"
+      if [ -n "$cv" ] && [ "$cv" -ge 1 ] 2>/dev/null; then
+        HASHER_JOBS="$cv"
+        if [ "$cv" -gt "$cores" ]; then
+          warn "Set to $cv, above the $cores detected cores — workers will contend for CPU."
+        fi
+      else
+        warn "Invalid value; keeping $HASHER_JOBS."
+      fi
+      ;;
+    *) info "No change."; printf "Press Enter to continue... "; read -r _ || true; return ;;
+  esac
+
+  # Persist
+  printf '%s\n' "$HASHER_JOBS" > "$HASHER_JOBS_FILE" 2>/dev/null || true
+  export HASHER_JOBS
+  ok "Parallel hashing set to $HASHER_JOBS worker(s). Saved."
+  printf "Press Enter to continue... "; read -r _ || true
 }
 
 action_view_logs_follow(){
@@ -913,6 +993,7 @@ while :; do
     1)       action_start_hashing ;;
     a|A)     action_custom_hashing ;;
     s|S)     action_check_status ;;
+    p|P)     action_performance_settings ;;
 
     # ── Stage 2: Identify ─────────────────────────────────────────────────
     2)       action_find_duplicate_files ;;
