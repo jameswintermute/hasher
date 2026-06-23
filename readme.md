@@ -5,6 +5,8 @@ Synology DSM / BusyBox compatible. Pure shell — no dependencies beyond standar
 
 > **Safety-first design:** all deletion flows use quarantine-first, dry-run support,
 > and explicit confirmation. Nothing is deleted without a plan file you can review first.
+> Before quarantining, each candidate is re-hashed and skipped if its content has
+> changed since the plan was made (v1.2.0).
 
 ---
 
@@ -39,7 +41,7 @@ nano local/paths.txt   # add the directories you want to scan
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.1.13**
+Started Dec 2022. Current version: **v1.2.0**
 For full history see: `version-history.md`
 
 ---
@@ -48,10 +50,10 @@ For full history see: `version-history.md`
 
 Hasher helps protect and maintain NAS-stored data by:
 
-- Generating SHA-256 hashes of all files
+- Generating SHA-256 hashes of all files (optionally in parallel)
 - Detecting duplicate folders (entire tree-level matches)
 - Detecting duplicate files (hash-level matches)
-- Applying dedup plans safely via quarantine
+- Applying dedup plans safely via quarantine, with content re-verification
 - Non-interactive auto-dedup for large-scale cleanup
 - Identifying and removing zero-length files
 - Cleaning junk and OS artefacts (Thumbs.db, .DS_Store, etc.)
@@ -62,7 +64,7 @@ Hasher helps protect and maintain NAS-stored data by:
 ## Requirements
 
 - Synology DSM, macOS, or any Linux environment with bash
-- Standard tools: `bash`, `awk`, `sort`, `stat`, `find`, `mv`, `rm`
+- Standard tools: `bash`, `awk`, `sort`, `stat`, `find`, `mv`, `rm`, `xargs`
 - Recommended install location: same volume you scan (e.g. `/volume1/hasher`)
 
 Cross-platform support is tested on Synology DSM, Linux, and macOS. Host-aware
@@ -77,6 +79,7 @@ Stage 1 — Hash
    1) Start hashing (NAS-safe defaults)
    a) Advanced / custom hashing
    s) Hashing status
+   p) Performance settings (parallel hashing)
 
 Stage 2 — Identify
    2) Find duplicate files
@@ -103,8 +106,38 @@ Other
 ```
 
 Number keys 1–9 drive the main workflow. Letters cover meta and infrequent
-operations: `a`/`s` for hashing variants, `f` for hash lookup, `r` for folder
-plan review, and `d/l/t/v/c` for diagnostics and housekeeping.
+operations: `a`/`s`/`p` for hashing variants, status, and performance; `f` for
+hash lookup; `r` for folder plan review; and `d/l/t/v/c` for diagnostics and
+housekeeping.
+
+---
+
+## Performance — parallel hashing
+
+By default Hasher hashes files serially (one worker), matching its original
+behaviour. On multi-core systems with SSD or SHR storage, parallel hashing
+can cut large-run times substantially — the per-file process overhead, not the
+hashing maths, dominates wall-clock on big small-file corpora (photo libraries).
+
+Set the worker count via the **`p` menu option** (Performance settings). It
+detects your CPU cores, recommends a safe value (`min(cores, 4)`), and persists
+your choice in `var/jobs.conf`. You can also set it directly:
+
+```bash
+# One-off:
+bin/hasher.sh --pathfile local/paths.txt --jobs 4
+
+# Or in local/hasher.conf:
+[performance]
+jobs = 4
+```
+
+> **Single spinning HDD?** Keep workers low (1–2). Too many parallel readers
+> cause seek thrashing and can make a single-disk NAS *slower*, not faster.
+> SSD and multi-disk SHR/RAID arrays benefit most from higher worker counts.
+
+Serial and parallel runs produce identical hash output; parallelism only changes
+the order rows are written to the CSV.
 
 ---
 
@@ -158,12 +191,17 @@ cat logs/duplicate-folders-plan-*.txt | head -20
 cat logs/duplicate-folders-plan-reviewed-*.txt
 ```
 
-**File plan format** (one decision per line, with markers):
+**File plan format** (one decision per line, with markers). Since v1.2.0, `DEL`
+lines carry the expected content hash as a third field so the file can be
+re-verified before quarantine:
 ```
 KEEP|/volume1/James/Photos/IMG_001.jpg
-DEL|/volume1/James/Backup/Photos/IMG_001.jpg
-DEL|/volume1/James/Archive/Photos/IMG_001.jpg
+DEL|/volume1/James/Backup/Photos/IMG_001.jpg|3a7bd3e2360a3d29eea436fcfb7e44c7...
+DEL|/volume1/James/Archive/Photos/IMG_001.jpg|3a7bd3e2360a3d29eea436fcfb7e44c7...
 ```
+
+Older two-field plans (`DEL|path`, no hash) are still accepted — re-verification
+is simply skipped, with a warning, falling back to an existence check.
 
 **Folder plan format** (one path per line; all listed paths get quarantined;
 the implicit keeper is the one *not* listed for each group):
@@ -192,6 +230,9 @@ local/junk-extensions.txt   — rules for junk file cleanup
 ```
 
 Precedence: `CLI flags > local/hasher.conf > default/hasher.conf`
+
+Parallel-hashing precedence: `--jobs flag > hasher.conf [performance] jobs >
+var/jobs.conf (set by the 'p' menu) > HASH_JOBS env > default (1)`.
 
 ---
 
@@ -235,7 +276,7 @@ hasher/
 │
 ├── logs/                        — plan files and reports (gitignored)
 ├── hashes/                      — hash CSVs (gitignored)
-├── var/                         — working files (gitignored)
+├── var/                         — working files, jobs.conf (gitignored)
 ├── quarantine/                  — files moved by delete-duplicates.sh
 │
 ├── launcher.sh
@@ -249,6 +290,9 @@ hasher/
 ## Safety Model
 
 - Plans are written and reviewable before anything is moved
+- **Content re-verification (v1.2.0):** before quarantining, `delete-duplicates.sh`
+  re-hashes each candidate and skips any whose content no longer matches the hash
+  in the plan — protecting files modified between planning and applying
 - The folder-dedup reviewer (option `r`) lets you accept, skip, or swap keepers
   per duplicate group before applying anything
 - Applying a raw (unreviewed) folder plan prompts for explicit confirmation
@@ -276,6 +320,14 @@ drive not mounted, typo in volume name, NAS share offline. Use `ls /Volumes`
 **Folder review says "no groups TSV found"**
 Run option 3 (Find duplicate folders) first. The reviewer reads
 `logs/duplicate-folders-groups-*.tsv`, which is produced by the finder.
+
+**"Content changed since plan was made — SKIPPING"**
+Expected and safe: a file changed between hashing and applying, so it's no longer
+a verified duplicate. Re-run hashing and dedup to re-evaluate it.
+
+**Parallel hashing makes my NAS slower**
+You're likely on a single spinning HDD. Set workers back to 1–2 via the `p` menu.
+Parallelism helps SSD/SHR arrays, not single-spindle disks.
 
 ---
 
