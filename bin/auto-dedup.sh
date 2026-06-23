@@ -229,6 +229,10 @@ flush_group() {
   groups_processed=$((groups_processed+1))
 
   # Write plan entries
+  # v1.2.0: DEL lines now carry the group's expected hash as a third field
+  # (DEL|path|hash) so delete-duplicates.sh can re-verify the file content
+  # still matches before quarantining. KEEP lines stay 2-field; they're not
+  # acted on destructively.
   while IFS= read -r _fp || [ -n "$_fp" ]; do
     [ -z "$_fp" ] && continue
     if [ "$_fp" = "$keeper" ]; then
@@ -240,7 +244,7 @@ flush_group() {
       files_kept=$((files_kept+1))
     else
       if [ "$DRY_RUN" -eq 0 ]; then
-        printf 'DEL|%s\n' "$_fp" >> "$PLAN_OUT"
+        printf 'DEL|%s|%s\n' "$_fp" "$cur_hash" >> "$PLAN_OUT"
       else
         detail "DEL   $_fp"
       fi
