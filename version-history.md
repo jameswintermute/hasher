@@ -503,6 +503,84 @@ been updated to match v1.1.13.
   `run-find-duplicates.sh`) updated to reference the new option numbers.
 
 ---
+## 2026‑06 — v1.2.0
+**Parallel hashing + just-in-time re-verification + dedup correctness fix** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+A minor-version bump because two of the three changes alter behaviour
+in ways worth flagging: hashing can now run in parallel, and the dedup
+plan format gained a third field. Both are backward compatible.
+
+### Parallel hashing (item 4 — was in the earliest xargs-based designs)
+
+`bin/hasher.sh` previously hashed strictly one file at a time, forking
+three processes per file (two `stat`, one hash binary). On large
+small-file corpora (photo libraries) that fork overhead — not the
+hashing itself — dominated wall-clock. A benchmark of 2,000 tiny files
+showed ~11s serial vs ~0.1s with `xargs -P4`.
+
+The hashing loop now fans the file list out to N workers via `xargs -P`
+when `HASH_JOBS > 1`. `HASH_JOBS=1` preserves the exact historical
+serial path with no `bash -c` overhead. Workers emit CSV rows whose
+single-`printf` writes stay under PIPE_BUF, so rows from concurrent
+workers never interleave; failures are counted via a sentinel channel.
+Verified: serial and parallel produce byte-identical hash sets,
+including filenames with spaces and embedded quotes.
+
+Controls:
+- `--jobs N` flag on hasher.sh
+- `[performance] jobs = N` in hasher.conf
+- `HASH_JOBS` environment variable
+- **New launcher menu option `p` (Performance settings)** — interactive
+  picker (serial / recommended / aggressive / custom), persisted in
+  `var/jobs.conf`, with core detection and HDD-thrashing guidance.
+  Default remains conservative (serial) so nothing changes unless the
+  user opts in.
+
+### Just-in-time re-verification before quarantine (item 1b)
+
+Previously the pipeline hashed at T0, planned at T1, and applied at T2 —
+potentially days apart — and `delete-duplicates.sh` checked only that a
+file still *existed* before quarantining it, never that its content
+still matched the hash that justified calling it a duplicate. A file
+modified between plan and apply would be quarantined on stale data.
+
+The dedup plan format now carries the expected hash as a third field:
+`DEL|path|expectedhash`. At apply time, `delete-duplicates.sh` re-hashes
+each candidate and **skips any whose content no longer matches**,
+reporting expected vs actual. This closes the stale-plan window — and
+does so cheaply, re-hashing only the handful of files about to be
+deleted rather than the whole corpus.
+
+All four plan producers updated to emit the hash: `auto-dedup.sh`,
+`find-duplicates.sh` (bulk mode), `review-duplicates.sh` (both delete-all
+and keep-one paths). Old-format plans (`DEL|path`, no hash) are still
+accepted — `delete-duplicates.sh` warns once and falls back to the
+existence check. Verified across three scenarios: unchanged file
+quarantines normally; changed file is skipped and protected; old plan
+falls back cleanly.
+
+### Dedup grouping correctness fix (item 2)
+
+`bin/find-duplicates.sh` used `grep -F -f "$HASHES_TMP" "$TMP"` to keep
+rows belonging to duplicate hashes. `grep -F` matches each hash as an
+unanchored substring against the whole line — including the *path*
+column. Content-addressed files (git objects, nix/ipfs stores,
+hash-named thumbnail caches, dedup backups) can have a hash string
+embedded in their path, which would pull unrelated rows into a duplicate
+group and silently corrupt the grouping. Replaced with an `awk` join
+keyed strictly on the hash column. Verified with a collision case: a
+file named `/cache/aaaa1111.dat` (content hash `bbbb2222`) is no longer
+mis-grouped with the real `aaaa1111` duplicates.
+
+### Other
+
+- **`default/hasher.conf`** — version bumped to v1.2.0, finally syncing
+  the conf version string with the launcher (it had drifted at v1.1.10
+  through three releases). New `[performance]` section documents `jobs`.
+- Portability: avoided a bash-4 `${kind^}` that slipped into the new
+  parallel failure-reporting path; replaced with the plain value.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
