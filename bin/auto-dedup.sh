@@ -99,7 +99,7 @@ case "$KEEP_STRATEGY" in
 esac
 
 # ── Validate inputs ────────────────────────────────────────────────────────────
-[ -r "$REPORT" ] || { err "Report not found: $REPORT"; err "Run option 3 (Find duplicate files) first."; exit 1; }
+[ -r "$REPORT" ] || { err "Report not found: $REPORT"; err "Run option 2 (Find duplicate files) first."; exit 1; }
 
 if [ "$DRY_RUN" -eq 0 ]; then
   touch "$PLAN_OUT" 2>/dev/null || { err "Cannot write plan file: $PLAN_OUT"; exit 1; }
