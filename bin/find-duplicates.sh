@@ -153,8 +153,19 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   exit 0
 fi
 
-# Keep only rows belonging to duplicate hashes
-grep -F -f "$HASHES_TMP" "$TMP" > "$OUT_CSV" || true
+# Keep only rows belonging to duplicate hashes.
+# FIX (v1.2.0): previously used `grep -F -f "$HASHES_TMP" "$TMP"`, which
+# matched each hash as an UNANCHORED substring against the whole line —
+# including the path column. Content-addressed files (git objects, nix/ipfs
+# stores, hash-named thumbnail caches, dedup backups) can have a hash string
+# embedded in their PATH, which would pull unrelated rows into a duplicate
+# group and silently corrupt the grouping. We now match strictly on the
+# hash column (field 1 of "$TMP", which is "hash,path,size") using an awk
+# join keyed on the exact hash value.
+awk -F',' '
+  NR==FNR { want[$1]=1; next }       # first file: the wanted hashes
+  ($1 in want)                       # second file: keep rows whose col-1 hash matches
+' "$HASHES_TMP" "$TMP" > "$OUT_CSV" || true
 
 # Single-pass AWK to render canonical + groups; avoids bash loops under set -e
 awk -F',' -v min="$MIN_GROUP" \
@@ -217,9 +228,11 @@ if [[ "$MODE" == "bulk" ]]; then
       for (h in idx) {
         if (idx[h] >= 2) {
           k=best[h]
-          # Emit KEEP first, then DEL for every other path in the group
+          # Emit KEEP first, then DEL for every other path in the group.
+          # v1.2.0: DEL lines carry the group hash (h) as a third field so
+          # delete-duplicates.sh can re-verify content before quarantining.
           printf "KEEP|%s\n", k
-          for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) printf "DEL|%s\n", p }
+          for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) printf "DEL|%s|%s\n", p, h }
         }
       }
     }
