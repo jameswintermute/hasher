@@ -437,7 +437,7 @@ action_performance_settings(){
   # Persist
   printf '%s\n' "$HASHER_JOBS" > "$HASHER_JOBS_FILE" 2>/dev/null || true
   export HASHER_JOBS
-  ok "Parallel hashing set to $HASHER_JOBS worker(s). Saved."
+  info "Parallel hashing set to $HASHER_JOBS worker(s). Saved."
   printf "Press Enter to continue... "; read -r _ || true
 }
 
