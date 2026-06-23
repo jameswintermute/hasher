@@ -60,7 +60,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.1.12 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.1.13 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -115,32 +115,33 @@ ensure_no_running_hasher() {
 
 print_menu() {
   echo
-  echo "### Stage 1 - Hash ###"
-  echo "  0) Check hashing status (static)"
-  echo "  1) Start Hashing (NAS-safe defaults)"
-  echo "  8) Advanced / Custom hashing"
+  echo "${BOLD}Stage 1 — Hash${RST}"
+  echo "   1) Start hashing (NAS-safe defaults)"
+  echo "   a) Advanced / custom hashing"
+  echo "   s) Hashing status"
   echo
-  echo "### Stage 2 - Identify ###"
-  echo "  2) Find duplicate folders"
-  echo "  3) Find duplicate files"
-  echo " 12) Find file by HASH (lookup)"
+  echo "${BOLD}Stage 2 — Identify${RST}"
+  echo "   2) Find duplicate files"
+  echo "   3) Find duplicate folders"
+  echo "   f) Find file by hash (lookup)"
   echo
-  echo "### Stage 3 - Clean up ###"
-  echo "  4) Review duplicates (interactive)"
-  echo " 16) Auto-dedup (keep shortest path — no prompts)"
-  echo "  5) Delete zero-length files"
-  echo "  6) Delete duplicates (apply plan)"
-  echo " 10) Clean cache files & @eaDir (safe)"
-  echo " 11) Delete junk (uses local/junk-extensions.txt)"
+  echo "${BOLD}Stage 3 — Review & clean${RST}"
+  echo "   4) Review duplicate FILES (interactive)"
+  echo "   r) Review duplicate FOLDERS plan (interactive)"
+  echo "   5) Auto-dedup (keep shortest path — no prompts)"
+  echo "   6) Apply dedup plan (FILE or FOLDER)"
+  echo "   7) Delete zero-length files"
+  echo "   8) Delete junk (uses local/junk-extensions.txt)"
+  echo "   9) Clean cache files & @eaDir (safe)"
   echo
-  echo "### Other ###"
-  echo "  7) System check (deps & readiness)"
-  echo "  9) Follow logs (tail -f background.log)"
-  echo " 13) Stats & scheduling hints"
-  echo " 14) Clean internal working files (var/)"
-  echo " 15) Clean logs (rotate & prune old logs/plans)"
+  echo "${BOLD}Other${RST}"
+  echo "   d) System diagnostics (deps & readiness)"
+  echo "   l) Follow logs (tail -f background.log)"
+  echo "   t) Stats & scheduling hints"
+  echo "   v) Clean internal working files (var/)"
+  echo "   c) Clean logs (rotate & prune)"
   echo
-  echo "  q) Quit"
+  echo "   q) Quit"
   echo
   printf "Select an option: "
 }
@@ -298,7 +299,7 @@ EOF
     tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
     clear_pidfile
   fi
-  info "While it runs, use option 9 to watch logs. Path: $BACKGROUND_LOG"
+  info "While it runs, use option 'l' to watch logs. Path: $BACKGROUND_LOG"
 }
 
 run_hasher_interactive() {
@@ -399,12 +400,47 @@ action_find_duplicate_folders(){
     || true
 
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+  groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
   if [ -n "$plan" ]; then
     info "Plan saved to: $plan"
-    info "Review it first (cat/tail), then run option 6) Delete duplicates (apply plan)."
+    [ -n "$groups" ] && info "Group context: $groups"
+    echo
+    # NEW (v1.1.13): offer to launch the interactive reviewer immediately
+    if [ -n "$groups" ] && [ -x "$BIN_DIR/review-folder-plan.sh" ]; then
+      printf "Review this plan interactively now? [Y/n]: "
+      read -r ans || ans="y"
+      case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+        ""|y|yes)
+          "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan" || true
+          ;;
+        *)
+          info "OK — review later with menu option 'r', or apply raw plan via option 6."
+          ;;
+      esac
+    else
+      info "Review later with menu option 'r', or apply raw plan via option 6."
+    fi
   else
     info "No folder plan found to suggest next steps."
   fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# NEW (v1.1.13): interactive reviewer for the folder-dedup plan
+action_review_folder_plan(){
+  groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
+  if [ -z "$groups" ]; then
+    err "No folder groups TSV found. Run option 3 (Find duplicate folders) first."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  if [ ! -x "$BIN_DIR/review-folder-plan.sh" ]; then
+    err "$BIN_DIR/review-folder-plan.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+  "$BIN_DIR/review-folder-plan.sh" --groups "$groups" ${plan:+--plan "$plan"} || true
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -453,7 +489,24 @@ action_apply_plan(){
   # Collect latest plan of each type: review-duplicates, auto-dedup, folder
   review_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
   auto_plan="$(ls -1t "$LOGS_DIR"/auto-dedup-plan-*.txt 2>/dev/null | head -n1 || true)"
-  folder_plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+
+  # NEW (v1.1.13): for folder plans, prefer reviewed plans over raw ones.
+  # The reviewer writes duplicate-folders-plan-reviewed-DATETIME.txt; the
+  # finder writes duplicate-folders-plan-DATE.txt. Both match the same
+  # broad glob, so we split them and pick the reviewed one when present,
+  # warning the user if they're about to apply a raw plan that has no
+  # reviewed sibling.
+  folder_plan_reviewed="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt 2>/dev/null | head -n1 || true)"
+  folder_plan_raw="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
+
+  folder_plan=""; _folder_src=""
+  if [ -n "$folder_plan_reviewed" ]; then
+    folder_plan="$folder_plan_reviewed"
+    _folder_src="reviewed"
+  elif [ -n "$folder_plan_raw" ]; then
+    folder_plan="$folder_plan_raw"
+    _folder_src="raw (unreviewed)"
+  fi
 
   # Use the newest file plan between review and auto-dedup
   file_plan=""; _plan_src=""
@@ -474,7 +527,9 @@ action_apply_plan(){
   [ -n "$folder_plan" ] && has_folder=1
 
   if [ "$has_file" -eq 0 ] && [ "$has_folder" -eq 0 ]; then
-    info "No plan found. Run option 3+4 (interactive review) or 16 (auto-dedup) first."
+    info "No plan found. Generate one first:"
+    info "  - File dedup: option 2 (find duplicate files), then option 4 (review) or 5 (auto-dedup)"
+    info "  - Folder dedup: option 3 (find duplicate folders), then option 'r' (review)"
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
@@ -487,7 +542,13 @@ action_apply_plan(){
     info "No file dedupe plan found."
   fi
   if [ "$has_folder" -eq 1 ]; then
-    info "Latest FOLDER dedupe plan: $folder_plan"
+    info "Latest FOLDER dedupe plan ($_folder_src):"
+    info "  $folder_plan"
+    # NEW (v1.1.13): warn if folder plan is unreviewed
+    if [ "$_folder_src" = "raw (unreviewed)" ]; then
+      warn "This folder plan has NOT been interactively reviewed."
+      warn "Consider running menu option 'r' first to review each group before applying."
+    fi
   else
     info "No folder dedupe plan found."
   fi
@@ -495,7 +556,7 @@ action_apply_plan(){
   echo
   echo "Which plan do you want to apply?"
   [ "$has_file"   -eq 1 ] && echo "  f) Apply FILE plan   ($_plan_src)"
-  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan (find-duplicate-folders)"
+  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan ($_folder_src)"
   echo "  q) Cancel"
   printf "Choice: "
   read -r ans || ans="q"
@@ -515,6 +576,17 @@ action_apply_plan(){
     d)
       if [ "$has_folder" -eq 0 ]; then
         warn "No folder plan available."; printf "Press Enter to continue... "; read -r _ || true; return
+      fi
+      # NEW (v1.1.13): extra confirmation when applying an unreviewed plan
+      if [ "$_folder_src" = "raw (unreviewed)" ]; then
+        warn "About to apply an UNREVIEWED folder plan."
+        printf "Proceed without review? [y/N]: "
+        read -r confirm || confirm="n"
+        case "$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]')" in
+          y|yes) : ;;
+          *) info "Cancelled. Run menu option 'r' to review first."
+             printf "Press Enter to continue... "; read -r _ || true; return ;;
+        esac
       fi
       info "Applying FOLDER plan: $folder_plan"
       if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
@@ -837,23 +909,32 @@ while :; do
   read -r choice || { echo; exit 0; }
 
   case "${choice:-}" in
-    0)  action_check_status ;;
-    1)  action_start_hashing ;;
-    8)  action_custom_hashing ;;
-    2)  action_find_duplicate_folders ;;
-    3)  action_find_duplicate_files ;;
-    12) action_find_by_hash ;;
-    4)  action_review_duplicates ;;
-    16) action_auto_dedup ;;
-    5)  action_delete_zero_length ;;
-    6)  action_apply_plan ;;
-    10) action_clean_caches ;;
-    11) action_delete_junk ;;
-    7)  action_system_check ;;
-    9)  action_view_logs_follow ;;
-    13) action_stats_and_cron ;;
-    14) action_clean_internal ;;
-    15) action_clean_logs ;;
+    # ── Stage 1: Hash ─────────────────────────────────────────────────────
+    1)       action_start_hashing ;;
+    a|A)     action_custom_hashing ;;
+    s|S)     action_check_status ;;
+
+    # ── Stage 2: Identify ─────────────────────────────────────────────────
+    2)       action_find_duplicate_files ;;
+    3)       action_find_duplicate_folders ;;
+    f|F)     action_find_by_hash ;;
+
+    # ── Stage 3: Review & clean ───────────────────────────────────────────
+    4)       action_review_duplicates ;;
+    r|R)     action_review_folder_plan ;;
+    5)       action_auto_dedup ;;
+    6)       action_apply_plan ;;
+    7)       action_delete_zero_length ;;
+    8)       action_delete_junk ;;
+    9)       action_clean_caches ;;
+
+    # ── Other ─────────────────────────────────────────────────────────────
+    d|D)     action_system_check ;;
+    l|L)     action_view_logs_follow ;;
+    t|T)     action_stats_and_cron ;;
+    v|V)     action_clean_internal ;;
+    c|C)     action_clean_logs ;;
+
     q|Q)
         echo "Bye."
         exit 0
