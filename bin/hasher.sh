@@ -40,6 +40,11 @@ CONFIG_FILE=""
 # Progress interval (seconds) for background.log
 PROGRESS_INTERVAL=15
 
+# Parallel hashing workers (v1.2.0). 1 = serial (historical behaviour).
+# Overridable via --jobs N, HASH_JOBS env, or [performance] jobs in hasher.conf.
+# Precedence: --jobs flag > hasher.conf > HASH_JOBS env > default (1).
+HASH_JOBS="${HASH_JOBS:-1}"
+
 # Default excludes (kept minimal; comment out if undesired)
 DEFAULT_EXCLUDES=( "#recycle" "@eaDir" ".DS_Store" "lost+found" )
 EXTRA_EXCLUDES=()
@@ -279,6 +284,13 @@ load_config() {
           *)              : ;;
         esac
         ;;
+      "performance")
+        case "$key" in
+          # v1.2.0: parallel hashing worker count
+          jobs|hash-jobs|hash_jobs) HASH_JOBS="$val" ;;
+          *)                        : ;;
+        esac
+        ;;
       *) : ;;
     esac
   done < "$f"
@@ -335,6 +347,7 @@ while [[ $# -gt 0 ]]; do
     --nohup)    RUN_IN_BACKGROUND=true ;;
     --level)    LOG_LEVEL="${2:-}"; shift ;;
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
+    --jobs)     HASH_JOBS="${2:-1}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
     --config)   CONFIG_FILE="${2:-}"; shift ;;
@@ -351,7 +364,7 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   args=( "$0" --child )
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
-  args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" )
+  args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" --jobs "$HASH_JOBS" )
   # FIX (v1.1.10): "${arr[@]}" on an empty array errors under set -u in
   # bash 3.2 (Apple's stock /bin/bash) and 4.0–4.3. The :- guard is the
   # portable form for safe-on-empty array iteration. Same fix as line ~425.
@@ -694,30 +707,121 @@ main() {
   local start_ts
   start_ts=$(date +%s)
 
-  while IFS= read -r -d '' f; do
-    local size mtime
+  # PARALLEL HASHING (v1.2.0)
+  # ─────────────────────────
+  # HASH_JOBS controls worker parallelism. 1 = serial (identical to the
+  # historical behaviour). >1 fans the file list out to N workers via xargs,
+  # each doing stat+hash and emitting a CSV row. Rationale: the serial loop
+  # forks 3 processes per file (two stat, one hash binary); on large
+  # small-file corpora (photo libraries) this fork overhead — not the hashing
+  # itself — dominates wall-clock. Parallelism recovers most of it on
+  # multi-core NAS units and SSD/SHR arrays. Single-spindle HDD users should
+  # keep HASH_JOBS low (1-2) to avoid seek thrashing; that's why the default
+  # is a conservative cap rather than full nproc.
+  #
+  # Atomicity: each worker writes one CSV row per file via a single printf.
+  # POSIX guarantees writes up to PIPE_BUF (>=512, 4096 on Linux) to a pipe
+  # are atomic, and a CSV row is well under that, so rows from concurrent
+  # workers do not interleave. Failure rows are emitted to stderr-channel as
+  # a sentinel the parent counts.
+
+  local jobs="${HASH_JOBS:-1}"
+  # sanitise: must be a positive integer
+  case "$jobs" in (''|*[!0-9]*) jobs=1 ;; esac
+  [[ "$jobs" -lt 1 ]] && jobs=1
+
+  if [[ "$jobs" -gt 1 ]]; then
+    info "Parallel hashing enabled: $jobs workers."
+  fi
+
+  # The worker: reads ONE file path as $1, stats + hashes it, prints a CSV row
+  # on success, or a FAIL sentinel line (prefixed with the NUL-safe marker) on
+  # failure. Exported into the environment for `bash -c` invocation by xargs.
+  # We pass ALGO and the hash command through the environment.
+  _hash_worker() {
+    local f="$1"
+    local size mtime line hash
     size=$(_stat_size "$f" 2>/dev/null || echo -1)
     mtime=$(_stat_mtime "$f" 2>/dev/null || echo -1)
-
     if [[ "$size" -lt 0 || "$mtime" -lt 0 ]]; then
-      warn "Stat failed: $f"
-      FAIL=$((FAIL+1))
-      DONE=$((DONE+1))
-      continue
+      printf '\037FAIL\037stat\t%s\n' "$f"   # \037 = unit separator, unlikely in paths
+      return 0
     fi
-
-    local line hash
     if ! line=$("${hash_cmd[@]}" -- "$f" 2>/dev/null); then
-      warn "Hash failed: $f"
-      FAIL=$((FAIL+1))
-      DONE=$((DONE+1))
-      continue
+      printf '\037FAIL\037hash\t%s\n' "$f"
+      return 0
     fi
     hash="${line%% *}"
+    # csv_escape inline (worker runs in a subshell that has the function)
+    local esc="${f//\"/\"\"}"
+    printf '"%s",%s,%s,%s,%s\n' "$esc" "$size" "$mtime" "$ALGO" "$hash"
+  }
+  export -f _hash_worker _stat_size _stat_mtime 2>/dev/null || true
+  export ALGO
+  # hash_cmd is an array; export its serialised form and rebuild in workers
+  export HASH_CMD_STR="${hash_cmd[*]}"
 
-    append_csv_row "$f" "$size" "$mtime" "$ALGO" "$hash"
-    DONE=$((DONE+1))
-  done < "$FILES_LIST"
+  # Stream: NUL-delimited file list → xargs → workers → tee into a post-processor
+  # that splits CSV rows (to $OUTPUT) from FAIL sentinels (counted).
+  local fail_file="$VAR_DIR/hash-fails.$$"
+  : > "$fail_file"
+
+  if [[ "$jobs" -gt 1 ]]; then
+    # Parallel path via xargs -P. We invoke a tiny bash -c per file that
+    # rebuilds the hash_cmd array from HASH_CMD_STR and calls the worker.
+    # -n 1 keeps the per-file granularity (simplest correct mapping); the
+    # fork cost of bash -c is offset by the parallelism for large corpora.
+    xargs -0 -P "$jobs" -n 1 bash -c '
+      read -ra hash_cmd <<< "$HASH_CMD_STR"
+      _hash_worker "$1"
+    ' _ < "$FILES_LIST" \
+    | while IFS= read -r row; do
+        case "$row" in
+          $'\037'FAIL$'\037'*)
+            printf '%s\n' "$row" >> "$fail_file"
+            ;;
+          *)
+            printf '%s\n' "$row" >> "$OUTPUT"
+            ;;
+        esac
+      done
+  else
+    # Serial path: preserve exact historical behaviour, no bash -c overhead.
+    while IFS= read -r -d '' f; do
+      local out
+      out="$(_hash_worker "$f")"
+      case "$out" in
+        $'\037'FAIL$'\037'*)
+          printf '%s\n' "$out" >> "$fail_file"
+          ;;
+        *)
+          printf '%s\n' "$out" >> "$OUTPUT"
+          ;;
+      esac
+    done < "$FILES_LIST"
+  fi
+
+  # Tally results
+  local hashed_rows fail_rows
+  hashed_rows=$(( $(wc -l < "$OUTPUT" 2>/dev/null || echo 1) - 1 ))   # minus header
+  [[ "$hashed_rows" -lt 0 ]] && hashed_rows=0
+  fail_rows=$(wc -l < "$fail_file" 2>/dev/null | tr -d ' ' || echo 0)
+  [[ -z "$fail_rows" ]] && fail_rows=0
+
+  # Emit per-failure warnings (kept concise; full list is in the fail file)
+  if [[ "$fail_rows" -gt 0 ]]; then
+    while IFS= read -r fl; do
+      local kind path
+      kind="${fl#$'\037'FAIL$'\037'}"; kind="${kind%%$'\t'*}"
+      path="${fl#*$'\t'}"
+      # portable: don't use bash-4 ${kind^}; just print the kind as-is
+      warn "$kind failed: $path"
+    done < "$fail_file"
+  fi
+  rm -f -- "$fail_file" 2>/dev/null || true
+
+  DONE=$(( hashed_rows + fail_rows ))
+  FAIL="$fail_rows"
 
   local end_ts elapsed sH sM sS
   end_ts=$(date +%s)

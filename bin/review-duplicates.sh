@@ -451,7 +451,12 @@ present_group(){
             # shellcheck disable=SC2162
             while IFS= read -r fp || [ -n "$fp" ]; do
               [ -z "$fp" ] && continue
-              printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+              # v1.2.0: emit group hash for re-verification at quarantine time
+              if [ -n "${group_hash:-}" ]; then
+                printf "DEL|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
+              else
+                printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+              fi
             done <"$ORDERED"
             echo "   -> All copies in this group have been marked for deletion in the plan."
             break
@@ -482,7 +487,12 @@ present_group(){
                 if [ "$idx" -eq "$sel" ]; then
                   printf "KEEP|%s\n" "$fp" >>"$PLAN_OUT"
                 else
-                  printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+                  # v1.2.0: emit group hash for re-verification
+                  if [ -n "${group_hash:-}" ]; then
+                    printf "DEL|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
+                  else
+                    printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
+                  fi
                 fi
               done <"$ORDERED"
               echo "   -> Choice recorded: keeping #$sel, others marked for deletion."
