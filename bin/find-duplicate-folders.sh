@@ -55,6 +55,12 @@ case "$MODE" in plan) : ;; *) err "Only --mode plan is supported"; exit 2;; esac
 
 DATE_TAG="$(date +%F)"
 PLAN="$LOGS_DIR/duplicate-folders-plan-$DATE_TAG.txt"
+# NEW (v1.1.13): persist the per-group TSV alongside the plan so the
+# review-folder-plan.sh tool can present full keep/del context to the
+# user. Columns: reclaim_bytes \t keep_dir \t delete_dir
+# Each row represents one delete decision; multiple rows can share a
+# keep_dir (one keeper, multiple deletes within one group).
+GROUPS_TSV="$LOGS_DIR/duplicate-folders-groups-$DATE_TAG.tsv"
 TMP_BASE="$VAR_DIR/dupdirs.$$"
 TMP_FILES="$TMP_BASE.files.tsv"     # dir \t basename \t hash \t size
 TMP_SORTED="$TMP_BASE.sorted.tsv"   # sorted by dir, then basename/hash/size
@@ -211,5 +217,10 @@ while IFS='	' read -r sz keepdir deldir; do
   printf "%s\n" "$deldir" >> "$PLAN"
 done < "$TMP_BASE.groups.sorted.tsv"
 
+# NEW (v1.1.13): persist the per-group decision context for the reviewer.
+# Format identical to TMP_GROUPS but lives in logs/ alongside the plan.
+cp -f -- "$TMP_BASE.groups.sorted.tsv" "$GROUPS_TSV"
+
 ok "Plan written: $PLAN"
+ok "Group context: $GROUPS_TSV"
 exit 0
