@@ -278,15 +278,21 @@ prompt_swap_choice() {
   local n
   n="$(printf "%s\n" "$dels" | wc -l | tr -d ' ')"
   if [ "$n" -lt 1 ]; then printf ""; return; fi
-  echo "  Which DEL should become the new keeper?"
+  # FIX (v1.2.1): this function is called inside $(...) command substitution,
+  # so its STDOUT is captured as the return value. All human-facing UI (the
+  # menu, the prompt) must therefore go to STDERR (>&2) — otherwise the menu
+  # text gets captured into the caller's variable alongside the chosen number,
+  # and the prompt never appears live (which manifested as needing to press
+  # Enter twice). Only the chosen number is written to stdout.
+  echo "  Which DEL should become the new keeper?" >&2
   local i=0
   while IFS= read -r d; do
     [ -z "$d" ] && continue
     i=$((i + 1))
-    printf "    %d) %s\n" "$i" "$d"
+    printf "    %d) %s\n" "$i" "$d" >&2
   done <<< "$dels"
-  printf "    c) Cancel — keep original keeper\n"
-  printf "  Choice: "
+  printf "    c) Cancel — keep original keeper\n" >&2
+  printf "  Choice: " >&2
   read -r reply || reply="c"
   case "$reply" in
     c|C|"") printf "" ;;
