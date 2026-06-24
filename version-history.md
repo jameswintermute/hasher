@@ -581,6 +581,101 @@ mis-grouped with the real `aaaa1111` duplicates.
   parallel failure-reporting path; replaced with the plain value.
 
 ---
+## 2026‑06 — v1.2.1
+**Folder reviewer swap-prompt fix** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Found during real-world folder-dedup review on a 280,944-file NAS corpus
+(238 duplicate groups). The `[s] Swap keeper` option required pressing
+Enter twice to take effect.
+
+### Bug fix
+
+- **`bin/review-folder-plan.sh`** — `prompt_swap_choice()` is invoked
+  inside a `$(...)` command substitution (`chosen="$(prompt_swap_choice "$i")"`),
+  so everything it wrote to stdout was captured as the return value —
+  including the menu text and the "Choice:" prompt. Two consequences:
+  the prompt never appeared live (the user was effectively typing blind,
+  which felt like needing a second Enter), and the captured `$chosen`
+  contained the whole menu string plus the number rather than just the
+  number. Downstream numeric validation masked the second problem, so
+  swaps still worked — but awkwardly.
+
+  Fixed by sending all human-facing UI (menu, prompt) to stderr (`>&2`)
+  and writing only the chosen number to stdout. The prompt now appears
+  immediately and a single Enter advances. Verified end-to-end: a 3-way
+  group swap correctly leaves the chosen folder as the implicit keeper
+  and lists the other two for quarantine.
+
+### Note for a future iteration
+
+Real-world use surfaced an asymmetry worth recording: the v1.2.0
+just-in-time content re-verification protects the FILE dedup path
+(`delete-duplicates.sh` re-hashes each candidate before quarantine) but
+NOT the FOLDER dedup path (`apply-folder-plan.sh` moves whole directory
+trees without re-verifying their contents against the groups TSV). For
+folder plans the matching is by content signature so coincidental
+false-positives are unlikely, but a folder whose contents changed
+between hashing and applying would still be moved. A symmetric fix —
+re-verifying folder contents before the move — is a candidate for a
+later release.
+
+---
+## 2026‑06 — v1.2.2
+**Stateful folder review + high-fidelity audit log** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Addresses a workflow gap found applying folder dedup across multiple
+sessions on the 280k-file NAS corpus: after applying a reviewed plan to
+~20 folders and returning later, the reviewer looped back to group 1,
+re-presenting groups whose duplicates had already been quarantined. It
+had no awareness of what had already been done.
+
+### Design principle: logs record, disk decides
+
+The fix deliberately does NOT read a log to decide what to skip. A log
+that is read back to drive a root-running bulk-deletion tool becomes a
+forgeable control input — a line injected into the log could steer
+deletions. Instead:
+
+- **The disk is the source of truth.** The reviewer checks whether each
+  group's DEL folder still exists at its original path. If it's gone
+  (quarantined in a prior session, or removed by any other means) there
+  is nothing left to quarantine, so the group is auto-skipped. This fact
+  cannot be forged by editing a log.
+- **The log is write-only.** A new high-fidelity audit log records what
+  was done, for humans and audit — and is never read back by the tool.
+
+### `bin/review-folder-plan.sh` — stateful skip
+
+- At startup, pre-scans all groups against current disk state and reports
+  e.g. "18 of 238 group(s) already applied (DEL folders gone) — these
+  will be skipped. 220 group(s) remain to review." This explains why the
+  walk may start partway through the list.
+- Groups whose DEL folders are all gone are auto-skipped (decision
+  recorded as `already_done`, never written to the reviewed plan).
+- The `[a]` apply-last-to-all path also skips already-gone groups rather
+  than re-listing absent folders for quarantine.
+- End summary gains an "Already applied" line, separate from accept /
+  skip / swap / not-reviewed, with corrected quit-early arithmetic.
+
+### `bin/apply-folder-plan.sh` — audit log + counter fix
+
+- Writes a single persistent `logs/folder-actions.log` (no per-run log
+  spread). Tab-separated records: ISO-8601 UTC timestamp, action
+  (QUARANTINED / DELETE_METADATA / *_FAILED), source, destination,
+  size in KB — preceded by a human-readable per-session header. This is
+  the high-fidelity audit trail; the tool never reads it back.
+- Fixed a latent counter bug: the success path called the `ok()` helper
+  but never incremented the move counter, so "Moved: N" always reported
+  0. Now reports the true count.
+
+### Still deferred
+
+Folder-content re-verification before the move (the file-path equivalent
+landed in v1.2.0) remains a candidate for a future release. The v1.2.2
+skip logic keys on folder *presence*, not content; a folder still present
+but changed since hashing would still be actioned.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

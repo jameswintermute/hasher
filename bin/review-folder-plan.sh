@@ -111,6 +111,31 @@ sample_files_in_dir() {
   fi
 }
 
+# v1.2.2: classify a group's DEL folders by their CURRENT presence on disk.
+# This is how the reviewer knows a group was already actioned — it asks the
+# disk (unforgeable), never a log (forgeable). Returns one of:
+#   present  — at least one DEL folder still exists at its original path
+#   gone     — every DEL folder is absent from its original path
+# A "gone" group has nothing left to quarantine (whether Hasher moved it in a
+# previous session, or it was removed by other means), so it is auto-skipped.
+group_del_status() {
+  local idx="$1"
+  local dels="${G_DELS[$idx]}"
+  local any_present=0
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    if [ -e "$d" ]; then
+      any_present=1
+      break
+    fi
+  done <<< "$dels"
+  if [ "$any_present" -eq 1 ]; then
+    printf "present"
+  else
+    printf "gone"
+  fi
+}
+
 # Build the in-memory group list from the TSV. Multiple rows can share a
 # keep_dir (one group with N>=1 delete entries each). We collapse them into
 # group records: keepdir, list of deldirs, total reclaim bytes.
@@ -172,6 +197,7 @@ load_groups() {
 
 declare -a D_ACTION D_SWAP_TO
 LAST_ACTION="accept"  # used by [a] apply-last-to-all
+SKIPPED_GONE=0        # v1.2.2: count of groups auto-skipped (DEL already gone)
 
 # ── per-group rendering ─────────────────────────────────────────────────────
 
@@ -278,15 +304,21 @@ prompt_swap_choice() {
   local n
   n="$(printf "%s\n" "$dels" | wc -l | tr -d ' ')"
   if [ "$n" -lt 1 ]; then printf ""; return; fi
-  echo "  Which DEL should become the new keeper?"
+  # FIX (v1.2.1): this function is called inside $(...) command substitution,
+  # so its STDOUT is captured as the return value. All human-facing UI (the
+  # menu, the prompt) must therefore go to STDERR (>&2) — otherwise the menu
+  # text gets captured into the caller's variable alongside the chosen number,
+  # and the prompt never appears live (which manifested as needing to press
+  # Enter twice). Only the chosen number is written to stdout.
+  echo "  Which DEL should become the new keeper?" >&2
   local i=0
   while IFS= read -r d; do
     [ -z "$d" ] && continue
     i=$((i + 1))
-    printf "    %d) %s\n" "$i" "$d"
+    printf "    %d) %s\n" "$i" "$d" >&2
   done <<< "$dels"
-  printf "    c) Cancel — keep original keeper\n"
-  printf "  Choice: "
+  printf "    c) Cancel — keep original keeper\n" >&2
+  printf "  Choice: " >&2
   read -r reply || reply="c"
   case "$reply" in
     c|C|"") printf "" ;;
@@ -322,6 +354,13 @@ apply_remaining_with_last() {
     y|Y|yes|YES)
       local i
       for (( i = from_idx; i < G_COUNT; i++ )); do
+        # v1.2.2: never bulk-action a group whose DEL folders are already gone
+        if [ "$(group_del_status "$i")" = "gone" ]; then
+          D_ACTION[i]="already_done"
+          D_SWAP_TO[i]=""
+          SKIPPED_GONE=$((SKIPPED_GONE + 1))
+          continue
+        fi
         D_ACTION[i]="$action"
         D_SWAP_TO[i]=""
         printf "  %s[Group %d]%s DECISION: %s\n" "$C_DIM" "$((i + 1))" "$C_RST" "$action"
@@ -337,7 +376,38 @@ apply_remaining_with_last() {
 
 review_loop() {
   local i=0
+
+  # v1.2.2: pre-scan the disk to report how many groups are already applied
+  # before we start, so the user understands why the walk may begin at a
+  # group number other than 1 (or skip large stretches). This is a read-only
+  # disk check; it makes no decisions and reads no logs.
+  local pre_gone=0 pre_present=0 _s
+  for (( _s = 0; _s < G_COUNT; _s++ )); do
+    if [ "$(group_del_status "$_s")" = "gone" ]; then
+      pre_gone=$((pre_gone + 1))
+    else
+      pre_present=$((pre_present + 1))
+    fi
+  done
+  if [ "$pre_gone" -gt 0 ]; then
+    info "$pre_gone of $G_COUNT group(s) already applied (DEL folders gone) — these will be skipped."
+    info "$pre_present group(s) remain to review."
+    echo
+  fi
+
   while [ "$i" -lt "$G_COUNT" ]; do
+    # v1.2.2: skip groups whose DEL folders are already gone from disk.
+    # This is the disk-state check that stops the reviewer looping back
+    # through groups actioned in a previous session. Decision is driven by
+    # physical reality, not by reading any log.
+    if [ "$(group_del_status "$i")" = "gone" ]; then
+      D_ACTION[i]="already_done"
+      D_SWAP_TO[i]=""
+      SKIPPED_GONE=$((SKIPPED_GONE + 1))
+      i=$((i + 1))
+      continue
+    fi
+
     show_group "$i"
 
     local default_letter="y"
@@ -459,6 +529,11 @@ write_reviewed_plan() {
         n_skip=$((n_skip + 1))
         # nothing written
         ;;
+      already_done)
+        # v1.2.2: DEL folder(s) already gone from disk — nothing to write,
+        # counted separately in the summary via SKIPPED_GONE.
+        :
+        ;;
       swap)
         n_swap=$((n_swap + 1))
         folders_swap=$((folders_swap + ndel))
@@ -495,7 +570,12 @@ write_reviewed_plan() {
   printf "  Swap keeper         : %d groups  (%s, %d folders)\n" \
     "$n_swap" "$(human_bytes "$bytes_swap")" "$folders_swap"
 
-  local n_quit=$((G_COUNT - n_accept - n_skip - n_swap))
+  # v1.2.2: groups auto-skipped because their DEL folders were already gone
+  if [ "$SKIPPED_GONE" -gt 0 ]; then
+    printf "  Already applied     : %d groups  (DEL folder no longer present — skipped)\n" "$SKIPPED_GONE"
+  fi
+
+  local n_quit=$((G_COUNT - n_accept - n_skip - n_swap - SKIPPED_GONE))
   if [ "$n_quit" -gt 0 ]; then
     printf "  Not reviewed        : %d groups  (quit early)\n" "$n_quit"
   fi
