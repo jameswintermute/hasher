@@ -581,6 +581,45 @@ mis-grouped with the real `aaaa1111` duplicates.
   parallel failure-reporting path; replaced with the plain value.
 
 ---
+## 2026‑06 — v1.2.1
+**Folder reviewer swap-prompt fix** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Found during real-world folder-dedup review on a 280,944-file NAS corpus
+(238 duplicate groups). The `[s] Swap keeper` option required pressing
+Enter twice to take effect.
+
+### Bug fix
+
+- **`bin/review-folder-plan.sh`** — `prompt_swap_choice()` is invoked
+  inside a `$(...)` command substitution (`chosen="$(prompt_swap_choice "$i")"`),
+  so everything it wrote to stdout was captured as the return value —
+  including the menu text and the "Choice:" prompt. Two consequences:
+  the prompt never appeared live (the user was effectively typing blind,
+  which felt like needing a second Enter), and the captured `$chosen`
+  contained the whole menu string plus the number rather than just the
+  number. Downstream numeric validation masked the second problem, so
+  swaps still worked — but awkwardly.
+
+  Fixed by sending all human-facing UI (menu, prompt) to stderr (`>&2`)
+  and writing only the chosen number to stdout. The prompt now appears
+  immediately and a single Enter advances. Verified end-to-end: a 3-way
+  group swap correctly leaves the chosen folder as the implicit keeper
+  and lists the other two for quarantine.
+
+### Note for a future iteration
+
+Real-world use surfaced an asymmetry worth recording: the v1.2.0
+just-in-time content re-verification protects the FILE dedup path
+(`delete-duplicates.sh` re-hashes each candidate before quarantine) but
+NOT the FOLDER dedup path (`apply-folder-plan.sh` moves whole directory
+trees without re-verifying their contents against the groups TSV). For
+folder plans the matching is by content signature so coincidental
+false-positives are unlikely, but a folder whose contents changed
+between hashing and applying would still be moved. A symmetric fix —
+re-verifying folder contents before the move — is a candidate for a
+later release.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
