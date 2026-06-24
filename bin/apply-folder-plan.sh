@@ -138,13 +138,46 @@ fi
 LOG_FILE="$LOGS_DIR/apply-folder-plan-$TS.log"
 info "Logging to $LOG_FILE"
 
-idx=0; ok=0; fail=0; removed=0
+# v1.2.2: single persistent, high-fidelity audit log of folder actions.
+# This is WRITE-ONLY from the tool's perspective — it is a human/audit record
+# and is NEVER read back to drive any deletion decision (that would make a
+# forgeable text file part of the trusted control path for a root-running
+# bulk-move tool). The reviewer determines "already done" from disk state
+# (the DEL folder's presence at its original path), not from this log.
+# Format: tab-separated, one record per actioned folder:
+#   ISO8601 \t ACTION \t SOURCE \t DEST \t SIZE_KB
+ACTIONS_LOG="$LOGS_DIR/folder-actions.log"
+_audit() {
+  # $1=action $2=source $3=dest $4=size_kb
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "${3:-}" "${4:-}" \
+    >> "$ACTIONS_LOG" 2>/dev/null || true
+}
+# Seed a human-readable session header (also write-only)
+{
+  printf '# ---- apply-folder-plan session %s ----\n' "$TS"
+  printf '# plan: %s\n' "$PLAN_FILE"
+  printf '# dest-root: %s\n' "$DEST_ROOT"
+} >> "$ACTIONS_LOG" 2>/dev/null || true
+
+idx=0; moved=0; fail=0; removed=0
 while IFS= read -r src; do
   [ -z "$src" ] && continue
   idx=$((idx+1))
+
+  # per-folder size (best-effort, for the audit record)
+  sz_kb="$(du -sk -- "$src" 2>/dev/null | awk 'NR==1{print $1}')"
+  [[ "$sz_kb" =~ ^[0-9]+$ ]] || sz_kb=""
+
   if [ "$DELETE_METADATA" = true ] && printf '%s\n' "$src" | grep -Eq '/(@eaDir|\.AppleDouble)(/|$)'; then
     work "($idx/$COUNT) delete metadata: $src"
-    if rm -rf -- "$src" 2>>"$LOG_FILE"; then removed=$((removed+1)); ok "deleted"; else warn "delete failed — see log"; fail=$((fail+1)); fi
+    if rm -rf -- "$src" 2>>"$LOG_FILE"; then
+      removed=$((removed+1)); ok "deleted"
+      _audit "DELETE_METADATA" "$src" "" "$sz_kb"
+    else
+      warn "delete failed — see log"; fail=$((fail+1))
+      _audit "DELETE_METADATA_FAILED" "$src" "" "$sz_kb"
+    fi
     continue
   fi
   # Build a unique destination slot using the full source path, not just
@@ -160,9 +193,16 @@ while IFS= read -r src; do
   slot="$(printf '%s\n' "$src" | sed 's|^/||; s|/|__|g')"
   dest="$DEST_ROOT/$slot"
   work "($idx/$COUNT) $src -> $dest"
-  if mv -- "$src" "$dest" 2>>"$LOG_FILE"; then ok "moved"; else warn "move failed — see log"; fail=$((fail+1)); fi
+  if mv -- "$src" "$dest" 2>>"$LOG_FILE"; then
+    moved=$((moved+1)); ok "moved"
+    _audit "QUARANTINED" "$src" "$dest" "$sz_kb"
+  else
+    warn "move failed — see log"; fail=$((fail+1))
+    _audit "QUARANTINE_FAILED" "$src" "$dest" "$sz_kb"
+  fi
 done < "$PLAN_FILE"
 
-info "Done. Moved: $ok  | Deleted metadata: $removed  | Failed: $fail  | Log: $LOG_FILE"
+info "Done. Moved: $moved  | Deleted metadata: $removed  | Failed: $fail  | Log: $LOG_FILE"
+info "Audit record appended to: $ACTIONS_LOG"
 info "Review quarantine: $DEST_ROOT"
 exit 0
