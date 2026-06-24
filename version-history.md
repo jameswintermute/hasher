@@ -620,6 +620,62 @@ re-verifying folder contents before the move — is a candidate for a
 later release.
 
 ---
+## 2026‑06 — v1.2.2
+**Stateful folder review + high-fidelity audit log** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Addresses a workflow gap found applying folder dedup across multiple
+sessions on the 280k-file NAS corpus: after applying a reviewed plan to
+~20 folders and returning later, the reviewer looped back to group 1,
+re-presenting groups whose duplicates had already been quarantined. It
+had no awareness of what had already been done.
+
+### Design principle: logs record, disk decides
+
+The fix deliberately does NOT read a log to decide what to skip. A log
+that is read back to drive a root-running bulk-deletion tool becomes a
+forgeable control input — a line injected into the log could steer
+deletions. Instead:
+
+- **The disk is the source of truth.** The reviewer checks whether each
+  group's DEL folder still exists at its original path. If it's gone
+  (quarantined in a prior session, or removed by any other means) there
+  is nothing left to quarantine, so the group is auto-skipped. This fact
+  cannot be forged by editing a log.
+- **The log is write-only.** A new high-fidelity audit log records what
+  was done, for humans and audit — and is never read back by the tool.
+
+### `bin/review-folder-plan.sh` — stateful skip
+
+- At startup, pre-scans all groups against current disk state and reports
+  e.g. "18 of 238 group(s) already applied (DEL folders gone) — these
+  will be skipped. 220 group(s) remain to review." This explains why the
+  walk may start partway through the list.
+- Groups whose DEL folders are all gone are auto-skipped (decision
+  recorded as `already_done`, never written to the reviewed plan).
+- The `[a]` apply-last-to-all path also skips already-gone groups rather
+  than re-listing absent folders for quarantine.
+- End summary gains an "Already applied" line, separate from accept /
+  skip / swap / not-reviewed, with corrected quit-early arithmetic.
+
+### `bin/apply-folder-plan.sh` — audit log + counter fix
+
+- Writes a single persistent `logs/folder-actions.log` (no per-run log
+  spread). Tab-separated records: ISO-8601 UTC timestamp, action
+  (QUARANTINED / DELETE_METADATA / *_FAILED), source, destination,
+  size in KB — preceded by a human-readable per-session header. This is
+  the high-fidelity audit trail; the tool never reads it back.
+- Fixed a latent counter bug: the success path called the `ok()` helper
+  but never incremented the move counter, so "Moved: N" always reported
+  0. Now reports the true count.
+
+### Still deferred
+
+Folder-content re-verification before the move (the file-path equivalent
+landed in v1.2.0) remains a candidate for a future release. The v1.2.2
+skip logic keys on folder *presence*, not content; a folder still present
+but changed since hashing would still be actioned.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
