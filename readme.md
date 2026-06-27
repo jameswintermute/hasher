@@ -1,25 +1,81 @@
-# Hasher — NAS File Hasher & Duplicate Finder
+# Hasher — NAS File Hasher, Integrity Monitor & Duplicate Finder
 
-Robust hashing, duplicate discovery, and safe cleanup tooling for NAS environments.
-Synology DSM / BusyBox compatible. Pure shell — no dependencies beyond standard tools.
+A pure-shell tool that catalogues every file on a NAS by its SHA-256 hash, so you
+can find duplicates, reclaim space safely, and — over time — prove what has changed,
+vanished, or silently corrupted. Synology DSM / BusyBox compatible, with no
+dependencies beyond standard Unix tools.
 
-> **Safety-first design:** all deletion flows use quarantine-first, dry-run support,
-> and explicit confirmation. Nothing is deleted without a plan file you can review first.
-> Before quarantining, each candidate is re-hashed and skipped if its content has
-> changed since the plan was made (v1.2.0).
+> **Safety-first by design.** Nothing is ever deleted outright. Every removal moves
+> files to a recoverable quarantine, driven by a plan file you can review first, and
+> each candidate is re-hashed immediately before it is moved — so a file that changed
+> after the plan was made is skipped, not lost.
 
 ---
 
-## Scope
+## Why Hasher exists
 
-Hasher is a content-integrity tool. It catalogues files by SHA-256 hash, identifies
-duplicates, removes them safely (quarantine-first), and produces a CSV that other
-tools can use for downstream analysis — including silent-deletion detection.
+Large file collections decay quietly. Photos and documents accumulated over decades
+develop duplicates across backups and imports; bits rot on disk without warning; and
+files can disappear — through accidental deletion, a failing drive, sync gone wrong,
+or a malicious actor — without anyone noticing until the file is needed and gone.
 
-Hasher is deliberately narrow: hashing, duplicate detection (file and folder),
-safe removal, CSV output. Workflow tooling that consumes Hasher's CSV is out of
-scope and belongs in separate projects. This separation keeps Hasher small enough
-to audit and stable enough to depend on.
+A SHA-256 hash is a fingerprint of a file's exact contents. If you fingerprint every
+file on a regular schedule, you hold a precise record of what existed and what each
+file contained at each point in time. That record is the foundation for answering
+questions that matter for long-term data integrity:
+
+- **Silent corruption** — has a file's content changed while its name and timestamp
+  stayed the same? (The classic signature of bit-rot, and of tampering.)
+- **Silent or malicious deletion** — which files were present last month and are
+  gone now, with no deliberate action to explain it?
+- **Change tracking** — what has been added, modified, or moved since the last run?
+
+Deduplication is the immediately useful half of the tool: it finds identical files
+and whole identical folders and helps you reclaim space safely. Integrity monitoring
+is the longer-game half: the same hashes, captured repeatedly, become an audit trail.
+
+---
+
+## What Hasher is
+
+Hasher is a **content-integrity tool**. Its single job is to hash files reliably and
+act on those hashes safely:
+
+- Catalogue every file by SHA-256 (optionally in parallel across CPU cores)
+- Detect duplicate **files** (identical content) and duplicate **folders** (entire
+  identical directory trees — the highest-leverage cleanup)
+- Remove duplicates safely: quarantine-first, plan-before-act, re-verified before the move
+- Find and remove zero-length files and OS junk artefacts
+- Emit a timestamped CSV of the complete catalogue on every run
+
+Hasher is deliberately narrow. It hashes, finds duplicates, removes them safely, and
+writes the CSV. It does one thing well so it stays small enough to audit and stable
+enough to trust with a root-level deletion role on a NAS.
+
+---
+
+## How the integrity monitoring works
+
+Hasher itself does not diff one run against another — that is out of scope, and keeping
+it out is what keeps the core small. Instead, **every hash run writes a timestamped CSV**
+to `hashes/` (`hasher-YYYY-MM-DD-HHMM.csv`): one row per file, recording its path, size,
+modification time, algorithm, and hash.
+
+Those CSVs are the substrate for integrity monitoring. Because each is a complete,
+dated snapshot of the catalogue, comparing two of them reveals exactly what changed:
+
+- A path present in the older CSV but absent in the newer one was **deleted**.
+- A path in both, with the **same size and mtime but a different hash**, is the
+  fingerprint of **silent corruption or tampering**.
+- A path whose hash changed alongside an updated mtime was a normal **edit**.
+- A path only in the newer CSV was **added**.
+
+Separate, purpose-built tooling consumes these CSVs and reports those differences
+across iterations. Keeping the comparison in its own project means the part of the
+system that runs as root and moves files stays minimal and auditable, while the
+analysis that only *reads* CSVs can evolve independently. Hasher's contract is simply
+to produce honest, complete, timestamped snapshots; what you learn by comparing them
+is built on top.
 
 ---
 
@@ -31,33 +87,21 @@ cd hasher
 
 chmod +x launcher.sh bin/*.sh
 
-nano local/paths.txt   # add the directories you want to scan
-
-./launcher.sh          # menu-driven launcher
+./launcher.sh          # first launch runs a short guided setup
 ```
+
+On first launch Hasher offers a brief, skippable guided setup: it checks
+dependencies, helps you choose a parallel-hashing level for your hardware, prompts
+for a directory to scan, and shows you where quarantine will live. Everything it
+configures is also reachable from the menu afterwards.
 
 ---
 
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.2.0**
+Started Dec 2022. Current version: **v1.3.0**
 For full history see: `version-history.md`
-
----
-
-## Purpose
-
-Hasher helps protect and maintain NAS-stored data by:
-
-- Generating SHA-256 hashes of all files (optionally in parallel)
-- Detecting duplicate folders (entire tree-level matches)
-- Detecting duplicate files (hash-level matches)
-- Applying dedup plans safely via quarantine, with content re-verification
-- Non-interactive auto-dedup for large-scale cleanup
-- Identifying and removing zero-length files
-- Cleaning junk and OS artefacts (Thumbs.db, .DS_Store, etc.)
-- Maintaining long-term NAS hygiene
 
 ---
 
@@ -65,7 +109,7 @@ Hasher helps protect and maintain NAS-stored data by:
 
 - Synology DSM, macOS, or any Linux environment with bash
 - Standard tools: `bash`, `awk`, `sort`, `stat`, `find`, `mv`, `rm`, `xargs`
-- Recommended install location: same volume you scan (e.g. `/volume1/hasher`)
+- Recommended install location: anywhere on the volume you scan (e.g. `/volume1/Tools/hasher`). Quarantine is created beside the tool.
 
 Cross-platform support is tested on Synology DSM, Linux, and macOS. Host-aware
 defaults (excludes, quarantine paths) are auto-applied via `lib/host-detect.sh`.
