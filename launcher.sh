@@ -70,7 +70,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.2.3 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.0 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -439,6 +439,191 @@ action_performance_settings(){
   export HASHER_JOBS
   info "Parallel hashing set to $HASHER_JOBS worker(s). Saved."
   printf "Press Enter to continue... "; read -r _ || true
+}
+
+# ── First-run guided setup (v1.3.0) ──────────────────────────────────────────
+# Detection: presence of the sentinel file local/.setup-complete. Absent means
+# this is the first launch on this install. The sentinel is written when setup
+# finishes OR is skipped, so the prompt never appears again (first launch only,
+# never on upgrade). Reaching every step manually via the menu is always
+# possible; this flow just guides a new user through the sensible starting
+# points so they aren't dropped cold into the full menu.
+
+SETUP_SENTINEL="$LOCAL_DIR/.setup-complete"
+
+is_first_run() {
+  [ ! -f "$SETUP_SENTINEL" ]
+}
+
+mark_setup_complete() {
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || true
+  {
+    printf '# Hasher setup completed/skipped on %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '# Delete this file to see the first-run guided setup again.\n'
+  } > "$SETUP_SENTINEL" 2>/dev/null || true
+}
+
+# Step: pick a parallel-jobs value (shared logic with action_performance_settings,
+# but inline here so the first-run flow reads as one continuous guided sequence).
+firstrun_performance() {
+  cores=1
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || echo 1)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  fi
+  case "$cores" in ''|*[!0-9]*) cores=1 ;; esac
+  recommended="$cores"; [ "$recommended" -gt 4 ] && recommended=4
+
+  echo
+  echo "${BOLD}Step 2 of 4 — Performance (parallel hashing)${RST}"
+  echo
+  echo "Hashing can use multiple workers in parallel. More workers are faster"
+  echo "on multi-core systems with SSD or SHR/RAID storage. On a single spinning"
+  echo "HDD, keep this low (1-2) — too many workers cause seek thrashing."
+  echo
+  echo "  Detected CPU cores : $cores"
+  echo
+  echo "  1) Serial (1 worker)         — safest"
+  echo "  2) Recommended ($recommended worker(s))  — good default for most NAS units"
+  echo "  3) Aggressive ($cores worker(s))   — SSD/SHR arrays only"
+  echo "  s) Skip (leave at current: $HASHER_JOBS)"
+  echo
+  printf "Choice [2]: "
+  read -r pc || pc="2"
+  [ -z "$pc" ] && pc="2"
+  case "$pc" in
+    1) HASHER_JOBS=1 ;;
+    2) HASHER_JOBS="$recommended" ;;
+    3) HASHER_JOBS="$cores" ;;
+    s|S) info "Skipped — performance left at $HASHER_JOBS."; return ;;
+    *) info "Unrecognised; using recommended ($recommended)."; HASHER_JOBS="$recommended" ;;
+  esac
+  printf '%s\n' "$HASHER_JOBS" > "$HASHER_JOBS_FILE" 2>/dev/null || true
+  export HASHER_JOBS
+  info "Parallel hashing set to $HASHER_JOBS worker(s)."
+}
+
+# Step: ensure paths.txt has at least one real scan root.
+firstrun_paths() {
+  echo
+  echo "${BOLD}Step 3 of 4 — Scan paths${RST}"
+  echo
+  pfile="$(determine_paths_file)"
+  # "configured" = a paths file exists with at least one non-comment, non-blank line
+  configured=0
+  if [ -n "$pfile" ]; then
+    if grep -vE '^[[:space:]]*(#|$)' "$pfile" >/dev/null 2>&1; then configured=1; fi
+  fi
+
+  if [ "$configured" -eq 1 ]; then
+    info "Scan paths already configured in: $pfile"
+    grep -vE '^[[:space:]]*(#|$)' "$pfile" | sed 's/^/    /'
+    info "Edit that file any time to change what gets scanned."
+    return
+  fi
+
+  echo "Hasher needs at least one directory to scan. None is configured yet."
+  echo "You can add one now, or skip and edit local/paths.txt yourself later."
+  echo
+  printf "Enter a directory to scan (absolute path), or leave blank to skip: "
+  read -r p || p=""
+  p="$(printf '%s' "$p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ -z "$p" ]; then
+    warn "Skipped. Add paths to local/paths.txt before hashing (menu option 1 will warn if empty)."
+    return
+  fi
+  if [ ! -d "$p" ]; then
+    warn "That path does not exist or is not a directory: $p"
+    warn "Not added. You can add it later in local/paths.txt once it's available."
+    return
+  fi
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || true
+  # Preserve any template header if the file exists; just append the real path.
+  printf '%s\n' "$p" >> "$LOCAL_DIR/paths.txt"
+  info "Added to local/paths.txt: $p"
+  info "Add more any time by editing that file (one path per line)."
+}
+
+# Step: confirm where quarantine will live (read-only; reassurance, not a change).
+firstrun_quarantine() {
+  echo
+  echo "${BOLD}Step 4 of 4 — Quarantine location${RST}"
+  echo
+  qroot=""
+  if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$ROOT_DIR/lib/host-detect.sh"
+    qroot="$(default_quarantine_root 2>/dev/null || true)"
+  fi
+  [ -z "$qroot" ] && qroot="$ROOT_DIR/quarantine-$(date +%F)"
+  echo "When you remove duplicates or junk, Hasher MOVES them to quarantine"
+  echo "(it never deletes outright — quarantine is recoverable). On this install,"
+  echo "quarantine will be created beside the tool, at:"
+  echo
+  echo "    ${BOLD}$qroot${RST}"
+  echo
+  echo "To use a different location, set QUARANTINE_DIR in local/hasher.conf."
+  info "Nothing to do here — just so you know where to look."
+}
+
+first_run_setup() {
+  clear 2>/dev/null || true
+  header
+  echo "${BOLD}Welcome to Hasher — first-run setup${RST}"
+  echo
+  echo "This looks like the first launch on this install. I can walk you through"
+  echo "a few quick checks to get you ready: dependencies, performance, scan paths,"
+  echo "and where quarantine lives. It takes under a minute and everything is"
+  echo "skippable. You can also reach all of it later from the menu."
+  echo
+  printf "Run guided setup now? [Y/n]: "
+  read -r ans || ans="y"
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    n|no)
+      info "Skipping guided setup. You can run individual checks from the menu"
+      info "(d = diagnostics, p = performance). This prompt won't appear again."
+      mark_setup_complete
+      printf "Press Enter to continue to the menu... "; read -r _ || true
+      return
+      ;;
+  esac
+
+  # Step 1 — dependencies (reuse check-deps.sh)
+  echo
+  echo "${BOLD}Step 1 of 4 — Dependencies & readiness${RST}"
+  echo
+  if [ -x "$BIN_DIR/check-deps.sh" ]; then
+    "$BIN_DIR/check-deps.sh" || true
+    echo
+    # offer --fix if it looks like a hash tool may be missing
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+      warn "No sha256 tool detected."
+      printf "Attempt to create OpenSSL-based shims now? [y/N]: "
+      read -r fixit || fixit="n"
+      case "$(printf '%s' "$fixit" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) "$BIN_DIR/check-deps.sh" --fix || true ;;
+      esac
+    fi
+  else
+    warn "check-deps.sh not found — skipping dependency check."
+  fi
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 2 — performance
+  firstrun_performance
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 3 — paths
+  firstrun_paths
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 4 — quarantine
+  firstrun_quarantine
+  echo
+  echo "${BOLD}Setup complete.${RST} You're ready to hash (menu option 1)."
+  mark_setup_complete
+  printf "Press Enter to continue to the menu... "; read -r _ || true
 }
 
 action_view_logs_follow(){
@@ -980,6 +1165,12 @@ action_auto_dedup() {
 
   printf "Press Enter to continue... "; read -r _ || true
 }
+
+# ── First-run guided setup (v1.3.0) ──────────────────────────────────────────
+# Runs once on the first launch of a new install (sentinel: local/.setup-complete).
+if is_first_run; then
+  first_run_setup
+fi
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while :; do
