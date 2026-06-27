@@ -676,6 +676,59 @@ skip logic keys on folder *presence*, not content; a folder still present
 but changed since hashing would still be actioned.
 
 ---
+## 2026‑06 — v1.2.3
+**Critical fix: reviewed folder plans now actually apply** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Found in real use: after reviewing ~35 folder groups and choosing to
+apply, **nothing arrived in quarantine**. The folder dedup apply step
+was silently doing nothing for reviewed plans.
+
+### Root cause
+
+`review-folder-plan.sh` writes its reviewed plan with an 8-line
+`#`-prefixed comment header (provenance + format notes). But
+`apply-folder-plan.sh` read the plan without skipping comment lines.
+The failure chain:
+
+1. The `du` size-estimate loop ran `du` on a non-existent path named
+   `# Reviewed folder dedup plan`, which returned an empty size.
+2. The accumulator `du_total_k=$((10#${kb:-0}))` with an empty `kb`
+   is a fatal bash arithmetic error (`10#` followed by nothing).
+3. Under `set -Eeuo pipefail`, that error **terminated the entire
+   script before the move loop ran** — so not a single folder was
+   moved, and the quarantine directory was created but left empty.
+
+Raw plans (from `find-duplicate-folders.sh`) have no comment header, so
+they applied fine — which is why this stayed hidden until reviewed plans
+were applied at scale. The mismatch was introduced in v1.1.13 when the
+reviewer began writing the comment header, but the apply step was never
+taught to skip it.
+
+### Fix
+
+- **`bin/apply-folder-plan.sh`** — the plan is now normalised once into a
+  comment-free, blank-free temporary file (`PLAN_CLEAN`), and every
+  downstream read (directory count, metadata scan, `du` estimate, move
+  loop) uses it. The move loop also skips `#` lines defensively. The
+  `du` accumulator is hardened against empty/non-numeric sizes so a
+  vanished path can never again abort the run via arithmetic error.
+
+### Verified
+
+- Reviewed plan (with comment header): both folders correctly moved to
+  quarantine; "Moved: 2 | Failed: 0"; quarantine populated; originals
+  gone. Previously: silent no-op, empty quarantine.
+- Raw plan (no header): still works (regression check).
+- Audit log accumulates correctly across both session types.
+
+### Also
+
+- **`default/hasher.conf`** — version string synced to v1.2.3 (it had
+  been left at v1.1.10 in the live repo despite the v1.2.0 sync; the
+  `[performance]` section documenting parallel `jobs` was also missing
+  and has been restored).
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
