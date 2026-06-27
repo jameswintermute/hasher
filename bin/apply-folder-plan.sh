@@ -69,9 +69,10 @@ resolve_quarantine_dir() {
   local val
   val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
   if [ -z "$val" ]; then
-    # FIX (v1.1.9): host-aware fallback. /volume1 (the historical default
-    # baked into default/hasher.conf) is Synology-only; on macOS or
-    # generic Linux fall back to the repo-local quarantine instead.
+    # FIX (v1.1.9): host-aware fallback via host-detect.sh.
+    # v1.2.4: default_quarantine_root() now returns an install-relative path
+    # ($ROOT_DIR/quarantine-DATE) on every host, so quarantine lives beside
+    # the tool. Set QUARANTINE_DIR in local/hasher.conf to override.
     if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
       . "$ROOT_DIR/lib/host-detect.sh"
       val="$(default_quarantine_root)"
@@ -94,11 +95,32 @@ mkdir -p -- "$DEST_ROOT"
 DF_H="$(df -h "$QDIR" | awk 'NR==2{print $4" free on "$1" ("$6")"}')"
 info "Quarantine: $QDIR — $DF_H"
 
-COUNT="$(wc -l < "$PLAN_FILE" | tr -d ' ')"
+# FIX (v1.2.3): the reviewed plans written by review-folder-plan.sh begin with
+# a '#'-prefixed comment header (provenance + format notes). The previous code
+# read the plan line-by-line WITHOUT skipping comments, which caused two
+# failures:
+#   1. the du size-estimate loop ran `du` on a non-existent "folder" named
+#      "# Reviewed folder dedup plan", got an empty size, and the arithmetic
+#      `$((10#${kb:-0}))` with an empty kb is a syntax error that, under
+#      `set -e`, killed the whole script BEFORE any folder was moved — which
+#      is why quarantine ended up empty.
+#   2. the move loop would otherwise try to `mv` each comment line as a path.
+# Raw plans (from find-duplicate-folders.sh) have no comments, so they worked;
+# reviewed plans silently did nothing. We now normalise the plan ONCE into a
+# comment-free, blank-free temp file and use it for all reads below.
+PLAN_CLEAN="$(mktemp "${TMPDIR:-/tmp}/folder-plan.XXXXXX")"
+trap 'rm -f "$PLAN_CLEAN"' EXIT
+# strip blank lines and full-line comments (leading optional whitespace + '#')
+sed -e 's/[[:space:]]*$//' "$PLAN_FILE" \
+  | grep -vE '^[[:space:]]*#' \
+  | grep -vE '^[[:space:]]*$' \
+  > "$PLAN_CLEAN" || true
+
+COUNT="$(wc -l < "$PLAN_CLEAN" | tr -d ' ')"
 info "Plan: $PLAN_FILE  | Directories: $COUNT"
 
 # Count metadata entries in plan
-META_COUNT="$(grep -Ec '/(@eaDir|\.AppleDouble)(/|$)' "$PLAN_FILE" || true)"
+META_COUNT="$(grep -Ec '/(@eaDir|\.AppleDouble)(/|$)' "$PLAN_CLEAN" || true)"
 if [ "${META_COUNT:-0}" -gt 0 ] && ! $DELETE_METADATA; then
   printf "%s" "$(printf "%b[INFO]%b " "$CINFO" "$CRESET")"
   read -r -p "Found $META_COUNT metadata cache dirs in plan (@eaDir, .AppleDouble). Delete them instead of moving? [y/N]: " reply || reply=""
@@ -117,8 +139,13 @@ if command -v du >/dev/null 2>&1; then
     if ! [[ "$kb" =~ ^[0-9]+$ ]]; then
       kb="$(du -k -- "$d" 2>/dev/null | awk '{sum+=$1} END{print sum+0}')"
     fi
-    du_total_k=$((10#${du_total_k:-0}+10#${kb:-0}))
-  done < "$PLAN_FILE"
+    # FIX (v1.2.3): guard against empty/non-numeric kb (e.g. a path that no
+    # longer exists), which would make $((10#${kb:-0})) a fatal arithmetic
+    # error under set -e. Default to 0 explicitly.
+    [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+    [[ "$du_total_k" =~ ^[0-9]+$ ]] || du_total_k=0
+    du_total_k=$(( du_total_k + kb ))
+  done < "$PLAN_CLEAN"
   du_bytes=$((du_total_k*1024))
   awk -v b="$du_bytes" 'BEGIN{ gb=b/1024/1024/1024; mb=b/1024/1024; if (gb>=1) printf("[INFO] Estimated move size (recursive): %.2f GB\n", gb); else printf("[INFO] Estimated move size (recursive): %.2f MB\n", mb); }'
 fi
@@ -163,6 +190,8 @@ _audit() {
 idx=0; moved=0; fail=0; removed=0
 while IFS= read -r src; do
   [ -z "$src" ] && continue
+  # belt-and-braces: skip any comment line even though PLAN_CLEAN is filtered
+  case "$src" in \#*) continue ;; esac
   idx=$((idx+1))
 
   # per-folder size (best-effort, for the audit record)
@@ -200,7 +229,7 @@ while IFS= read -r src; do
     warn "move failed — see log"; fail=$((fail+1))
     _audit "QUARANTINE_FAILED" "$src" "$dest" "$sz_kb"
   fi
-done < "$PLAN_FILE"
+done < "$PLAN_CLEAN"
 
 info "Done. Moved: $moved  | Deleted metadata: $removed  | Failed: $fail  | Log: $LOG_FILE"
 info "Audit record appended to: $ACTIONS_LOG"

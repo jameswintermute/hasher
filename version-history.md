@@ -676,6 +676,146 @@ skip logic keys on folder *presence*, not content; a folder still present
 but changed since hashing would still be actioned.
 
 ---
+## 2026‑06 — v1.2.3
+**Critical fix: reviewed folder plans now actually apply** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Found in real use: after reviewing ~35 folder groups and choosing to
+apply, **nothing arrived in quarantine**. The folder dedup apply step
+was silently doing nothing for reviewed plans.
+
+### Root cause
+
+`review-folder-plan.sh` writes its reviewed plan with an 8-line
+`#`-prefixed comment header (provenance + format notes). But
+`apply-folder-plan.sh` read the plan without skipping comment lines.
+The failure chain:
+
+1. The `du` size-estimate loop ran `du` on a non-existent path named
+   `# Reviewed folder dedup plan`, which returned an empty size.
+2. The accumulator `du_total_k=$((10#${kb:-0}))` with an empty `kb`
+   is a fatal bash arithmetic error (`10#` followed by nothing).
+3. Under `set -Eeuo pipefail`, that error **terminated the entire
+   script before the move loop ran** — so not a single folder was
+   moved, and the quarantine directory was created but left empty.
+
+Raw plans (from `find-duplicate-folders.sh`) have no comment header, so
+they applied fine — which is why this stayed hidden until reviewed plans
+were applied at scale. The mismatch was introduced in v1.1.13 when the
+reviewer began writing the comment header, but the apply step was never
+taught to skip it.
+
+### Fix
+
+- **`bin/apply-folder-plan.sh`** — the plan is now normalised once into a
+  comment-free, blank-free temporary file (`PLAN_CLEAN`), and every
+  downstream read (directory count, metadata scan, `du` estimate, move
+  loop) uses it. The move loop also skips `#` lines defensively. The
+  `du` accumulator is hardened against empty/non-numeric sizes so a
+  vanished path can never again abort the run via arithmetic error.
+
+### Verified
+
+- Reviewed plan (with comment header): both folders correctly moved to
+  quarantine; "Moved: 2 | Failed: 0"; quarantine populated; originals
+  gone. Previously: silent no-op, empty quarantine.
+- Raw plan (no header): still works (regression check).
+- Audit log accumulates correctly across both session types.
+
+### Also
+
+- **`default/hasher.conf`** — version string synced to v1.2.3 (it had
+  been left at v1.1.10 in the live repo despite the v1.2.0 sync; the
+  `[performance]` section documenting parallel `jobs` was also missing
+  and has been restored).
+
+---
+## 2026‑06 — v1.2.4
+**Quarantine lives beside the tool (no more hardcoded /volume1/hasher)** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Surfaced when a user who had moved their install to /volume1/Tools/hasher
+found their quarantine directories at the old /volume1/hasher path
+instead — and had to go hunting for where quarantined data had gone.
+
+### Root cause
+
+`lib/host-detect.sh`'s `default_quarantine_root()` special-cased
+Synology to a hardcoded `/volume1/hasher/quarantine-DATE` — a legacy
+default from before installs lived anywhere else. Every other host
+already used an install-relative `$ROOT_DIR/quarantine-DATE`. Once the
+tool was moved out of /volume1/hasher, the quarantine target didn't
+follow it: data was quarantined to a fixed path unrelated to where the
+tool actually lived. For a tool whose safety model is "moved, not
+deleted — recoverable," the user not knowing where "moved" went
+undermines the guarantee.
+
+### Fix
+
+- **`lib/host-detect.sh`** — `default_quarantine_root()` now returns
+  `$ROOT_DIR/quarantine-DATE` on **every** host, including Synology. The
+  quarantine always lives beside the tool that created it. Verified: a
+  Synology install at /volume1/Tools/hasher now quarantines to
+  /volume1/Tools/hasher/quarantine-DATE.
+- This automatically corrects every consumer that resolves quarantine
+  via `default_quarantine_root()`: `apply-folder-plan.sh` (folder dedup)
+  and `delete-zero-length.sh`. Stale comments in both updated.
+- `delete-duplicates.sh` (file dedup) was already install-relative
+  (`$ROOT_DIR/quarantine`) and was never affected — so all three
+  quarantine paths are now consistent.
+- **`default/hasher.conf`** — quarantine documentation updated to
+  describe the install-relative default. Users wanting a fixed location
+  can still set `QUARANTINE_DIR` explicitly.
+
+### Migration note
+
+Any existing quarantine directories under the old `/volume1/hasher/`
+path can be moved or deleted at the user's discretion. (In this user's
+case they were empty — a consequence of the separate v1.2.3 apply bug,
+now fixed — so nothing needed migrating.)
+
+---
+## 2026‑06 — v1.3.0
+**First-run guided setup** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Until now a new user (or a fresh install) was dropped straight into the
+full menu with no guidance — they had to know to run dependency checks,
+set a performance level, and populate paths.txt before anything worked.
+The conf carried a `first_run_help = true` key that nothing ever read.
+
+### New: first-run detection + skippable guided setup
+
+- **Detection** is by sentinel file `local/.setup-complete` (gitignored,
+  per-install). Absent ⇒ first launch ⇒ offer guided setup. The sentinel
+  is written whether the user completes OR skips, so the prompt appears
+  on the first launch only and never on upgrade. Delete the file to see
+  setup again.
+- **The flow is fully skippable** — declining at the top still writes the
+  sentinel and goes to the menu; every individual step can be skipped too.
+  Everything remains reachable from the menu afterwards.
+
+Four guided steps:
+1. **Dependencies & readiness** — runs the existing `check-deps.sh`. If no
+   sha256 tool is found, offers to create OpenSSL shims (`--fix`).
+2. **Performance** — detects CPU cores, recommends `min(cores,4)`, persists
+   to `var/jobs.conf` (same mechanism as the `p` menu).
+3. **Scan paths** — if `paths.txt` has no real entries, prompts for one
+   directory, validates it exists before appending, or lets the user skip
+   and edit the file themselves later. No forced editor launch.
+4. **Quarantine location** — shows where quarantine will be created (the
+   v1.2.4 install-relative path), so the user knows where removed items
+   go. Read-only reassurance, no change.
+
+### Other
+
+- **`default/hasher.conf`** — `[setup]` section now documents that the
+  sentinel file is the real first-run mechanism; version → v1.3.0.
+
+### Note
+
+The sentinel lives in `local/` (persistent config), not `var/` (working
+state), so "clean internal working files" (menu `v`) never accidentally
+re-triggers onboarding.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
