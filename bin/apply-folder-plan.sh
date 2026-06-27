@@ -69,9 +69,10 @@ resolve_quarantine_dir() {
   local val
   val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
   if [ -z "$val" ]; then
-    # FIX (v1.1.9): host-aware fallback. /volume1 (the historical default
-    # baked into default/hasher.conf) is Synology-only; on macOS or
-    # generic Linux fall back to the repo-local quarantine instead.
+    # FIX (v1.1.9): host-aware fallback via host-detect.sh.
+    # v1.2.4: default_quarantine_root() now returns an install-relative path
+    # ($ROOT_DIR/quarantine-DATE) on every host, so quarantine lives beside
+    # the tool. Set QUARANTINE_DIR in local/hasher.conf to override.
     if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
       . "$ROOT_DIR/lib/host-detect.sh"
       val="$(default_quarantine_root)"

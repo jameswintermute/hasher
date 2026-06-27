@@ -55,8 +55,10 @@ resolve_quarantine_dir() {
   val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
   if [ -z "$val" ]; then
     # FIX (v1.1.9): host-aware fallback instead of hardcoded repo-root path.
-    # On Synology, prefer /volume1/hasher/quarantine-DATE; elsewhere stay
-    # under the repo so we never assume a NAS-only path exists.
+    # v1.2.4: default_quarantine_root() now returns an install-relative path
+    # ($ROOT_DIR/quarantine-DATE) on every host, including Synology, so the
+    # quarantine always lives beside the tool. Set QUARANTINE_DIR in
+    # local/hasher.conf to override.
     if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
       . "$ROOT_DIR/lib/host-detect.sh"
       val="$(default_quarantine_root)"
