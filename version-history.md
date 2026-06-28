@@ -816,6 +816,70 @@ state), so "clean internal working files" (menu `v`) never accidentally
 re-triggers onboarding.
 
 ---
+## 2026‑06 — v1.3.1
+**Critical: comma-in-filename data-loss fix + honest safety docs** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Both items from an external code review. The first is a genuine data-loss
+risk that had been latent in the core file-dedup path.
+
+### Item 1 (critical) — CSV parsing broke on commas in filenames
+
+`bin/find-duplicates.sh` parsed the hash CSV with `awk -F','` and fixed
+field numbers, even though `hasher.sh` writes RFC4180 CSV that
+double-quotes any path containing a comma. A file like
+`"/photos/Smith, John.jpg",1024,...,sha256,<hash>` shifted every field:
+the parser took the literal string `sha256` as the "hash" and truncated
+the path at the first comma. Consequences, both serious:
+
+- **Mis-grouping:** every comma-named file collapsed onto the same fake
+  key (`sha256`) and was treated as a mutual duplicate regardless of
+  real content.
+- **Wrong delete plans:** generated `DEL|` lines pointed at truncated,
+  non-existent paths (`/photos/Smith`) — a path that, if it happened to
+  exist, would be the wrong file to quarantine.
+
+The v1.2.0 re-verification offered only accidental protection (the
+truncated path usually wouldn't exist, so the move was skipped) — luck,
+not design.
+
+**Fix:** replaced the naive split with a proper quote-aware (RFC4180)
+CSV field parser in `find-duplicates.sh`, and switched the script's
+internal intermediate format from comma-joined to TAB-separated so that
+paths containing commas survive every downstream `awk` stage (the hash
+join, the canonical/group render, and the bulk-plan emitter all updated).
+Paths containing a literal tab are sanitised to a space in the
+intermediate (tabs in filenames are vanishingly rare).
+
+Verified with a regression matrix of pathological names — comma, double
+quote, pipe, space, and leading-dash — each as an identical-content pair:
+all four pairs grouped correctly on their real hash, plans carried
+complete intact paths and correct hashes, and applying the plan
+quarantined exactly the intended files while keepers survived.
+
+### Item 4 (cheap) — README safety claim was stronger than the code
+
+The README stated "Nothing is ever deleted outright. Every removal moves
+files to a recoverable quarantine." That is true for **deduplication**
+(the core workflow) but false for the **housekeeping helpers**:
+`delete-zero-length.sh` deletes by default (with `--quarantine` opt-in),
+and `delete-junk.sh` / cache cleaning use `rm`. The top-of-readme
+safety note and the Safety Model section now state plainly that dedup is
+quarantine-first and never deletes, while the housekeeping helpers delete
+by default. (The over-strong wording was introduced in the v1.3.0 README
+rewrite; this corrects it.)
+
+### Still outstanding from the same review (not in this release)
+
+- Item 2: "recursive" folder dedup matches leaf directories, not whole
+  trees — the label overpromises. (Honest rename or true tree signatures.)
+- Item 3: the launcher pidfile guard clears itself immediately (a subshell
+  cannot `wait` a sibling), so the duplicate-run guard is illusory.
+- Item 5: a stale duplicate `bin/host-detect.sh` carries the v1.2.4
+  quarantine fix while the *sourced* `lib/host-detect.sh` still hardcodes
+  `/volume1/hasher` — so the v1.2.4 fix is not actually in effect; plus
+  some scripts lack the executable bit in the zip.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
