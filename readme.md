@@ -5,10 +5,14 @@ can find duplicates, reclaim space safely, and — over time — prove what has 
 vanished, or silently corrupted. Synology DSM / BusyBox compatible, with no
 dependencies beyond standard Unix tools.
 
-> **Safety-first by design.** Nothing is ever deleted outright. Every removal moves
-> files to a recoverable quarantine, driven by a plan file you can review first, and
-> each candidate is re-hashed immediately before it is moved — so a file that changed
-> after the plan was made is skipped, not lost.
+> **Safety-first by design.** Duplicate removal is quarantine-first: identical files
+> and folders are *moved* to a recoverable quarantine, never deleted outright, driven
+> by a plan file you review first, and each candidate is re-hashed immediately before
+> the move so a file that changed after the plan was made is skipped. Note that the
+> separate housekeeping tools — zero-length-file removal, junk-extension cleanup, and
+> cache/`@eaDir` cleaning — delete by default (zero-length removal supports
+> `--quarantine` if you prefer). Dedup, the core workflow, never deletes; the
+> housekeeping helpers do.
 
 ---
 
@@ -100,7 +104,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.0**
+Started Dec 2022. Current version: **v1.3.1**
 For full history see: `version-history.md`
 
 ---
@@ -333,6 +337,8 @@ hasher/
 
 ## Safety Model
 
+**Deduplication (the core workflow) is quarantine-first and never deletes:**
+
 - Plans are written and reviewable before anything is moved
 - **Content re-verification (v1.2.0):** before quarantining, `delete-duplicates.sh`
   re-hashes each candidate and skips any whose content no longer matches the hash
@@ -340,9 +346,21 @@ hasher/
 - The folder-dedup reviewer (option `r`) lets you accept, skip, or swap keepers
   per duplicate group before applying anything
 - Applying a raw (unreviewed) folder plan prompts for explicit confirmation
-- `delete-duplicates.sh` moves files to quarantine — not permanent deletion
-- `apply-folder-plan.sh` uses collision-proof quarantine naming (v1.1.6+)
+- `delete-duplicates.sh` and `apply-folder-plan.sh` move files to quarantine —
+  not permanent deletion; `apply-folder-plan.sh` uses collision-proof quarantine
+  naming (v1.1.6+)
 - Exceptions list prevents re-flagging known-safe duplicates
+
+**Housekeeping helpers delete by default** — these are separate from dedup and
+remove files permanently unless noted:
+
+- `delete-zero-length.sh` deletes empty files; pass `--quarantine` to move them instead
+- `delete-junk.sh` permanently removes files matching `local/junk-extensions.txt`
+- cache/`@eaDir` cleaning permanently removes those caches
+- All support `--force`/dry-run patterns; review the plan or run without `--force` first
+
+**General:**
+
 - All scripts re-verify paths immediately before acting
 - Bash 3.2 / BSD awk / macOS userland compatibility audited (v1.1.9–v1.1.12)
 

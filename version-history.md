@@ -816,6 +816,132 @@ state), so "clean internal working files" (menu `v`) never accidentally
 re-triggers onboarding.
 
 ---
+## 2026‑06 — v1.3.1
+**Critical: comma-in-filename data-loss fix + honest safety docs** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Both items from an external code review. The first is a genuine data-loss
+risk that had been latent in the core file-dedup path.
+
+### Item 1 (critical) — CSV parsing broke on commas in filenames
+
+`bin/find-duplicates.sh` parsed the hash CSV with `awk -F','` and fixed
+field numbers, even though `hasher.sh` writes RFC4180 CSV that
+double-quotes any path containing a comma. A file like
+`"/photos/Smith, John.jpg",1024,...,sha256,<hash>` shifted every field:
+the parser took the literal string `sha256` as the "hash" and truncated
+the path at the first comma. Consequences, both serious:
+
+- **Mis-grouping:** every comma-named file collapsed onto the same fake
+  key (`sha256`) and was treated as a mutual duplicate regardless of
+  real content.
+- **Wrong delete plans:** generated `DEL|` lines pointed at truncated,
+  non-existent paths (`/photos/Smith`) — a path that, if it happened to
+  exist, would be the wrong file to quarantine.
+
+The v1.2.0 re-verification offered only accidental protection (the
+truncated path usually wouldn't exist, so the move was skipped) — luck,
+not design.
+
+**Fix:** replaced the naive split with a proper quote-aware (RFC4180)
+CSV field parser in `find-duplicates.sh`, and switched the script's
+internal intermediate format from comma-joined to TAB-separated so that
+paths containing commas survive every downstream `awk` stage (the hash
+join, the canonical/group render, and the bulk-plan emitter all updated).
+Paths containing a literal tab are sanitised to a space in the
+intermediate (tabs in filenames are vanishingly rare).
+
+Verified with a regression matrix of pathological names — comma, double
+quote, pipe, space, and leading-dash — each as an identical-content pair:
+all four pairs grouped correctly on their real hash, plans carried
+complete intact paths and correct hashes, and applying the plan
+quarantined exactly the intended files while keepers survived.
+
+### Item 4 (cheap) — README safety claim was stronger than the code
+
+The README stated "Nothing is ever deleted outright. Every removal moves
+files to a recoverable quarantine." That is true for **deduplication**
+(the core workflow) but false for the **housekeeping helpers**:
+`delete-zero-length.sh` deletes by default (with `--quarantine` opt-in),
+and `delete-junk.sh` / cache cleaning use `rm`. The top-of-readme
+safety note and the Safety Model section now state plainly that dedup is
+quarantine-first and never deletes, while the housekeeping helpers delete
+by default. (The over-strong wording was introduced in the v1.3.0 README
+rewrite; this corrects it.)
+
+### Still outstanding from the same review (not in this release)
+
+- Item 2: "recursive" folder dedup matches leaf directories, not whole
+  trees — the label overpromises. (Honest rename or true tree signatures.)
+- Item 3: the launcher pidfile guard clears itself immediately (a subshell
+  cannot `wait` a sibling), so the duplicate-run guard is illusory.
+- Item 5: a stale duplicate `bin/host-detect.sh` carries the v1.2.4
+  quarantine fix while the *sourced* `lib/host-detect.sh` still hardcodes
+  `/volume1/hasher` — so the v1.2.4 fix is not actually in effect; plus
+  some scripts lack the executable bit in the zip.
+
+---
+## 2026‑06 — v1.3.2
+**Item 5: the v1.2.4 quarantine fix finally takes effect** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+External review found that the v1.2.4 "quarantine lives beside the tool"
+fix had never actually been in effect, plus related release-hygiene drift.
+Three linked problems, all fixed here.
+
+### 1. The quarantine fix was in the wrong (unused) file
+
+There were two `host-detect.sh` files. The v1.2.4 install-relative fix had
+been applied to `bin/host-detect.sh`, but every script sources
+`lib/host-detect.sh` — and that copy still hardcoded
+`/volume1/hasher/quarantine-DATE` for Synology. So on a Synology install
+moved out of `/volume1/hasher` (e.g. to `/volume1/Tools/hasher`),
+quarantine was *still* being written to the old fixed path, exactly the
+bug v1.2.4 was meant to cure. This is the same wrong-file class of error
+as the conf-version drift (bumped conf landing in gitignored `local/`).
+
+**Fix:** `lib/host-detect.sh` — `default_quarantine_root()` is now
+install-relative on every host (`$ROOT_DIR/quarantine-DATE`), so the fix
+is in the file that is actually loaded. Verified: a simulated Synology
+install at `/volume1/Tools/hasher` now resolves quarantine to
+`/volume1/Tools/hasher/quarantine-DATE`.
+
+### 2. Deleted the stale duplicate helper
+
+`bin/host-detect.sh` is removed. Nothing sourced it; keeping a
+newer-looking duplicate of a sourced library is precisely what let the
+v1.2.4 fix land in the wrong place and sit there unused. One canonical
+`lib/host-detect.sh` remains.
+
+> **Upgrade note:** because this *deletes* a tracked file, removing it must
+> be done explicitly in the repo (a file upload won't delete it). Delete
+> `bin/host-detect.sh` when committing this release.
+
+### 3. Executable-bit resilience
+
+`bin/auto-dedup.sh` and `bin/review-folder-plan.sh` shipped without the
+executable bit in the zip, while the launcher gated them behind `[ -x ]`
+and hard-failed otherwise — breaking auto-dedup (option 5) and folder
+review on installs created via the GitHub web UI / zip upload (which does
+not preserve +x, and where chmod on the NAS is awkward).
+
+**Fix:** the exec bits are set in this release, AND the launcher no longer
+depends on them. New `run_script` helper runs a helper directly when it is
+executable, and otherwise falls back to `bash <script>` (after a
+best-effort `chmod +x`). The `[ -x ]` gates became `script_runnable`
+(executable *or* readable). Verified: with the +x bit stripped, folder
+review and auto-dedup still run via the bash fallback.
+
+### Still outstanding from the same review
+
+- Item 2: "recursive" folder dedup matches leaf directories, not whole trees.
+- Item 3: the launcher pidfile guard clears itself immediately (subshell
+  cannot `wait` a sibling), so the duplicate-run guard is illusory.
+
+A `bin/self-test.sh` preflight (checking exec bits, sourced-helper paths,
+required commands, Bash version, and that every menu target is runnable)
+would mechanically catch this whole wrong-file/missing-bit class of error
+and is a strong candidate for a future release.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

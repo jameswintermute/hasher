@@ -45,21 +45,23 @@ detect_host() {
 # Prints (does not export) a directory path suitable as a quarantine root
 # when the user has not set QUARANTINE_DIR in hasher.conf.
 #
-# Synology: /volume1/hasher/quarantine-DATE  (legacy default, preserved)
-# Other:    $ROOT_DIR/quarantine-DATE         (repo-local, no NAS assumption)
+# Synology: previously special-cased to /volume1/hasher/quarantine-DATE.
+# v1.3.2: now install-relative on EVERY host ($ROOT_DIR/quarantine-DATE), so
+# quarantine always lives beside the tool — even when the install was moved
+# out of /volume1/hasher (e.g. to /volume1/Tools/hasher). The Synology
+# special-case was a legacy default that silently sent quarantine to the old
+# fixed path after a move; this removes that surprise. Users who want a fixed
+# location can still set QUARANTINE_DIR in local/hasher.conf.
+#
+# NOTE: This is the SOURCED copy. The v1.2.4 fix was mistakenly applied only to
+# a now-deleted bin/host-detect.sh duplicate, so it never took effect until
+# v1.3.2 corrected it here, in the file every script actually loads.
 #
 # Requires ROOT_DIR to be set by the caller.
 default_quarantine_root() {
   detect_host
   date_tag="$(date +%F)"
-  case "$HASHER_HOST" in
-    synology)
-      printf '/volume1/hasher/quarantine-%s\n' "$date_tag"
-      ;;
-    *)
-      printf '%s/quarantine-%s\n' "${ROOT_DIR:-.}" "$date_tag"
-      ;;
-  esac
+  printf '%s/quarantine-%s\n' "${ROOT_DIR:-.}" "$date_tag"
 }
 
 # ── Default exclude patterns for the detected host ─────────────────────
