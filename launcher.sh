@@ -62,6 +62,32 @@ warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
 err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
 next(){  printf "%s[NEXT]%s %s\n" "$BLU" "$RST" "$*"; }
 
+# v1.3.2: tolerate helper scripts that arrived without the executable bit.
+# Some users install via the GitHub web UI / zip upload, which does not
+# preserve the +x bit, and cannot easily chmod on the NAS. Previously the
+# launcher hard-failed ("not found or not executable") when a needed helper
+# lacked +x — breaking folder review and auto-dedup on such installs.
+# script_runnable: true if the script can be run either directly (+x) or via bash.
+script_runnable() {
+  [ -x "$1" ] || [ -r "$1" ]
+}
+# run_script: execute a helper, preferring direct execution; if it is readable
+# but not executable, fall back to running it through bash so a missing +x bit
+# is not fatal. (Best-effort chmod first, in case the filesystem allows it.)
+run_script() {
+  local s="$1"; shift
+  if [ ! -x "$s" ] && [ -r "$s" ]; then
+    chmod +x "$s" 2>/dev/null || true   # may fail on some mounts; harmless
+  fi
+  if [ -x "$s" ]; then
+    "$s" "$@"
+  elif [ -r "$s" ]; then
+    bash "$s" "$@"
+  else
+    return 127
+  fi
+}
+
 header() {
   printf "%s" "$MAG"
   printf "%s\n" " _   _           _               "
@@ -70,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.1 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.2 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -671,12 +697,12 @@ action_find_duplicate_folders(){
     [ -n "$groups" ] && info "Group context: $groups"
     echo
     # NEW (v1.1.13): offer to launch the interactive reviewer immediately
-    if [ -n "$groups" ] && [ -x "$BIN_DIR/review-folder-plan.sh" ]; then
+    if [ -n "$groups" ] && script_runnable "$BIN_DIR/review-folder-plan.sh"; then
       printf "Review this plan interactively now? [Y/n]: "
       read -r ans || ans="y"
       case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
         ""|y|yes)
-          "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan" || true
+          run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan" || true
           ;;
         *)
           info "OK — review later with menu option 'r', or apply raw plan via option 6."
@@ -699,13 +725,13 @@ action_review_folder_plan(){
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
-  if [ ! -x "$BIN_DIR/review-folder-plan.sh" ]; then
-    err "$BIN_DIR/review-folder-plan.sh not found or not executable."
+  if ! script_runnable "$BIN_DIR/review-folder-plan.sh"; then
+    err "$BIN_DIR/review-folder-plan.sh not found or not readable."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-  "$BIN_DIR/review-folder-plan.sh" --groups "$groups" ${plan:+--plan "$plan"} || true
+  run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" ${plan:+--plan "$plan"} || true
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -1101,8 +1127,8 @@ action_clean_internal() {
 }
 
 action_auto_dedup() {
-  if [ ! -x "$BIN_DIR/auto-dedup.sh" ]; then
-    err "$BIN_DIR/auto-dedup.sh not found or not executable."
+  if ! script_runnable "$BIN_DIR/auto-dedup.sh"; then
+    err "$BIN_DIR/auto-dedup.sh not found or not readable."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
@@ -1138,7 +1164,7 @@ action_auto_dedup() {
   info "Running auto-dedup with strategy: $KEEP"
   echo
 
-  "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" || true
+  run_script "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" || true
 
   # Offer to apply the plan immediately
   echo

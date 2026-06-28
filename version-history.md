@@ -880,6 +880,68 @@ rewrite; this corrects it.)
   some scripts lack the executable bit in the zip.
 
 ---
+## 2026‑06 — v1.3.2
+**Item 5: the v1.2.4 quarantine fix finally takes effect** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+External review found that the v1.2.4 "quarantine lives beside the tool"
+fix had never actually been in effect, plus related release-hygiene drift.
+Three linked problems, all fixed here.
+
+### 1. The quarantine fix was in the wrong (unused) file
+
+There were two `host-detect.sh` files. The v1.2.4 install-relative fix had
+been applied to `bin/host-detect.sh`, but every script sources
+`lib/host-detect.sh` — and that copy still hardcoded
+`/volume1/hasher/quarantine-DATE` for Synology. So on a Synology install
+moved out of `/volume1/hasher` (e.g. to `/volume1/Tools/hasher`),
+quarantine was *still* being written to the old fixed path, exactly the
+bug v1.2.4 was meant to cure. This is the same wrong-file class of error
+as the conf-version drift (bumped conf landing in gitignored `local/`).
+
+**Fix:** `lib/host-detect.sh` — `default_quarantine_root()` is now
+install-relative on every host (`$ROOT_DIR/quarantine-DATE`), so the fix
+is in the file that is actually loaded. Verified: a simulated Synology
+install at `/volume1/Tools/hasher` now resolves quarantine to
+`/volume1/Tools/hasher/quarantine-DATE`.
+
+### 2. Deleted the stale duplicate helper
+
+`bin/host-detect.sh` is removed. Nothing sourced it; keeping a
+newer-looking duplicate of a sourced library is precisely what let the
+v1.2.4 fix land in the wrong place and sit there unused. One canonical
+`lib/host-detect.sh` remains.
+
+> **Upgrade note:** because this *deletes* a tracked file, removing it must
+> be done explicitly in the repo (a file upload won't delete it). Delete
+> `bin/host-detect.sh` when committing this release.
+
+### 3. Executable-bit resilience
+
+`bin/auto-dedup.sh` and `bin/review-folder-plan.sh` shipped without the
+executable bit in the zip, while the launcher gated them behind `[ -x ]`
+and hard-failed otherwise — breaking auto-dedup (option 5) and folder
+review on installs created via the GitHub web UI / zip upload (which does
+not preserve +x, and where chmod on the NAS is awkward).
+
+**Fix:** the exec bits are set in this release, AND the launcher no longer
+depends on them. New `run_script` helper runs a helper directly when it is
+executable, and otherwise falls back to `bash <script>` (after a
+best-effort `chmod +x`). The `[ -x ]` gates became `script_runnable`
+(executable *or* readable). Verified: with the +x bit stripped, folder
+review and auto-dedup still run via the bash fallback.
+
+### Still outstanding from the same review
+
+- Item 2: "recursive" folder dedup matches leaf directories, not whole trees.
+- Item 3: the launcher pidfile guard clears itself immediately (subshell
+  cannot `wait` a sibling), so the duplicate-run guard is illusory.
+
+A `bin/self-test.sh` preflight (checking exec bits, sourced-helper paths,
+required commands, Bash version, and that every menu target is runnable)
+would mechanically catch this whole wrong-file/missing-bit class of error
+and is a strong candidate for a future release.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
