@@ -703,16 +703,16 @@ main() {
     info  "  • Report: $out"
 
     bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
-    bglog INFO "NEXT: Review (dry-run): bin/delete-zero-length.sh \"$out\""
-    bglog INFO "NEXT: Delete: bin/delete-zero-length.sh \"$out\" --force"
+    bglog INFO "NEXT: Review (dry-run): bin/delete-zero-length.sh --report \"$out\" --dry-run"
+    bglog INFO "NEXT: Delete: bin/delete-zero-length.sh --report \"$out\" --force"
 
     echo
     echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
-    echo "  1) Review or delete zero-length files (dry-run first):"
-    echo "       bin/delete-zero-length.sh \"$out\""
-    echo "  2) Execute deletion safely (or move to quarantine):"
-    echo "       bin/delete-zero-length.sh \"$out\" --force"
-    echo "       bin/delete-zero-length.sh \"$out\" --force --quarantine \"$VAR_DIR/quarantine-$DATE_TAG\""
+    echo "  1) Review what would be affected (no changes made):"
+    echo "       bin/delete-zero-length.sh --report \"$out\" --dry-run"
+    echo "  2) Delete, or move to quarantine instead of deleting:"
+    echo "       bin/delete-zero-length.sh --report \"$out\" --force"
+    echo "       bin/delete-zero-length.sh --report \"$out\" --force --quarantine"
     echo
     return
   fi
@@ -935,9 +935,9 @@ post_run_reports() {
   echo "  2) Find and review duplicate files:"
   echo "       bin/find-duplicates.sh --input \"$csv\""
   echo "       bin/review-duplicates.sh --from-report \"$dupes_txt\""
-  echo "  3) Remove zero-length files (dry-run first):"
-  echo "       bin/delete-zero-length.sh \"$zero_txt\""
-  echo "       bin/delete-zero-length.sh \"$zero_txt\" --force"
+  echo "  3) Remove zero-length files (review first, no changes):"
+  echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --dry-run"
+  echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --force"
   echo
 }
 

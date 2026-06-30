@@ -53,6 +53,16 @@ if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
   . "$ROOT_DIR/lib/host-detect.sh"
   detect_host
   echo "Hasher host: $(host_pretty_label) ($HASHER_HOST)"
+  # v1.3.7: show the running Bash version. The oldest supported (3.2) is most
+  # often macOS /bin/bash; flag it so users understand any 3.2-related notes.
+  if command -v detect_bash_version >/dev/null 2>&1; then
+    detect_bash_version
+    if bash_at_least 3 2; then
+      echo "Bash version: ${HASHER_BASH_VERSION:-unknown} (>= 3.2 baseline)"
+    else
+      echo "Bash version: ${HASHER_BASH_VERSION:-unknown} (BELOW 3.2 baseline — may misbehave)"
+    fi
+  fi
 fi
 
 # CPU cores
