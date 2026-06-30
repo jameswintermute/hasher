@@ -1274,6 +1274,59 @@ launcher's `run_script` fallback covers menu use; self-test flags any that
 don't survive.
 
 ---
+## 2026‑06 — v1.3.8
+**Fifth recheck: apply-time leaf safety, plan-resolution order, O(n²) fix, resolver unification** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+A recheck found five issues; the first is a genuine safety gap, the rest
+correctness/performance/consistency. All fixed and verified.
+
+### Concern 1 (urgent) — apply-time leaf check
+
+v1.3.7 excludes non-leaf folders at PLAN time, but a folder that was a leaf
+when the plan was written can gain a subdirectory before the plan is
+applied. Apply moves directories recursively, so a now-non-leaf folder
+would relocate nested data that was never compared — and the content
+re-verification didn't catch it (the direct-file signature still matched).
+Added an apply-time leaf check in `apply-folder-plan.sh`: immediately before
+moving, re-check from disk that both the delete folder and its keeper are
+still leaves (no child directories); skip if not. Holds even under
+`--no-verify`; `--allow-unverified` is the single escape hatch. Verified: a
+folder that gains a subdirectory after planning is skipped and its nested
+data preserved; genuine leaves still move.
+
+### Concern 2 — default plan resolution order
+
+Verification-sidecar discovery ran before the default (no `--plan`)
+PLAN_FILE was resolved, so direct `apply-folder-plan.sh --force` found no
+matching groups TSV and (under the fail-safe) skipped everything. Reordered:
+parse args → default+validate PLAN_FILE → discover sidecar → apply. Verified
+default usage now applies the latest plan with verification.
+
+### Concern 3 — O(n²) leaf detection replaced
+
+The plan-time non-leaf detection compared every directory against every
+other (~18s for 11k dirs here). Replaced with a sort/`comm`-based approach
+that emits each directory's ancestors and intersects with the catalogue —
+~0.04s for the same 11k dirs (~400× faster), with identical output, and
+preserving transitive semantics (an ancestor several levels up is still
+flagged).
+
+### Concern 4 — quarantine resolver unified
+
+`apply-folder-plan.sh` and `delete-zero-length.sh` kept private
+`resolve_quarantine_dir()` copies that ignored an exported `QUARANTINE_DIR`
+environment variable. Both now source `lib/host-detect.sh` and call the
+shared resolver (conf → env → install-relative default). Verified an
+exported `QUARANTINE_DIR` is now honoured by both.
+
+### Concern 5 — executable bits
+
+Still stripped by the GitHub web-UI/zip upload; the launcher's run_script
+fallback covers menu use and self-test flags them. Set in the released
+files; re-applying on the NAS (`chmod +x bin/*.sh`) clears the warnings and
+enables direct CLI use.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
