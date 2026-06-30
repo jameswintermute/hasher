@@ -46,8 +46,8 @@ Hasher is a **content-integrity tool**. Its single job is to hash files reliably
 act on those hashes safely:
 
 - Catalogue every file by SHA-256 (optionally in parallel across CPU cores)
-- Detect duplicate **files** (identical content) and duplicate **folders** (entire
-  identical directory trees — the highest-leverage cleanup)
+- Detect duplicate **files** (identical content) and duplicate **folders**
+  (directories whose direct file contents are identical — see note below)
 - Remove duplicates safely: quarantine-first, plan-before-act, re-verified before the move
 - Find and remove zero-length files and OS junk artefacts
 - Emit a timestamped CSV of the complete catalogue on every run
@@ -104,7 +104,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.2**
+Started Dec 2022. Current version: **v1.3.3**
 For full history see: `version-history.md`
 
 ---
@@ -220,6 +220,18 @@ Run it first:
 When you run option 3, you'll be offered the reviewer immediately. Decline if
 you want to inspect the plan in a different terminal first; option `r` is always
 available to come back to.
+
+> **How folder matching works (and what it does not do).** Folder dedup matches
+> directories whose *direct* file contents are identical — the files sitting
+> immediately inside each directory, compared by name + hash + size. It matches at
+> the **leaf level**: given `/A/2013/photos` and `/B/2013/photos` containing the
+> same files, it reports those two `photos` directories as duplicates. It does
+> **not** build a single signature for a whole tree, so it will not, in one
+> decision, identify `/A/2013` as a duplicate of `/B/2013` when those contain only
+> sub-folders rather than direct files. For typical layouts (e.g. photos grouped as
+> `year/event/files`) leaf-level matching is what you want; just be aware the older
+> `--scope recursive` label overstated this and is now an alias for the honest
+> `--scope leaf-folders`.
 
 ---
 
