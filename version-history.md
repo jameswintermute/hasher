@@ -942,6 +942,78 @@ would mechanically catch this whole wrong-file/missing-bit class of error
 and is a strong candidate for a future release.
 
 ---
+## 2026‑06 — v1.3.3
+**Items 2 & 3: real duplicate-run guard + honest folder-scope label** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+The last two findings from the external review.
+
+### Item 3 (high) — the duplicate-run guard was illusory
+
+The launcher wrote a pidfile, then ran
+`( wait "$bgpid" 2>/dev/null; clear_pidfile ) &` to clear it on exit. But a
+subshell cannot `wait` on a sibling process: `wait` returned immediately,
+so the pidfile was cleared within milliseconds of launch — while the hash
+run continued for hours. `is_hasher_running()` therefore always reported
+"not running", and the option-1 guard against starting a second concurrent
+hash never fired. Reproduced directly: the cleanup fired at t≈0 with the
+background process still alive.
+
+**Fix:** pidfile ownership moved into `bin/hasher.sh`, the process that
+actually runs. It writes its own PID (`$$`) at the start of `main()` and
+removes the pidfile in its existing `cleanup()` EXIT trap (only if the file
+still holds its own PID). The launcher still writes the pidfile immediately
+on launch so the guard is active in the brief window before hasher.sh
+claims it, but the broken subshell is removed. Verified: across a
+multi-second real hash run the pidfile persisted in every poll while the
+process was alive (previously: gone almost immediately) and was cleaned up
+on completion.
+
+### Item 2 (high) — "recursive" folder dedup was a misnomer
+
+`--scope recursive` was accepted and displayed, but the tool fingerprints
+each directory by its DIRECT file contents (basename + hash + size of the
+files immediately inside it) and matches at the leaf level. Given `/A/sub`
+and `/B/sub` with identical files it reports `/A/sub` vs `/B/sub`, never
+`/A` vs `/B`. It does not build whole-tree signatures. The "recursive"
+label overstated the behaviour.
+
+**Fix (honest rename, not a behaviour change):** the default scope is now
+`leaf-folders`, which accurately describes what happens. `recursive` is
+still accepted as a deprecated alias (existing scripts/menus keep working)
+but emits a one-time note explaining the misnomer. The info line now reads
+"Scope: leaf-folders (matches directories by their direct file contents)".
+The launcher passes `--scope leaf-folders` and prints a short explanation;
+the README's What section and a new note in the folder-first workflow
+describe leaf-level matching plainly (the previous "entire identical
+directory trees" wording is corrected). For typical layouts
+(`year/event/files`) leaf-level matching is the desired behaviour; true
+whole-tree signatures remain a possible future feature, not a bug fix.
+
+### Also — first-run cosmetic fix
+
+First-run testing on the NAS showed raw `\033[0;36m` escape codes printing
+literally during the dependency-check step. `bin/check-deps.sh` defined its
+colour variables as single-quoted literals (`'\033[...]'` — the characters,
+not real ESC bytes) and then emitted them with `printf "%s"` / plain `echo`,
+neither of which interprets backslash escapes (and BusyBox `echo` on
+Synology never does). Fixed by building real ESC bytes with
+`printf '\033[...'`, matching the pattern used elsewhere. Audited the other
+scripts: `apply-folder-plan.sh`, `delete-zero-length.sh`,
+`find-duplicates.sh` and `hasher.sh` use `printf "%b"`, format-string
+colours, or `echo -e` under a `#!/bin/bash` shebang, so they render
+correctly — `check-deps.sh` was the only broken one.
+
+### Review status
+
+All five findings from the 2026-06-27 external review are now addressed:
+item 1 (comma CSV parsing) and item 4 (safety docs) in v1.3.1; item 5
+(quarantine wrong-file + exec bits) in v1.3.2; items 2 and 3 here. A
+`bin/self-test.sh` preflight (exec bits / sourced-helper paths / required
+commands / Bash version / menu-target runnability) remains the strongest
+candidate for catching the recurring wrong-file/missing-bit class of error
+before it reaches production.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

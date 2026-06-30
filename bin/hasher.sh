@@ -20,6 +20,12 @@ LOGS_DIR="$ROOT_DIR/logs"
 VAR_DIR="$ROOT_DIR/var"
 # FIX: ZERO_DIR moved from repo root into var/ to consolidate working files
 ZERO_DIR="$VAR_DIR/zero-length"
+# v1.3.3: hasher.sh owns its own pidfile (same path the launcher checks),
+# written at start of main() and removed by the cleanup trap. This replaces
+# the launcher's broken "( wait $bgpid; clear_pidfile ) &" subshell, which
+# cleared the pidfile almost immediately because a subshell cannot wait on a
+# sibling process.
+HASHER_PIDFILE="$VAR_DIR/hasher.pid"
 
 # DATE_TAG is kept for human-facing daily reports
 DATE_TAG="$(date +'%Y-%m-%d')"
@@ -632,6 +638,14 @@ cleanup() {
   stop_zero_progress
   # Clean up any leftover working files for this run
   rm -f -- "$FILES_LIST" "$FILES_LIST.tmp" "$FILES_LIST.stdin.tmp" 2>/dev/null || true
+  # v1.3.3: hasher.sh now OWNS its pidfile. Remove it on exit (any exit:
+  # success, error, or signal) so the duplicate-run guard reflects reality.
+  # Only remove it if it still holds OUR pid — avoids deleting a pidfile a
+  # newer run may have written if PIDs were somehow reused.
+  if [ -n "${HASHER_PIDFILE:-}" ] && [ -f "$HASHER_PIDFILE" ]; then
+    _pf="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    [ "$_pf" = "$$" ] && rm -f -- "$HASHER_PIDFILE" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -641,6 +655,9 @@ DONE=0
 FAIL=0
 
 main() {
+  # v1.3.3: claim the pidfile for this process. mkdir -p in case var/ is fresh.
+  mkdir -p "$VAR_DIR" 2>/dev/null || true
+  printf '%s\n' "$$" > "$HASHER_PIDFILE" 2>/dev/null || true
   info "Run-ID: $RUN_ID"
   [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
   info "Config: ${PATHFILE:+pathfile=$PATHFILE} | Algo: $ALGO | Level: $LOG_LEVEL | Interval: ${PROGRESS_INTERVAL}s"

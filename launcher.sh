@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.2 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.3 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -301,12 +301,19 @@ EOF
   fi
   bgpid=$!
 
-  # FIX: write pidfile so is_hasher_running() works reliably
+  # v1.3.3: write the pidfile immediately so the duplicate-run guard is active
+  # in the brief window before hasher.sh claims it. hasher.sh then overwrites
+  # this with its own PID at the start of main() and removes it via its EXIT
+  # trap when the run finishes.
+  #
+  # The previous "( wait "$bgpid" 2>/dev/null; clear_pidfile ) &" line was
+  # removed: a subshell cannot wait on a sibling process, so wait returned
+  # immediately and cleared the pidfile within milliseconds of launch — while
+  # the hash run continued for hours. That made is_hasher_running() always
+  # report "not running" and the guard never fired. Pidfile lifecycle now
+  # lives entirely in hasher.sh, where it can be tied to the real process via
+  # $$ and a trap.
   write_pidfile "$bgpid"
-
-  # Register cleanup so pidfile is removed when the background process exits
-  # (best-effort; works when launched from an interactive shell)
-  ( wait "$bgpid" 2>/dev/null; clear_pidfile ) &
 
   sleep 1
   # FIX (v1.1.10): the previous check was 'tail -n 5 | grep Run-ID:'.
@@ -677,17 +684,19 @@ action_find_duplicate_folders(){
   # FIX: inform the user of the defaults being applied, especially --keep shortest-path
   # which silently decides which copy is the "primary". Users should know this.
   echo
-  info "Running with defaults: --mode plan --scope recursive --min-group-size 2 --keep shortest-path"
+  info "Running with defaults: --mode plan --scope leaf-folders --min-group-size 2 --keep shortest-path"
+  info "Note: matches directories whose DIRECT file contents are identical (leaf level),"
+  info "not whole directory trees. See the README 'Duplicate folders' section."
   warn "Note: '--keep shortest-path' will nominate the copy with the shortest path as the keeper."
   warn "Edit local/hasher.conf to change this default, or run find-duplicate-folders.sh directly for custom flags."
   echo
 
-  "$BIN_DIR/find-duplicate-folders.sh" \
-    --input "$input"       \
-    --mode plan            \
-    --scope recursive      \
-    --min-group-size 2     \
-    --keep shortest-path   \
+  run_script "$BIN_DIR/find-duplicate-folders.sh" \
+    --input "$input"        \
+    --mode plan             \
+    --scope leaf-folders    \
+    --min-group-size 2      \
+    --keep shortest-path    \
     || true
 
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
