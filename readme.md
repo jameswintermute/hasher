@@ -35,8 +35,9 @@ questions that matter for long-term data integrity:
 - **Change tracking** — what has been added, modified, or moved since the last run?
 
 Deduplication is the immediately useful half of the tool: it finds identical files
-and whole identical folders and helps you reclaim space safely. Integrity monitoring
-is the longer-game half: the same hashes, captured repeatedly, become an audit trail.
+and folders with identical direct contents, and helps you reclaim space safely.
+Integrity monitoring is the longer-game half: the same hashes, captured repeatedly,
+become an audit trail.
 
 ---
 
@@ -104,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.4**
+Started Dec 2022. Current version: **v1.3.5**
 For full history see: `version-history.md`
 
 ---
@@ -353,9 +354,11 @@ hasher/
 **Deduplication (the core workflow) is quarantine-first and never deletes:**
 
 - Plans are written and reviewable before anything is moved
-- **Content re-verification (v1.2.0):** before quarantining, `delete-duplicates.sh`
-  re-hashes each candidate and skips any whose content no longer matches the hash
-  in the plan — protecting files modified between planning and applying
+- **Content re-verification (v1.2.0 files, v1.3.5 folders):** before quarantining,
+  `delete-duplicates.sh` re-hashes each candidate file, and `apply-folder-plan.sh`
+  recomputes each duplicate folder's direct-file signature from disk, skipping
+  anything whose content no longer matches the plan/keeper — protecting files and
+  folders modified between planning and applying
 - The folder-dedup reviewer (option `r`) lets you accept, skip, or swap keepers
   per duplicate group before applying anything
 - Applying a raw (unreviewed) folder plan prompts for explicit confirmation

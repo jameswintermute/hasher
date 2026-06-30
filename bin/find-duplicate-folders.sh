@@ -236,8 +236,19 @@ while IFS='	' read -r sz keepdir deldir; do
 done < "$TMP_BASE.groups.sorted.tsv"
 
 # NEW (v1.1.13): persist the per-group decision context for the reviewer.
-# Format identical to TMP_GROUPS but lives in logs/ alongside the plan.
 cp -f -- "$TMP_BASE.groups.sorted.tsv" "$GROUPS_TSV"
+
+# FIX (v1.3.5 — peer-review item 4): do not advertise an empty plan as a
+# success. When no duplicate folders were found, the plan and groups files are
+# empty; previously the script still printed "Plan written" and exited 0,
+# leading the launcher (which tested -n "$plan", a non-empty STRING) to offer
+# review/apply of an empty plan. Now we report honestly and remove the empty
+# artefacts so nothing downstream mistakes them for actionable output.
+if [ "${groups_count:-0}" -eq 0 ]; then
+  rm -f -- "$PLAN" "$GROUPS_TSV" 2>/dev/null || true
+  ok "No duplicate folders found. No plan written."
+  exit 0
+fi
 
 ok "Plan written: $PLAN"
 ok "Group context: $GROUPS_TSV"

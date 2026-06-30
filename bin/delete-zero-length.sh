@@ -12,6 +12,7 @@ LOGS_DIR="${ROOT_DIR}/logs"
 HASHES_DIR="${ROOT_DIR}/hashes"
 LOCAL_DIR="${ROOT_DIR}/local"
 DEFAULT_DIR="${ROOT_DIR}/default"
+VAR_DIR="${ROOT_DIR}/var"
 mkdir -p "$LOGS_DIR"
 
 MODE="csv"           # csv|scan
@@ -104,16 +105,66 @@ cleanup(){ rm -f -- "$TMP_LIST" 2>/dev/null || true; }
 trap cleanup EXIT
 
 if [ "$MODE" = "csv" ]; then
-  info "Finding zero-length files from CSV: $INPUT"
-  header="$(head -n1 -- "$INPUT" || true)"
-  if printf %s "$header" | grep -q $'\t'; then dlm=$'\t'; else dlm=','; fi
-  col_idx(){ printf '%s\n' "$1" | awk -v dlm="$2" 'BEGIN{FS=dlm} NR==1{for(i=1;i<=NF;i++){h=tolower($i); gsub(/^[ \t"]+|[ \t"]+$/,"",h); if(h=="path"){p=i} if(h=="size_bytes"){s=i}}} END{print p+0","s+0}' ; }
-  idx="$(printf '%s\n' "$header" | col_idx "$header" "$dlm")"
-  pidx="${idx%,*}"; sidx="${idx#*,}"
-  if [ "$pidx" = "0" ] || [ "$sidx" = "0" ]; then
-    err "CSV missing path/size_bytes columns."; exit 2
+  # FIX (v1.3.5 — peer-review item 3): the previous CSV path used
+  # `awk -v FS="$dlm"` with fixed field numbers. hasher.sh quotes any path
+  # containing a comma, so a zero-length file named e.g. "a, b.txt" had its
+  # fields shifted and the size column ($s) pointed at part of the path — the
+  # file was silently NOT detected. Two-part fix:
+  #   1. Prefer the clean, already-correct report hasher.sh writes during the
+  #      run (var/zero-length/zero-length-DATE.txt): one path per line, built
+  #      with a quote-aware parser. No CSV parsing needed.
+  #   2. If no such report exists, parse the CSV QUOTE-AWARE (RFC4180), the
+  #      same approach as find-duplicates.sh, instead of the naive split.
+  zreport=""
+  # Derive the date tag from the CSV name if it looks like hasher-YYYY-MM-DD-*.csv,
+  # else try today; accept any matching report under var/zero-length/.
+  csv_base="$(basename -- "$INPUT")"
+  date_guess="$(printf '%s\n' "$csv_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)"
+  for cand in \
+    "$VAR_DIR/zero-length/zero-length-${date_guess}.txt" \
+    "$(ls -1t "$VAR_DIR"/zero-length/zero-length-*.txt 2>/dev/null | head -1)"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { zreport="$cand"; break; }
+  done
+
+  if [ -n "$zreport" ]; then
+    info "Using pre-built zero-length report: $zreport"
+    # Plain newline-delimited path list; copy through, skipping blanks/comments.
+    grep -vE '^[[:space:]]*(#|$)' "$zreport" > "$TMP_LIST" 2>/dev/null || true
+  else
+    info "Finding zero-length files from CSV (quote-aware): $INPUT"
+    header="$(head -n1 -- "$INPUT" || true)"
+    if printf %s "$header" | grep -q $'\t'; then dlm=$'\t'; else dlm=','; fi
+    col_idx(){ printf '%s\n' "$1" | awk -v dlm="$2" 'BEGIN{FS=dlm} NR==1{for(i=1;i<=NF;i++){h=tolower($i); gsub(/^[ \t"]+|[ \t"]+$/,"",h); if(h=="path"){p=i} if(h=="size_bytes"){s=i}}} END{print p+0","s+0}' ; }
+    idx="$(printf '%s\n' "$header" | col_idx "$header" "$dlm")"
+    pidx="${idx%,*}"; sidx="${idx#*,}"
+    if [ "$pidx" = "0" ] || [ "$sidx" = "0" ]; then
+      err "CSV missing path/size_bytes columns."; exit 2
+    fi
+    awk -v ch="$pidx" -v cs="$sidx" -v DELIM="$dlm" '
+      # Quote-aware RFC4180 splitter (comma delimiter); plain split otherwise.
+      function csv_split(s, sep,   i,c,nf,cur,inq,n) {
+        n=length(s); nf=0; cur=""; inq=0;
+        if (sep != ",") { nf=split(s,A,sep); for(i=1;i<=nf;i++) F[i]=A[i]; return nf; }
+        for (i=1;i<=n;i++) {
+          c=substr(s,i,1);
+          if (inq) {
+            if (c=="\"") { if (substr(s,i+1,1)=="\"") { cur=cur "\""; i++ } else inq=0 }
+            else cur=cur c
+          } else {
+            if (c=="\"") inq=1; else if (c==sep) { F[++nf]=cur; cur="" } else cur=cur c
+          }
+        }
+        F[++nf]=cur; return nf;
+      }
+      NR==1 { next }
+      {
+        nf=csv_split($0, DELIM);
+        path=(ch<=nf?F[ch]:""); size=(cs<=nf?F[cs]:"");
+        sub(/^[ \t\r\n]+/,"",size); sub(/[ \t\r\n]+$/,"",size);
+        if (size+0==0 && path!="") print path;
+      }
+    ' "$INPUT" > "$TMP_LIST"
   fi
-  awk -v FS="$dlm" -v p="$pidx" -v s="$sidx" 'NR>1{ if ($s==0) {path=$p; gsub(/^"|"$/,"",path); print path} }' "$INPUT" > "$TMP_LIST"
 else
   info "Scanning filesystem for zero-length files (this may take a while)…"
   # Scope: if a paths file exists, use it; otherwise scan /volume1 (Synology default root) safely

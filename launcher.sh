@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.4 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.5 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -591,9 +591,11 @@ firstrun_quarantine() {
     qroot="$(default_quarantine_root 2>/dev/null || true)"
   fi
   [ -z "$qroot" ] && qroot="$ROOT_DIR/quarantine-$(date +%F)"
-  echo "When you remove duplicates or junk, Hasher MOVES them to quarantine"
-  echo "(it never deletes outright — quarantine is recoverable). On this install,"
-  echo "quarantine will be created beside the tool, at:"
+  echo "When you remove DUPLICATES, Hasher MOVES them to quarantine — it never"
+  echo "deletes duplicates outright, and quarantine is recoverable. (The separate"
+  echo "housekeeping helpers — zero-length, junk, and cache cleaning — delete by"
+  echo "default; zero-length removal supports --quarantine if you prefer.) On this"
+  echo "install, quarantine will be created beside the tool, at:"
   echo
   echo "    ${BOLD}$qroot${RST}"
   echo
@@ -702,12 +704,16 @@ action_find_duplicate_folders(){
 
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
   groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
-  if [ -n "$plan" ]; then
+  # FIX (v1.3.5 — peer-review item 4): test -s (non-empty FILE), not -n
+  # (non-empty string/path). An empty plan file would otherwise be offered for
+  # review. find-duplicate-folders.sh no longer writes empty plans, but this
+  # guards against a stale empty plan from an earlier version too.
+  if [ -s "$plan" ]; then
     info "Plan saved to: $plan"
-    [ -n "$groups" ] && info "Group context: $groups"
+    [ -s "$groups" ] && info "Group context: $groups"
     echo
     # NEW (v1.1.13): offer to launch the interactive reviewer immediately
-    if [ -n "$groups" ] && script_runnable "$BIN_DIR/review-folder-plan.sh"; then
+    if [ -s "$groups" ] && script_runnable "$BIN_DIR/review-folder-plan.sh"; then
       printf "Review this plan interactively now? [Y/n]: "
       read -r ans || ans="y"
       case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
@@ -722,7 +728,7 @@ action_find_duplicate_folders(){
       info "Review later with menu option 'r', or apply raw plan via option 6."
     fi
   else
-    info "No folder plan found to suggest next steps."
+    info "No duplicate folders found — nothing to review or apply."
   fi
   printf "Press Enter to continue... "; read -r _ || true
 }
@@ -730,8 +736,8 @@ action_find_duplicate_folders(){
 # NEW (v1.1.13): interactive reviewer for the folder-dedup plan
 action_review_folder_plan(){
   groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
-  if [ -z "$groups" ]; then
-    err "No folder groups TSV found. Run option 3 (Find duplicate folders) first."
+  if [ ! -s "$groups" ]; then
+    err "No duplicate-folder groups found. Run option 3 (Find duplicate folders) first."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
