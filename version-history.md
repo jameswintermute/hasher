@@ -1070,6 +1070,67 @@ v1.3.3), the first-run colour bug fixed in v1.3.3, and the reviewer's
 suggested `self-test.sh` / "make audit" preflight delivered here.
 
 ---
+## 2026‑06 — v1.3.5
+**Second peer review: zero-length parsing, folder re-verification, and quarantine consistency** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+A second external review found five operational edge cases, all verified
+against the live code and fixed here.
+
+### Item 3 (high) — zero-length CSV parsing repeated the comma bug
+
+`delete-zero-length.sh` still parsed the hash CSV with a fixed-field
+`awk -v FS=`, so a zero-length file whose quoted path contained a comma
+(e.g. "a, b.txt") had its size column misread and was silently NOT
+detected. Fixed two ways: (1) prefer the clean, already-correct
+`var/zero-length/zero-length-DATE.txt` report that hasher.sh writes during
+the run (one path per line, built with a quote-aware parser — no CSV
+parsing needed); (2) if no report exists, parse the CSV with the same
+quote-aware RFC4180 splitter used by find-duplicates.sh. Verified the
+comma-named zero-length file is now detected.
+
+### Item 2 (high) — folder dedup now has apply-time re-verification
+
+File dedup re-hashes before quarantine; folder dedup did not, so a folder
+plan made on Monday would still move a directory on Tuesday even if a
+unique file had been added to it meanwhile. `apply-folder-plan.sh` now
+recomputes each DEL folder's CURRENT direct-file signature from disk and
+compares it to its keeper (from the groups TSV, auto-discovered or passed
+via `--verify-against`); any DEL folder that no longer matches its keeper
+is skipped and logged, not moved. `--no-verify` disables it. Verified:
+identical folders still move; a folder with a newly-added unique file is
+skipped and preserved. This closes the file/folder safety asymmetry first
+noted in v1.2.1.
+
+### Item 4 (medium) — no more empty "successful" folder plans
+
+With a unique-only CSV, `find-duplicate-folders.sh` used to print "Plan
+written" and create empty plan/group files; the launcher then offered an
+empty plan for review because it tested `-n "$plan"` (non-empty string)
+rather than `-s` (non-empty file). Now: zero groups → "No duplicate
+folders found", no files written, exit 0; and the launcher tests `-s`
+throughout for folder plans and group TSVs.
+
+### Item 5 (medium) — quarantine resolution standardised; mv -n risk removed
+
+File dedup quarantined to a static `$ROOT_DIR/quarantine` while folder and
+zero-length used the dated, configurable `default_quarantine_root()`.
+`delete-duplicates.sh` now uses the shared resolver too (honouring
+`QUARANTINE_DIR`), so all three quarantine-capable tools agree. Also
+replaced `mv -n` — which can return success while silently NOT moving when
+the destination exists, leaving a duplicate live at its source and
+miscounting it as quarantined — with explicit collision handling (numeric
+`.dupN` suffix) and a post-move check that the source is actually gone.
+
+### Item 5b / Item 1 (wording) — safety messaging aligned
+
+First-run setup said "When you remove duplicates or junk, Hasher MOVES
+them to quarantine (it never deletes outright)", which contradicted the
+housekeeping helpers. Reworded to state dedup is quarantine-first while
+housekeeping (zero-length/junk/cache) deletes by default. The README intro
+line "whole identical folders" is corrected to "folders with identical
+direct contents", matching the leaf-level behaviour.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
