@@ -16,7 +16,7 @@ INPUT=""
 MODE="plan"
 MIN_GROUP=2
 KEEP="shortest-path"
-SCOPE="recursive"
+SCOPE="leaf-folders"
 SIGNATURE="name+content"   # printed for info only
 
 # colors if tty
@@ -49,6 +49,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# v1.3.3 (item 2): honest scope labelling. This tool matches DIRECTORIES whose
+# DIRECT file contents are identical (basename + hash + size of the files
+# immediately inside each directory). It does NOT build whole-tree signatures:
+# given /A/sub and /B/sub with identical files, it reports the duplicate at the
+# /A/sub vs /B/sub (leaf) level, not /A vs /B. The historical label "recursive"
+# overstated this. "leaf-folders" is the honest name. We still accept
+# "recursive" as a deprecated alias so existing scripts/menus keep working.
+case "$SCOPE" in
+  recursive)
+    warn "scope 'recursive' is a deprecated alias for 'leaf-folders' and is a"
+    warn "misnomer: this tool matches directories by their DIRECT file contents"
+    warn "(leaf level), not whole directory trees. Treating as 'leaf-folders'."
+    SCOPE="leaf-folders"
+    ;;
+  leaf-folders|leaf) SCOPE="leaf-folders" ;;
+  *) : ;;  # any other value passes through unchanged (forward-compat)
+esac
+
 [ -n "${INPUT:-}" ] || { err "Missing --input FILE"; usage; exit 2; }
 [ -f "$INPUT" ] || { err "Input not found: $INPUT"; exit 2; }
 case "$MODE" in plan) : ;; *) err "Only --mode plan is supported"; exit 2;; esac
@@ -70,7 +88,7 @@ TMP_GROUPS="$TMP_BASE.groups.tsv"   # reclaim_bytes \t keep_dir \t delete_dir
 trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" 2>/dev/null || true' EXIT INT TERM
 
 info "Input: $INPUT"
-info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE  | Keep: $KEEP  | Signature: $SIGNATURE"
+info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE (matches directories by their direct file contents) | Keep: $KEEP"
 info "Using size_bytes from CSV/TSV (fast path)."
 
 # 1) explode CSV into (dir, basename, hash, size). Header-aware; supports 4 or 5 columns.
