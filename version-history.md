@@ -1189,6 +1189,91 @@ exact match. No associative arrays remain anywhere in the codebase.
   and honour QUARANTINE_DIR from the conf.
 
 ---
+## 2026‑06 — v1.3.7
+**Runtime Bash-version detection in host detection** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Following the v1.3.6 Bash-4 regression (a `declare -A` that would have
+broken macOS), Bash-version awareness is now a first-class part of host
+detection rather than an afterthought in self-test.
+
+### Important nuance corrected
+
+The intuition "Mac new, Synology ancient" is backwards for the version
+that actually bites this project. **macOS ships Bash 3.2.57 as
+`/bin/bash`** (frozen since 2007 to avoid GPLv3) — so a `#!/bin/bash`
+script on a Mac runs under the OLDEST bash. Many Synology DSM builds
+carry a newer 4.x bash. The 3.2 baseline this project has always held is
+therefore primarily a macOS concern.
+
+### New in `lib/host-detect.sh`
+
+- `detect_bash_version` — sets `HASHER_BASH_MAJOR`, `HASHER_BASH_MINOR`,
+  `HASHER_BASH_VERSION` (works even when sourced from a non-bash shell by
+  asking the bash binary on PATH).
+- `bash_at_least MAJOR MINOR` — guard for optional fast paths.
+- `require_bash MAJOR MINOR [feature]` — for a path that genuinely needs a
+  newer bash: prints a clear, platform-aware error (including the Homebrew
+  hint on macOS) and returns non-zero so callers refuse gracefully instead
+  of dying on a cryptic syntax error.
+
+### Wiring
+
+- **Launcher header** now shows `Bash: <version>` beside `Host:`, and a
+  startup warning fires if running below the 3.2 baseline.
+- **check-deps.sh** diagnostics show the Bash version and whether it meets
+  the baseline.
+- **self-test.sh** now uses the shared `bash_at_least` (single source of
+  truth) instead of its own inline check, and notes when Bash 3.x is in
+  use (common on macOS).
+
+No behavioural change to hashing or dedup; this is environment awareness
+and future-proofing so any later Bash-4-only optimisation must be guarded
+with `require_bash`/`bash_at_least` rather than silently breaking 3.2.
+
+### Fourth cross-check review (5 concerns)
+
+A further review found five issues; all fixed and verified.
+
+**Concern 1 (urgent) — folder dedup could move unique nested data.**
+The signature compares a directory's DIRECT files, but apply moves the
+directory recursively. So `B` with a matching `B/common.txt` but a unique
+`B/sub/unique.txt` was planned for deletion, and applying it moved the
+unique nested file. Fixed by making "leaf-folders" literal: any directory
+that is a parent of another directory in the catalogue is excluded from
+candidacy. A true leaf has no sub-folders, so its direct-file signature IS
+its complete content — compare-shallow and move-deep become equivalent.
+Verified: `B` is excluded; genuine leaf folders still match.
+
+**Concern 2 — zero-length report matching was date-only.** Daily reports
+(`zero-length-DATE.txt`) couldn't be reliably tied to per-run CSVs
+(`hasher-DATE-HHMM.csv`); a same-day explicit `--input` could still be
+overridden by an unrelated report. Fixed: an explicit `--input` ALWAYS
+parses that CSV; a report is used ONLY via an explicit new `--report FILE`
+flag. Removed report auto-selection from the CSV path entirely.
+
+**Concern 3 — folder apply could verify against the wrong sidecar and
+move unverified.** Auto-discovery preferred the newest reviewed sidecar
+even for an explicit raw plan, found no keeper mapping, and proceeded.
+Fixed two ways: (a) resolve the sidecar STRICTLY from the plan being
+applied (reviewed plan → exact reviewed sidecar by stamp; raw plan → the
+same-date original groups TSV; never "newest"); (b) FAIL-SAFE — when
+verification is active but a planned delete has no keeper mapping, SKIP it
+by default. Override with `--allow-unverified`; disable checks entirely
+with `--no-verify`. Verified all three modes.
+
+**Concern 4 — hasher.sh recommended invalid zero-length commands.** It
+suggested a positional report path and `--quarantine DIR`, but the script
+takes `--input CSV` and `--quarantine` is boolean. Added `--report FILE`
+and `--dry-run` to delete-zero-length.sh and corrected the recommendations
+to `--report "$out" --dry-run` / `--report "$out" --force [--quarantine]`.
+Verified the recommended commands now run.
+
+**Concern 5 — release hygiene.** Versions realigned (launcher, conf, and
+README all v1.3.7). Executable bits are stripped by the upload but the
+launcher's `run_script` fallback covers menu use; self-test flags any that
+don't survive.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

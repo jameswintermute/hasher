@@ -200,11 +200,31 @@ fi
 
 # ── 6. Bash version ───────────────────────────────────────────────────────────
 head_ "6. Shell"
-bmaj="${BASH_VERSINFO:-0}"; bmin="${BASH_VERSINFO[1]:-0}"
-if [ "$bmaj" -gt 3 ] || { [ "$bmaj" -eq 3 ] && [ "$bmin" -ge 2 ]; }; then
-  pass "bash ${BASH_VERSINFO:-?}.${BASH_VERSINFO[1]:-?} (>= 3.2 baseline)"
+# v1.3.7: use the shared detection from lib/host-detect.sh (single source of
+# truth) when available; fall back to inline if not.
+if [ -r "$LIB_DIR/host-detect.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$LIB_DIR/host-detect.sh"
+fi
+if command -v bash_at_least >/dev/null 2>&1; then
+  detect_bash_version
+  if bash_at_least 3 2; then
+    pass "bash ${HASHER_BASH_VERSION:-?} (>= 3.2 baseline)"
+  else
+    warn "bash ${HASHER_BASH_VERSION:-?} is below the 3.2 baseline; some scripts may misbehave"
+  fi
+  # Informational: note when running the project's oldest supported bash, which
+  # is most commonly macOS /bin/bash 3.2.
+  if [ "${HASHER_BASH_MAJOR:-0}" -eq 3 ]; then
+    [ "$QUIET" -eq 1 ] || printf '       (Bash 3.x — the project 3.2 baseline; common on macOS /bin/bash)\n'
+  fi
 else
-  warn "bash ${bmaj}.${bmin} is below the 3.2 baseline; some scripts may misbehave"
+  bmaj="${BASH_VERSINFO:-0}"; bmin="${BASH_VERSINFO[1]:-0}"
+  if [ "$bmaj" -gt 3 ] || { [ "$bmaj" -eq 3 ] && [ "$bmin" -ge 2 ]; }; then
+    pass "bash ${BASH_VERSINFO:-?}.${BASH_VERSINFO[1]:-?} (>= 3.2 baseline)"
+  else
+    warn "bash ${bmaj}.${bmin} is below the 3.2 baseline; some scripts may misbehave"
+  fi
 fi
 
 # ── 7. Config & paths ─────────────────────────────────────────────────────────

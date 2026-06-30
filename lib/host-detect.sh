@@ -41,6 +41,75 @@ detect_host() {
   export HASHER_HOST
 }
 
+# ── Bash version detection ─────────────────────────────────────────────
+# Captures the running Bash version so any script can branch on it, and so
+# the launcher/self-test can warn clearly. Important nuance: the platform
+# most likely to give you an OLD bash is macOS, NOT Synology — Apple ships
+# Bash 3.2.57 as /bin/bash (frozen since 2007 to avoid GPLv3), while many
+# Synology DSM builds carry a newer 4.x bash (and BusyBox ash separately).
+# So "ancient bash" here usually means a Mac, which is exactly why this
+# project holds a 3.2 baseline.
+#
+# Sets globals:
+#   HASHER_BASH_MAJOR, HASHER_BASH_MINOR  (integers; 0 if not bash)
+#   HASHER_BASH_VERSION                   (e.g. "3.2.57" or "unknown")
+# Idempotent.
+detect_bash_version() {
+  if [ -n "${HASHER_BASH_VERSION:-}" ]; then
+    return 0
+  fi
+  if [ -n "${BASH_VERSINFO:-}" ]; then
+    HASHER_BASH_MAJOR="${BASH_VERSINFO[0]:-0}"
+    HASHER_BASH_MINOR="${BASH_VERSINFO[1]:-0}"
+    HASHER_BASH_VERSION="${BASH_VERSION:-unknown}"
+  else
+    # Not running under bash (e.g. sourced from BusyBox ash). Best-effort:
+    # ask the bash binary on PATH, if any.
+    HASHER_BASH_MAJOR=0; HASHER_BASH_MINOR=0; HASHER_BASH_VERSION="unknown"
+    if command -v bash >/dev/null 2>&1; then
+      _bv="$(bash -c 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]} ${BASH_VERSION}"' 2>/dev/null)"
+      if [ -n "$_bv" ]; then
+        HASHER_BASH_MAJOR="$(printf '%s\n' "$_bv" | awk '{print $1+0}')"
+        HASHER_BASH_MINOR="$(printf '%s\n' "$_bv" | awk '{print $2+0}')"
+        HASHER_BASH_VERSION="$(printf '%s\n' "$_bv" | awk '{print $3}')"
+      fi
+    fi
+  fi
+  export HASHER_BASH_MAJOR HASHER_BASH_MINOR HASHER_BASH_VERSION
+}
+
+# bash_at_least MAJOR MINOR  → returns 0 (true) if the running bash is >= that.
+# Use to guard optional features:  if bash_at_least 4 0; then ...fast path... fi
+bash_at_least() {
+  detect_bash_version
+  _need_maj="${1:-0}"; _need_min="${2:-0}"
+  if [ "${HASHER_BASH_MAJOR:-0}" -gt "$_need_maj" ]; then
+    return 0
+  elif [ "${HASHER_BASH_MAJOR:-0}" -eq "$_need_maj" ] && [ "${HASHER_BASH_MINOR:-0}" -ge "$_need_min" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# require_bash MAJOR MINOR [feature-name]
+# For a code path that genuinely needs a newer bash: if the running bash is
+# too old, print a clear, platform-aware error and return non-zero so the
+# caller can refuse gracefully instead of failing with a cryptic syntax error.
+require_bash() {
+  _rmaj="${1:-4}"; _rmin="${2:-0}"; _feat="${3:-this feature}"
+  if bash_at_least "$_rmaj" "$_rmin"; then
+    return 0
+  fi
+  detect_host
+  _hint=""
+  case "${HASHER_HOST:-}" in
+    macos) _hint=" (macOS ships Bash 3.2 as /bin/bash; install a newer bash via Homebrew — 'brew install bash' — and run hasher with it)";;
+  esac
+  printf '[ERR ] %s requires Bash %s.%s or newer; this is Bash %s.%s%s\n' \
+    "$_feat" "$_rmaj" "$_rmin" "${HASHER_BASH_MAJOR:-0}" "${HASHER_BASH_MINOR:-0}" "$_hint" >&2
+  return 1
+}
+
 # ── Default quarantine root for the detected host ──────────────────────
 # Prints (does not export) a directory path suitable as a quarantine root
 # when the user has not set QUARANTINE_DIR in hasher.conf.
