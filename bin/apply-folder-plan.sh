@@ -44,10 +44,59 @@ while [ $# -gt 0 ]; do
     --plan) PLAN_FILE="${2:-}"; shift 2;;
     --force) FORCE=true; shift;;
     --delete-metadata) DELETE_METADATA=true; shift;;
+    --verify-against) VERIFY_TSV="${2:-}"; shift 2;;
+    --no-verify) NO_VERIFY=true; shift;;
     -h|--help) usage; exit 0;;
     *) err "Unknown arg: $1"; usage; exit 2;;
   esac
 done
+VERIFY_TSV="${VERIFY_TSV:-}"
+NO_VERIFY="${NO_VERIFY:-false}"
+
+# FIX (v1.3.5 — peer-review item 2): apply-time content re-verification for
+# folder dedup, mirroring the file-dedup re-hash. If a groups TSV is available
+# (size\tkeepdir\tdeldir), we recompute each pair's CURRENT direct-file
+# signature from disk immediately before moving, and skip any DEL folder whose
+# signature no longer matches its KEEP folder — e.g. a unique file was added to
+# the DEL folder after the plan was generated. Disk is the source of truth.
+# Auto-discover the latest groups TSV if not supplied and not disabled.
+if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
+  VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
+fi
+
+# Compute the direct-file signature of a directory from disk: for each file
+# immediately inside DIR (not recursing), "basename|sha|size", sorted by
+# basename, joined by newslines. Empty string if dir missing/empty.
+dir_signature() {
+  d="$1"
+  [ -d "$d" ] || { printf ''; return; }
+  # hash tool: prefer sha256sum, fall back to shasum -a 256
+  find "$d" -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+    b="$(basename "$f")"
+    sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+    if command -v sha256sum >/dev/null 2>&1; then
+      h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')"
+    else
+      h="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
+    fi
+    printf '%s|%s|%s\n' "$b" "$h" "$sz"
+  done
+}
+
+# Build a lookup of DEL -> KEEP from the groups TSV, if available.
+# (Used only when verification is active.)
+VERIFY_ACTIVE=false
+declare -A KEEP_OF 2>/dev/null || true
+if [ "$NO_VERIFY" != true ] && [ -n "$VERIFY_TSV" ] && [ -s "$VERIFY_TSV" ]; then
+  VERIFY_ACTIVE=true
+  while IFS="$(printf '\t')" read -r _sz _keep _del; do
+    [ -z "${_del:-}" ] && continue
+    KEEP_OF["$_del"]="$_keep"
+  done < "$VERIFY_TSV"
+  info "Apply-time verification ON (groups: $VERIFY_TSV). DEL folders whose contents no longer match their keeper will be skipped."
+else
+  [ "$NO_VERIFY" = true ] && warn "Apply-time verification DISABLED (--no-verify)."
+fi
 
 if [ -z "${PLAN_FILE:-}" ]; then
   PLAN_FILE="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
@@ -187,7 +236,7 @@ _audit() {
   printf '# dest-root: %s\n' "$DEST_ROOT"
 } >> "$ACTIONS_LOG" 2>/dev/null || true
 
-idx=0; moved=0; fail=0; removed=0
+idx=0; moved=0; fail=0; removed=0; skipped_verify=0
 while IFS= read -r src; do
   [ -z "$src" ] && continue
   # belt-and-braces: skip any comment line even though PLAN_CLEAN is filtered
@@ -197,6 +246,29 @@ while IFS= read -r src; do
   # per-folder size (best-effort, for the audit record)
   sz_kb="$(du -sk -- "$src" 2>/dev/null | awk 'NR==1{print $1}')"
   [[ "$sz_kb" =~ ^[0-9]+$ ]] || sz_kb=""
+
+  # FIX (v1.3.5 — item 2): apply-time content re-verification. If we have a
+  # keeper for this DEL folder, recompute both signatures from disk NOW and skip
+  # the move if they differ — the folder is no longer a true duplicate (e.g. a
+  # unique file was added after the plan was generated).
+  if [ "$VERIFY_ACTIVE" = true ]; then
+    keep="${KEEP_OF[$src]:-}"
+    if [ -n "$keep" ]; then
+      del_sig="$(dir_signature "$src")"
+      keep_sig="$(dir_signature "$keep")"
+      if [ "$del_sig" != "$keep_sig" ]; then
+        warn "($idx/$COUNT) SKIP — contents no longer match keeper: $src"
+        warn "   keeper: $keep"
+        skipped_verify=$((skipped_verify+1))
+        _audit "SKIPPED_VERIFY_MISMATCH" "$src" "$keep" "$sz_kb"
+        continue
+      fi
+    else
+      # No keeper mapping for this DEL (e.g. raw plan w/o groups). Proceed, but
+      # note it so the audit trail is honest about what was verified.
+      _audit "VERIFY_NO_KEEPER" "$src" "" "$sz_kb"
+    fi
+  fi
 
   if [ "$DELETE_METADATA" = true ] && printf '%s\n' "$src" | grep -Eq '/(@eaDir|\.AppleDouble)(/|$)'; then
     work "($idx/$COUNT) delete metadata: $src"
@@ -231,7 +303,11 @@ while IFS= read -r src; do
   fi
 done < "$PLAN_CLEAN"
 
-info "Done. Moved: $moved  | Deleted metadata: $removed  | Failed: $fail  | Log: $LOG_FILE"
+info "Done. Moved: $moved  | Deleted metadata: $removed  | Skipped (changed): $skipped_verify  | Failed: $fail  | Log: $LOG_FILE"
+if [ "$skipped_verify" -gt 0 ]; then
+  warn "$skipped_verify folder(s) skipped because their contents no longer matched the keeper (changed since the plan was made)."
+  warn "Re-run option 3 (find duplicate folders) to re-evaluate them."
+fi
 info "Audit record appended to: $ACTIONS_LOG"
 info "Review quarantine: $DEST_ROOT"
 exit 0

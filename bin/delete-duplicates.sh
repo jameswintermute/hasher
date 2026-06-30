@@ -10,7 +10,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 LOGS_DIR="$ROOT_DIR/logs";        mkdir -p "$LOGS_DIR"
 VAR_DIR="$ROOT_DIR/var";          mkdir -p "$VAR_DIR"
-QUAR_DIR="$ROOT_DIR/quarantine";  mkdir -p "$QUAR_DIR"
+# FIX (v1.3.5 — peer-review item 5): use the SHARED quarantine resolver so file
+# dedup, folder dedup, and zero-length removal all quarantine to the same place
+# and honour QUARANTINE_DIR from local/hasher.conf. Previously this was a static
+# undated "$ROOT_DIR/quarantine", diverging from default_quarantine_root() used
+# elsewhere. Falls back to the old path only if the helper is unavailable.
+if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT_DIR/lib/host-detect.sh"
+  QUAR_DIR="$(default_quarantine_root 2>/dev/null || true)"
+fi
+# allow an explicit QUARANTINE_DIR override from the environment/conf if present
+[ -n "${QUARANTINE_DIR:-}" ] && QUAR_DIR="$QUARANTINE_DIR"
+[ -z "${QUAR_DIR:-}" ] && QUAR_DIR="$ROOT_DIR/quarantine"
+mkdir -p "$QUAR_DIR"
 
 PLAN_FILE="${1:-}"
 
@@ -156,10 +169,22 @@ while IFS= read -r line || [ -n "$line" ]; do
       dest_dir=$(dirname "$dest")
       mkdir -p "$dest_dir"
 
-      if mv -n -- "$DEL_PATH" "$dest"; then
+      # FIX (v1.3.5 — peer-review item 5): `mv -n` can return success while
+      # silently NOT moving when the destination already exists, which would be
+      # counted as a successful quarantine while the duplicate remained live at
+      # its source. Detect collisions explicitly: if the destination already
+      # exists, disambiguate with a numeric suffix rather than skipping or
+      # clobbering, and verify the source is actually gone after the move.
+      if [ -e "$dest" ]; then
+        n=1
+        while [ -e "${dest}.dup${n}" ]; do n=$((n+1)); done
+        warn "Quarantine target already exists; using ${dest}.dup${n}"
+        dest="${dest}.dup${n}"
+      fi
+      if mv -- "$DEL_PATH" "$dest" 2>/dev/null && [ ! -e "$DEL_PATH" ]; then
         moves_ok=$((moves_ok+1))
       else
-        warn "Failed to move: $DEL_PATH"
+        warn "Failed to move (source still present): $DEL_PATH"
         moves_fail=$((moves_fail+1))
       fi
       ;;
