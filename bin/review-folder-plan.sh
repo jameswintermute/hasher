@@ -488,6 +488,14 @@ write_reviewed_plan() {
   local stamp
   stamp="$(date +%Y-%m-%d-%H%M%S)"
   local out="$LOGS_DIR/duplicate-folders-plan-reviewed-$stamp.txt"
+  # FIX (v1.3.6 — cross-check concern 4): also write a reviewed GROUPS sidecar
+  # that records the FINAL keeper for every DEL folder after accept/swap, so
+  # apply-time verification checks each delete against the REVIEWED keeper, not
+  # the original groups TSV. Without this, a swapped keeper (original keeper now
+  # being deleted) had no mapping and was moved without verification.
+  # Format: size<TAB>keepdir<TAB>deldir (same shape as the original groups TSV).
+  local rgroups="$LOGS_DIR/duplicate-folders-groups-reviewed-$stamp.tsv"
+  : > "$rgroups"
 
   {
     printf "# Reviewed folder dedup plan\n"
@@ -498,6 +506,7 @@ write_reviewed_plan() {
     printf "# Format: one directory path per line. apply-folder-plan.sh will\n"
     printf "# quarantine each listed directory. All decisions in this file\n"
     printf "# have been explicitly reviewed by a human.\n"
+    printf "# Reviewed groups (keeper mapping): %s\n" "$rgroups"
     printf "#\n"
   } > "$out"
 
@@ -523,6 +532,8 @@ write_reviewed_plan() {
         while IFS= read -r d; do
           [ -z "$d" ] && continue
           printf "%s\n" "$d" >> "$out"
+          # reviewed-groups mapping: del -> original keeper
+          printf "%s\t%s\t%s\n" "${G_BYTES[$i]}" "$keep" "$d" >> "$rgroups"
         done <<< "$dels"
         ;;
       skip)
@@ -548,12 +559,23 @@ write_reviewed_plan() {
           del_n=$((del_n + 1))
           if [ "$del_n" = "$swap_to" ]; then
             new_keeper="$d"
-          else
-            printf "%s\n" "$d" >> "$out"
           fi
         done <<< "$dels"
-        # original keeper goes into the DEL list
+        # Now write the dels (everything except the new keeper) + original keeper,
+        # each mapped to the NEW keeper for apply-time verification.
+        del_n=0
+        while IFS= read -r d; do
+          [ -z "$d" ] && continue
+          del_n=$((del_n + 1))
+          if [ "$del_n" = "$swap_to" ]; then
+            continue   # this is the new keeper; not deleted
+          fi
+          printf "%s\n" "$d" >> "$out"
+          printf "%s\t%s\t%s\n" "${G_BYTES[$i]}" "$new_keeper" "$d" >> "$rgroups"
+        done <<< "$dels"
+        # original keeper goes into the DEL list, mapped to the new keeper
         printf "%s\n" "$keep" >> "$out"
+        printf "%s\t%s\t%s\n" "${G_BYTES[$i]}" "$new_keeper" "$keep" >> "$rgroups"
         ;;
     esac
   done
