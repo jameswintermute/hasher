@@ -105,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.7**
+Started Dec 2022. Current version: **v1.3.8**
 For full history see: `version-history.md`
 
 ---
@@ -442,4 +442,23 @@ GNU GPLv3 — see LICENSE.
 
 ## Further Reading
 
-- [Facebook — Silent Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/) — the motivating use case for hash-based integrity monitoring
+## Further reading
+* [Backblaze, “Drive Stats for 2025”](https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/)
+
+* [Bernd Panzer-Steindel, “Data Integrity”, CERN, 2007](https://indico.cern.ch/event/13797/contributions/1362288/attachments/115080/163419/Data_integrity_v3.pdf)
+
+* [Btrfs documentation, “Scrub”](https://btrfs.readthedocs.io/en/latest/Scrub.html)
+
+* [David S. H. Rosenthal, “Keeping Bits Safe: How Hard Can It Be?”, ACM Queue, 2010](https://queue.acm.org/detail.cfm?id=1866298)
+
+* [Facebook Engineering, “Silent Data Corruption”](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/) — the motivating use case for hash-based integrity monitoring
+
+* [Google SRE Book, “Data Integrity: What You Read Is What You Wrote”](https://sre.google/sre-book/data-integrity/)
+
+* [Lakshmi N. Bairavasundaram et al., “An Analysis of Data Corruption in the Storage Stack”, USENIX FAST 2008](https://www.usenix.org/conference/fast-08/analysis-data-corruption-storage-stack)
+
+* [Mary Baker et al., “A Fresh Look at the Reliability of Long-term Digital Storage”, 2005](https://arxiv.org/abs/cs/0508130)
+
+* [OpenZFS documentation, “Checksums and Their Use in ZFS”](https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Checksums.html)
+
+* [Synology, “How data scrubbing protects against data corruption”](https://blog.synology.com/how-data-scrubbing-protects-against-data-corruption)

@@ -44,34 +44,14 @@ usage() {
     "By default, files are deleted; use --quarantine to move them into QUARANTINE_DIR for review."
 }
 
-resolve_quarantine_dir() {
-  local raw=""
-  if [ -f "$LOCAL_DIR/hasher.conf" ]; then
-    raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$LOCAL_DIR/hasher.conf" | tail -n1 || true)"
-  fi
-  if [ -z "$raw" ] && [ -f "$DEFAULT_DIR/hasher.conf" ]; then
-    raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$DEFAULT_DIR/hasher.conf" | tail -n1 || true)"
-  fi
-  local val
-  val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
-  if [ -z "$val" ]; then
-    # FIX (v1.1.9): host-aware fallback instead of hardcoded repo-root path.
-    # v1.2.4: default_quarantine_root() now returns an install-relative path
-    # ($ROOT_DIR/quarantine-DATE) on every host, including Synology, so the
-    # quarantine always lives beside the tool. Set QUARANTINE_DIR in
-    # local/hasher.conf to override.
-    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
-      . "$ROOT_DIR/lib/host-detect.sh"
-      val="$(default_quarantine_root)"
-    else
-      val="$ROOT_DIR/quarantine-$(date +%F)"
-    fi
-  else
-    val="${val//\$\((date +%F)\)/$(date +%F)}"
-    val="${val//\$(date +%F)/$(date +%F)}"
-  fi
-  printf '%s\n' "$val"
-}
+# FIX (v1.3.8 — recheck concern 4): use the SHARED resolve_quarantine_dir() from
+# lib/host-detect.sh rather than a private copy that ignored an exported
+# QUARANTINE_DIR environment variable. Source the helper here; the call site
+# uses the shared function (with a graceful fallback if the helper is missing).
+if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT_DIR/lib/host-detect.sh"
+fi
 
 # Parse args
 REPORT=""            # explicit pre-built zero-length report (newline path list)
@@ -223,7 +203,11 @@ fi
 
 # Prepare quarantine if needed
 if $QUARANTINE; then
-  QDIR="$(resolve_quarantine_dir)"
+  if command -v resolve_quarantine_dir >/dev/null 2>&1; then
+    QDIR="$(resolve_quarantine_dir)"
+  else
+    QDIR="${QUARANTINE_DIR:-$ROOT_DIR/quarantine-$(date +%F)}"
+  fi
   TS="$(date +%F-%H%M%S)"
   DEST="$QDIR/zero-length-$TS"
   mkdir -p -- "$DEST"
