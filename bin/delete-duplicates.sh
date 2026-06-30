@@ -10,18 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 LOGS_DIR="$ROOT_DIR/logs";        mkdir -p "$LOGS_DIR"
 VAR_DIR="$ROOT_DIR/var";          mkdir -p "$VAR_DIR"
-# FIX (v1.3.5 — peer-review item 5): use the SHARED quarantine resolver so file
-# dedup, folder dedup, and zero-length removal all quarantine to the same place
-# and honour QUARANTINE_DIR from local/hasher.conf. Previously this was a static
-# undated "$ROOT_DIR/quarantine", diverging from default_quarantine_root() used
-# elsewhere. Falls back to the old path only if the helper is unavailable.
+# FIX (v1.3.6 — cross-check concern 3): use the SHARED resolve_quarantine_dir()
+# from lib/host-detect.sh, which reads QUARANTINE_DIR from local/hasher.conf
+# (then default/hasher.conf, then env, then the install-relative default). The
+# v1.3.5 version only honoured an environment variable, not the conf setting —
+# so a user's local/hasher.conf QUARANTINE_DIR was silently ignored.
 if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
   # shellcheck disable=SC1090
   . "$ROOT_DIR/lib/host-detect.sh"
-  QUAR_DIR="$(default_quarantine_root 2>/dev/null || true)"
+  QUAR_DIR="$(resolve_quarantine_dir 2>/dev/null || true)"
 fi
-# allow an explicit QUARANTINE_DIR override from the environment/conf if present
-[ -n "${QUARANTINE_DIR:-}" ] && QUAR_DIR="$QUARANTINE_DIR"
 [ -z "${QUAR_DIR:-}" ] && QUAR_DIR="$ROOT_DIR/quarantine"
 mkdir -p "$QUAR_DIR"
 

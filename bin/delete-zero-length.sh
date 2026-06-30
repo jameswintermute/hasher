@@ -116,18 +116,25 @@ if [ "$MODE" = "csv" ]; then
   #   2. If no such report exists, parse the CSV QUOTE-AWARE (RFC4180), the
   #      same approach as find-duplicates.sh, instead of the naive split.
   zreport=""
-  # Derive the date tag from the CSV name if it looks like hasher-YYYY-MM-DD-*.csv,
-  # else try today; accept any matching report under var/zero-length/.
+  # FIX (v1.3.6 — cross-check concerns 1 & 2):
+  #   Concern 2: add `|| true` so a CSV filename with no date doesn't make the
+  #   pipe fail under `set -Eeuo pipefail` and silently kill the script.
+  #   Concern 1: an explicit --input must NEVER be overridden by an unrelated
+  #   cached report. Only use a pre-built zero-length report when its date
+  #   EXACTLY matches the CSV's date. If the CSV has no date, or no date-matched
+  #   report exists, parse the supplied CSV directly. Do not fall back to
+  #   "latest report".
   csv_base="$(basename -- "$INPUT")"
-  date_guess="$(printf '%s\n' "$csv_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)"
-  for cand in \
-    "$VAR_DIR/zero-length/zero-length-${date_guess}.txt" \
-    "$(ls -1t "$VAR_DIR"/zero-length/zero-length-*.txt 2>/dev/null | head -1)"; do
-    [ -n "$cand" ] && [ -f "$cand" ] && { zreport="$cand"; break; }
-  done
+  date_guess="$(printf '%s\n' "$csv_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
+  if [ -n "$date_guess" ]; then
+    cand="$VAR_DIR/zero-length/zero-length-${date_guess}.txt"
+    if [ -f "$cand" ]; then
+      zreport="$cand"
+    fi
+  fi
 
   if [ -n "$zreport" ]; then
-    info "Using pre-built zero-length report: $zreport"
+    info "Using pre-built zero-length report (date-matched): $zreport"
     # Plain newline-delimited path list; copy through, skipping blanks/comments.
     grep -vE '^[[:space:]]*(#|$)' "$zreport" > "$TMP_LIST" 2>/dev/null || true
   else

@@ -59,9 +59,22 @@ NO_VERIFY="${NO_VERIFY:-false}"
 # signature from disk immediately before moving, and skip any DEL folder whose
 # signature no longer matches its KEEP folder — e.g. a unique file was added to
 # the DEL folder after the plan was generated. Disk is the source of truth.
-# Auto-discover the latest groups TSV if not supplied and not disabled.
+# Auto-discover the groups TSV for verification if not supplied and not disabled.
+# FIX (v1.3.6 — concern 4): prefer a REVIEWED groups sidecar
+# (duplicate-folders-groups-reviewed-*.tsv) over the original groups TSV,
+# because the reviewed one reflects final keeper decisions after accept/swap.
+# If applying a specific reviewed plan, match its timestamp; otherwise take the
+# newest reviewed sidecar, then fall back to the original groups TSV.
 if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
-  VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
+  # try to extract a stamp from a reviewed plan filename, e.g.
+  # duplicate-folders-plan-reviewed-2026-06-30-124035.txt
+  _stamp="$(printf '%s\n' "$(basename -- "${PLAN_FILE:-}")" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' | head -1 || true)"
+  if [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv" ]; then
+    VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv"
+  else
+    VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv 2>/dev/null | head -n1 || true)"
+    [ -z "$VERIFY_TSV" ] && VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | grep -v reviewed | head -n1 || true)"
+  fi
 fi
 
 # Compute the direct-file signature of a directory from disk: for each file
@@ -84,19 +97,27 @@ dir_signature() {
 }
 
 # Build a lookup of DEL -> KEEP from the groups TSV, if available.
-# (Used only when verification is active.)
+# FIX (v1.3.6 — cross-check concern 5): the v1.3.5 version used `declare -A`
+# (associative array), which is Bash 4+ only and breaks the project's Bash 3.2
+# baseline (macOS ships 3.2 as /bin/bash). Replaced with a 3.2-safe lookup: a
+# normalised temp TSV (keeper<TAB>del) queried per-DEL with awk on exact match.
 VERIFY_ACTIVE=false
-declare -A KEEP_OF 2>/dev/null || true
+KEEP_MAP=""
 if [ "$NO_VERIFY" != true ] && [ -n "$VERIFY_TSV" ] && [ -s "$VERIFY_TSV" ]; then
   VERIFY_ACTIVE=true
-  while IFS="$(printf '\t')" read -r _sz _keep _del; do
-    [ -z "${_del:-}" ] && continue
-    KEEP_OF["$_del"]="$_keep"
-  done < "$VERIFY_TSV"
+  KEEP_MAP="$(mktemp "${TMPDIR:-/tmp}/keepmap.XXXXXX")"
+  # Normalise to "deldir<TAB>keepdir" for direct lookup by del path.
+  awk -F'\t' 'NF>=3 { print $3 "\t" $2 }' "$VERIFY_TSV" > "$KEEP_MAP" 2>/dev/null || true
   info "Apply-time verification ON (groups: $VERIFY_TSV). DEL folders whose contents no longer match their keeper will be skipped."
 else
   [ "$NO_VERIFY" = true ] && warn "Apply-time verification DISABLED (--no-verify)."
 fi
+
+# keeper_for DEL  → prints the mapped keeper dir (exact match), or empty.
+keeper_for() {
+  [ -n "$KEEP_MAP" ] && [ -s "$KEEP_MAP" ] || { printf ''; return; }
+  awk -F'\t' -v d="$1" '$1==d { print $2; exit }' "$KEEP_MAP"
+}
 
 if [ -z "${PLAN_FILE:-}" ]; then
   PLAN_FILE="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
@@ -158,7 +179,7 @@ info "Quarantine: $QDIR — $DF_H"
 # reviewed plans silently did nothing. We now normalise the plan ONCE into a
 # comment-free, blank-free temp file and use it for all reads below.
 PLAN_CLEAN="$(mktemp "${TMPDIR:-/tmp}/folder-plan.XXXXXX")"
-trap 'rm -f "$PLAN_CLEAN"' EXIT
+trap 'rm -f "$PLAN_CLEAN" "${KEEP_MAP:-}" 2>/dev/null' EXIT
 # strip blank lines and full-line comments (leading optional whitespace + '#')
 sed -e 's/[[:space:]]*$//' "$PLAN_FILE" \
   | grep -vE '^[[:space:]]*#' \
@@ -252,7 +273,7 @@ while IFS= read -r src; do
   # the move if they differ — the folder is no longer a true duplicate (e.g. a
   # unique file was added after the plan was generated).
   if [ "$VERIFY_ACTIVE" = true ]; then
-    keep="${KEEP_OF[$src]:-}"
+    keep="$(keeper_for "$src")"
     if [ -n "$keep" ]; then
       del_sig="$(dir_signature "$src")"
       keep_sig="$(dir_signature "$keep")"
