@@ -104,7 +104,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.3**
+Started Dec 2022. Current version: **v1.3.4**
 For full history see: `version-history.md`
 
 ---
@@ -145,6 +145,7 @@ Stage 3 — Review & clean
 
 Other
    d) System diagnostics (deps & readiness)
+   x) Self-test (integrity preflight)
    l) Follow logs (tail -f background.log)
    t) Stats & scheduling hints
    v) Clean internal working files (var/)
@@ -375,6 +376,31 @@ remove files permanently unless noted:
 
 - All scripts re-verify paths immediately before acting
 - Bash 3.2 / BSD awk / macOS userland compatibility audited (v1.1.9–v1.1.12)
+
+---
+
+## Self-test (integrity preflight)
+
+`bin/self-test.sh` is a read-only check that verifies the install is internally
+consistent — it never moves, deletes, or rewrites anything. It runs automatically
+(and silently) at launcher startup, surfacing a banner only if it finds errors,
+and is available on demand from the menu (option `x`) or directly:
+
+```bash
+bin/self-test.sh            # full report
+bin/self-test.sh --quiet    # only warnings/errors + summary
+bin/self-test.sh --strict   # treat warnings as failures (for CI)
+```
+
+It checks that sourced helpers resolve and parse, that there are no stale
+duplicate copies of a sourced helper, that every launcher menu target exists and
+is runnable (executable, or readable for the bash fallback), that the launcher
+and `default/hasher.conf` versions agree, that required commands and a SHA-256
+tool are present, that Bash meets the 3.2 baseline, and that the config and scan
+paths are sane. Exit status is `0` on pass, `1` if any errors are found. It exists
+to catch — at launch rather than in production — the class of problem where a
+correct change lands in a file the running code doesn't load, a script arrives
+without its executable bit, or the conf version drifts out of sync.
 
 ---
 

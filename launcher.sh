@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.3 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.4 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -173,6 +173,7 @@ print_menu() {
   echo
   echo "${BOLD}Other${RST}"
   echo "   d) System diagnostics (deps & readiness)"
+  echo "   x) Self-test (integrity preflight)"
   echo "   l) Follow logs (tail -f background.log)"
   echo "   t) Stats & scheduling hints"
   echo "   v) Clean internal working files (var/)"
@@ -930,6 +931,18 @@ action_system_check(){
   printf "Press Enter to continue... "; read -r _ || true;
 }
 
+action_self_test(){
+  # v1.3.4: run the integrity preflight on demand. Uses run_script so a missing
+  # +x bit on self-test.sh itself is not fatal.
+  if script_runnable "$BIN_DIR/self-test.sh"; then
+    run_script "$BIN_DIR/self-test.sh" || true
+  else
+    err "$BIN_DIR/self-test.sh not found."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+
 action_clean_caches() {
   paths_file="$LOCAL_DIR/paths.txt"
   # FIX (v1.1.9): host-aware default scan root instead of hardcoded /volume1
@@ -1201,6 +1214,20 @@ action_auto_dedup() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# ── Startup integrity preflight (v1.3.4) ─────────────────────────────────────
+# Run self-test quietly at launch. On a healthy install this is silent; if it
+# finds ERRORS (missing helper, duplicate helper, version drift, missing menu
+# target) it prints a short banner so the problem is seen immediately rather
+# than discovered later in production. Warnings (e.g. missing +x, handled by the
+# bash fallback) are not surfaced here to avoid nagging.
+if [ -r "$BIN_DIR/self-test.sh" ]; then
+  if ! _st_out="$(run_script "$BIN_DIR/self-test.sh" --quiet 2>&1)"; then
+    printf '%s\n' "$_st_out" | grep -E '\[FAIL\]' 2>/dev/null
+    warn "Self-test reported problems above. Run option 'x' for the full report."
+    printf "Press Enter to continue... "; read -r _ || true
+  fi
+fi
+
 # ── First-run guided setup (v1.3.0) ──────────────────────────────────────────
 # Runs once on the first launch of a new install (sentinel: local/.setup-complete).
 if is_first_run; then
@@ -1237,6 +1264,7 @@ while :; do
 
     # ── Other ─────────────────────────────────────────────────────────────
     d|D)     action_system_check ;;
+    x|X)     action_self_test ;;
     l|L)     action_view_logs_follow ;;
     t|T)     action_stats_and_cron ;;
     v|V)     action_clean_internal ;;
