@@ -128,3 +128,35 @@ host_pretty_label() {
     *)        printf 'unknown host\n' ;;
   esac
 }
+
+# ── Shared quarantine resolver (v1.3.6) ────────────────────────────────
+# Single source of truth for where quarantine lives, used by ALL
+# quarantine-capable tools (delete-duplicates.sh, apply-folder-plan.sh,
+# delete-zero-length.sh) so they never diverge. Resolution order:
+#   1. QUARANTINE_DIR set in local/hasher.conf  (user override; preferred)
+#   2. QUARANTINE_DIR set in default/hasher.conf
+#   3. QUARANTINE_DIR exported in the environment
+#   4. default_quarantine_root()  ($ROOT_DIR/quarantine-DATE, install-relative)
+# A literal $(date +%F) inside a conf value is expanded. Requires ROOT_DIR set.
+resolve_quarantine_dir() {
+  _rqd_raw=""
+  if [ -f "${ROOT_DIR:-.}/local/hasher.conf" ]; then
+    _rqd_raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "${ROOT_DIR}/local/hasher.conf" | tail -n1 || true)"
+  fi
+  if [ -z "$_rqd_raw" ] && [ -f "${ROOT_DIR:-.}/default/hasher.conf" ]; then
+    _rqd_raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "${ROOT_DIR}/default/hasher.conf" | tail -n1 || true)"
+  fi
+  _rqd_val="$(printf '%s\n' "$_rqd_raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')"
+  # environment override only if conf did not provide one
+  if [ -z "$_rqd_val" ] && [ -n "${QUARANTINE_DIR:-}" ]; then
+    _rqd_val="$QUARANTINE_DIR"
+  fi
+  if [ -z "$_rqd_val" ]; then
+    _rqd_val="$(default_quarantine_root)"
+  else
+    # expand a literal $(date +%F) if present in the conf value
+    _today="$(date +%F)"
+    _rqd_val="$(printf '%s\n' "$_rqd_val" | sed "s/\\\$(date +%F)/$_today/g")"
+  fi
+  printf '%s\n' "$_rqd_val"
+}

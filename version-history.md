@@ -1131,6 +1131,64 @@ line "whole identical folders" is corrected to "folders with identical
 direct contents", matching the leaf-level behaviour.
 
 ---
+## 2026‑06 — v1.3.6
+**Third cross-check: regressions and gaps in the v1.3.5 fixes** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+A follow-up review found five issues, three of them regressions introduced
+by v1.3.5's own fixes. All verified and corrected.
+
+### Concern 1 (critical) — zero-length report could override an explicit --input
+
+v1.3.5 made `delete-zero-length.sh` prefer a pre-built
+`var/zero-length/zero-length-DATE.txt` report, but the fallback also
+accepted the *latest* report when no date-matched one existed — so an
+explicit `--input some.csv` could be silently overridden by an unrelated
+cached report, deleting/quarantining the wrong files. Fixed: a pre-built
+report is used ONLY when its date exactly matches the CSV's date;
+otherwise the supplied CSV is parsed (quote-aware). No "latest report"
+fallback.
+
+### Concern 2 (high) — no-date CSV killed the script under pipefail
+
+`date_guess="$(... grep -oE ... | head -1)"` had no `|| true`; a CSV
+filename without a date made the pipe fail under `set -Eeuo pipefail`,
+exiting silently before doing any work. Added `|| true`.
+
+### Concern 3 (high) — file dedup ignored local/hasher.conf QUARANTINE_DIR
+
+v1.3.5 claimed `delete-duplicates.sh` honoured the conf, but it only read
+the QUARANTINE_DIR *environment variable*, not the conf setting. Added a
+shared `resolve_quarantine_dir()` to `lib/host-detect.sh` (reads
+local/ then default/ hasher.conf, then env, then the install-relative
+default) and switched `delete-duplicates.sh` to use it. Verified: a
+QUARANTINE_DIR in local/hasher.conf now takes effect for file dedup.
+
+### Concern 4 (high) — swap-keeper plans bypassed apply-time verification
+
+Folder verification (v1.3.5) keyed on the ORIGINAL groups TSV (del→keep).
+When the reviewer swapped a keeper, the reviewed plan deletes the original
+keeper, for which the original TSV had no mapping — so it moved without
+verification. Fixed: the reviewer now also writes a reviewed groups
+sidecar (`duplicate-folders-groups-reviewed-STAMP.tsv`) recording the
+FINAL keeper for every delete after accept/swap, and `apply-folder-plan.sh`
+prefers that sidecar (matched to the reviewed plan's timestamp). Verified:
+a swapped keeper that changes after planning is now correctly skipped.
+
+### Concern 5 (high) — apply-folder-plan required Bash 4+
+
+v1.3.5 used `declare -A` (associative array), Bash 4+ only, breaking the
+project's Bash 3.2 baseline (macOS /bin/bash). Replaced with a 3.2-safe
+lookup: a normalised temp TSV (del<TAB>keep) queried per-delete via awk
+exact match. No associative arrays remain anywhere in the codebase.
+
+### Hygiene
+
+- `default/hasher.conf` quarantine documentation corrected to describe the
+  install-relative default (was still showing the old `/volume1/hasher`).
+- All three quarantine-capable tools now resolve quarantine consistently
+  and honour QUARANTINE_DIR from the conf.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
