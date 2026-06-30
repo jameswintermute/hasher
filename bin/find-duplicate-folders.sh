@@ -85,7 +85,7 @@ TMP_SORTED="$TMP_BASE.sorted.tsv"   # sorted by dir, then basename/hash/size
 TMP_SIGS="$TMP_BASE.sigs.tsv"       # signature_string \t dir
 TMP_GROUPS="$TMP_BASE.groups.tsv"   # reclaim_bytes \t keep_dir \t delete_dir
 
-trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" "$TMP_BASE.alldirs.txt" "$TMP_BASE.nonleaf.txt" "$TMP_BASE.dirsize.tsv" "$TMP_BASE.sig_dir_size.tsv" "$TMP_BASE.groups.sorted.tsv" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" "$TMP_BASE.alldirs.txt" "$TMP_BASE.ancestors.txt" "$TMP_BASE.nonleaf.txt" "$TMP_BASE.dirsize.tsv" "$TMP_BASE.sig_dir_size.tsv" "$TMP_BASE.groups.sorted.tsv" 2>/dev/null || true' EXIT INT TERM
 
 info "Input: $INPUT"
 info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE (matches directories by their direct file contents) | Keep: $KEEP"
@@ -170,22 +170,34 @@ awk -F '	' '
 # B/sub/unique.txt) would be planned for deletion and its unique nested data
 # moved. A true leaf directory has NO child directories, so its direct-file
 # signature IS its complete content — making compare-shallow and move-deep
-# equivalent. We exclude any directory that is a parent of another directory
+# equivalent. We exclude any directory that is an ANCESTOR of another directory
 # in the catalogue (derived purely from the dir column, no extra disk cost).
+#
+# FIX (v1.3.8 — recheck concern 3): the previous implementation compared every
+# directory against every other (O(n²)) and was measured at ~13s for ~11k dirs.
+# This version is linear-ish (sort-based): for each catalogue directory, emit
+# ALL of its ancestor paths; any catalogue directory that appears in that
+# ancestor set is a non-leaf. Emitting all ancestors (not just the immediate
+# parent) preserves the original transitive semantics — e.g. /A is correctly
+# flagged as non-leaf when only /A and /A/sub/deep carry files.
 cut -f1 "$TMP_FILES" | LC_ALL=C sort -u > "$TMP_BASE.alldirs.txt"
+# All ancestor directories of every catalogue dir (strip one trailing component
+# at a time), deduplicated.
 awk '
-  { d[NR]=$0 }
-  END{
-    for (i=1;i<=NR;i++){
-      di=d[i]; dilen=length(di); isparent=0;
-      for (j=1;j<=NR;j++){
-        if (i==j) continue;
-        if (substr(d[j],1,dilen+1) == di "/"){ isparent=1; break }
-      }
-      if (isparent) print di;   # emit NON-leaf dirs (have at least one child dir)
+  {
+    p=$0;
+    # strip trailing slashes just in case
+    sub(/\/+$/,"",p);
+    while (1) {
+      q=p; sub(/\/[^/]+$/,"",q);
+      if (q==p || q=="") break;
+      print q;
+      p=q;
     }
   }
-' "$TMP_BASE.alldirs.txt" > "$TMP_BASE.nonleaf.txt"
+' "$TMP_BASE.alldirs.txt" | LC_ALL=C sort -u > "$TMP_BASE.ancestors.txt"
+# Non-leaf catalogue dirs = catalogue dirs that are also an ancestor of some dir.
+LC_ALL=C comm -12 "$TMP_BASE.alldirs.txt" "$TMP_BASE.ancestors.txt" > "$TMP_BASE.nonleaf.txt"
 
 nonleaf_count="$(wc -l < "$TMP_BASE.nonleaf.txt" | tr -d ' ')"
 if [ "${nonleaf_count:-0}" -gt 0 ]; then

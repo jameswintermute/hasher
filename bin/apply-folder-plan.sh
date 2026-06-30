@@ -59,6 +59,19 @@ VERIFY_TSV="${VERIFY_TSV:-}"
 NO_VERIFY="${NO_VERIFY:-false}"
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
 
+# FIX (v1.3.8 — recheck concern 2): resolve and validate PLAN_FILE BEFORE
+# verification-sidecar discovery. Previously the default (no --plan) plan was
+# resolved later, so sidecar discovery ran with an empty PLAN_FILE, found no
+# matching groups TSV, and (under the fail-safe) skipped every deletion. Order
+# is now: parse args → default+validate PLAN_FILE → discover sidecar → apply.
+if [ -z "${PLAN_FILE:-}" ]; then
+  PLAN_FILE="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+fi
+if [ -z "${PLAN_FILE:-}" ] || [ ! -s "$PLAN_FILE" ]; then
+  err "No plan file found. Run 'Find duplicate folders' first."
+  exit 2
+fi
+
 # FIX (v1.3.5 — peer-review item 2): apply-time content re-verification for
 # folder dedup, mirroring the file-dedup re-hash. If a groups TSV is available
 # (size\tkeepdir\tdeldir), we recompute each pair's CURRENT direct-file
@@ -141,50 +154,33 @@ else
 fi
 [ "$ALLOW_UNVERIFIED" = true ] && warn "--allow-unverified: deletes without a keeper mapping will PROCEED unverified."
 
+# has_child_dirs DIR → returns 0 (true) if DIR contains at least one immediate
+# subdirectory. Used for the apply-time leaf check (concern: a folder that was a
+# leaf at plan time may have gained a subdirectory before apply).
+has_child_dirs() {
+  find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .
+}
+
 # keeper_for DEL  → prints the mapped keeper dir (exact match), or empty.
 keeper_for() {
   [ -n "$KEEP_MAP" ] && [ -s "$KEEP_MAP" ] || { printf ''; return; }
   awk -F'\t' -v d="$1" '$1==d { print $2; exit }' "$KEEP_MAP"
 }
 
-if [ -z "${PLAN_FILE:-}" ]; then
-  PLAN_FILE="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
+# FIX (v1.3.8 — recheck concern 4): use the SHARED resolve_quarantine_dir() from
+# lib/host-detect.sh rather than a private copy. The local copy did not honour an
+# exported QUARANTINE_DIR environment variable (only the conf), diverging from
+# the shared resolver. Source the helper and call the shared function; fall back
+# to an install-relative default only if the helper is missing.
+if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT_DIR/lib/host-detect.sh"
 fi
-if [ -z "${PLAN_FILE:-}" ] || [ ! -s "$PLAN_FILE" ]; then
-  err "No plan file found. Run 'Find duplicate folders' first."
-  exit 2
+if command -v resolve_quarantine_dir >/dev/null 2>&1; then
+  QDIR="$(resolve_quarantine_dir)"
+else
+  QDIR="${QUARANTINE_DIR:-$ROOT_DIR/quarantine-$(date +%F)}"
 fi
-
-# Resolve quarantine dir from hasher.conf (local overrides default)
-resolve_quarantine_dir() {
-  local raw=""
-  if [ -f "$ROOT_DIR/local/hasher.conf" ]; then
-    raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$ROOT_DIR/local/hasher.conf" | tail -n1 || true)"
-  fi
-  if [ -z "$raw" ] && [ -f "$ROOT_DIR/default/hasher.conf" ]; then
-    raw="$(grep -E '^[[:space:]]*QUARANTINE_DIR[[:space:]]*=' "$ROOT_DIR/default/hasher.conf" | tail -n1 || true)"
-  fi
-  local val
-  val="$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*QUARANTINE_DIR[[:space:]]*=[[:space:]]*//; s/^[\"\x27]//; s/[\"\x27]$//')"
-  if [ -z "$val" ]; then
-    # FIX (v1.1.9): host-aware fallback via host-detect.sh.
-    # v1.2.4: default_quarantine_root() now returns an install-relative path
-    # ($ROOT_DIR/quarantine-DATE) on every host, so quarantine lives beside
-    # the tool. Set QUARANTINE_DIR in local/hasher.conf to override.
-    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
-      . "$ROOT_DIR/lib/host-detect.sh"
-      val="$(default_quarantine_root)"
-    else
-      val="$ROOT_DIR/quarantine-$(date +%F)"
-    fi
-  else
-    val="${val//\$\((date +%F)\)/$(date +%F)}"
-    val="${val//\$(date +%F)/$(date +%F)}"
-  fi
-  printf '%s\n' "$val"
-}
-
-QDIR="$(resolve_quarantine_dir)"
 TS="$(date +%F-%H%M%S)"
 DEST_ROOT="$QDIR/folders-$TS"
 mkdir -p -- "$DEST_ROOT"
@@ -300,6 +296,33 @@ while IFS= read -r src; do
   # keeper for this DEL folder, recompute both signatures from disk NOW and skip
   # the move if they differ — the folder is no longer a true duplicate (e.g. a
   # unique file was added after the plan was generated).
+  # FIX (v1.3.8 — recheck concern 1): APPLY-TIME LEAF CHECK. find-duplicate-
+  # folders.sh excludes non-leaf directories at PLAN time, but a folder that was
+  # a leaf when the plan was written may have gained a subdirectory before the
+  # plan is applied. Since apply moves the directory RECURSIVELY, moving a folder
+  # that is no longer a leaf would relocate nested data that was never compared.
+  # Re-check leaf status from disk NOW and skip if either the delete folder or
+  # its keeper has child directories. This is independent of content
+  # verification — it holds even under --no-verify — because moving non-leaf
+  # data is outside what a leaf-level tool ever proved. --allow-unverified is the
+  # single documented escape hatch.
+  if [ "$ALLOW_UNVERIFIED" != true ]; then
+    _keep_for_leaf="$(keeper_for "$src" 2>/dev/null || true)"
+    if has_child_dirs "$src"; then
+      warn "($idx/$COUNT) SKIP — no longer a leaf folder (gained sub-folders since planning): $src"
+      warn "   moving it would relocate nested data that was never compared."
+      skipped_verify=$((skipped_verify+1))
+      _audit "SKIPPED_NONLEAF_DEL" "$src" "${_keep_for_leaf:-}" "$sz_kb"
+      continue
+    fi
+    if [ -n "$_keep_for_leaf" ] && has_child_dirs "$_keep_for_leaf"; then
+      warn "($idx/$COUNT) SKIP — keeper is no longer a leaf folder: $_keep_for_leaf"
+      skipped_verify=$((skipped_verify+1))
+      _audit "SKIPPED_NONLEAF_KEEP" "$src" "$_keep_for_leaf" "$sz_kb"
+      continue
+    fi
+  fi
+
   if [ "$VERIFY_ACTIVE" = true ]; then
     keep="$(keeper_for "$src")"
     if [ -n "$keep" ]; then
