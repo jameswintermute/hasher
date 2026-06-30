@@ -442,7 +442,6 @@ GNU GPLv3 — see LICENSE.
 
 ## Further Reading
 
-## Further reading
 * [Backblaze, “Drive Stats for 2025”](https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/)
 
 * [Bernd Panzer-Steindel, “Data Integrity”, CERN, 2007](https://indico.cern.ch/event/13797/contributions/1362288/attachments/115080/163419/Data_integrity_v3.pdf)
