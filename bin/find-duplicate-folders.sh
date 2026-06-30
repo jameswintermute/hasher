@@ -85,7 +85,7 @@ TMP_SORTED="$TMP_BASE.sorted.tsv"   # sorted by dir, then basename/hash/size
 TMP_SIGS="$TMP_BASE.sigs.tsv"       # signature_string \t dir
 TMP_GROUPS="$TMP_BASE.groups.tsv"   # reclaim_bytes \t keep_dir \t delete_dir
 
-trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -f -- "$TMP_FILES" "$TMP_SORTED" "$TMP_SIGS" "$TMP_GROUPS" "$TMP_BASE.alldirs.txt" "$TMP_BASE.nonleaf.txt" "$TMP_BASE.dirsize.tsv" "$TMP_BASE.sig_dir_size.tsv" "$TMP_BASE.groups.sorted.tsv" 2>/dev/null || true' EXIT INT TERM
 
 info "Input: $INPUT"
 info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE (matches directories by their direct file contents) | Keep: $KEEP"
@@ -163,6 +163,38 @@ awk -F '	' '
   END{ flush_prev() }
 ' "$TMP_SORTED" > "$TMP_SIGS"
 
+# 2a) FIX (v1.3.7 — cross-check concern 1): make "leaf-folders" LITERAL.
+# The signature only fingerprints a directory's DIRECT files, but
+# apply-folder-plan.sh moves the directory RECURSIVELY. So a directory with
+# matching direct files but unique CHILD subdirectories (e.g. B containing
+# B/sub/unique.txt) would be planned for deletion and its unique nested data
+# moved. A true leaf directory has NO child directories, so its direct-file
+# signature IS its complete content — making compare-shallow and move-deep
+# equivalent. We exclude any directory that is a parent of another directory
+# in the catalogue (derived purely from the dir column, no extra disk cost).
+cut -f1 "$TMP_FILES" | LC_ALL=C sort -u > "$TMP_BASE.alldirs.txt"
+awk '
+  { d[NR]=$0 }
+  END{
+    for (i=1;i<=NR;i++){
+      di=d[i]; dilen=length(di); isparent=0;
+      for (j=1;j<=NR;j++){
+        if (i==j) continue;
+        if (substr(d[j],1,dilen+1) == di "/"){ isparent=1; break }
+      }
+      if (isparent) print di;   # emit NON-leaf dirs (have at least one child dir)
+    }
+  }
+' "$TMP_BASE.alldirs.txt" > "$TMP_BASE.nonleaf.txt"
+
+nonleaf_count="$(wc -l < "$TMP_BASE.nonleaf.txt" | tr -d ' ')"
+if [ "${nonleaf_count:-0}" -gt 0 ]; then
+  info "Excluding $nonleaf_count directory(ies) that contain sub-folders (not leaf folders; moving them could relocate unmatched nested data)."
+  awk -F '	' '
+    FNR==NR { bad[$0]=1; next }
+    !($2 in bad)
+  ' "$TMP_BASE.nonleaf.txt" "$TMP_SIGS" > "$TMP_SIGS.leaf" && mv -- "$TMP_SIGS.leaf" "$TMP_SIGS"
+fi
 # 3) dir -> total size
 awk -F '	' '
   {

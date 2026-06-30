@@ -38,7 +38,7 @@ init_colors
 
 usage() {
   printf "%s\n" \
-    "Usage: delete-zero-length.sh [--input CSV] [--scan] [--force] [--quarantine] [--quiet]" \
+    "Usage: delete-zero-length.sh [--input CSV] [--report FILE] [--scan] [--dry-run] [--force] [--quarantine] [--quiet]" \
     "" \
     "If --input not provided, uses latest CSV in hashes/. --scan performs a direct filesystem find (slower)." \
     "By default, files are deleted; use --quarantine to move them into QUARANTINE_DIR for review."
@@ -74,11 +74,15 @@ resolve_quarantine_dir() {
 }
 
 # Parse args
+REPORT=""            # explicit pre-built zero-length report (newline path list)
+DRYRUN=false         # if true, list what would be acted on and exit (no changes)
 while [ $# -gt 0 ]; do
   case "$1" in
     --input) INPUT="${2:-}"; shift 2;;
+    --report) REPORT="${2:-}"; shift 2;;
     --scan) MODE="scan"; shift;;
     --force) FORCE=true; shift;;
+    --dry-run) DRYRUN=true; shift;;
     --quarantine) QUARANTINE=true; shift;;
     --quiet) QUIET=true; shift;;
     -h|--help) usage; exit 0;;
@@ -86,7 +90,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Determine CSV
+# Determine mode of input.
+# FIX (v1.3.7 — cross-check concern 2): an explicit --input ALWAYS parses that
+# CSV. A pre-built zero-length report is used ONLY when the user explicitly
+# passes --report FILE. We no longer auto-select a report behind an --input,
+# because daily reports (zero-length-DATE.txt) cannot be reliably matched to
+# per-run CSVs (hasher-DATE-HHMM.csv) and an unrelated same-day report could be
+# acted on instead of the requested CSV.
+if [ -n "$REPORT" ]; then
+  if [ ! -f "$REPORT" ]; then err "Report not found: $REPORT"; exit 2; fi
+  MODE="report"
+fi
+
+# Determine CSV (only when not using an explicit report)
 if [ "$MODE" = "csv" ]; then
   if [ -z "${INPUT:-}" ]; then
     INPUT="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
@@ -98,49 +114,20 @@ if [ "$MODE" = "csv" ]; then
 fi
 
 # Collect candidate paths into a tmp list
-# FIX (v1.1.9): explicit TMPDIR-based form is portable across BSD/GNU mktemp
-# (BSD mktemp's '-t' semantics differ from GNU's).
 TMP_LIST="$(mktemp "${TMPDIR:-/tmp}/zero-list.XXXXXX")"
 cleanup(){ rm -f -- "$TMP_LIST" 2>/dev/null || true; }
 trap cleanup EXIT
 
-if [ "$MODE" = "csv" ]; then
-  # FIX (v1.3.5 — peer-review item 3): the previous CSV path used
-  # `awk -v FS="$dlm"` with fixed field numbers. hasher.sh quotes any path
-  # containing a comma, so a zero-length file named e.g. "a, b.txt" had its
-  # fields shifted and the size column ($s) pointed at part of the path — the
-  # file was silently NOT detected. Two-part fix:
-  #   1. Prefer the clean, already-correct report hasher.sh writes during the
-  #      run (var/zero-length/zero-length-DATE.txt): one path per line, built
-  #      with a quote-aware parser. No CSV parsing needed.
-  #   2. If no such report exists, parse the CSV QUOTE-AWARE (RFC4180), the
-  #      same approach as find-duplicates.sh, instead of the naive split.
-  zreport=""
-  # FIX (v1.3.6 — cross-check concerns 1 & 2):
-  #   Concern 2: add `|| true` so a CSV filename with no date doesn't make the
-  #   pipe fail under `set -Eeuo pipefail` and silently kill the script.
-  #   Concern 1: an explicit --input must NEVER be overridden by an unrelated
-  #   cached report. Only use a pre-built zero-length report when its date
-  #   EXACTLY matches the CSV's date. If the CSV has no date, or no date-matched
-  #   report exists, parse the supplied CSV directly. Do not fall back to
-  #   "latest report".
-  csv_base="$(basename -- "$INPUT")"
-  date_guess="$(printf '%s\n' "$csv_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
-  if [ -n "$date_guess" ]; then
-    cand="$VAR_DIR/zero-length/zero-length-${date_guess}.txt"
-    if [ -f "$cand" ]; then
-      zreport="$cand"
-    fi
-  fi
-
-  if [ -n "$zreport" ]; then
-    info "Using pre-built zero-length report (date-matched): $zreport"
-    # Plain newline-delimited path list; copy through, skipping blanks/comments.
-    grep -vE '^[[:space:]]*(#|$)' "$zreport" > "$TMP_LIST" 2>/dev/null || true
-  else
-    info "Finding zero-length files from CSV (quote-aware): $INPUT"
-    header="$(head -n1 -- "$INPUT" || true)"
-    if printf %s "$header" | grep -q $'\t'; then dlm=$'\t'; else dlm=','; fi
+if [ "$MODE" = "report" ]; then
+  info "Using explicit zero-length report: $REPORT"
+  grep -vE '^[[:space:]]*(#|$)' "$REPORT" > "$TMP_LIST" 2>/dev/null || true
+elif [ "$MODE" = "csv" ]; then
+  # The CSV is parsed QUOTE-AWARE (RFC4180) — hasher.sh quotes any path
+  # containing a comma, so a fixed-field split would mis-read the size column
+  # for comma-named files and silently miss them (the v1.3.5 bug).
+  info "Finding zero-length files from CSV (quote-aware): $INPUT"
+  header="$(head -n1 -- "$INPUT" || true)"
+  if printf %s "$header" | grep -q $'\t'; then dlm=$'\t'; else dlm=','; fi
     col_idx(){ printf '%s\n' "$1" | awk -v dlm="$2" 'BEGIN{FS=dlm} NR==1{for(i=1;i<=NF;i++){h=tolower($i); gsub(/^[ \t"]+|[ \t"]+$/,"",h); if(h=="path"){p=i} if(h=="size_bytes"){s=i}}} END{print p+0","s+0}' ; }
     idx="$(printf '%s\n' "$header" | col_idx "$header" "$dlm")"
     pidx="${idx%,*}"; sidx="${idx#*,}"
@@ -171,7 +158,6 @@ if [ "$MODE" = "csv" ]; then
         if (size+0==0 && path!="") print path;
       }
     ' "$INPUT" > "$TMP_LIST"
-  fi
 else
   info "Scanning filesystem for zero-length files (this may take a while)…"
   # Scope: if a paths file exists, use it; otherwise scan /volume1 (Synology default root) safely
@@ -205,6 +191,20 @@ if [ "${COUNT:-0}" -eq 0 ]; then
   exit 0
 fi
 info "Zero-length files found: $COUNT"
+
+# v1.3.7 (concern 4): --dry-run lists what WOULD be acted on and exits with no
+# prompt and no changes. Pairs with the corrected hasher.sh recommendations.
+if $DRYRUN; then
+  if $QUARANTINE; then
+    info "[DRY-RUN] Would move $COUNT zero-length file(s) to quarantine. No changes made."
+  else
+    info "[DRY-RUN] Would delete $COUNT zero-length file(s). No changes made."
+  fi
+  echo "----- files that would be affected -----"
+  cat "$TMP_LIST"
+  echo "----------------------------------------"
+  exit 0
+fi
 
 # Confirm
 if ! $FORCE; then

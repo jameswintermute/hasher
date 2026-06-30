@@ -34,9 +34,13 @@ init_colors
 usage() {
   printf "%s\n" \
     "Usage: apply-folder-plan.sh [--plan <file>] [--force] [--delete-metadata]" \
+    "                            [--verify-against TSV] [--no-verify] [--allow-unverified]" \
     "  --plan FILE         Plan file (one directory per line). Defaults to latest duplicate-folders plan in logs/" \
     "  --force             Do not ask for confirmation." \
-    "  --delete-metadata   Delete metadata cache dirs (@eaDir, .AppleDouble) instead of moving them."
+    "  --delete-metadata   Delete metadata cache dirs (@eaDir, .AppleDouble) instead of moving them." \
+    "  --verify-against TSV  Groups TSV (size<TAB>keep<TAB>del) for apply-time content re-verification." \
+    "  --no-verify         Disable apply-time content re-verification entirely." \
+    "  --allow-unverified  Proceed even when a planned delete has no keeper mapping (default: skip it)."
 }
 
 while [ $# -gt 0 ]; do
@@ -46,12 +50,14 @@ while [ $# -gt 0 ]; do
     --delete-metadata) DELETE_METADATA=true; shift;;
     --verify-against) VERIFY_TSV="${2:-}"; shift 2;;
     --no-verify) NO_VERIFY=true; shift;;
+    --allow-unverified) ALLOW_UNVERIFIED=true; shift;;
     -h|--help) usage; exit 0;;
     *) err "Unknown arg: $1"; usage; exit 2;;
   esac
 done
 VERIFY_TSV="${VERIFY_TSV:-}"
 NO_VERIFY="${NO_VERIFY:-false}"
+ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
 
 # FIX (v1.3.5 — peer-review item 2): apply-time content re-verification for
 # folder dedup, mirroring the file-dedup re-hash. If a groups TSV is available
@@ -60,20 +66,32 @@ NO_VERIFY="${NO_VERIFY:-false}"
 # signature no longer matches its KEEP folder — e.g. a unique file was added to
 # the DEL folder after the plan was generated. Disk is the source of truth.
 # Auto-discover the groups TSV for verification if not supplied and not disabled.
-# FIX (v1.3.6 — concern 4): prefer a REVIEWED groups sidecar
-# (duplicate-folders-groups-reviewed-*.tsv) over the original groups TSV,
-# because the reviewed one reflects final keeper decisions after accept/swap.
-# If applying a specific reviewed plan, match its timestamp; otherwise take the
-# newest reviewed sidecar, then fall back to the original groups TSV.
+# FIX (v1.3.7 — cross-check concern 3): resolve the sidecar STRICTLY from the
+# plan being applied. If the plan is a reviewed plan (has a -STAMP), use the
+# matching reviewed sidecar and ONLY that. If it's a raw/unstamped plan, use the
+# matching original groups TSV by date if present. Never fall back to "newest
+# reviewed sidecar" — an unrelated sidecar gives a wrong keeper map. If no
+# matching mapping is found, verification stays ON but with an empty map, which
+# (per the fail-safe change below) causes unmapped deletes to be SKIPPED rather
+# than moved.
 if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
-  # try to extract a stamp from a reviewed plan filename, e.g.
-  # duplicate-folders-plan-reviewed-2026-06-30-124035.txt
-  _stamp="$(printf '%s\n' "$(basename -- "${PLAN_FILE:-}")" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' | head -1 || true)"
-  if [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv" ]; then
-    VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv"
+  _plan_base="$(basename -- "${PLAN_FILE:-}")"
+  _stamp="$(printf '%s\n' "$_plan_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' | head -1 || true)"
+  if printf '%s\n' "$_plan_base" | grep -q 'reviewed'; then
+    # reviewed plan → require the exactly-matching reviewed sidecar
+    if [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv" ]; then
+      VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-reviewed-$_stamp.tsv"
+    else
+      warn "Reviewed plan has no matching reviewed groups sidecar; deletions without a keeper mapping will be SKIPPED."
+    fi
   else
-    VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv 2>/dev/null | head -n1 || true)"
-    [ -z "$VERIFY_TSV" ] && VERIFY_TSV="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | grep -v reviewed | head -n1 || true)"
+    # raw plan → use the original groups TSV for the same date, if present
+    _date="$(printf '%s\n' "$_plan_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
+    if [ -n "$_date" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_date.tsv" ]; then
+      VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_date.tsv"
+    else
+      warn "No groups TSV matching this plan; deletions without a keeper mapping will be SKIPPED (use --allow-unverified to override)."
+    fi
   fi
 fi
 
@@ -103,15 +121,25 @@ dir_signature() {
 # normalised temp TSV (keeper<TAB>del) queried per-DEL with awk on exact match.
 VERIFY_ACTIVE=false
 KEEP_MAP=""
-if [ "$NO_VERIFY" != true ] && [ -n "$VERIFY_TSV" ] && [ -s "$VERIFY_TSV" ]; then
-  VERIFY_ACTIVE=true
-  KEEP_MAP="$(mktemp "${TMPDIR:-/tmp}/keepmap.XXXXXX")"
-  # Normalise to "deldir<TAB>keepdir" for direct lookup by del path.
-  awk -F'\t' 'NF>=3 { print $3 "\t" $2 }' "$VERIFY_TSV" > "$KEEP_MAP" 2>/dev/null || true
-  info "Apply-time verification ON (groups: $VERIFY_TSV). DEL folders whose contents no longer match their keeper will be skipped."
+if [ "$NO_VERIFY" = true ]; then
+  warn "Apply-time verification DISABLED (--no-verify)."
 else
-  [ "$NO_VERIFY" = true ] && warn "Apply-time verification DISABLED (--no-verify)."
+  # FIX (v1.3.7 — cross-check concern 3): verification is ACTIVE whenever it is
+  # not explicitly disabled, even if no groups TSV/keeper map was resolved. With
+  # no map, every planned delete hits the no-keeper branch, which fail-safes to
+  # SKIP (unless --allow-unverified). Previously VERIFY_ACTIVE was false when the
+  # map was missing, so deletes proceeded entirely unverified.
+  VERIFY_ACTIVE=true
+  if [ -n "$VERIFY_TSV" ] && [ -s "$VERIFY_TSV" ]; then
+    KEEP_MAP="$(mktemp "${TMPDIR:-/tmp}/keepmap.XXXXXX")"
+    # Normalise to "deldir<TAB>keepdir" for direct lookup by del path.
+    awk -F'\t' 'NF>=3 { print $3 "\t" $2 }' "$VERIFY_TSV" > "$KEEP_MAP" 2>/dev/null || true
+    info "Apply-time verification ON (groups: $VERIFY_TSV). DEL folders that no longer match their keeper, or have no keeper mapping, will be skipped."
+  else
+    warn "Apply-time verification ON but no keeper map resolved — planned deletes without a mapping will be SKIPPED (use --allow-unverified to override, or --no-verify to disable)."
+  fi
 fi
+[ "$ALLOW_UNVERIFIED" = true ] && warn "--allow-unverified: deletes without a keeper mapping will PROCEED unverified."
 
 # keeper_for DEL  → prints the mapped keeper dir (exact match), or empty.
 keeper_for() {
@@ -285,9 +313,21 @@ while IFS= read -r src; do
         continue
       fi
     else
-      # No keeper mapping for this DEL (e.g. raw plan w/o groups). Proceed, but
-      # note it so the audit trail is honest about what was verified.
-      _audit "VERIFY_NO_KEEPER" "$src" "" "$sz_kb"
+      # FIX (v1.3.7 — cross-check concern 3): FAIL-SAFE. When verification is
+      # active but this DEL folder has no keeper mapping, we cannot prove it is
+      # still a duplicate. Default to SKIPPING it rather than moving it. The user
+      # can override with --allow-unverified (proceed despite no mapping) or
+      # --no-verify (disable verification entirely).
+      if [ "$ALLOW_UNVERIFIED" = true ]; then
+        warn "($idx/$COUNT) no keeper mapping; proceeding anyway (--allow-unverified): $src"
+        _audit "VERIFY_NO_KEEPER_ALLOWED" "$src" "" "$sz_kb"
+      else
+        warn "($idx/$COUNT) SKIP — no keeper mapping to verify against: $src"
+        warn "   (use --allow-unverified to move it anyway, or --no-verify to disable checks)"
+        skipped_verify=$((skipped_verify+1))
+        _audit "SKIPPED_NO_KEEPER" "$src" "" "$sz_kb"
+        continue
+      fi
     fi
   fi
 
