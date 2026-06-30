@@ -1014,6 +1014,62 @@ candidate for catching the recurring wrong-file/missing-bit class of error
 before it reaches production.
 
 ---
+## 2026‑06 — v1.3.4
+**bin/self-test.sh — integrity preflight** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Addresses the recurring meta-problem behind several earlier bugs: a correct
+change landing in a file the running code does not load. This struck at
+least three times — a version-bumped conf uploaded into gitignored
+`local/` (never reaching tracked `default/`), the v1.2.4 quarantine fix
+applied to an unused `bin/host-detect.sh` while the sourced
+`lib/host-detect.sh` stayed wrong, and helper scripts arriving without
+their executable bit after a GitHub web-UI/zip upload. Each was invisible
+until it bit in production.
+
+### New: `bin/self-test.sh`
+
+A read-only preflight (it inspects and reports; never moves, deletes, or
+rewrites). Checks:
+
+1. **Sourced helpers** resolve, are readable, and parse (`lib/host-detect.sh`).
+2. **No stale duplicates** — flags any second copy of a sourced helper
+   (the exact `bin/` vs `lib/` host-detect trap).
+3. **Menu targets** all exist and are runnable — missing is an error;
+   present-but-non-executable is a warning (the launcher's bash fallback
+   handles it).
+4. **Version consistency** — launcher vs `default/hasher.conf` must agree;
+   also warns if a `local/hasher.conf` disagrees (the drift trap).
+5. **Required commands** and a SHA-256 tool are present.
+6. **Bash** meets the 3.2 baseline.
+7. **Config/paths** sanity.
+
+Exit `0` pass, `1` on errors; `--quiet` and `--strict` modes.
+
+### Wiring
+
+- Runs silently at launcher startup; prints a banner only if it finds
+  ERRORS, then points to option `x`. A clean install sees nothing.
+- New menu entry **`x) Self-test (integrity preflight)`** for on-demand
+  full reports.
+- Invoked via `run_script`, so a missing +x bit on self-test.sh itself is
+  not fatal.
+
+### Verified
+
+Fault-injection across all the real failure classes: recreated the stale
+`bin/host-detect.sh` (flagged), stripped a menu target's +x bit (warned,
+not fatal), forced conf version drift (flagged), removed a sourced helper
+(flagged), removed a menu target (flagged) — each caught; clean tree
+passes; startup banner appears only on error and is silent otherwise.
+
+### Review status
+
+This completes the response to the 2026-06-27 external review: all five
+findings fixed (items 1 & 4 in v1.3.1, item 5 in v1.3.2, items 2 & 3 in
+v1.3.3), the first-run colour bug fixed in v1.3.3, and the reviewer's
+suggested `self-test.sh` / "make audit" preflight delivered here.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
