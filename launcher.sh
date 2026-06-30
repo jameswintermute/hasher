@@ -96,11 +96,18 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.6 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.7 - June 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
     printf "%s\n" "      Host: $(host_pretty_label)"
+  fi
+  # v1.3.7: surface the running Bash version (the platform most likely to be
+  # ancient is macOS, which ships 3.2). Shown for transparency; a hard warning
+  # for below-baseline is emitted at startup separately.
+  if command -v detect_bash_version >/dev/null 2>&1; then
+    detect_bash_version
+    printf "%s\n" "      Bash: ${HASHER_BASH_VERSION:-unknown}"
   fi
   printf "%s" "$RST"
   printf "\n"
@@ -1219,6 +1226,18 @@ action_auto_dedup() {
 
   printf "Press Enter to continue... "; read -r _ || true
 }
+
+# ── Bash baseline check (v1.3.7) ─────────────────────────────────────────────
+# Warn once at startup if running below the Bash 3.2 baseline. The tool targets
+# 3.2+ (macOS /bin/bash is 3.2); below that, behaviour is unsupported.
+if command -v bash_at_least >/dev/null 2>&1; then
+  if ! bash_at_least 3 2; then
+    detect_bash_version
+    warn "Running under Bash ${HASHER_BASH_VERSION:-unknown}, which is below the 3.2 baseline."
+    warn "Some features may misbehave. Bash 3.2 or newer is recommended."
+    printf "Press Enter to continue... "; read -r _ || true
+  fi
+fi
 
 # ── Startup integrity preflight (v1.3.4) ─────────────────────────────────────
 # Run self-test quietly at launch. On a healthy install this is silent; if it
