@@ -1327,6 +1327,66 @@ files; re-applying on the NAS (`chmod +x bin/*.sh`) clears the warnings and
 enables direct CLI use.
 
 ---
+## 2026‑06 — v1.3.9
+**Folders-first workflow guidance** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+A UX change to protect the correct dedup order. File dedup and folder dedup
+are not commutative: removing duplicate files collapses folder contents,
+changing those folders' direct-file signatures, so two folders that are
+currently identical may no longer match afterwards — and the high-leverage,
+one-decision folder cleanup is lost. Users effectively get one shot at the
+folder opportunity, and going files-first quietly forecloses it.
+
+Changes (medium-strength steering — guide, never block):
+
+- **Stage 2 reordered** so "Find duplicate folders" is listed first and
+  marked "← recommended first", with a short note explaining the ordering.
+  Key bindings are unchanged (3 = folders, 2 = files) so muscle memory and
+  the many "option 2/3" references across code and docs stay valid.
+- **Folders-first guard**: choosing file dedup (option 2) or auto-dedup
+  (option 5) before any folder plan/groups file exists prints a clear
+  warning about the irreversible signature change and asks for confirmation.
+  It's a single keypress, never blocks, and does not fire once a folder plan
+  exists (from this or a previous session). Implemented as a shared
+  `folders_first_guard` helper.
+- **README** auto-dedup workflow corrected to fold in folders-first, with a
+  "Why folders first?" callout.
+
+No change to hashing, dedup logic, or safety behaviour — this is workflow
+guidance only.
+
+---
+## 2026‑07 — v1.3.10
+**delete-junk.sh: fix printf abort on dash-leading output, and restore colour** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Two bugs surfaced running option 8 (delete junk) on a real NAS catalogue.
+
+### The abort (important)
+
+`delete-junk.sh` printed its table separators with
+`printf "--------  ---..."`. Because the format string starts with `--`,
+`printf` treats it as an end-of-options marker and rejects `--------` as an
+invalid option: `printf: --: invalid option`. Under the script's `set -eu`,
+that non-zero return ABORTED the whole run — after the preview header but
+before the confirmation prompt or any deletion — so junk cleanup silently
+failed on any invocation that reached those lines (both the short and long
+list branches). Fixed by passing the dashes as DATA under a `%s` format:
+`printf '%s\n' "--------  ---..."`, which printf never parses as options.
+Audited the rest of the codebase — no other dash-leading printf formats.
+
+### Colour restored
+
+The script used plain `echo "[INFO] ..."` with no colour, so its messages
+were uncoloured unlike the rest of the tool. Added TTY-guarded colour
+variables built with `printf '\033[...'` (real ESC bytes) and routed all
+messages through `info`/`ok`/`warn`/`err` helpers, matching the pattern used
+across the codebase.
+
+Verified end-to-end: a junk file whose name starts with `-` no longer
+triggers the error, both the short and long (>10 files) list branches
+complete, and messages render in colour on a TTY.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

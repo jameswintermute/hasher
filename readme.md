@@ -105,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.8**
+Started Dec 2022. Current version: **v1.3.10**
 For full history see: `version-history.md`
 
 ---
@@ -196,14 +196,24 @@ the order rows are written to the CSV.
 ### For large volumes — use auto-dedup (option 5)
 
 When you have hundreds or thousands of duplicate groups and don't need
-per-group review, option 5 handles the whole process in one step:
+per-group review, option 5 handles file dedup in one step. **Do folders first**
+(see the note below on ordering):
 
 1. Run **option 1** — hash all files
-2. Run **option 2** — find duplicate files
-3. Run **option 5** — auto-dedup (generates plan + offers to apply)
+2. Run **option 3** — find duplicate folders, then **option r** to review and
+   **option 6 → d** to apply the folder plan
+3. Run **option 2** — find duplicate files (now far fewer)
+4. Run **option 5** — auto-dedup the remaining files (generates plan + offers to apply)
 
 Auto-dedup keeps the copy with the **shortest file path** in each duplicate group
 and quarantines the others. Configurable to longest-path, newest, or oldest.
+
+> **Why folders first?** File dedup collapses duplicate files *inside* folders,
+> which changes those folders' contents. Two folders that are currently identical
+> may no longer match afterwards — so you lose the bigger, one-decision folder
+> cleanup. The menu lists folders first and will warn you if you start file dedup
+> (option 2 or 5) before running folder detection. The warning is a single
+> keypress and never blocks you; it just protects the recommended order.
 
 ### For careful review — folder-first, then files
 
@@ -442,22 +452,4 @@ GNU GPLv3 — see LICENSE.
 
 ## Further Reading
 
-* [Backblaze, “Drive Stats for 2025”](https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/)
-
-* [Bernd Panzer-Steindel, “Data Integrity”, CERN, 2007](https://indico.cern.ch/event/13797/contributions/1362288/attachments/115080/163419/Data_integrity_v3.pdf)
-
-* [Btrfs documentation, “Scrub”](https://btrfs.readthedocs.io/en/latest/Scrub.html)
-
-* [David S. H. Rosenthal, “Keeping Bits Safe: How Hard Can It Be?”, ACM Queue, 2010](https://queue.acm.org/detail.cfm?id=1866298)
-
-* [Facebook Engineering, “Silent Data Corruption”](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/) — the motivating use case for hash-based integrity monitoring
-
-* [Google SRE Book, “Data Integrity: What You Read Is What You Wrote”](https://sre.google/sre-book/data-integrity/)
-
-* [Lakshmi N. Bairavasundaram et al., “An Analysis of Data Corruption in the Storage Stack”, USENIX FAST 2008](https://www.usenix.org/conference/fast-08/analysis-data-corruption-storage-stack)
-
-* [Mary Baker et al., “A Fresh Look at the Reliability of Long-term Digital Storage”, 2005](https://arxiv.org/abs/cs/0508130)
-
-* [OpenZFS documentation, “Checksums and Their Use in ZFS”](https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Checksums.html)
-
-* [Synology, “How data scrubbing protects against data corruption”](https://blog.synology.com/how-data-scrubbing-protects-against-data-corruption)
+- [Facebook — Silent Data Corruption](https://engineering.fb.com/2021/02/23/data-infrastructure/silent-data-corruption/) — the motivating use case for hash-based integrity monitoring
