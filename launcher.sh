@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.8 - June 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.10 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -164,10 +164,13 @@ print_menu() {
   echo "   s) Hashing status"
   echo "   p) Performance settings (parallel hashing)"
   echo
-  echo "${BOLD}Stage 2 — Identify${RST}"
+  echo "${BOLD}Stage 2 — Identify${RST}  ${YELLOW}(run folders first — see note)${RST}"
+  echo "   3) Find duplicate folders   ${BOLD}← recommended first${RST}"
   echo "   2) Find duplicate files"
-  echo "   3) Find duplicate folders"
   echo "   f) Find file by hash (lookup)"
+  echo "      Note: dedup FOLDERS before FILES. Removing duplicate files first"
+  echo "      changes folders' contents, so identical folders may no longer match"
+  echo "      and you lose the bigger, one-decision folder cleanup."
   echo
   echo "${BOLD}Stage 3 — Review & clean${RST}"
   echo "   4) Review duplicate FILES (interactive)"
@@ -758,7 +761,37 @@ action_review_folder_plan(){
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# v1.3.9: folders-first guard (medium). File dedup collapses duplicate files
+# WITHIN folders, changing those folders' direct-file signatures — so two
+# folders that are currently identical may no longer match afterwards, and the
+# high-leverage one-decision folder cleanup is lost. Returns 0 to proceed, 1 to
+# abort. Never blocks outright (one keypress); does not fire once a folder plan
+# or groups file exists (from this or a previous session).
+folders_first_guard() {
+  _what="${1:-this step}"
+  if ls "$LOGS_DIR"/duplicate-folders-plan-*.txt >/dev/null 2>&1 \
+     || ls "$LOGS_DIR"/duplicate-folders-groups-*.tsv >/dev/null 2>&1; then
+    return 0
+  fi
+  echo
+  warn "You haven't run duplicate-FOLDER detection yet (option 3)."
+  warn "Recommended order is FOLDERS first, then FILES. Removing duplicate"
+  warn "files now changes folders' contents, so identical folders may no longer"
+  warn "match — and you lose the bigger, one-decision folder cleanup. This"
+  warn "cannot be undone by re-running afterwards."
+  echo
+  info "Tip: choose 'n', run option 3 (and review with 'r'), then come back."
+  printf "Continue with %s anyway? [y/N]: " "$_what"
+  read -r _ans || _ans=""
+  case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) return 0 ;;
+    *) info "Good call — run option 3 (Find duplicate folders) first."; return 1 ;;
+  esac
+}
+
 action_find_duplicate_files(){
+  folders_first_guard "FILE dedup" || { printf "Press Enter to continue... "; read -r _ || true; return; }
+
   if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
     "$BIN_DIR/run-find-duplicates.sh" || true
   else
@@ -1167,6 +1200,7 @@ action_auto_dedup() {
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
+  folders_first_guard "AUTO file dedup" || { printf "Press Enter to continue... "; read -r _ || true; return; }
 
   echo
   echo ">>> Auto-dedup — keep shortest path"
