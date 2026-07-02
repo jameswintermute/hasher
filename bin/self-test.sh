@@ -255,6 +255,35 @@ else
   warn "paths.txt exists but has no active scan paths ($pf)"
 fi
 
+# ── 8. Launcher colour-variable sanity ─────────────────────────────────────────
+# The launcher runs under `set -eu`, so a colour variable referenced in the menu
+# but never defined (e.g. ${YELLOW} when only ${YEL} is defined) is not a syntax
+# error — bash -n passes it — but it CRASHES the menu at runtime with "unbound
+# variable". This check greps the launcher for colour-style ${VAR} references and
+# flags any that lack a corresponding assignment. (v1.3.11 shipped exactly this
+# bug: ${YELLOW} vs the defined ${YEL}.)
+head_ "8. Launcher colour variables"
+_lf="$ROOT_DIR/launcher.sh"
+if [ -r "$_lf" ]; then
+  _refs="$(grep -oE '\$\{(RED|GRN|GREEN|YEL|YELLOW|BLU|BLUE|MAG|MAGENTA|CYAN|CYN|BOLD|RST|RESET|NC)\}' "$_lf" 2>/dev/null | sed 's/[${}]//g' | sort -u)"
+  _defs="$(grep -oE '^\s*(RED|GRN|GREEN|YEL|YELLOW|BLU|BLUE|MAG|MAGENTA|CYAN|CYN|BOLD|RST|RESET|NC)=' "$_lf" 2>/dev/null | sed 's/[[:space:]=]//g' | sort -u)"
+  _missing=""
+  for r in $_refs; do
+    if ! printf '%s\n' "$_defs" | grep -qx "$r"; then
+      _missing="$_missing $r"
+    fi
+  done
+  if [ -n "$_missing" ]; then
+    for m in $_missing; do
+      fail "launcher references \${$m} but never defines it — will crash under set -u"
+    done
+  else
+    pass "all launcher colour variables are defined before use"
+  fi
+else
+  warn "launcher.sh not found for colour-variable check"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 printf '\n%s────────────────────────────────────────%s\n' "$BOLD" "$RST"
 printf '%sSummary:%s %s%d passed%s, %s%d warning(s)%s, %s%d error(s)%s\n' \
