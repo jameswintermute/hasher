@@ -13,21 +13,17 @@ JUNK_FILE="$LOCAL/junk-extensions.txt"
 LOGS="$ROOT_DIR/logs"; mkdir -p "$LOGS"
 LISTFILE="$LOGS/junk-candidates-$(date +%F-%H%M%S)-$$.txt"
 
-# Colours + logging helpers (v1.3.9). Previously this script used plain
-# `echo "[INFO] ..."` with no colour, so its messages were uncoloured unlike
-# the rest of the tool. Build real ESC bytes with printf (TTY only), matching
-# the pattern used across the codebase, and route messages through info/warn/err.
-if [ -t 1 ]; then
-  C_INFO="$(printf '\033[0;36m')"; C_OK="$(printf '\033[0;32m')"
-  C_WARN="$(printf '\033[1;33m')"; C_ERR="$(printf '\033[0;31m')"
-  C_RST="$(printf '\033[0m')"
+# Colours + logging helpers now come from the shared module (v1.3.11), the
+# single source of truth for info/ok/warn/err and TTY-guarded colour. Fallback
+# to minimal local definitions only if the shared file is somehow missing.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
 else
-  C_INFO=''; C_OK=''; C_WARN=''; C_ERR=''; C_RST=''
+  info() { printf '[INFO] %s\n' "$*"; }
+  ok()   { printf '[OK] %s\n'   "$*"; }
+  warn() { printf '[WARN] %s\n' "$*"; }
+  err()  { printf '[ERR] %s\n'  "$*" >&2; }
 fi
-info() { printf '%s[INFO]%s %s\n' "$C_INFO" "$C_RST" "$*"; }
-ok()   { printf '%s[OK]%s %s\n'   "$C_OK"   "$C_RST" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$C_WARN" "$C_RST" "$*"; }
-err()  { printf '%s[ERR]%s %s\n'  "$C_ERR"  "$C_RST" "$*" >&2; }
 
 human_size() {
   b="$1"

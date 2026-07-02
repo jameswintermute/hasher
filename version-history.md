@@ -1387,6 +1387,48 @@ triggers the error, both the short and long (>10 files) list branches
 complete, and messages render in colour on a TTY.
 
 ---
+## 2026‑07 — v1.3.11
+**lib/log.sh — shared colour + logging module** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Addresses the root cause behind two separate colour bugs (check-deps.sh in
+v1.3.3, delete-junk.sh in v1.3.10): every script reinvented colour handling,
+with six different naming conventions and five different definition styles,
+so each new script was a fresh chance to get it wrong.
+
+### New: `lib/log.sh`
+
+A single POSIX-sh source of truth for terminal colour and the
+`info`/`ok`/`warn`/`err`/`work` functions. Colours are built with
+`printf '\033[...'` (real ESC bytes, not literal strings), TTY-guarded
+(`[ -t 1 ]`), and emitted via printf with the colour as a plain `%s`
+argument — so there is no dash-leading-format or `%b`-escaping hazard.
+Every legacy colour variable name previously used across the codebase
+(`CINFO`, `C_INFO`, `GRN`, `GREEN`, `c_green`, …) is defined as a
+back-compat alias, so scripts referencing raw colour vars keep working.
+
+Canonical scheme: INFO=cyan, OK=green, WARN=yellow, ERR=red, WORK=cyan.
+A few migrated scripts' colours shift slightly to this standard — an
+intentional consistency change.
+
+### Migrated in this pass (conservative)
+
+The two bug-prone scripts plus the recently-heavily-edited ones now source
+`lib/log.sh` instead of defining their own: `check-deps.sh`,
+`delete-junk.sh`, `self-test.sh`, `apply-folder-plan.sh`,
+`find-duplicate-folders.sh`. Scripts with special logging (self-test's
+counter-maintaining pass/warn/fail, check-deps' column-aligned output) keep
+their own functions but take colours from the shared module. The remaining
+stable scripts will be migrated gradually — no need to churn 19 files at
+once. Each migration keeps a minimal inline fallback if `lib/log.sh` is
+somehow absent.
+
+### Self-test
+
+`lib/log.sh` is now in self-test's sourced-helpers check, so a missing or
+broken shared module is caught at launch (verified: a syntax error in
+lib/log.sh makes self-test FAIL). Check count is now 38.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

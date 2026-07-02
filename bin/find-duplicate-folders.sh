@@ -19,17 +19,15 @@ KEEP="shortest-path"
 SCOPE="leaf-folders"
 SIGNATURE="name+content"   # printed for info only
 
-# colors if tty
-if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
-  CINFO="$(printf '\033[1;34m')"; COK="$(printf '\033[1;32m')"; CWARN="$(printf '\033[1;33m')"; CERR="$(printf '\033[1;31m')"; C0="$(printf '\033[0m')"
+# Colours + logging from the shared module (v1.3.11), the single source of truth.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
 else
-  CINFO=""; COK=""; CWARN=""; CERR=""; C0=""
+  info(){ printf '[INFO] %s\n' "$*"; }
+  ok(){   printf '[OK] %s\n'   "$*"; }
+  warn(){ printf '[WARN] %s\n' "$*"; }
+  err(){  printf '[ERR] %s\n'  "$*" >&2; }
 fi
-
-info(){ printf "%s[INFO]%s %s\n" "$CINFO" "$C0" "$*"; }
-ok(){   printf "%s[OK]%s %s\n"   "$COK"   "$C0" "$*"; }
-warn(){ printf "%s[WARN]%s %s\n" "$CWARN" "$C0" "$*"; }
-err(){  printf "%s[ERROR]%s %s\n" "$CERR" "$C0" "$*"; }
 
 usage(){
   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
