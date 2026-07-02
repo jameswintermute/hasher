@@ -1429,6 +1429,43 @@ broken shared module is caught at launch (verified: a syntax error in
 lib/log.sh makes self-test FAIL). Check count is now 38.
 
 ---
+## 2026‑07 — v1.3.12
+**Fix launcher crash on unbound ${YELLOW}; self-test now guards this class** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+### The crash
+
+The launcher runs under `set -eu`. The Stage 2 menu (added in v1.3.9)
+referenced `${YELLOW}`, but the launcher defines its warning colour as
+`${YEL}` — so `${YELLOW}` was an unbound variable. Under `set -u` this
+aborts the moment the menu renders: the tool printed Stage 1 and then died
+with `line 167: YELLOW: unbound variable`. `bash -n` does not catch this
+(it is not a syntax error), which is why it passed the syntax sweep and
+reached the NAS. Fixed by using the defined `${YEL}`.
+
+### The real fix — self-test now catches unbound colour vars
+
+A launch-blocking crash that the preflight missed is a preflight gap.
+Added self-test check 8: it greps the launcher for colour-style `${VAR}`
+references and fails if any lacks a matching assignment. Verified it PASSES
+on the fix and FAILS if `${YELLOW}` is reintroduced. Had this existed, the
+bug would have been caught before shipping. (Check count now 39.)
+
+### Note on the delete-junk printf error in the same report
+
+The `delete-junk.sh: line 99: printf: --: invalid option` in the report was
+the pre-v1.3.10 behaviour ("before the latest MR", as noted); the deployed
+zip already carries the v1.3.10 fix (dashes passed as `%s` data), verified
+against the long-list branch. No further change needed there.
+
+### Follow-up (not done here)
+
+The launcher still maintains its own colour block rather than sourcing
+lib/log.sh. Migrating it would define every colour alias (YELLOW included)
+and make this class structurally impossible, but the launcher's colour setup
+sits inside the `set -eu` startup path and is best migrated deliberately
+rather than reactively. Deferred to the gradual lib/log.sh rollout.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
