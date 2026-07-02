@@ -15,21 +15,17 @@ PLAN_FILE=""
 FORCE=false
 DELETE_METADATA=false
 
-# Color helper
-init_colors() {
-  if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
-    CINFO="\033[1;34m"; CWORK="\033[1;36m"; COK="\033[1;32m"; CWARN="\033[1;33m"; CERR="\033[1;31m"; CRESET="\033[0m"
-  else
-    CINFO=""; CWORK=""; COK=""; CWARN=""; CERR=""; CRESET=""
-  fi
-}
-info(){ printf "%b[INFO]%b %s\n" "$CINFO" "$CRESET" "$*"; }
-work(){ printf "%b[WORK]%b %s\n" "$CWORK" "$CRESET" "$*"; }
-ok(){   printf "%b[OK]%b %s\n"   "$COK"   "$CRESET" "$*"; }
-warn(){ printf "%b[WARN]%b %s\n" "$CWARN" "$CRESET" "$*"; }
-err(){  printf "%b[ERROR]%b %s\n" "$CERR" "$CRESET" "$*"; }
-
-init_colors
+# Colours + logging from the shared module (v1.3.11), the single source of truth.
+# Fallback to minimal local defs if the shared file is missing.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
+else
+  info(){ printf '[INFO] %s\n' "$*"; }
+  work(){ printf '[WORK] %s\n' "$*"; }
+  ok(){   printf '[OK] %s\n'   "$*"; }
+  warn(){ printf '[WARN] %s\n' "$*"; }
+  err(){  printf '[ERR] %s\n'  "$*" >&2; }
+fi
 
 usage() {
   printf "%s\n" \

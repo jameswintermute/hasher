@@ -17,23 +17,25 @@ ROOT_DIR="$(cd "$BIN_DIR/.." && pwd -P)"
 FIX=0
 [ "${1:-}" = "--fix" ] && FIX=1
 
-# Colors if TTY
-# FIX (v1.3.3): previously these were single-quoted literals ('\033[...]'),
-# i.e. the seven characters backslash-0-3-3-[..., not real escape bytes. They
-# were then emitted with printf "%s" and echo, neither of which interprets
-# backslash escapes (and BusyBox echo on Synology never does), so the raw
-# "\033[0;32m" text printed verbatim on the NAS. Build real ESC bytes with
-# printf, matching the pattern used elsewhere in the codebase.
-if [ -t 1 ]; then
-  GRN="$(printf '\033[0;32m')"; YEL="$(printf '\033[1;33m')"
-  RED="$(printf '\033[0;31m')"; CYN="$(printf '\033[0;36m')"
-  RST="$(printf '\033[0m')"
+# Colours from the shared module (v1.3.11) — single source of truth, TTY-guarded,
+# real ESC bytes. This script keeps its own ok/warn/err below because it uses
+# custom column alignment and an [ERROR] label; it only needs the colour vars
+# (GRN/YEL/RED/CYN/RST) which lib/log.sh provides as back-compat aliases.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
 else
-  GRN=''; YEL=''; RED=''; CYN=''; RST=''
+  if [ -t 1 ]; then
+    GRN="$(printf '\033[0;32m')"; YEL="$(printf '\033[1;33m')"
+    RED="$(printf '\033[0;31m')"; CYN="$(printf '\033[0;36m')"
+    RST="$(printf '\033[0m')"
+  else
+    GRN=''; YEL=''; RED=''; CYN=''; RST=''
+  fi
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Locally-styled variants (aligned columns, [ERROR] label) — colours from lib/log.sh.
 ok()   { printf "%s[OK]%s     %s\n"   "$GRN" "$RST" "$1"; }
 warn() { printf "%s[WARN]%s   %s\n"   "$YEL" "$RST" "$1"; }
 err()  { printf "%s[ERROR]%s  %s\n"   "$RED" "$RST" "$1"; }

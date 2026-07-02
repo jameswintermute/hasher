@@ -42,13 +42,19 @@ for a in "$@"; do
   esac
 done
 
-# Colours (real ESC bytes; TTY only) — same robust pattern as the rest of v1.3.3+
-if [ -t 1 ]; then
-  GRN="$(printf '\033[0;32m')"; YEL="$(printf '\033[1;33m')"
-  RED="$(printf '\033[0;31m')"; CYN="$(printf '\033[0;36m')"
-  BOLD="$(printf '\033[1m')";   RST="$(printf '\033[0m')"
+# Colours from the shared module (v1.3.11). This script keeps its own
+# pass/warn/fail below because they also maintain counters; it only needs the
+# colour vars, which lib/log.sh provides (GRN/YEL/RED/CYN/BOLD/RST aliases).
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
 else
-  GRN=''; YEL=''; RED=''; CYN=''; BOLD=''; RST=''
+  if [ -t 1 ]; then
+    GRN="$(printf '\033[0;32m')"; YEL="$(printf '\033[1;33m')"
+    RED="$(printf '\033[0;31m')"; CYN="$(printf '\033[0;36m')"
+    BOLD="$(printf '\033[1m')";   RST="$(printf '\033[0m')"
+  else
+    GRN=''; YEL=''; RED=''; CYN=''; BOLD=''; RST=''
+  fi
 fi
 
 PASS_N=0; WARN_N=0; ERR_N=0
@@ -83,6 +89,7 @@ run-find-duplicates.sh
 # the executable bit is irrelevant for sourced files.
 SOURCED_HELPERS="
 lib/host-detect.sh
+lib/log.sh
 "
 
 # Commands the tool needs to function at all.
