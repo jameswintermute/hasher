@@ -88,7 +88,35 @@ if [ -z "$FOUND_LINE" ]; then
     exit 0
 fi
 
-PATH_FIELD="$(echo "$FOUND_LINE" | awk -F, -v p="$PATH_COL" '{print $p}')"
+# v1.3.13 (recheck item 3): extract a CSV field QUOTE-AWARELY. The previous
+# naive `awk -F,` misreported any path containing a comma (e.g. "a,b.txt" showed
+# as `"/…/a`). This is the same RFC4180 state-machine parser used by
+# find-duplicates.sh and delete-zero-length.sh: quoted fields may contain
+# commas, and "" inside a quoted field is a literal quote.
+csv_field() {  # csv_field LINE FIELD_NUM
+  printf '%s\n' "$1" | awk -v p="$2" '
+    function csv_split(s,    i, c, nf, cur, inq, n) {
+      n = length(s); nf = 0; cur = ""; inq = 0;
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1);
+        if (inq) {
+          if (c == "\"") {
+            if (substr(s, i+1, 1) == "\"") { cur = cur "\""; i++; }
+            else { inq = 0; }
+          } else { cur = cur c; }
+        } else {
+          if (c == "\"") { inq = 1; }
+          else if (c == ",") { F[++nf] = cur; cur = ""; }
+          else { cur = cur c; }
+        }
+      }
+      F[++nf] = cur;
+      return nf;
+    }
+    { nf = csv_split($0); if (p >= 1 && p <= nf) print F[p]; }'
+}
+
+PATH_FIELD="$(csv_field "$FOUND_LINE" "$PATH_COL")"
 FILE_NAME="$(basename "$PATH_FIELD" 2>/dev/null || echo unknown)"
 
 echo "✅ Found in latest hash report"

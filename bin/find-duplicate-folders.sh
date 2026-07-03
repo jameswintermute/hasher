@@ -69,7 +69,11 @@ esac
 [ -f "$INPUT" ] || { err "Input not found: $INPUT"; exit 2; }
 case "$MODE" in plan) : ;; *) err "Only --mode plan is supported"; exit 2;; esac
 
-DATE_TAG="$(date +%F)"
+# v1.3.13 (recheck item 4): full timestamp, not date-only. Previously two runs
+# on the same day silently overwrote each other's raw plan + groups TSV, which
+# weakened auditability. apply-folder-plan.sh matches the sidecar by this same
+# stamp (with a date-only fallback for pre-v1.3.13 artefacts).
+DATE_TAG="$(date +%F-%H%M%S)"
 PLAN="$LOGS_DIR/duplicate-folders-plan-$DATE_TAG.txt"
 # NEW (v1.1.13): persist the per-group TSV alongside the plan so the
 # review-folder-plan.sh tool can present full keep/del context to the

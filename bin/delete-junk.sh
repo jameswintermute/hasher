@@ -83,7 +83,9 @@ TMP="$LISTFILE.sizes"
 : > "$TMP"
 total=0
 while IFS= read -r f; do
-  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  # v1.3.13 (audit F1): GNU stat -c with BSD stat -f fallback so sizes work on
+  # macOS too (previously macOS showed every junk file as 0B).
+  sz=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
   total=$((total + sz))
   printf "%s\t%s\n" "$sz" "$f" >> "$TMP"
 done < "$LISTFILE"

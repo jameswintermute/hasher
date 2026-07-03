@@ -105,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.12**
+Started Dec 2022. Current version: **v1.3.13**
 For full history see: `version-history.md`
 
 ---
@@ -130,10 +130,13 @@ Stage 1 — Hash
    s) Hashing status
    p) Performance settings (parallel hashing)
 
-Stage 2 — Identify
+Stage 2 — Identify  (run folders first — see note)
+   3) Find duplicate folders   ← recommended first
    2) Find duplicate files
-   3) Find duplicate folders
    f) Find file by hash (lookup)
+      Note: dedup FOLDERS before FILES. Removing duplicate files first
+      changes folders' contents, so identical folders may no longer match
+      and you lose the bigger, one-decision folder cleanup.
 
 Stage 3 — Review & clean
    4) Review duplicate FILES (interactive)
@@ -297,7 +300,6 @@ local/hasher.conf           — your overrides
 local/paths.txt             — scan roots, one per line
 local/excludes.txt          — find exclusion patterns
 local/exceptions-hashes.txt — hashes excluded from dedup
-local/excluded-from-dedup.txt — path prefixes excluded from dedup
 local/junk-extensions.txt   — rules for junk file cleanup
 ```
 
@@ -321,7 +323,6 @@ hasher/
 │   ├── delete-duplicates.sh
 │   ├── delete-junk.sh
 │   ├── delete-zero-length.sh
-│   ├── du-summary.sh
 │   ├── find-duplicate-folders.sh
 │   ├── find-duplicates.sh
 │   ├── hash-check.sh
@@ -329,7 +330,6 @@ hasher/
 │   ├── launch-review.sh
 │   ├── review-duplicates.sh
 │   ├── review-folder-plan.sh    ← v1.1.13
-│   ├── review-junk.sh
 │   └── run-find-duplicates.sh
 │
 ├── lib/
@@ -340,7 +340,6 @@ hasher/
 │
 ├── local/                       — your config (gitignored)
 │   ├── exceptions-hashes.txt
-│   ├── excluded-from-dedup.txt
 │   ├── excludes.txt
 │   ├── hasher.conf
 │   ├── junk-extensions.txt

@@ -1466,6 +1466,66 @@ sits inside the `set -eu` startup path and is best migrated deliberately
 rather than reactively. Deferred to the gradual lib/log.sh rollout.
 
 ---
+## 2026‑07 — v1.3.13
+**Maturity release: stale-code removal, honest config, timestamped artefacts** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Implements the internal audit's top-3 (A1–A3) plus all ten items from the
+sixth peer review — a codebase-maturity pass rather than new features.
+
+### Removals (delete these explicitly in the GitHub web UI)
+- **bin/du-summary.sh** — stale artefact model (expected groups.summary.txt
+  etc., which no longer exist) and a line-106 quoting bug that crashed with
+  `RUN: No such file or directory`. Removed rather than rewritten.
+- **bin/review-junk.sh** — legacy junk cleaner superseded by delete-junk.sh
+  (its own header even said delete-junk.sh). One implementation per job.
+- **lib/hasher.conf** — stray stale v1.3.11 copy from a wrong-directory
+  upload. Config lives ONLY in default/ and local/. **Self-test now FAILS on
+  any hasher.conf outside those two homes** (new check).
+- **local/excluded-from-dedup.txt** references — documented as a dedup
+  exclusion control but no code read it; an unimplemented safety promise is
+  worse than none. Removed from README.
+
+### Config honesty (recheck item 5)
+Removed keys no code consumes from default/hasher.conf: the whole [review]
+section, LOW_VALUE_THRESHOLD_BYTES (its comment claimed review-duplicates.sh
+reads it — verified false), ZERO_APPLY_EXCLUDES, EXCLUDES_FILE, CRON_SPEC.
+
+### Timestamped folder artefacts (recheck item 4)
+find-duplicate-folders.sh now writes
+`duplicate-folders-plan-YYYY-MM-DD-HHMMSS.txt` and matching groups TSV —
+same-day runs no longer overwrite each other. apply-folder-plan.sh matches
+the raw sidecar by exact stamp, with a date-only fallback for pre-v1.3.13
+artefacts. Verified: two same-day runs coexist; apply picks the exactly
+matching sidecar (not the newest); old date-only plans still verify+apply;
+reviewed plans still pick their reviewed sidecar over a same-stamp raw decoy.
+
+### Correctness fixes
+- **hash-check.sh** (item 3): comma paths were misreported by a naive
+  `awk -F,` split. Now uses the same RFC4180 quote-aware parser as
+  find-duplicates.sh. Verified `a,b.txt` reports fully and unquoted.
+- **launcher sh→bash fallbacks** (item 7): both non-executable fallbacks
+  (`nohup sh` background, `sh` interactive) now invoke `bash` — the targets
+  are Bash scripts and sh (dash/ash) would break on bashisms.
+- **delete-junk.sh macOS sizes** (audit F1/A3): `stat -c` now falls back to
+  BSD `stat -f %z`, so macOS no longer shows every junk file as 0B.
+- **clean-logs.sh** (item 8): retention patterns updated to current artefact
+  names (reviewed folder plans/groups, apply-folder-plan/delete-zero-length
+  logs, groups TSVs — which now accumulate under timestamping), rotate
+  folder-actions.log, and **reject arguments honestly** — `--dry-run` was
+  silently ignored while logs were actually pruned; it now exits 2 with an
+  explanation.
+- **apply summary wording** (item 9): the skip counter covers content
+  mismatch, missing keeper mapping, and non-leaf skips, so the summary now
+  says "changed, lost verification context, or were no longer safe to move".
+- **README** (A2): Stage 2 menu listing updated to the folders-first order
+  shipped in v1.3.9; file tree updated for removals.
+- **Dead code** (item 10): removed unused append_csv_row() from hasher.sh
+  and unused path_len() from auto-dedup.sh (review-duplicates.sh keeps its
+  own, which is used).
+
+Self-test: 40 checks, PASS. Full syntax sweep across 20 files.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
