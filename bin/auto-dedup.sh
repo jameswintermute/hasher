@@ -126,7 +126,8 @@ file_mtime() {
   echo 0
 }
 
-path_len() { printf '%s' "$1" | wc -c | awk '{print $1}'; }
+# v1.3.13 (recheck item 10): removed unused path_len() — keeper selection here
+# uses awk length() directly. (review-duplicates.sh keeps its own, which IS used.)
 
 # ── Choose keeper from a list of paths (one per line on stdin) ─────────────────
 # Prints the single path that should be kept.

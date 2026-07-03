@@ -69,7 +69,7 @@ if [ -z "$GROUPS_TSV" ]; then
 fi
 if [ -z "$GROUPS_TSV" ] || [ ! -s "$GROUPS_TSV" ]; then
   err "No groups TSV found. Run 'Find duplicate folders' (launcher option 3) first."
-  err "Expected file: logs/duplicate-folders-groups-YYYY-MM-DD.tsv"
+  err "Expected file: logs/duplicate-folders-groups-YYYY-MM-DD-HHMMSS.tsv"
   exit 2
 fi
 

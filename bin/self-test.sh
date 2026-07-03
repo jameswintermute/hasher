@@ -135,6 +135,25 @@ EOF
 done
 [ "$dup_found" -eq 0 ] && pass "no duplicate copies of sourced helpers"
 
+# v1.3.13 (recheck item 6 / A1): hasher.conf belongs ONLY in default/ (shipped)
+# and local/ (user override). A stray copy anywhere else — e.g. lib/hasher.conf
+# left behind by a wrong-directory upload — is inert but confusing, carries a
+# stale version, and is exactly the drift class that caused the historical
+# eight-release version stagnation. Flag any copy outside the two legal homes.
+conf_stray=0
+while IFS= read -r hit; do
+  [ -z "$hit" ] && continue
+  relhit="${hit#$ROOT_DIR/}"
+  case "$relhit" in
+    default/hasher.conf|local/hasher.conf) : ;;  # legal homes
+    *) fail "stray hasher.conf at $relhit — config lives ONLY in default/ and local/ (delete the stray)"
+       conf_stray=1 ;;
+  esac
+done <<EOF
+$(find "$ROOT_DIR" -name "hasher.conf" -type f 2>/dev/null)
+EOF
+[ "$conf_stray" -eq 0 ] && pass "hasher.conf present only in default/ and local/"
+
 # ── 3. Menu targets exist and are runnable ────────────────────────────────────
 # "Runnable" means present AND (executable OR readable) — because the launcher's
 # run_script falls back to `bash <script>` when +x is missing (v1.3.2). A

@@ -531,11 +531,8 @@ write_csv_header() {
   fi
 }
 
-append_csv_row() {
-  local path="$1" size="$2" mtime="$3" algo="$4" hash="$5"
-  printf '%s,%s,%s,%s,%s\n' \
-    "$(csv_escape "$path")" "$size" "$mtime" "$algo" "$hash" >> "$OUTPUT"
-}
+# v1.3.13 (recheck item 10): removed unused append_csv_row() — CSV rows are
+# written inline in the hashing worker path; the helper was never called.
 
 # ───────────────────────── Progress Tickers ────────────────
 T_START=0

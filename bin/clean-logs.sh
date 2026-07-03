@@ -17,6 +17,16 @@ VAR_DIR="$APP_HOME/var"
 
 mkdir -p "$LOGS_DIR" "$VAR_DIR"
 
+# v1.3.13 (recheck item 8): this script takes NO arguments. Previously any
+# argument (including --dry-run) was silently ignored, which made it look like
+# a dry-run had happened when logs were actually pruned. Reject unknown args
+# honestly rather than pretending.
+if [ "$#" -gt 0 ]; then
+  printf '[ERR] clean-logs.sh takes no arguments (got: %s)\n' "$*" >&2
+  printf '      There is no --dry-run mode; it prunes according to fixed retention rules.\n' >&2
+  exit 2
+fi
+
 # ---------------------------------------------------------------------------
 # Colours / logging (TTY-aware)
 # ---------------------------------------------------------------------------
@@ -137,10 +147,16 @@ keep_latest_n "$LOGS_DIR"/review-dedupe-plan-*.txt 10 "review dedupe plan"
 keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-*.txt 10 "duplicate-folders plan"
 
 # Keep last 10 folder-review plans
-keep_latest_n "$LOGS_DIR"/review-folder-dedupe-plan-*.txt 10 "folder review plan"
-
-# Keep last 10 apply-file-plan logs
-keep_latest_n "$LOGS_DIR"/apply-file-plan-*.log 10 "apply-file-plan log"
+# v1.3.13 (recheck item 8): retention patterns updated to CURRENT artefact
+# names. The old review-folder-dedupe-plan-*.txt and apply-file-plan-*.log
+# patterns matched nothing (those artefacts no longer exist). With v1.3.13's
+# timestamped raw folder artefacts, same-day runs accumulate instead of
+# overwriting — so groups TSVs need retention too.
+keep_latest_n "$LOGS_DIR"/duplicate-folders-groups-*.tsv 10 "duplicate-folders groups TSV"
+keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt 10 "reviewed folder plan"
+keep_latest_n "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv 10 "reviewed folder groups TSV"
+keep_latest_n "$LOGS_DIR"/apply-folder-plan-*.log 10 "apply-folder-plan log"
+keep_latest_n "$LOGS_DIR"/delete-zero-length-*.log 10 "delete-zero-length log"
 
 # 3) Rotate main logs if they grow too large (> 5 MiB)
 MAX_LOG_BYTES=$((5 * 1024 * 1024))
@@ -148,6 +164,7 @@ MAX_LOG_BYTES=$((5 * 1024 * 1024))
 rotate_if_big "$LOGS_DIR/hasher.log"        "hasher.log"        "$MAX_LOG_BYTES"
 rotate_if_big "$LOGS_DIR/background.log"    "background.log"    "$MAX_LOG_BYTES"
 rotate_if_big "$LOGS_DIR/cron-hasher.log"   "cron-hasher.log"   "$MAX_LOG_BYTES"
+rotate_if_big "$LOGS_DIR/folder-actions.log" "folder-actions.log" "$MAX_LOG_BYTES"
 
 after_kb="$(du_kb "$LOGS_DIR")"
 [ -z "$after_kb" ] && after_kb="$before_kb"

@@ -94,12 +94,19 @@ if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
       warn "Reviewed plan has no matching reviewed groups sidecar; deletions without a keeper mapping will be SKIPPED."
     fi
   else
-    # raw plan → use the original groups TSV for the same date, if present
-    _date="$(printf '%s\n' "$_plan_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
-    if [ -n "$_date" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_date.tsv" ]; then
-      VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_date.tsv"
+    # raw plan → use the original groups TSV written by the same run.
+    # v1.3.13 (recheck item 4): raw artefacts are now fully timestamped
+    # (YYYY-MM-DD-HHMMSS), so try the exact stamp first; fall back to the
+    # date-only name for artefacts created before v1.3.13.
+    if [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_stamp.tsv" ]; then
+      VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_stamp.tsv"
     else
-      warn "No groups TSV matching this plan; deletions without a keeper mapping will be SKIPPED (use --allow-unverified to override)."
+      _date="$(printf '%s\n' "$_plan_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
+      if [ -n "$_date" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_date.tsv" ]; then
+        VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_date.tsv"
+      else
+        warn "No groups TSV matching this plan; deletions without a keeper mapping will be SKIPPED (use --allow-unverified to override)."
+      fi
     fi
   fi
 fi
@@ -385,7 +392,11 @@ done < "$PLAN_CLEAN"
 
 info "Done. Moved: $moved  | Deleted metadata: $removed  | Skipped (changed): $skipped_verify  | Failed: $fail  | Log: $LOG_FILE"
 if [ "$skipped_verify" -gt 0 ]; then
-  warn "$skipped_verify folder(s) skipped because their contents no longer matched the keeper (changed since the plan was made)."
+  # v1.3.13 (recheck item 9): the counter covers several skip reasons (content
+  # mismatch, no keeper mapping, delete/keeper no longer a leaf), so the
+  # summary must not claim they were all content mismatches. The per-folder
+  # warnings above give the exact reason for each.
+  warn "$skipped_verify folder(s) skipped because they changed, lost verification context, or were no longer safe to move (see warnings above for each)."
   warn "Re-run option 3 (find duplicate folders) to re-evaluate them."
 fi
 info "Audit record appended to: $ACTIONS_LOG"
