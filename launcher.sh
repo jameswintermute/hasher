@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.12 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.13 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -308,7 +308,10 @@ EOF
   if [ -x "$script" ]; then
     nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   else
-    nohup sh "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
+    # v1.3.13 (recheck item 7): fallback interpreter is BASH, not sh — the
+    # target (bin/hasher.sh) is a Bash script; sh (dash/BusyBox ash) would
+    # break on its bashisms.
+    nohup bash "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
   fi
   bgpid=$!
 
@@ -401,7 +404,8 @@ EOF
     set -- "$@" --jobs "$HASHER_JOBS"
     info "Parallel hashing: $HASHER_JOBS workers."
   fi
-  if [ -x "$script" ]; then "$@"; else sh "$@"; fi
+  # v1.3.13 (recheck item 7): bash fallback, not sh (targets are Bash scripts)
+  if [ -x "$script" ]; then "$@"; else bash "$@"; fi
 }
 
 action_check_status(){
