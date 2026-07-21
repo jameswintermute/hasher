@@ -23,7 +23,35 @@ fi
 [ -z "${QUAR_DIR:-}" ] && QUAR_DIR="$ROOT_DIR/quarantine"
 mkdir -p "$QUAR_DIR"
 
-PLAN_FILE="${1:-}"
+PLAN_FILE=""
+ALLOW_UNVERIFIED_PLAN=0
+
+# v1.3.16 (peer-review finding #5): parse args explicitly. Previously $1 was
+# taken as the plan path unconditionally; we now accept --plan/-p and add
+# --allow-unverified-plan to explicitly opt in to applying old-format plans
+# that carry no per-entry hashes (which cannot be re-verified).
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --plan|-p) PLAN_FILE="${2:-}"; shift 2 ;;
+    --allow-unverified-plan) ALLOW_UNVERIFIED_PLAN=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [--plan PATH] [--allow-unverified-plan]
+
+Applies a review-dedupe plan by quarantining the DEL entries.
+
+By default, plans MUST carry per-entry SHA-256 hashes so each file is
+re-verified immediately before it is moved (protects against stale-plan
+drift). Old-format plans without hashes are refused; pass
+--allow-unverified-plan (and confirm) to apply them regardless.
+EOF
+      exit 0 ;;
+    -*) error "Unknown option: $1"; exit 2 ;;
+    *)  # positional: plan path (back-compat with the old "$1" behaviour)
+        [ -z "$PLAN_FILE" ] && PLAN_FILE="$1"
+        shift ;;
+  esac
+done
 
 info()  { printf "[INFO] %s\n"  "$1" >&2; }
 warn()  { printf "[WARN] %s\n"  "$1" >&2; }
@@ -98,8 +126,32 @@ if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
     PLAN_HAS_HASHES=0
   fi
 else
-  warn "Plan has no content hashes (old format) — falling back to existence check only."
-  warn "Regenerate the plan with auto-dedup v1.2.0+ to enable re-verification."
+  # v1.3.16 (peer-review finding #5): CRITICAL — do NOT silently accept plans
+  # without per-entry hashes. The reviewer demonstrated that a one-line legacy
+  # plan can move any file that still exists to quarantine, bypassing the
+  # core stale-plan safety guarantee. Refuse by default; require an explicit
+  # opt-in flag AND an interactive confirmation.
+  if [ "${ALLOW_UNVERIFIED_PLAN:-0}" -ne 1 ]; then
+    error "Plan has NO per-entry content hashes (old format): $PLAN_FILE"
+    error "This tool cannot re-verify entries before quarantining them, which"
+    error "means a stale plan could move a file that is no longer duplicate."
+    error ""
+    error "Options:"
+    error "  1) Regenerate the plan against a current hash manifest (recommended):"
+    error "       bin/find-duplicates.sh   →   review/auto-dedup   →   apply"
+    error "  2) Override deliberately (still uses quarantine — recoverable):"
+    error "       $(basename "$0") --plan \"$PLAN_FILE\" --allow-unverified-plan"
+    exit 2
+  fi
+  warn "Applying an UNVERIFIED plan (no per-entry hashes) — proceeding on the"
+  warn "existence check only. Quarantine is recoverable, but this bypasses the"
+  warn "stale-plan safety check."
+  printf "Type 'apply-unverified' to confirm: "
+  read -r _confirm || _confirm=""
+  if [ "$_confirm" != "apply-unverified" ]; then
+    info "Aborted (confirmation not given)."
+    exit 0
+  fi
 fi
 
 # Pass 1: count existing vs missing
