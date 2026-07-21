@@ -105,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.13**
+Started Dec 2022. Current version: **v1.3.15**
 For full history see: `version-history.md`
 
 ---
@@ -129,6 +129,7 @@ Stage 1 — Hash
    a) Advanced / custom hashing
    s) Hashing status
    p) Performance settings (parallel hashing)
+   k) Stop hashing (terminate running hash jobs)
 
 Stage 2 — Identify  (run folders first — see note)
    3) Find duplicate folders   ← recommended first

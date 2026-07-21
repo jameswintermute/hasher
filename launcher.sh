@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.13 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.15 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -142,6 +142,35 @@ is_hasher_running() {
   fi
 }
 
+# v1.3.15: ps-scan for ALL live hasher.sh processes (parents AND --jobs worker
+# subshells share the same cmdline). The pidfile tracks only the most recent
+# launch, so orphans from crashed/duplicate runs are invisible to it — as seen
+# in the field: three concurrent hasher.sh runs needing manual `ps | grep` +
+# `kill -9`. PRECISION MATTERS: we must match processes EXECUTING hasher.sh,
+# not any cmdline that merely mentions it (an editor, tail -f, or shell
+# one-liner touching the file must never be killed). A process is executing
+# it iff an interpreter token (bash/sh, any path prefix) is immediately
+# followed by a token ending in bin/hasher.sh — which is exactly how the
+# launcher (nohup bash …), the exec-bit shebang, and DSM's ps all render it.
+# Prints one PID per line.
+list_hasher_pids() {
+  { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v self="$$" '
+    BEGIN { tgt = "bin/" "hasher" ".sh" }
+    $1 == self { next }
+    {
+      for (i = 2; i < NF; i++) {
+        itp = $i; sub(/^.*\//, "", itp)          # basename of candidate token
+        if (itp == "bash" || itp == "sh") {
+          nxt = $(i + 1)
+          if (length(nxt) >= length(tgt) && substr(nxt, length(nxt) - length(tgt) + 1) == tgt) {
+            print $1; next
+          }
+        }
+      }
+    }
+  ' | grep -E '^[0-9]+$' || true
+}
+
 ensure_no_running_hasher() {
   if is_hasher_running; then
     pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
@@ -153,7 +182,79 @@ ensure_no_running_hasher() {
       *) printf "Aborting new hasher run.\n"; return 1 ;;
     esac
   fi
+  # v1.3.15: belt-and-braces — the pidfile only knows about the most recent
+  # launch. Scan for orphaned hasher.sh processes (e.g. from a crashed
+  # session) so concurrent runs can't start silently.
+  _orphans="$(list_hasher_pids)"
+  if [ -n "$_orphans" ]; then
+    warn "Found running hasher.sh process(es) not tracked by the pidfile:"
+    for _p in $_orphans; do warn "   PID $_p"; done
+    warn "Recommended: choose 'k' (Stop hashing) from the menu first."
+    printf "Start another run anyway? [y/N]: "
+    read -r ans || ans=""
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) return 0 ;;
+      *) printf "Aborting new hasher run.\n"; return 1 ;;
+    esac
+  fi
   return 0
+}
+
+# v1.3.15: menu action — stop all running hashing cleanly. Sends TERM first
+# (hasher.sh now traps TERM: stops progress tickers, removes working files
+# and its pidfile), waits up to 8s, then KILLs any survivor. Covers parents,
+# --jobs worker subshells, and orphans alike via the ps scan; no more manual
+# `ps aux | grep hasher` + recursive kill -9.
+action_stop_hashing() {
+  pids="$(list_hasher_pids)"
+  # merge in the pidfile PID in case ps output is unavailable on this host
+  if [ -f "$HASHER_PIDFILE" ]; then
+    _pfpid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    case "$_pfpid" in
+      *[!0-9]*|'') : ;;
+      *) case " $pids " in *" $_pfpid "*) : ;; *) pids="$pids $_pfpid" ;; esac ;;
+    esac
+  fi
+  pids="$(printf '%s\n' $pids 2>/dev/null | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')"
+
+  if [ -z "${pids// /}" ]; then
+    info "No hashing processes are running."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  echo
+  warn "The following hashing process(es) will be stopped:"
+  for p in $pids; do
+    _line="$( { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v p="$p" '$1==p {print; exit}' )"
+    printf '   %s\n' "${_line:-PID $p}"
+  done
+  printf "Stop hashing now? [y/N]: "
+  read -r ans || ans=""
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) : ;;
+    *) info "Left running."; printf "Press Enter to continue... "; read -r _ || true; return ;;
+  esac
+
+  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+  info "Sent TERM; waiting for clean shutdown…"
+  waited=0
+  while [ "$waited" -lt 8 ]; do
+    alive=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "${alive// /}" ] && break
+    sleep 1; waited=$((waited+1))
+  done
+  killed=0
+  if [ -n "${alive:-}" ] && [ -n "${alive// /}" ]; then
+    for p in $alive; do kill -KILL "$p" 2>/dev/null && killed=$((killed+1)) || true; done
+    warn "Escalated to KILL for:$alive"
+  fi
+  clear_pidfile
+  printf '%s [launcher] hashing stopped via menu (TERM%s)\n' "$(date '+%F %T')" \
+    "$( [ "$killed" -gt 0 ] && printf ', %d force-killed' "$killed" )" >>"$BACKGROUND_LOG" 2>/dev/null || true
+  ok "Hashing stopped."
+  printf "Press Enter to continue... "; read -r _ || true
 }
 
 print_menu() {
@@ -163,6 +264,7 @@ print_menu() {
   echo "   a) Advanced / custom hashing"
   echo "   s) Hashing status"
   echo "   p) Performance settings (parallel hashing)"
+  echo "   k) Stop hashing (terminate running hash jobs)"
   echo
   echo "${BOLD}Stage 2 — Identify${RST}  ${YEL}(run folders first — see note)${RST}"
   echo "   3) Find duplicate folders   ${BOLD}← recommended first${RST}"
@@ -1310,6 +1412,7 @@ while :; do
     a|A)     action_custom_hashing ;;
     s|S)     action_check_status ;;
     p|P)     action_performance_settings ;;
+    k|K)     action_stop_hashing ;;
 
     # ── Stage 2: Identify ─────────────────────────────────────────────────
     2)       action_find_duplicate_files ;;
