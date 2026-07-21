@@ -1874,6 +1874,107 @@ find output still works; nonexistent piped path → rc=3.
 Self-test: 40 passed, 0 warnings, 0 errors. All 20 files pass syntax.
 
 ---
+## 2026‑07 — v1.3.19
+**Peer-review recheck 1–5: BusyBox compatibility, TERM handler self-signalling, honest deletion accounting, manifest algorithm gate, per-run derived reports** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Five findings after v1.3.18. All confirmed live; all five fixed. The
+critical one is #1 — since v1.3.16, exclusion filtering and delimiter
+skip on Synology DSM (BusyBox awk) has been broken in a mode that
+produced silently-empty CSVs.
+
+### #1 (critical) — BusyBox awk compatibility via auto-detect
+
+`awk -v RS='\0' -v ORS='\0'` was used in four sites. gawk and mawk handle
+NUL RS/ORS correctly; **BusyBox awk (Synology DSM, Alpine) processes
+only the first NUL record and drops the ORS**. Reviewer reproduced a
+four-file hash run producing a header-only CSV and a "all four files
+matched exclusions" message. Empirically verified locally: BusyBox
+1.36.1 on our 3-record input emits 2 bytes vs gawk/mawk's 9.
+
+Fix: new `lib/awk-detect.sh` module. At startup, hasher probes the
+local awk's NUL behaviour with a canonical 3-record test — expects 6
+bytes back. If it gets that, uses the awk fast path; otherwise
+transparently switches to a pure-bash `while IFS= read -r -d ''` path
+that reproduces the same semantics byte-for-byte. Two helpers exposed:
+
+- `hasher_nul_filter_delim(in, skiplog)` — splits a NUL stream into
+  clean records (stdout, NUL-delimited) and TAB/LF/CR-bearing records
+  (skiplog, newline-delimited with `<TAB>`/`<LF>`/`<CR>` substitutions).
+- `hasher_nul_filter_globs(in, patterns...)` — case-insensitive glob
+  exclusion filter (same documented semantics as v1.3.18).
+
+All four sites (hasher.sh × 2, delete-junk.sh, delete-zero-length.sh)
+now call the helpers rather than inlining awk. On a normal Linux/macOS
+host the awk path runs (fast). On DSM with BusyBox awk, the bash path
+runs (correct). Verified: forced-bash and natural-awk paths produce
+byte-identical output on the same fixtures.
+
+**Also 1b**: `find-duplicate-folders.sh` ancestor regex used `\/[^/]+$`
+which BusyBox awk rejects as "bad regex". Replaced with `[/][^/]+$`
+(character class) — accepted by gawk, mawk, nawk, AND BusyBox.
+
+### #2 (critical) — Internal TERM handler no longer self-signals
+
+`_stop_group()` ran `kill -TERM -$$` from inside its own process group.
+Bash executes handler statements one at a time; the kill line signalled
+every group member INCLUDING $$, so the shell terminated at that line
+and never reached the wait/KILL escalation or descendant verification.
+With cooperative workers (ordinary sha256sum) descendants exited within
+milliseconds and the bug was masked. With uncooperative workers, the
+parent died and released its lock/pidfile while workers kept running;
+a fresh run could then start alongside them.
+
+Fix: enumerate group members EXCLUDING `$$` and signal only those. If
+descendants survive the KILL escalation, print an explicit warning so
+the operator knows the lock/pidfile release that follows may be
+premature (rather than silently claiming success). The launcher's
+external `kill -TERM -PGID` is unaffected — it runs in a different
+group and won't self-kill.
+
+### #3 (high) — delete-junk deletion accounting is honest
+
+`rm -f -- "$p" 2>/dev/null || true` swallowed every error; `del=$((del+1))`
+fired regardless. Read-only files, mounted-read-only volumes, and
+permission-denied cases all reported "Deleted: N files" while the
+files remained on disk. Fix: check rm's rc AND `[ ! -e "$p" ]`
+post-condition; increment success only when both pass; increment
+failure counter otherwise; log every failure to a sibling
+`*-delete-failures.log`; exit rc=1 if any deletion failed. Verified
+via a PATH-shim that makes `rm` fail on `.part` files: rc=1, "Deleted: 0",
+"Failed to delete 1", failure log written, file untouched.
+
+### #4 (medium-high) — find-duplicates rejects non-SHA-256 manifests
+
+`find-duplicates.sh` accepted hash columns named md5/sha1/sha512/blake2
+and passed them through. `auto-dedup.sh` then generated plans that
+`delete-duplicates.sh` couldn't apply — the wrong-length hashes were
+absorbed into the pathname. Fix: two-stage validation at start of
+find-duplicates.sh — column name must be `hash`/`digest`/`checksum`/
+`sha256`; and the first data row's hash value must be exactly 64
+hexadecimal characters. Otherwise exit rc=2 with a clear message
+pointing at hasher.sh regeneration.
+
+### #5 (medium) — Derived reports are per-run
+
+`post_run_reports` wrote `zero-length-YYYY-MM-DD.txt` and
+`YYYY-MM-DD-duplicate-hashes.txt` — date-only, so a second run on the
+same day overwrote the first. Since source CSVs became run-unique in
+v1.3.16 (`%F-%H%M%S-$$`), the "next-step commands" printed by an earlier
+run could later point at a report from an entirely different scan.
+
+Fix: reports now include the full run tag —
+`zero-length-YYYY-MM-DD-HHMMSS-PID.txt` and
+`duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt`. Two convenience symlinks
+(`*-latest.txt`) always point at the most recent report of each kind
+so next-step commands remain stable across time. Falls back to a
+rewritten copy on filesystems that reject symlinks (rare NAS SMB
+shares). Verified: two same-second runs produce two distinct reports;
+latest symlink points at the newer one.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax
+(the +1 is the new `lib/awk-detect.sh`).
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
