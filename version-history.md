@@ -1621,6 +1621,79 @@ Also carries forward v1.3.14 (review N-count fix + review colour
 migration) for deployments that skipped it.
 
 ---
+## 2026‑07 — v1.3.16
+**Peer-review findings 1–5: safety, correctness, run isolation, parallel-worker termination, plan verification** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Five findings from an external review; **all five confirmed in v1.3.15 with
+reproductions**, all five fixed here. Finding #1 is the most serious defect
+this project has shipped: exclusions have been silent no-ops on every
+parallel-safe run since NUL-delimited processing landed.
+
+### #1 (critical) — exclusion filter was silently no-op
+
+`build_file_list` piped candidates through an awk block that filtered on
+NUL records but emitted retained paths with `printf "%s", $0` — omitting
+the NUL terminator that `ORS='\0'` was supposed to add. Every filtered
+output had zero NUL records; a fallback then **restored the unfiltered
+list** on the reasoning that "exclusions removed everything must be a
+mistake". Result: `@eaDir`, `#recycle`, `.part`, `.bak`, `/Cache`,
+`/.Trash`, `@tmp`, `@SynoResource` and every user-supplied exclusion have
+been included in every CSV. Fix: `print $0` under `ORS='\0'` (awk emits the
+terminator); the "restore unfiltered" fallback is REMOVED — if exclusions
+legitimately empty the candidate list, the honest message is "nothing to
+hash this run", not a silent re-include.
+
+### #2 (high) — advertised algorithms didn't work end-to-end
+
+hasher.sh accepted `--algo sha1|sha512|md5|blake2`, but downstream
+(`delete-duplicates.sh`, `find-duplicates.sh`, plan format) only recognises
+64-hex SHA-256. An MD5 plan's 32-char hash was absorbed into the pathname
+during apply; the tool then reported "no planned files existed". Rather
+than plumb the algorithm through every downstream tool (a much larger
+change), be honest: **hasher.sh now rejects non-sha256 algorithms up front
+with rc=2** and the usage/help lines no longer advertise them.
+
+### #3 (high) — run isolation
+
+Two problems: `CSV_TAG` was minute-precision so same-minute runs shared a
+name, and `write_csv_header` **silently appended** to an existing manifest
+if it wasn't empty. Fix: `CSV_TAG` is now `%F-%H%M%S-$$` (distinct per run
+including PID), and `write_csv_header` **refuses to open a non-empty output
+unless `--append` is passed** (explicit opt-in). Separately, hasher.sh now
+takes its own **atomic lock** in `main()` via `mkdir "$VAR_DIR/hasher.lock"`
+so direct-CLI and cron starts get the same concurrency protection that the
+launcher's pidfile guard provided; stale locks from crashed runs are
+adopted after checking the recorded PID isn't alive.
+
+### #4 (high) — Stop hashing left parallel workers alive
+
+`list_hasher_pids` matches only interpreter processes executing
+`bin/hasher.sh`. The `--jobs N` path fans work out through `xargs -0 -P N`,
+`bash -c` workers and hash commands — none of which have `bin/hasher.sh`
+in their cmdline. TERM to the parent left every descendant orphaned; the
+8-second wait then reported "Hashing stopped" while xargs and the workers
+were still running. Fix: **hasher.sh becomes its own session leader** via
+a `setsid` re-exec at startup (stdin redirected from `/dev/null` to avoid
+deadlocking on inherited pipes). The launcher resolves each parent's PGID
+and signals the whole group: `kill -TERM -PGID` catches xargs, workers,
+hash commands, sleeps — everything spawned since the setsid. hasher.sh's
+TERM/INT traps do the same internally. Verified end-to-end: 20 descendants
+in the pgroup, one signal reaps all of them.
+
+### #5 (high) — unhashed plans were applied fail-open
+
+`delete-duplicates.sh` accepted old-format `DEL|path` entries (no hash)
+with only a warning, then moved any file that still existed. A one-line
+legacy plan pointing to a unique file moved it to quarantine — bypassing
+the stale-plan safety guarantee that per-entry re-verification provides.
+Fix: **unhashed plans refused by default** (rc=2 with a clear message and
+two options — regenerate, or override). The override is
+`--allow-unverified-plan` PLUS an interactive confirmation requiring the
+user to type `apply-unverified` verbatim. Also cleaned up delete-duplicates
+arg parsing along the way (proper `--plan/-p` flag; the old positional `$1`
+still works for backward compatibility).
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

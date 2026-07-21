@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.15 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.16 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -224,10 +224,19 @@ action_stop_hashing() {
   fi
 
   echo
-  warn "The following hashing process(es) will be stopped:"
+  warn "The following hashing process(es) will be stopped (with all their workers):"
+  # v1.3.16 (peer-review finding #4): resolve each parent to its PGID and
+  # kill the whole process group. Hasher.sh is a session leader (pgid == pid
+  # since v1.3.16), so this catches xargs, worker shells, and hash commands
+  # in a single signal. For any parent that predates v1.3.16 (no session
+  # isolation), the parent's own pgid still works — it's just not guaranteed
+  # to include descendants; the wait+KILL escalation below covers that case.
+  pgids=""
   for p in $pids; do
     _line="$( { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v p="$p" '$1==p {print; exit}' )"
     printf '   %s\n' "${_line:-PID $p}"
+    _pg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ' || echo "$p")"
+    case " $pgids " in *" $_pg "*) : ;; *) pgids="$pgids $_pg" ;; esac
   done
   printf "Stop hashing now? [y/N]: "
   read -r ans || ans=""
@@ -236,8 +245,9 @@ action_stop_hashing() {
     *) info "Left running."; printf "Press Enter to continue... "; read -r _ || true; return ;;
   esac
 
-  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
-  info "Sent TERM; waiting for clean shutdown…"
+  # TERM the whole process group for each session leader.
+  for g in $pgids; do kill -TERM "-$g" 2>/dev/null || true; done
+  info "Sent TERM to process group(s); waiting for clean shutdown…"
   waited=0
   while [ "$waited" -lt 8 ]; do
     alive=""
@@ -247,13 +257,26 @@ action_stop_hashing() {
   done
   killed=0
   if [ -n "${alive:-}" ] && [ -n "${alive// /}" ]; then
-    for p in $alive; do kill -KILL "$p" 2>/dev/null && killed=$((killed+1)) || true; done
-    warn "Escalated to KILL for:$alive"
+    # Escalate: KILL the whole group, not just the parent PIDs
+    for g in $pgids; do kill -KILL "-$g" 2>/dev/null && killed=$((killed+1)) || true; done
+    warn "Escalated to KILL for process group(s):$pgids"
   fi
+  # v1.3.16 (finding #4): verify no descendants remain before reporting success.
+  sleep 1
+  survivors=""
+  for g in $pgids; do
+    _s="$(pgrep -g "$g" 2>/dev/null | tr '\n' ' ' || true)"
+    [ -n "$_s" ] && survivors="$survivors $_s"
+  done
   clear_pidfile
   printf '%s [launcher] hashing stopped via menu (TERM%s)\n' "$(date '+%F %T')" \
-    "$( [ "$killed" -gt 0 ] && printf ', %d force-killed' "$killed" )" >>"$BACKGROUND_LOG" 2>/dev/null || true
-  ok "Hashing stopped."
+    "$( [ "$killed" -gt 0 ] && printf ', %d group(s) force-killed' "$killed" )" >>"$BACKGROUND_LOG" 2>/dev/null || true
+  if [ -n "${survivors// /}" ]; then
+    warn "Some descendants may still be alive: $survivors"
+    warn "You can investigate with:  ps -eo pid,pgid,cmd | grep -E 'hasher|xargs'"
+  else
+    ok "Hashing stopped (no descendants remain)."
+  fi
   printf "Press Enter to continue... "; read -r _ || true
 }
 
