@@ -8,6 +8,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'; LC_ALL=C
 
 ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd -P)"
+
+# v1.3.19: source awk NUL-safety detection
+if [ -r "$ROOT_DIR/lib/awk-detect.sh" ]; then
+  . "$ROOT_DIR/lib/awk-detect.sh"
+  hasher_detect_awk_nul_safety
+fi
 LOGS_DIR="${ROOT_DIR}/logs"
 HASHES_DIR="${ROOT_DIR}/hashes"
 LOCAL_DIR="${ROOT_DIR}/local"
@@ -173,16 +179,10 @@ else
     warn "No paths file found; scanning $SCAN_ROOT (override with --input or local/paths.txt)"
     find "$SCAN_ROOT" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
   fi
-  # Filter TAB/LF/CR paths (record for the operator), then convert to text
   SAFE_NUL="$TMP_LIST.safe.nul"
-  awk -v RS='\0' -v ORS='\0' -v skip="$SKIP_ZL" '
-    /[\t\n\r]/ {
-      s = $0; gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
-      printf "%s\n", s >> skip
-      next
-    }
-    { print $0 }
-  ' "$SCAN_NUL" > "$SAFE_NUL"
+  # v1.3.19 (peer-review finding #1): use the lib helper (auto-selects bash
+  # fallback on BusyBox).
+  hasher_nul_filter_delim "$SCAN_NUL" "$SKIP_ZL" > "$SAFE_NUL"
   skipped_zl=$(wc -l < "$SKIP_ZL" 2>/dev/null | tr -d ' ')
   if [ "${skipped_zl:-0}" -gt 0 ]; then
     warn "Skipped $skipped_zl zero-length candidate(s) whose paths contain TAB/LF/CR."

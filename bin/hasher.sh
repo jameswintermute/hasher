@@ -77,6 +77,13 @@ export IS_SESSION_LEADER
 # to ROOT_DIR so hasher.sh works correctly regardless of working directory.
 ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
+# v1.3.19 (peer-review finding #1): auto-detect awk NUL support and use bash
+# fallbacks on BusyBox. See lib/awk-detect.sh for the two helpers and why.
+if [ -r "$ROOT_DIR/lib/awk-detect.sh" ]; then
+  . "$ROOT_DIR/lib/awk-detect.sh"
+  hasher_detect_awk_nul_safety
+fi
+
 # ───────────────────────── Constants ───────────────────────
 HASHES_DIR="$ROOT_DIR/hashes"
 LOGS_DIR="$ROOT_DIR/logs"
@@ -661,17 +668,10 @@ build_file_list() {
   local skipfile="$VAR_DIR/skipped-delimiter-paths.log"
   local skipped_delim=0
   if [[ -s "$FILES_LIST".tmp ]]; then
-    : > "$skipfile"
-    awk -v RS='\0' -v ORS='\0' -v skip="$skipfile" '
-      /[\t\n\r]/ {
-        # emit human-readable line for the report; use gsub for portability
-        s = $0
-        gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
-        printf "%s\n", s >> skip
-        next
-      }
-      { print $0 }
-    ' "$FILES_LIST".tmp > "$FILES_LIST".tmp.clean \
+    # v1.3.19 (peer-review finding #1): route through the lib helper so the
+    # bash fallback runs automatically on hosts (BusyBox/DSM) whose awk
+    # cannot handle RS='\0' correctly. Same semantics as before.
+    hasher_nul_filter_delim "$FILES_LIST".tmp "$skipfile" > "$FILES_LIST".tmp.clean \
       && mv -f -- "$FILES_LIST".tmp.clean "$FILES_LIST".tmp
     skipped_delim=$(wc -l < "$skipfile" 2>/dev/null | tr -d ' ')
     if [[ "${skipped_delim:-0}" -gt 0 ]]; then
@@ -696,75 +696,22 @@ build_file_list() {
   done
   if (( ${#patterns[@]} > 0 )); then
     # v1.3.18 (peer-review finding #2): implement the DOCUMENTED semantics
-    # for excludes.txt patterns — case-insensitive globs — instead of the
-    # previous case-sensitive literal substring match. The launcher used to
-    # strip `*` before passing patterns, which meant `*.part` in excludes.txt
-    # excluded `.part` under the launcher but NOT under direct/cron
-    # invocation (which saw the literal `*.part` that never matches).
-    # Ownership now lives in one place (hasher.sh); launcher no longer
-    # mangles patterns.
-    #
-    # Rules (documented so behaviour is predictable):
+    # v1.3.19 (peer-review finding #1): route through the lib helper. The
+    # implementation lives in lib/awk-detect.sh with matching awk and bash
+    # fallback code paths, auto-selected based on the local awk's NUL
+    # support. Documented semantics:
     #   * `*` matches any run of characters (including empty)
     #   * `?` matches exactly one character
-    #   * `.` is a literal dot
     #   * matching is case-insensitive
     #   * a pattern containing `/` matches against the FULL path;
     #     otherwise it matches against the basename (last path component)
-    #     — this is the natural "extension/name" convention users expect
-    #   * a pattern with no glob metacharacters still works as a literal
-    #     substring match against the basename (backward compat with the
-    #     old behaviour for user-supplied bare words like "#recycle")
+    #   * a pattern with no glob metacharacters matches as a case-
+    #     insensitive literal substring against the FULL PATH — preserves
+    #     the pre-v1.3.18 behaviour of "#recycle" / "@eaDir"
     #
-    # v1.3.16 (finding #1): NUL delimiter preserved by using `print` under
-    # ORS='\0'. No fallback that restores excluded items.
-    awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
-      function _glob_to_regex(g,   r, c, i, out) {
-        # Convert a glob to an ERE, escaping regex metacharacters and
-        # translating * and ? to their regex equivalents.
-        out = ""
-        for (i = 1; i <= length(g); i++) {
-          c = substr(g, i, 1)
-          if      (c == "*") out = out ".*"
-          else if (c == "?") out = out "."
-          else if (index(".+^$()[]{}|\\", c) > 0) out = out "\\" c
-          else out = out c
-        }
-        return out
-      }
-      function _basename(p,   n, a) {
-        n = split(p, a, "/")
-        return a[n]
-      }
-      function _matches(path, pattern,   is_path_glob, subject, regex) {
-        # If pattern has no glob metacharacters at all, match it as a
-        # case-insensitive literal substring against the FULL PATH.
-        # This preserves the pre-v1.3.18 behaviour of patterns like
-        # "#recycle" or "@eaDir" — they matched a path component
-        # anywhere in the path, not just the basename.
-        if (pattern !~ /[*?]/) {
-          return index(tolower(path), tolower(pattern)) > 0
-        }
-        # Glob patterns:
-        #   - if pattern contains "/", match the full path
-        #   - otherwise, match the basename only
-        # Both anchored with ^ and $ (glob semantics: * covers "any run").
-        is_path_glob = (index(pattern, "/") > 0)
-        subject = is_path_glob ? path : _basename(path)
-        regex   = "^" _glob_to_regex(tolower(pattern)) "$"
-        return (tolower(subject) ~ regex)
-      }
-      BEGIN {
-        for (i = 1; i <= N; i++) { pat[i] = ARGV[i]; ARGV[i] = "" }
-      }
-      {
-        keep = 1
-        for (i = 1; i <= N; i++) {
-          if (pat[i] != "" && _matches($0, pat[i])) { keep = 0; break }
-        }
-        if (keep) print $0
-      }
-    ' "${patterns[@]}" "$FILES_LIST".tmp > "$FILES_LIST"
+    # v1.3.16 (finding #1): NUL delimiter preserved; no fallback that
+    # restores excluded items.
+    hasher_nul_filter_globs "$FILES_LIST".tmp "${patterns[@]}" > "$FILES_LIST"
   else
     mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
   fi
@@ -940,22 +887,33 @@ trap cleanup EXIT
 # leader at startup via setsid). Wait briefly for descendants to exit before
 # cleanup so we don't remove files the workers are still writing to.
 _stop_group() {
-  # First, TERM the group (best effort). We reset the trap so re-entering
-  # this handler from our own signal doesn't loop.
+  # v1.3.19 (peer-review finding #2): CRITICAL — do NOT run `kill -TERM -$$`
+  # inside our own handler. That signals every member of our process group,
+  # which INCLUDES us — bash terminates this handler at the kill line,
+  # skipping the wait/KILL escalation and the descendant verification. With
+  # uncooperative workers (e.g. a hash tool that ignores TERM), the parent
+  # exits while the workers keep running; a fresh run can then start while
+  # orphaned workers are still reading disks.
+  #
+  # Fix: enumerate group members EXCLUDING $$, and signal only those.
+  # The launcher's `kill -TERM -PGID` from OUTSIDE the group is still fine —
+  # the launcher runs in a different group and won't self-kill.
+  #
+  # First, reset the trap so nothing re-enters this handler.
   trap - TERM INT
-  # v1.3.17 (review finding #1c): only signal our PROCESS GROUP if we
-  # actually own it. On hosts without setsid (or where setsid failed),
-  # our PGID may equal our CALLER'S PGID, and -$$-signalling would then
-  # take out the launcher — or worse, the invoking interactive shell.
-  # In that fallback we walk our descendant tree explicitly instead.
+
+  local _survivors _i
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-    kill -TERM -$$ 2>/dev/null || true
+    # Signal every group member except ourselves
+    _survivors="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" || true)"
+    for _pid in $_survivors; do kill -TERM "$_pid" 2>/dev/null || true; done
   else
-    # No session isolation: reap descendants by walking pgrep -P
+    # No session isolation: walk our descendant tree
     _kill_descendants_term $$
   fi
+
   # Give descendants up to ~3s to exit cleanly
-  local _i=0
+  _i=0
   while [[ $_i -lt 30 ]]; do
     local _n=0
     if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
@@ -966,11 +924,26 @@ _stop_group() {
     [[ "${_n:-0}" -eq 0 ]] && break
     sleep 0.1; _i=$((_i+1))
   done
-  # Anything still up gets KILLed
+
+  # Anything still up gets KILLed — again, excluding $$
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-    kill -KILL -$$ 2>/dev/null || true
+    _survivors="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" || true)"
+    for _pid in $_survivors; do kill -KILL "$_pid" 2>/dev/null || true; done
   else
     _kill_descendants_kill $$
+  fi
+
+  # Verify — if descendants are STILL alive, warn the caller so they know
+  # the lock/pidfile removal that follows may be premature.
+  local _still
+  if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+    _still="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+  else
+    _still="$(_count_descendants $$)"
+  fi
+  if [[ "${_still:-0}" -gt 0 ]]; then
+    printf '[WARN] %d descendant(s) survived KILL escalation; lock will still be released.\n' "$_still" >&2
+    printf '[WARN]   Investigate with: pgrep -g %d\n' "$$" >&2
   fi
 }
 # Descendant-walking helpers used only in the no-setsid fallback path.
@@ -1240,18 +1213,26 @@ main() {
 
   info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
-  post_run_reports "$OUTPUT" "$DATE_TAG"
+  post_run_reports "$OUTPUT" "$CSV_TAG"
 }
 
 # ───────────────────────── Post-run Reports ────────────────
 post_run_reports() {
   local csv="$1"
-  local date_tag="$2"
+  local run_tag="$2"  # v1.3.19 (finding #5): full run tag (F-HMS-PID),
+                       # not just DATE_TAG. Same-day runs no longer overwrite.
 
   mkdir -p "$LOGS_DIR" "$ZERO_DIR"
 
-  local zero_txt="$ZERO_DIR/zero-length-$date_tag.txt"
-  local dupes_txt="$LOGS_DIR/$date_tag-duplicate-hashes.txt"
+  # v1.3.19 (peer-review finding #5): derived reports now include the run
+  # tag so same-day runs don't overwrite each other. Two convenience
+  # symlinks (*-latest.txt) always point at the newest report of each kind
+  # — that's what next-step commands print, so they stay stable while
+  # historical reports accumulate.
+  local zero_txt="$ZERO_DIR/zero-length-$run_tag.txt"
+  local dupes_txt="$LOGS_DIR/duplicate-hashes-$run_tag.txt"
+  local zero_latest="$ZERO_DIR/zero-length-latest.txt"
+  local dupes_latest="$LOGS_DIR/duplicate-hashes-latest.txt"
 
   if [[ -f "$csv" ]]; then
     awk '
@@ -1306,6 +1287,16 @@ post_run_reports() {
       }
     }
   ' "$csv" > "$dupes_txt" || true
+
+  # v1.3.19 (finding #5): update -latest pointers atomically. Use symlinks
+  # where supported; fall back to a rewritten copy for filesystems that
+  # reject symlinks (rare NAS shares over SMB).
+  if ln -sfn -- "$(basename "$zero_txt")" "$zero_latest" 2>/dev/null; then :; else
+    cp -f -- "$zero_txt" "$zero_latest" 2>/dev/null || true
+  fi
+  if ln -sfn -- "$(basename "$dupes_txt")" "$dupes_latest" 2>/dev/null; then :; else
+    cp -f -- "$dupes_txt" "$dupes_latest" 2>/dev/null || true
+  fi
 
   local zero_count=0 dupe_groups=0 dupe_files=0
   [[ -s "$zero_txt" ]] && zero_count=$(wc -l < "$zero_txt" | tr -d ' ')
