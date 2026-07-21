@@ -188,10 +188,13 @@ cut -f1 "$TMP_FILES" | LC_ALL=C sort -u > "$TMP_BASE.alldirs.txt"
 awk '
   {
     p=$0;
-    # strip trailing slashes just in case
-    sub(/\/+$/,"",p);
+    # v1.3.19 (peer-review finding #1): use [/] character class instead of
+    # the escaped slash \/ — BusyBox awk rejects the escape form as "bad
+    # regex" and drops out of duplicate-folder discovery for non-leaf dirs.
+    # gawk/mawk/nawk all accept the character-class form identically.
+    sub("[/]+$","",p);
     while (1) {
-      q=p; sub(/\/[^/]+$/,"",q);
+      q=p; sub("[/][^/]+$","",q);
       if (q==p || q=="") break;
       print q;
       p=q;

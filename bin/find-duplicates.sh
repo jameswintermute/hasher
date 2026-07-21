@@ -101,9 +101,27 @@ find_hdr_idx() {
   echo ""
 }
 
-COL_HASH="$(find_hdr_idx 'hash|digest|checksum|sha256|sha1|sha512|md5|blake2|blake2b|blake2s')"
+# v1.3.19 (peer-review finding #4): dedupe workflows only speak SHA-256
+# since v1.3.16. The hash column name must be one that could plausibly
+# carry SHA-256 (`hash`, `digest`, `checksum`, `sha256`). Explicitly named
+# non-SHA-256 columns (md5, sha1, sha512, blake2*) are rejected up front
+# rather than accepted and then generating unusable plans that fail at
+# delete-duplicates.sh apply-time.
+COL_HASH="$(find_hdr_idx 'hash|digest|checksum|sha256')"
 COL_PATH="$(find_hdr_idx 'path|filepath|file|fullpath')"
 COL_SIZE="$(find_hdr_idx 'size|size_bytes|bytes|filesize|size_mb')"
+# If no SHA-256-capable column was found, check whether the CSV explicitly
+# names a non-SHA-256 hash algorithm — that's a clearer error message than
+# "no hash column found".
+if [[ -z "$COL_HASH" ]]; then
+  _wrong="$(find_hdr_idx 'md5|sha1|sha512|blake2|blake2b|blake2s')"
+  if [[ -n "$_wrong" ]]; then
+    printf '[ERROR] Manifest column is non-SHA-256 (md5/sha1/sha512/blake2*).\n' >&2
+    printf '[ERROR] This release only supports SHA-256 for dedupe workflows.\n' >&2
+    printf '[ERROR] Re-run bin/hasher.sh (which enforces sha256) to regenerate the CSV.\n' >&2
+    exit 2
+  fi
+fi
 
 if [[ -n "$COL_HASH" && -n "$COL_PATH" ]]; then
   SKIP_HEADER=1
@@ -112,6 +130,27 @@ else
   COL_HASH="${COL_HASH:-5}"   # for hasher CSV: path,size_bytes,mtime_epoch,algo,hash
   COL_PATH="${COL_PATH:-1}"
   COL_SIZE="${COL_SIZE:-2}"
+fi
+
+# v1.3.19 (peer-review finding #4): even if the hash column NAME looks
+# right, the values in it may be non-SHA-256 (MD5=32 hex, SHA1=40, SHA512=128).
+# Sample the first data row and refuse if the hash isn't 64 hex chars —
+# early failure with a clear message beats generating an unusable plan.
+if [[ -f "$INPUT" ]]; then
+  _first_data="$(awk -v skip="$SKIP_HEADER" -v NR_want=1 'NR>skip{print; exit}' "$INPUT" 2>/dev/null || true)"
+  if [[ -n "$_first_data" ]]; then
+    _hash_sample="$(printf '%s\n' "$_first_data" \
+      | awk -F"$DELIM" -v ch="$COL_HASH" '{gsub(/"/,"",$ch); print $ch}' 2>/dev/null || true)"
+    if [[ -n "$_hash_sample" ]]; then
+      _hlen=${#_hash_sample}
+      if [[ "$_hlen" -ne 64 ]] || ! [[ "$_hash_sample" =~ ^[0-9a-fA-F]+$ ]]; then
+        printf '[ERROR] First data row contains a non-SHA-256 hash (length=%d, expected 64 hex).\n' "$_hlen" >&2
+        printf '[ERROR] Sample: %s\n' "$_hash_sample" >&2
+        printf '[ERROR] Dedupe workflows require SHA-256 manifests. Regenerate with bin/hasher.sh.\n' >&2
+        exit 2
+      fi
+    fi
+  fi
 fi
 
 TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT

@@ -7,6 +7,12 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
+
+# v1.3.19: source the awk-safety detection helper (BusyBox fallback)
+if [ -r "$ROOT_DIR/lib/awk-detect.sh" ]; then
+  . "$ROOT_DIR/lib/awk-detect.sh"
+  hasher_detect_awk_nul_safety
+fi
 LOCAL="$ROOT_DIR/local"
 PATHS_FILE="$LOCAL/paths.txt"
 JUNK_FILE="$LOCAL/junk-extensions.txt"
@@ -82,16 +88,10 @@ done < "$PATHS_FILE" >> "$LISTFILE_NUL"
 # COINCIDENTAL file whose relative path happens to match a fragment. Skipped
 # entries are recorded so the operator can rename and retry.
 SKIP_JUNK="${LISTFILE%.txt}-skipped-delimiter.log"
-: > "$SKIP_JUNK"
 SAFE_NUL="$LISTFILE.safe.nul"
-awk -v RS='\0' -v ORS='\0' -v skip="$SKIP_JUNK" '
-  /[\t\n\r]/ {
-    s = $0; gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
-    printf "%s\n", s >> skip
-    next
-  }
-  { print $0 }
-' "$LISTFILE_NUL" > "$SAFE_NUL"
+# v1.3.19 (peer-review finding #1): use the lib helper so BusyBox hosts
+# take the pure-bash path instead of the broken NUL awk.
+hasher_nul_filter_delim "$LISTFILE_NUL" "$SKIP_JUNK" > "$SAFE_NUL"
 skipped_junk=$(wc -l < "$SKIP_JUNK" 2>/dev/null | tr -d ' ')
 if [ "${skipped_junk:-0}" -gt 0 ]; then
   warn "Skipped $skipped_junk junk candidate(s) whose paths contain TAB/LF/CR."
@@ -161,11 +161,28 @@ if [ "$FORCE" -eq 0 ]; then
 fi
 
 info "Deleting junk files…"
+# v1.3.19 (peer-review finding #3): rm errors were previously suppressed
+# with `2>/dev/null || true` and the counter incremented unconditionally,
+# producing false "Deleted: N files" reports when files were on read-only
+# media or lacked permissions. Now we track successes and failures
+# separately, log every failure, and exit non-zero if any deletion failed.
 del=0
+fail=0
+FAIL_LOG="${LISTFILE%.txt}-delete-failures.log"
+: > "$FAIL_LOG"
 while IFS=$(printf '\t') read -r s p; do
-  rm -f -- "$p" 2>/dev/null || true
-  del=$((del + 1))
+  if rm -f -- "$p" 2>>"$FAIL_LOG" && [ ! -e "$p" ]; then
+    del=$((del + 1))
+  else
+    fail=$((fail + 1))
+    printf '%s\n' "$p" >> "$FAIL_LOG"
+  fi
 done < "$TMP"
 
 info "Junk deletion complete."
 info "Deleted: $del files."
+if [ "$fail" -gt 0 ]; then
+  warn "Failed to delete $fail file(s). See $FAIL_LOG for details."
+  exit 1
+fi
+rm -f -- "$FAIL_LOG" 2>/dev/null || true
