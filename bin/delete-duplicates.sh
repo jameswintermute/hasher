@@ -75,8 +75,10 @@ info "Using FILE delete plan: $PLAN_FILE"
 # it is no longer safe to treat as a duplicate. This closes the stale-plan
 # window between hashing (T0) and applying (T2), which can be days.
 #
-# Old-format plans (DEL|path, no hash) are still accepted: verification is
-# simply not possible, so we fall back to the existence check and warn once.
+# v1.3.17: legacy plans (DEL|path, no per-entry hash) and mixed plans are now
+# refused by default. Legacy plans require --allow-unverified-plan and a
+# typed confirmation. Mixed plans (some entries hashed, some not) are always
+# refused. See the pre-flight validation below for the exact policy.
 
 # Resolve a hashing command (mirror hasher.sh's platform logic, minimal form)
 _resolve_hash_cmd_dd() {
@@ -110,27 +112,56 @@ if [ "$TOTAL_DEL" -eq 0 ]; then
   exit 0
 fi
 
-# Detect whether this plan carries hashes (sample the first DEL line)
-PLAN_HAS_HASHES=0
-_first_del="$(grep -m1 '^DEL|' "$PLAN_FILE" 2>/dev/null || true)"
-if [ -n "$_first_del" ]; then
-  _split_del_line "$_first_del"
-  [ -n "$DEL_HASH" ] && PLAN_HAS_HASHES=1
+# v1.3.17 (peer-review recheck finding #2): CRITICAL — validate EVERY DEL
+# line up front, not just the first. Previously a mixed plan (some entries
+# with hashes, some without) was classified as "hashed" from a single sample
+# and the unhashed entries were then moved with no verification. Second
+# fail-open: a hashed plan with no available hash tool used to silently
+# downgrade to "unhashed" and continue on the verified path. Both are gone.
+#
+# The plan is now classified into exactly one bucket after scanning every
+# DEL entry:
+#   - ALL entries carry a valid 64-hex hash        → PLAN_HAS_HASHES=1
+#   - NONE of the entries carry a hash             → PLAN_HAS_HASHES=0 (legacy)
+#   - MIXED, or malformed hash on any entry        → REFUSE outright
+_mixed_count=0
+_unhashed_count=0
+_hashed_count=0
+while IFS= read -r _line; do
+  [ -z "$_line" ] && continue
+  _split_del_line "$_line"
+  if [ -n "$DEL_HASH" ]; then
+    _hashed_count=$((_hashed_count + 1))
+  else
+    _unhashed_count=$((_unhashed_count + 1))
+  fi
+done < <(grep '^DEL|' "$PLAN_FILE" 2>/dev/null || true)
+
+if [ "$_hashed_count" -gt 0 ] && [ "$_unhashed_count" -gt 0 ]; then
+  _mixed_count=$_hashed_count
+  error "Plan is MIXED: $_hashed_count DEL entries carry a hash, $_unhashed_count do not."
+  error "Refusing to apply — a mixed plan cannot be safely classified as verified."
+  error "Regenerate the plan against a current hash manifest and try again."
+  exit 2
 fi
+
+PLAN_HAS_HASHES=0
+[ "$_hashed_count" -gt 0 ] && [ "$_unhashed_count" -eq 0 ] && PLAN_HAS_HASHES=1
 
 if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
   if [ -n "$HASH_CMD_DD" ]; then
-    info "Plan carries content hashes — candidates will be re-verified before quarantine."
+    info "Plan carries content hashes — all $_hashed_count candidates will be re-verified before quarantine."
   else
-    warn "Plan carries hashes but no hash tool (sha256sum/shasum) found — cannot re-verify."
-    PLAN_HAS_HASHES=0
+    # v1.3.17 (finding #2): fail closed. Do NOT silently downgrade a hashed
+    # plan to unverified just because the hash tool is missing — the whole
+    # point of the hashes is re-verification. Exit with a clear message.
+    error "Plan carries content hashes but no hash tool is available."
+    error "Install sha256sum (coreutils) or shasum (Perl), or run this on a"
+    error "host that has one. Refusing to apply without re-verification."
+    exit 2
   fi
 else
-  # v1.3.16 (peer-review finding #5): CRITICAL — do NOT silently accept plans
-  # without per-entry hashes. The reviewer demonstrated that a one-line legacy
-  # plan can move any file that still exists to quarantine, bypassing the
-  # core stale-plan safety guarantee. Refuse by default; require an explicit
-  # opt-in flag AND an interactive confirmation.
+  # No hashes at all → legacy plan path. Still refuse unless the user opts in.
   if [ "${ALLOW_UNVERIFIED_PLAN:-0}" -ne 1 ]; then
     error "Plan has NO per-entry content hashes (old format): $PLAN_FILE"
     error "This tool cannot re-verify entries before quarantining them, which"
@@ -195,7 +226,16 @@ while IFS= read -r line || [ -n "$line" ]; do
       [ -e "$DEL_PATH" ] || continue
 
       # v1.2.0: re-verify content hash before quarantining
-      if [ "$PLAN_HAS_HASHES" -eq 1 ] && [ -n "$DEL_HASH" ]; then
+      if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
+        # v1.3.17 (finding #2 belt-and-braces): if the pre-flight classified
+        # the plan as hashed but we somehow reach here with an empty DEL_HASH,
+        # that is a pre-flight bug or a race — safety-skip rather than move
+        # without verification.
+        if [ -z "$DEL_HASH" ]; then
+          warn "Missing per-entry hash on a verified plan — SKIPPING for safety: $DEL_PATH"
+          moves_skipped_changed=$((moves_skipped_changed+1))
+          continue
+        fi
         actual="$($HASH_CMD_DD -- "$DEL_PATH" 2>/dev/null | awk '{print $1}')"
         if [ -z "$actual" ]; then
           warn "Could not re-hash (skipping for safety): $DEL_PATH"

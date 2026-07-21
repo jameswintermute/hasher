@@ -1694,6 +1694,85 @@ arg parsing along the way (proper `--plan/-p` flag; the old positional `$1`
 still works for backward compatibility).
 
 ---
+## 2026‑07 — v1.3.17
+**Peer-review recheck 1–5: piped input restored, plan classification, delimiter policy, run isolation, cron parity** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Five follow-up findings after v1.3.16. All confirmed live; four were
+regressions or edge cases I introduced or missed, one was pre-existing.
+
+### #1 — Session isolation cleaned up (was breaking the documented pipe interface)
+
+Three sub-issues in the v1.3.16 setsid work:
+
+- **1a (regression I introduced):** `exec setsid "$0" "$@" </dev/null`
+  unconditionally redirected stdin, breaking the documented piped-paths
+  interface (`echo /path | hasher.sh`, `find … | hasher.sh`). Now only
+  redirects when stdin is a TTY; a piped stdin is preserved. The v1.3.16
+  hang I saw came from a test harness with a closed pipe, not real usage.
+- **1b:** the `--nohup` re-invocation inherited `HASHER_SESSION_LEADER=1`,
+  so the child skipped its own re-exec and stayed in the parent shell's
+  process group — group-signalling that PID would then hit the caller.
+  Now unset the guard before the child spawn.
+- **1c:** if setsid is unavailable, we no longer risk signalling the
+  caller's process group. Both hasher.sh's TERM trap and the launcher
+  check `PGID == PID` before using `kill -PGID`; when it isn't, they walk
+  the descendant tree with `pgrep -P` and TERM each child individually.
+  Also switched leadership detection from `getsid` (returns 0 in some
+  container/namespace configs) to PGID equality (portable).
+
+### #2 — Plan classification made whole-plan-honest
+
+Two fail-open paths in delete-duplicates.sh:
+
+- Classification sampled only the FIRST DEL line. A mixed plan (some
+  entries with hashes, some without) was tagged "hashed" and the unhashed
+  entries then moved with no verification. Now scans EVERY DEL line;
+  mixed plans are refused outright with a clear message.
+- If the plan was hashed but no hash tool was available, the code
+  silently downgraded `PLAN_HAS_HASHES=0` and continued through the
+  verified path — moving files without re-verifying anything. Now
+  refuses (rc=2): the whole point of the hashes is re-verification.
+- Belt-and-braces: at apply-time, an empty `DEL_HASH` on a plan
+  classified as hashed safety-skips the entry rather than falling
+  through to existence-only checks.
+
+### #3 — Tab/newline filename policy: detect and skip
+
+find-duplicates.sh's awk block silently rewrote tabs in paths to spaces
+(`gsub(/\t/," ",p)`), producing a report/plan whose paths didn't match
+files on disk — dedup could act on the wrong file. Hasher.sh now filters
+these at discovery: paths containing TAB, LF, or CR are skipped with a
+WARN and logged to `var/skipped-delimiter-paths.log` (with `<TAB>`/`<LF>`/
+`<CR>` markers so users can identify the exact files to rename). A NUL-
+delimited internal manifest across all tools is the fuller fix and stays
+on the roadmap; this policy closes the correctness gap in the meantime.
+
+### #4 — "Clean internal working files" refuses while hashing is active
+
+`action_clean_internal` (menu option 'v') did `find | rm -rf` on
+everything under `var/` with no active-run check. Removing `hasher.pid`,
+`hasher.lock`, `files-*.lst`, or `zero-length/*` during a live run
+unblocked concurrent runs (defeating the v1.3.16 lock) and corrupted
+in-flight reporting. Now uses the same two-signal detection as the start
+guard: refuses if `is_hasher_running` returns true OR if any hasher.sh
+process is visible in ps. Recommends 'k' (Stop hashing) first.
+
+### #5 — Cron path fixed; direct-CLI now inherits local/excludes.txt
+
+- **5a:** The "Stats & scheduling hints" screen showed
+  `./hasher.sh --pathfile …` (path doesn't exist). Corrected to
+  `bin/hasher.sh --pathfile …`, and added a note that hasher.sh loads
+  conf on startup so cron and menu runs use the same exclusion set.
+- **5b:** The launcher used to translate `local/excludes.txt` into a
+  series of `--exclude` flags, but hasher.sh itself never read the file
+  — direct-CLI and cron invocations produced a *different* manifest than
+  the menu. Now hasher.sh auto-loads `local/excludes.txt` on startup (one
+  pattern per line, blank/comment lines ignored), so all invocations see
+  the same exclusion set.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 20 files pass syntax.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  

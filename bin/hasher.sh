@@ -8,7 +8,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
 
-# ─── Process-group isolation (v1.3.16, peer-review finding #4) ───
+# ─── Process-group isolation (v1.3.16, revised v1.3.17 for review finding #1) ─
 # The parallel path fans work out via `xargs -0 -P N` and `bash -c` workers,
 # which then invoke the hash command (sha256sum/shasum). None of those
 # descendants have "bin/hasher.sh" in their argv, so the launcher's ps-based
@@ -18,26 +18,58 @@ LC_ALL=C
 # and the launcher can then signal the whole group with `kill -TERM -PGID`,
 # and every descendant goes down together.
 #
-# Detection: getsid $$ == $$ means we ARE the session leader. Otherwise we
-# re-exec under setsid. HASHER_SESSION_LEADER=1 is a paranoia guard so a
-# broken setsid can't loop.
+# v1.3.17 revisions after external review:
+#   1. Do NOT redirect stdin from /dev/null unconditionally. The reviewer
+#      showed this breaks the documented piped-paths interface
+#      (`echo /path | hasher.sh` produced 0/0 empty CSVs). Only redirect
+#      when stdin is already a TTY — a piped stdin is real input we must
+#      preserve. The v1.3.16 hang I saw came from stdin inheriting a
+#      closed pipe from a test harness, not from a real usage pattern.
+#   2. HASHER_SESSION_LEADER must be UNSET before spawning a --nohup child,
+#      or the child inherits it and skips its own re-exec — leaving the
+#      child in the parent shell's session, not its own. Handled at the
+#      --nohup spawn site further down, not here.
+#   3. If setsid is unavailable, we DO NOT attempt group signalling on this
+#      process. The TERM trap and launcher check whether we own our PGID
+#      (getsid $$ == $$) before using -PGID kills. Otherwise we would
+#      signal our caller's shell.
 if [[ -z "${HASHER_SESSION_LEADER:-}" ]]; then
-  _sid="$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ' || echo '')"
-  if [[ -n "$_sid" && "$_sid" != "$$" ]]; then
+  # v1.3.17: use PGID (not SID) for portability — session IDs can be 0 or
+  # unreliable in some container/namespace configs, but PGID is universal.
+  _pg="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || echo '')"
+  if [[ -n "$_pg" && "$_pg" != "$$" ]]; then
     if command -v setsid >/dev/null 2>&1; then
       export HASHER_SESSION_LEADER=1
       # `setsid` starts a new session; the new pgid == new pid. Use exec so
       # this shell is REPLACED, not sitting above the real process.
-      # Redirect stdin from /dev/null: hasher.sh never reads stdin, and
-      # inheriting an unusual stdin (e.g. a closed pipe from a caller) can
-      # deadlock the child under some kernels/shells.
-      exec setsid "$0" "$@" </dev/null
+      # v1.3.17: preserve stdin unless it's a TTY. Piped input is legitimate
+      # (documented at --pathfile help: "Required unless paths are piped").
+      # Only when the caller has left stdin as a TTY (interactive) is it
+      # safe (and helpful) to redirect from /dev/null so a background run
+      # doesn't block on read.
+      if [[ -t 0 ]]; then
+        exec setsid "$0" "$@" </dev/null
+      else
+        exec setsid "$0" "$@"
+      fi
     fi
-    # No setsid available (rare on modern DSM/Linux/macOS): continue, and
-    # rely on the trap-based fallback to reap descendants explicitly.
+    # No setsid available: continue without session isolation. Group-signalling
+    # is unsafe in this case — the TERM handler below checks IS_SESSION_LEADER.
   fi
   export HASHER_SESSION_LEADER=1
 fi
+
+# Am I the leader of my own process group? This is what actually matters for
+# `kill -PGID` — signalling the group only takes out our own descendants when
+# we own the group. Use PGID equality (portable across Linux/DSM/macOS/BusyBox)
+# rather than SID equality (returns 0 in some container/namespace configs).
+_our_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || echo '')"
+if [[ -n "$_our_pgid" && "$_our_pgid" = "$$" ]]; then
+  IS_SESSION_LEADER=1
+else
+  IS_SESSION_LEADER=0
+fi
+export IS_SESSION_LEADER
 
 # ───────────────────────── Root dir ────────────────────────
 # FIX: all dirs were relative ("hashes", "logs", "zero-length") which broke
@@ -354,6 +386,21 @@ load_config() {
 # Apply config early (before arg parsing), if set
 [[ -n "$CONFIG_FILE" ]] && load_config "$CONFIG_FILE"
 
+# v1.3.17 (peer-review finding #5b): auto-load local/excludes.txt if present,
+# so bin/hasher.sh from cron/CLI catalogues the SAME set as menu runs. The
+# launcher used to translate that file into a series of --exclude flags but
+# hasher.sh itself never read it — direct invocations produced a different
+# manifest. This inheritance is silent (no warning if the file is absent).
+if [[ -f "$ROOT_DIR/local/excludes.txt" ]]; then
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    # skip blank lines and #-comments
+    _stripped="${_line#"${_line%%[![:space:]]*}"}"
+    [[ -z "$_stripped" ]] && continue
+    case "$_stripped" in \#*) continue ;; esac
+    EXTRA_EXCLUDES+=("$_stripped")
+  done < "$ROOT_DIR/local/excludes.txt"
+fi
+
 # ───────────────────────── Arg Parsing ─────────────────────
 usage() {
   cat <<EOF
@@ -403,6 +450,12 @@ done
 # ───────────────────────── Nohup Re-exec ───────────────────
 if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   export IS_CHILD=true
+  # v1.3.17 (review finding #1b): unset the session-leader guard so the
+  # spawned child re-runs the setsid decision at its own top-of-file and
+  # becomes ITS OWN session leader. Previously the child inherited
+  # HASHER_SESSION_LEADER=1 and skipped the re-exec, so its group-signal
+  # would target the parent shell's PGID instead of an isolated group.
+  unset HASHER_SESSION_LEADER
   args=( "$0" --child )
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
@@ -540,6 +593,42 @@ build_file_list() {
 
   local pre_count=0
   [[ -s "$FILES_LIST".tmp ]] && pre_count=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
+
+  # v1.3.17 (peer-review finding #3): filenames containing tab, newline, or
+  # carriage return break the downstream line- and TAB-oriented artefacts
+  # (CSV manifest, TSV signatures, KEEP|/DEL| plans). Previously
+  # find-duplicates.sh silently rewrote tabs to spaces, so the report/plan
+  # referenced a DIFFERENT path than the file on disk — dedup could then
+  # act on the wrong file. Policy: DETECT AND SKIP these paths at discovery
+  # with a prominent report. Users see the exact skipped paths in
+  # var/skipped-delimiter-paths.log for follow-up (rename, or manual hash).
+  # A NUL-delimited internal manifest is the fuller fix; that's a future
+  # cross-cutting change. Detection is done in awk on NUL records so tabs
+  # and newlines inside a record are visible.
+  local skipfile="$VAR_DIR/skipped-delimiter-paths.log"
+  local skipped_delim=0
+  if [[ -s "$FILES_LIST".tmp ]]; then
+    : > "$skipfile"
+    awk -v RS='\0' -v ORS='\0' -v skip="$skipfile" '
+      /[\t\n\r]/ {
+        # emit human-readable line for the report; use gsub for portability
+        s = $0
+        gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
+        printf "%s\n", s >> skip
+        next
+      }
+      { print $0 }
+    ' "$FILES_LIST".tmp > "$FILES_LIST".tmp.clean \
+      && mv -f -- "$FILES_LIST".tmp.clean "$FILES_LIST".tmp
+    skipped_delim=$(wc -l < "$skipfile" 2>/dev/null | tr -d ' ')
+    if [[ "${skipped_delim:-0}" -gt 0 ]]; then
+      warn "Skipping $skipped_delim file(s) whose paths contain TAB/LF/CR — see $skipfile"
+      warn "  These characters break the CSV/TSV/plan artefacts. Rename the files to include them."
+      pre_count=$((pre_count - skipped_delim))
+    else
+      rm -f -- "$skipfile" 2>/dev/null || true
+    fi
+  fi
 
   # Apply excludes (literal substring match)
   # FIX (v1.1.10): "${EXTRA_EXCLUDES[@]}" raises 'unbound variable' under
@@ -746,20 +835,60 @@ _stop_group() {
   # First, TERM the group (best effort). We reset the trap so re-entering
   # this handler from our own signal doesn't loop.
   trap - TERM INT
-  kill -TERM -$$ 2>/dev/null || true
+  # v1.3.17 (review finding #1c): only signal our PROCESS GROUP if we
+  # actually own it. On hosts without setsid (or where setsid failed),
+  # our PGID may equal our CALLER'S PGID, and -$$-signalling would then
+  # take out the launcher — or worse, the invoking interactive shell.
+  # In that fallback we walk our descendant tree explicitly instead.
+  if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+    kill -TERM -$$ 2>/dev/null || true
+  else
+    # No session isolation: reap descendants by walking pgrep -P
+    _kill_descendants_term $$
+  fi
   # Give descendants up to ~3s to exit cleanly
   local _i=0
   while [[ $_i -lt 30 ]]; do
-    # any descendants still alive?
-    if ! pgrep -g $$ >/dev/null 2>&1; then break; fi
-    # count non-self processes in our group
-    local _n
-    _n="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+    local _n=0
+    if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+      _n="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+    else
+      _n="$(_count_descendants $$)"
+    fi
     [[ "${_n:-0}" -eq 0 ]] && break
     sleep 0.1; _i=$((_i+1))
   done
   # Anything still up gets KILLed
-  kill -KILL -$$ 2>/dev/null || true
+  if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+    kill -KILL -$$ 2>/dev/null || true
+  else
+    _kill_descendants_kill $$
+  fi
+}
+# Descendant-walking helpers used only in the no-setsid fallback path.
+_count_descendants() {
+  local p="$1" c=0
+  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  for k in $kids; do
+    c=$((c + 1 + $(_count_descendants "$k")))
+  done
+  printf '%s' "$c"
+}
+_kill_descendants_term() {
+  local p="$1"
+  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  for k in $kids; do
+    _kill_descendants_term "$k"
+    kill -TERM "$k" 2>/dev/null || true
+  done
+}
+_kill_descendants_kill() {
+  local p="$1"
+  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  for k in $kids; do
+    _kill_descendants_kill "$k"
+    kill -KILL "$k" 2>/dev/null || true
+  done
 }
 trap '_stop_group; cleanup; echo "[INFO] hashing stopped by signal (TERM)" >&2; exit 143' TERM
 trap '_stop_group; cleanup; echo "[INFO] hashing stopped by signal (INT)"  >&2; exit 130' INT

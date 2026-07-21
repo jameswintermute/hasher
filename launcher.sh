@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.16 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.17 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -225,19 +225,30 @@ action_stop_hashing() {
 
   echo
   warn "The following hashing process(es) will be stopped (with all their workers):"
-  # v1.3.16 (peer-review finding #4): resolve each parent to its PGID and
-  # kill the whole process group. Hasher.sh is a session leader (pgid == pid
-  # since v1.3.16), so this catches xargs, worker shells, and hash commands
-  # in a single signal. For any parent that predates v1.3.16 (no session
-  # isolation), the parent's own pgid still works — it's just not guaranteed
-  # to include descendants; the wait+KILL escalation below covers that case.
+  # v1.3.16 (finding #4) / v1.3.17 (recheck #1c): resolve each parent to its
+  # PGID and confirm the parent OWNS that group (PGID == PID) before we
+  # group-signal it. Without that check, a hasher process that failed to
+  # become a session leader (e.g. no setsid on host) would share PGID with
+  # its caller — group-signalling would take out the caller too, potentially
+  # the launcher itself or the interactive shell.
+  #
+  # Parents in a group they own → collected in $pgids for group-kill.
+  # Parents NOT owning their group → collected in $safe_pids for tree-walk.
   pgids=""
+  safe_pids=""
   for p in $pids; do
     _line="$( { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v p="$p" '$1==p {print; exit}' )"
     printf '   %s\n' "${_line:-PID $p}"
     _pg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ' || echo "$p")"
-    case " $pgids " in *" $_pg "*) : ;; *) pgids="$pgids $_pg" ;; esac
+    if [ "$_pg" = "$p" ]; then
+      case " $pgids " in *" $_pg "*) : ;; *) pgids="$pgids $_pg" ;; esac
+    else
+      safe_pids="$safe_pids $p"
+    fi
   done
+  if [ -n "${safe_pids// /}" ]; then
+    warn "  (some processes are not session leaders — will use descendant-tree TERM for those)"
+  fi
   printf "Stop hashing now? [y/N]: "
   read -r ans || ans=""
   case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
@@ -245,8 +256,13 @@ action_stop_hashing() {
     *) info "Left running."; printf "Press Enter to continue... "; read -r _ || true; return ;;
   esac
 
-  # TERM the whole process group for each session leader.
+  # TERM the whole process group for each verified session leader.
   for g in $pgids; do kill -TERM "-$g" 2>/dev/null || true; done
+  # For non-leaders: walk descendants and TERM each one, then the parent.
+  for p in $safe_pids; do
+    for d in $(pgrep -P "$p" 2>/dev/null); do kill -TERM "$d" 2>/dev/null || true; done
+    kill -TERM "$p" 2>/dev/null || true
+  done
   info "Sent TERM to process group(s); waiting for clean shutdown…"
   waited=0
   while [ "$waited" -lt 8 ]; do
@@ -257,9 +273,13 @@ action_stop_hashing() {
   done
   killed=0
   if [ -n "${alive:-}" ] && [ -n "${alive// /}" ]; then
-    # Escalate: KILL the whole group, not just the parent PIDs
+    # Escalate: KILL group for verified leaders; walk descendants otherwise
     for g in $pgids; do kill -KILL "-$g" 2>/dev/null && killed=$((killed+1)) || true; done
-    warn "Escalated to KILL for process group(s):$pgids"
+    for p in $safe_pids; do
+      for d in $(pgrep -P "$p" 2>/dev/null); do kill -KILL "$d" 2>/dev/null || true; done
+      kill -KILL "$p" 2>/dev/null || true
+    done
+    warn "Escalated to KILL"
   fi
   # v1.3.16 (finding #4): verify no descendants remain before reporting success.
   sleep 1
@@ -1258,10 +1278,15 @@ action_stats_and_cron() {
   echo "Example cron entries (templates only; adjust paths & options):"
   echo
   echo "  # Run hasher nightly at 02:00"
-  echo "  0 2 * * * cd <hasher_root_dir> && ./hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
+  echo "  0 2 * * * cd <hasher_root_dir> && bin/hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
   echo
   echo "  # Run junk cleaner weekly on Sundays at 03:00"
   echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh >> logs/cron-junk.log 2>&1"
+  echo
+  echo "Note: bin/hasher.sh loads default/hasher.conf and local/hasher.conf on start,"
+  echo "so cron and menu runs use the same exclusion set. If you rely on additional"
+  echo "excludes, put them in local/hasher.conf (see EXTRA_EXCLUDES) or pass"
+  echo "them explicitly with --exclude."
   echo
   echo "Edit crontab with: crontab -e"
   printf "Press Enter to continue... "; read -r _ || true
@@ -1284,6 +1309,29 @@ action_clean_logs() {
 action_clean_internal() {
   if [ ! -d "$VAR_DIR" ]; then
     info "VAR dir not found: $VAR_DIR"
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # v1.3.17 (peer-review finding #4): CRITICAL — never clean var/ while a
+  # hash run is active. Removing hasher.pid, hasher.lock, the current run's
+  # NUL file list, or the zero-length progress files during a live run
+  # unblocks concurrent runs and can corrupt in-flight reporting. Check the
+  # same two signals used elsewhere: (1) a live pidfile, (2) any tracked
+  # hasher.sh process visible to the launcher.
+  if is_hasher_running 2>/dev/null; then
+    _pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    err "Refusing to clean $VAR_DIR while hashing is active (PID ${_pid:-?})."
+    err "Stop hashing first (menu option 'k'), then try again."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  _orphans="$(list_hasher_pids 2>/dev/null || true)"
+  if [ -n "${_orphans// /}" ]; then
+    warn "Found live hasher.sh process(es) not tracked by the pidfile:"
+    for _p in $_orphans; do warn "   PID $_p"; done
+    err  "Refusing to clean $VAR_DIR while any hasher.sh is alive."
+    err  "Use menu option 'k' (Stop hashing) first."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
