@@ -23,13 +23,24 @@ PROGRESS_EVERY=1
 SHOW_PROGRESS=1
 ORDER="size"  # size|sizesmall|name|newest|oldest|shortpath|longpath
 
-is_tty() { [ -t 2 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; }
-if is_tty; then
-  C1="$(printf '\033[1;36m')"; C2="$(printf '\033[1;33m')"
-  COK="$(printf '\033[1;32m')" ; CERR="$(printf '\033[1;31m')"
-  CDIM="$(printf '\033[2m')"  ; C0="$(printf '\033[0m')"
+# v1.3.14: colours from the shared module (lib/log.sh) — single source of
+# truth, canonical scheme (INFO=cyan), correct TTY guard. This script keeps
+# its own warn/info/error wrappers because it deliberately routes them to
+# stderr (stdout is the interactive UI); only the palette is shared. CDIM
+# (dim) is not in the shared palette, so it is built locally with the same
+# TTY condition.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  . "$ROOT_DIR/lib/log.sh"
+  C1="$CYN"; C2="$YEL"; COK="$GRN"; CERR="$RED"; C0="$RST"
+  if [ -t 1 ]; then CDIM="$(printf '\033[2m')"; else CDIM=""; fi
 else
-  C1=""; C2=""; COK=""; CERR=""; CDIM=""; C0=""
+  if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+    C1="$(printf '\033[1;36m')"; C2="$(printf '\033[1;33m')"
+    COK="$(printf '\033[1;32m')" ; CERR="$(printf '\033[1;31m')"
+    CDIM="$(printf '\033[2m')"  ; C0="$(printf '\033[0m')"
+  else
+    C1=""; C2=""; COK=""; CERR=""; CDIM=""; C0=""
+  fi
 fi
 
 usage() {
@@ -46,7 +57,7 @@ EOF
 }
 
 warn()  { printf "%s[WARN]%s %s\n"  "$C2"  "$C0" "$1" >&2; }
-info()  { printf "%s[INFO]%s %s\n"  "$COK" "$C0" "$1" >&2; }
+info()  { printf "%s[INFO]%s %s\n"  "$C1"  "$C0" "$1" >&2; }
 error() { printf "%s[ERROR]%s %s\n" "$CERR" "$C0" "$1" >&2; }
 
 # Duration helper for progress
@@ -273,8 +284,9 @@ trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" 2>/dev/null || tru
 
 gno=0; in_group=0; N=0; first_path=""; CUR_HASH=""
 
-# FIX: grab_N was only checking start of match; now uses awk for robustness
-grab_N(){ echo "$1" | awk 'match($0, /\(N=([0-9]+)\)/, a) {print a[1]} !match($0, /\(N=([0-9]+)\)/, a) {print ""}' 2>/dev/null || echo "$1" | sed -n 's/.*(N=\([0-9][0-9]*\)).*/\1/p'; }
+# v1.3.14: grab_N removed — N is now counted from member lines in the index
+# pass (the old header re-parse was environment-sensitive and could silently
+# default to 2).
 grab_hash(){ echo "$1" | awk '{print $2}'; }
 
 index_started="$(date +%s)"
@@ -283,12 +295,16 @@ info "Indexing duplicate groups (potential savings)…"
 finish_group_index(){
   if [ "$in_group" -eq 1 ] && [ -n "${first_path:-}" ] && ! hash_is_exception "$CUR_HASH" "$EXC_CLEAN"; then
     sz="$(file_size "$first_path" 2>/dev/null || echo -1)"
-    [ -z "$N" ] && N=2
+    # v1.3.14: N was counted from member lines; a group can't be smaller than 2
+    [ "${N:-0}" -ge 2 ] || N=2
     # If size lookup failed, treat as 0 for potential calculation
     case "$sz" in ''|-1|*[!0-9]*) sz_calc=0 ;; *) sz_calc="$sz" ;; esac
     pot=$(( ( ${N:-2} - 1 ) * ${sz_calc:-0} ))
     # fields: group_no, potential_bytes, N, first_path, hash, base_size
-    printf "%d\t%llu\t%d\t%s\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" "$sz" >>"$INDEX_FILE"
+    # v1.3.14: %s for the numeric fields — they're already plain decimal shell
+    # strings, and %llu is a C length modifier that not every bash printf
+    # accepts (environment-sensitive on the NAS).
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" "$sz" >>"$INDEX_FILE"
   fi
 }
 
@@ -297,13 +313,25 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
     HASH\ *)
       finish_group_index
-      gno=$((gno+1)); in_group=1; first_path=""; CUR_HASH=""; N="$(grab_N "$line")"; [ -z "$N" ] && N=2
+      # v1.3.14: N is COUNTED from the member path lines below rather than
+      # parsed out of the header. The old grab_N parse (a gawk-only 3-arg
+      # match() with a sed fallback) could fail environment-dependently and
+      # silently default every group to N=2 — misreporting potential savings
+      # and therefore the size-ordering of the whole review. Counting the
+      # same lines the review displays makes N correct by construction.
+      gno=$((gno+1)); in_group=1; first_path=""; CUR_HASH=""; N=0
       CUR_HASH="$(grab_hash "$line")"
       _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"
       ;;
     *)
-      if [ "$in_group" -eq 1 ] && [ -z "${first_path:-}" ]; then
-        t="$(ltrim "$line")"; case "$t" in /*) first_path="$t" ;; esac
+      if [ "$in_group" -eq 1 ]; then
+        t="$(ltrim "$line")"
+        case "$t" in
+          /*)
+            N=$((N+1))
+            [ -z "${first_path:-}" ] && first_path="$t"
+            ;;
+        esac
       fi
       ;;
   esac
@@ -367,13 +395,20 @@ present_group(){
 
   echo; echo
   first="$(head -n1 "$ORDERED" 2>/dev/null || true)"
-  base_size=0; Nval=2; group_hash=""
+  base_size=0; group_hash=""
   if [ -n "$first" ]; then
     base_size="$(awk -v g="$gno" -F'\t' '$1==g{print $6}' "$INDEX_FILE" 2>/dev/null | head -n1)"
     case "$base_size" in ''|-1) base_size="$(file_size "$first" 2>/dev/null || echo -1)" ;; esac
   fi
-  Nval="$(awk -v g="$gno" -F'\t' '$1==g{print $3}' "$INDEX_FILE" 2>/dev/null | head -n1)"; [ -z "$Nval" ] && Nval=2
   group_hash="$(awk -v g="$gno" -F'\t' '$1==g{print $5}' "$INDEX_FILE" 2>/dev/null | head -n1)"
+
+  # v1.3.14: N and potential are derived from the SAME listing the user sees
+  # ($ORDERED), not from an index lookup — so the header can never disagree
+  # with the files displayed beneath it. (Previously a failed index lookup
+  # silently defaulted N to 2, so a 4-copy group showed "N=2" and understated
+  # potential — which also misled the size-ordering impression.)
+  Nval="$(awk 'END{print NR}' "$ORDERED")"
+  [ "${Nval:-0}" -ge 1 ] || Nval=1
   case "$base_size" in ''|-1|*[!0-9]*) pot=0 ;; *) pot=$(( (Nval - 1) * base_size )) ;; esac
 
   printf "%s[Group %d/%d]%s  (order: %s)  potential: %s (N=%d, size=%s)\n" \

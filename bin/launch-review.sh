@@ -14,16 +14,19 @@ HASHES_DIR="$APP_HOME/hashes"
 
 mkdir -p "$LOGS_DIR"
 
-COK="$(printf '\033[0;32m')"
-CWARN="$(printf '\033[1;33m')"
-CERR="$(printf '\033[0;31m')"
-CCYAN="$(printf '\033[0;36m')"
-CRESET="$(printf '\033[0m')"
-
-info(){ printf "%s[INFO]%s %s\n"  "$COK"   "$CRESET" "$*"; }
-warn(){ printf "%s[WARN]%s %s\n"  "$CWARN" "$CRESET" "$*"; }
-err(){  printf "%s[ERROR]%s %s\n" "$CERR"  "$CRESET" "$*"; }
-next(){ printf "%s[NEXT]%s %s\n"  "$CCYAN" "$CRESET" "$*"; }
+# v1.3.14: colours + logging from the shared module (lib/log.sh). The previous
+# local block set colours UNCONDITIONALLY (no TTY guard — escape codes leaked
+# into piped output) and coloured [INFO] green instead of the canonical cyan.
+# next() keeps its distinct [NEXT] label, using the shared palette.
+if [ -r "$APP_HOME/lib/log.sh" ]; then
+  . "$APP_HOME/lib/log.sh"
+  next(){ printf "%s[NEXT]%s %s\n" "$CYN" "$RST" "$*"; }
+else
+  info(){ printf '[INFO] %s\n' "$*"; }
+  warn(){ printf '[WARN] %s\n' "$*"; }
+  err(){  printf '[ERR] %s\n'  "$*" >&2; }
+  next(){ printf '[NEXT] %s\n' "$*"; }
+fi
 
 latest_canon_report() {
   # Prefer the canonical latest symlink written by find-duplicates.sh

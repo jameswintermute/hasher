@@ -645,6 +645,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# v1.3.15: an UNTRAPPED signal makes bash exit WITHOUT running the EXIT trap,
+# so a TERM from the launcher's new "Stop hashing" action would leave the
+# pidfile and working files behind. Trap TERM/INT explicitly: run cleanup,
+# note the stop in the log, and exit with the conventional 128+signal code.
+trap 'cleanup; echo "[INFO] hashing stopped by signal (TERM)" >&2; exit 143' TERM
+trap 'cleanup; echo "[INFO] hashing stopped by signal (INT)"  >&2; exit 130' INT
 
 # ───────────────────────── Main Hashing ────────────────────
 TOTAL=0

@@ -1526,6 +1526,101 @@ reviewed plans still pick their reviewed sidecar over a same-stamp raw decoy.
 Self-test: 40 checks, PASS. Full syntax sweep across 20 files.
 
 ---
+## 2026‑07 — v1.3.14
+**Interactive review: N/potential misreport fixed; review colours standardised** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Reported from a live NAS dedup run: group headers showed `N=2` for groups
+that visibly listed 3–4 files, with `potential` equal to a single file's
+size — i.e. `(N-1)=1` — so per-group savings were understated and the
+size-ordering of the whole review was skewed. Both screenshots shared that
+`potential == size` signature: the display's index lookup was failing on
+the NAS and silently falling back to the hard default `Nval=2`.
+
+### Root cause and fix
+
+`review-duplicates.sh` derived N by re-parsing the report header through
+`grab_N` (a gawk-only three-argument `match()` with a sed fallback) and
+writing an index row with `printf %llu` (a C length modifier not every
+bash builtin printf accepts) — two environment-sensitive constructs that
+behave differently under the NAS's bash 4.4/BusyBox toolchain than under a
+desktop shell, then a display lookup that defaulted to 2 on any failure.
+
+v1.3.14 removes the fragility rather than patching it:
+- **Pass 1 now COUNTS N from the member path lines** of each group — the
+  same lines the review displays. grab_N is deleted entirely; the header's
+  `(N=…)` is no longer trusted for anything.
+- **The header display derives N and potential from the very listing shown
+  beneath it** (`$ORDERED`), so the header can never disagree with the
+  files on screen, regardless of environment.
+- `%llu` → `%s` in the index row (values are already plain decimal).
+
+Verified: a 4-member group with spaces in paths shows `N=4,
+potential=3×size`; headers deliberately corrupted to carry NO parseable N
+still display correct counts (the failure mode is structurally impossible
+now); groups are still presented in savings-descending order; the plan
+file format (`KEEP|…` / `DEL|…|hash`) is unchanged.
+
+### Colours (second report: [INFO] not coloured)
+
+Continued the gradual lib/log.sh migration to the review pair:
+- **launch-review.sh** had NO TTY guard — colours were emitted
+  unconditionally (escape codes leaked into piped output) and [INFO] was
+  green. Now sources lib/log.sh: cyan [INFO], guarded, clean when piped.
+- **review-duplicates.sh** guarded on stderr (`-t 2`) rather than stdout
+  and coloured [INFO] green. Now takes its palette from lib/log.sh
+  (INFO=cyan, canonical), keeping its stderr-routed wrappers and dim style.
+
+Remaining unmigrated colour scripts (hasher.sh, find-duplicates.sh,
+delete-duplicates.sh, delete-zero-length.sh, clean-logs.sh, hash-check.sh,
+run-find-duplicates.sh, launcher.sh) continue on the gradual rollout; if a
+plain [INFO] appears again, note which stage printed it.
+
+---
+## 2026‑07 — v1.3.15
+**New menu action: k) Stop hashing — plus concurrent-run prevention** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Field report: three concurrent `hasher.sh` runs (started within a minute of
+each other) had to be found with `ps aux | grep hasher` and killed one PID
+at a time with `kill -9` as root. Two gaps: no way to stop hashing from the
+menu, and the pidfile duplicate-run guard only knows about the MOST RECENT
+launch — orphans from crashed or duplicate sessions are invisible to it.
+
+### k) Stop hashing (Stage 1)
+
+New launcher action that finds every live hasher.sh process — parents,
+`--jobs` worker subshells, and pidfile-untracked orphans alike — via a
+ps scan, shows the full process lines, asks for confirmation, sends TERM,
+waits up to 8s for clean shutdown, and only escalates to KILL for
+stragglers. Clears the pidfile and notes the stop in background.log.
+
+**Precision matters**: the scan matches only processes EXECUTING hasher.sh
+(an interpreter token immediately followed by the script path — exactly how
+the launcher, the shebang, and DSM's ps render it), never processes that
+merely mention the file. Verified: a `tail -f bin/hasher.sh` is not
+matched; three orphaned runs are all found and stopped. (The test harness
+managed to kill its own session twice by matching its own command line
+before this precision rule was in place — which is exactly the accident
+this rule prevents in the field.)
+
+### hasher.sh: graceful TERM/INT
+
+An untrapped signal makes bash exit WITHOUT running the EXIT trap, so a
+TERM would previously have left the pidfile and working files behind.
+hasher.sh now traps TERM/INT: runs its cleanup (progress tickers, working
+files, pidfile), logs the stop, exits 143/130. Verified against a real
+3000-file run: pidfile present during the run, gone after TERM.
+
+### Start guard hardened
+
+`ensure_no_running_hasher` now also ps-scans for orphans after the pidfile
+check. Starting a new run while untracked hasher processes exist warns,
+lists them, recommends 'k', and requires explicit confirmation — so the
+three-concurrent-runs situation can no longer arise silently.
+
+Also carries forward v1.3.14 (review N-count fix + review colour
+migration) for deployments that skipped it.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
