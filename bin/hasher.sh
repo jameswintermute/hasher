@@ -8,6 +8,37 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 LC_ALL=C
 
+# ─── Process-group isolation (v1.3.16, peer-review finding #4) ───
+# The parallel path fans work out via `xargs -0 -P N` and `bash -c` workers,
+# which then invoke the hash command (sha256sum/shasum). None of those
+# descendants have "bin/hasher.sh" in their argv, so the launcher's ps-based
+# process finder cannot see them. TERM to the parent leaves xargs, workers
+# and hash processes orphaned (reparented to init). Fix: put hasher.sh in
+# its own SESSION (which is also a new process group). The TERM/INT traps
+# and the launcher can then signal the whole group with `kill -TERM -PGID`,
+# and every descendant goes down together.
+#
+# Detection: getsid $$ == $$ means we ARE the session leader. Otherwise we
+# re-exec under setsid. HASHER_SESSION_LEADER=1 is a paranoia guard so a
+# broken setsid can't loop.
+if [[ -z "${HASHER_SESSION_LEADER:-}" ]]; then
+  _sid="$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ' || echo '')"
+  if [[ -n "$_sid" && "$_sid" != "$$" ]]; then
+    if command -v setsid >/dev/null 2>&1; then
+      export HASHER_SESSION_LEADER=1
+      # `setsid` starts a new session; the new pgid == new pid. Use exec so
+      # this shell is REPLACED, not sitting above the real process.
+      # Redirect stdin from /dev/null: hasher.sh never reads stdin, and
+      # inheriting an unusual stdin (e.g. a closed pipe from a caller) can
+      # deadlock the child under some kernels/shells.
+      exec setsid "$0" "$@" </dev/null
+    fi
+    # No setsid available (rare on modern DSM/Linux/macOS): continue, and
+    # rely on the trap-based fallback to reap descendants explicitly.
+  fi
+  export HASHER_SESSION_LEADER=1
+fi
+
 # ───────────────────────── Root dir ────────────────────────
 # FIX: all dirs were relative ("hashes", "logs", "zero-length") which broke
 # direct CLI calls from outside the repo root. Now all paths are anchored
@@ -29,8 +60,12 @@ HASHER_PIDFILE="$VAR_DIR/hasher.pid"
 
 # DATE_TAG is kept for human-facing daily reports
 DATE_TAG="$(date +'%Y-%m-%d')"
-# CSV_TAG adds time (SMB-safe; no colon) to avoid same-day collisions
-CSV_TAG="$(date +'%F-%H%M')"
+# v1.3.16 (peer-review finding #3): CSV_TAG uses SECONDS + a short run ID so
+# concurrent or same-minute starts get distinct output files. Previously the
+# minute-precision tag caused a second run in the same minute to APPEND to the
+# first CSV (write_csv_header returned early when the file existed), producing
+# a single merged manifest — reviewer reproduced this. SMB-safe: no colon.
+CSV_TAG="$(date +'%F-%H%M%S')-$$"
 OUTPUT="$HASHES_DIR/hasher-$CSV_TAG.csv"
 
 ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
@@ -322,13 +357,13 @@ load_config() {
 # ───────────────────────── Arg Parsing ─────────────────────
 usage() {
   cat <<EOF
-Usage: $0 [--pathfile FILE] [--algo sha256|sha1|sha512|md5|blake2] [--output CSV]
+Usage: $0 [--pathfile FILE] [--algo sha256] [--output CSV]
           [--nohup] [--level info|warn|error] [--interval SECONDS]
           [--exclude PATTERN ...] [--zero-length-only] [--config FILE] [--help]
 
 Options:
   --pathfile FILE    File containing one path (dir or file) per line. Required unless paths are piped.
-  --algo ALG         Hash algorithm (default: sha256).
+  --algo ALG         Hash algorithm (default: sha256; the only supported value in this release).
   --output CSV       Output CSV path (default: $OUTPUT).
   --nohup            Re-exec under nohup (background) with logs to $BACKGROUND_LOG.
   --level LEVEL      Log level threshold (info|warn|error). Default: info.
@@ -350,6 +385,7 @@ while [[ $# -gt 0 ]]; do
     --pathfile) PATHFILE="${2:-}"; shift ;;
     --algo)     ALGO="${2:-}"; shift ;;
     --output)   OUTPUT="${2:-}"; shift ;;
+    --append)   APPEND_MANIFEST=1 ;;   # v1.3.16: explicit opt-in to extend an existing CSV
     --nohup)    RUN_IN_BACKGROUND=true ;;
     --level)    LOG_LEVEL="${2:-}"; shift ;;
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
@@ -386,6 +422,30 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
 fi
 
 # ───────────────────────── Hash Tool Map ───────────────────
+# v1.3.16 (peer-review finding #2): The plan format used by find-duplicates.sh,
+# review-duplicates.sh, auto-dedup.sh and delete-duplicates.sh only recognises
+# a 64-hex SHA-256 hash. An MD5 plan (32 hex), SHA-1 (40), SHA-512/BLAKE2 (128)
+# would have their hash silently absorbed into the file path during apply, so
+# nothing gets re-verified or acted on. Rather than plumb the algorithm through
+# every downstream tool (a larger cross-cutting change), be honest about what
+# the tool actually supports: restrict hashing to SHA-256 and reject other
+# algorithms up front so no misleading CSVs or unworkable plans are produced.
+# The `--algo` option is retained for backwards-compatible invocations that
+# pass `--algo sha256` explicitly, and to give a clear error for anything else.
+case "$ALGO" in
+  sha256) : ;;
+  sha1|sha512|md5|blake2)
+    error "algo '$ALGO' is not supported for dedup workflows in this release."
+    error "Downstream tools (find-duplicates, review-duplicates, delete-duplicates)"
+    error "only understand SHA-256. Re-run with --algo sha256 (the default)."
+    exit 2
+    ;;
+  *)
+    error "Unknown algo '$ALGO'. Supported: sha256."
+    exit 2
+    ;;
+esac
+
 # Use platform-aware resolver (supports both GNU and BSD/macOS toolchains)
 hash_cmd_str="$(_resolve_hash_cmd "$ALGO")"
 if [[ -z "$hash_cmd_str" ]]; then
@@ -493,10 +553,20 @@ build_file_list() {
     [[ -n "$_p" ]] && patterns+=("$_p")
   done
   if (( ${#patterns[@]} > 0 )); then
+    # v1.3.16 (peer-review finding #1): CRITICAL fix.
+    # The previous body used `printf "%s", $0` — omitting the NUL delimiter that
+    # ORS='\0' was supposed to add — so the filtered output had zero NUL records.
+    # The old post-filter guard (see "Exclusion filter removed all…" warning
+    # below) then RESTORED the unfiltered list, silently re-including everything
+    # that had just been filtered out. Result: default excludes (@eaDir,
+    # #recycle, .part, .bak, /Cache, /.Trash, @tmp, @SynoResource, …) and any
+    # user-supplied excludes were no-ops for every parallel-safe run since the
+    # NUL-delimited pipeline landed. Use `print $0` under ORS='\0' so awk itself
+    # emits the record terminator.
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
       BEGIN{ for(i=1;i<=N;i++){ pat[i]=ARGV[i]; ARGV[i]="" } }
       { keep=1; for(i=1;i<=N;i++){ if (pat[i] != "" && index($0, pat[i])>0) { keep=0; break } }
-        if(keep) printf "%s", $0 }
+        if(keep) print $0 }
     ' "${patterns[@]}" "$FILES_LIST".tmp > "$FILES_LIST"
   else
     mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
@@ -504,10 +574,14 @@ build_file_list() {
 
   local post_count=0
   [[ -s "$FILES_LIST" ]] && post_count=$(tr -cd '\0' < "$FILES_LIST" | wc -c | tr -d ' ')
+  # v1.3.16 (peer-review finding #1): removed the "restore unfiltered list"
+  # fallback. If exclusions legitimately remove every candidate, the honest
+  # outcome is "no files remain after exclusions" — NOT to silently re-include
+  # everything the user asked to skip. If pre_count > 0 and post_count == 0
+  # after filtering, log it plainly; hasher.sh's main loop already handles the
+  # "no files to hash" case with a clean successful exit.
   if (( pre_count > 0 && post_count == 0 && ${#patterns[@]} > 0 )); then
-    warn "Exclusion filter removed all $pre_count candidates; using unfiltered list this run. Review [exclusions] in hasher.conf."
-    mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
-    post_count="$pre_count"
+    info "All $pre_count candidate(s) matched exclusion patterns; nothing to hash this run."
   fi
 
   rm -f -- "$FILES_LIST".tmp 2>/dev/null || true
@@ -520,6 +594,19 @@ write_csv_header() {
   local f="$OUTPUT"
   local dir; dir="$(dirname "$f")"
   mkdir -p "$dir"
+  # v1.3.16 (peer-review finding #3): refuse to append to an existing manifest.
+  # Previously an existing non-empty CSV was silently kept and rows were
+  # appended — two runs in the same minute merged into one file. Now: if the
+  # output exists and is non-empty, fail loudly. --append is provided as an
+  # explicit opt-in for the (rare) case of resuming or extending a manifest.
+  if [[ -e "$f" && -s "$f" && "${APPEND_MANIFEST:-0}" != "1" ]]; then
+    error "Output CSV already exists and is non-empty: $f"
+    error "Refusing to append silently (would merge runs). Options:"
+    error "  - Wait a second and re-run (default name includes seconds + PID since v1.3.16)"
+    error "  - Pass --output PATH to name a fresh file"
+    error "  - Pass --append to deliberately extend the existing manifest"
+    exit 2
+  fi
   if [[ ! -e "$f" || ! -s "$f" ]]; then
     printf 'path,size_bytes,mtime_epoch,algo,hash\n' > "$f"
     return
@@ -643,14 +730,39 @@ cleanup() {
     _pf="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
     [ "$_pf" = "$$" ] && rm -f -- "$HASHER_PIDFILE" 2>/dev/null || true
   fi
+  # v1.3.16 (finding #3): release our lockdir if we still hold it.
+  if [ -n "${HASHER_LOCKDIR:-}" ] && [ -d "$HASHER_LOCKDIR" ]; then
+    _lp="$(cat "$HASHER_LOCKDIR/pid" 2>/dev/null || true)"
+    [ "$_lp" = "$$" ] && rm -rf -- "$HASHER_LOCKDIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
-# v1.3.15: an UNTRAPPED signal makes bash exit WITHOUT running the EXIT trap,
-# so a TERM from the launcher's new "Stop hashing" action would leave the
-# pidfile and working files behind. Trap TERM/INT explicitly: run cleanup,
-# note the stop in the log, and exit with the conventional 128+signal code.
-trap 'cleanup; echo "[INFO] hashing stopped by signal (TERM)" >&2; exit 143' TERM
-trap 'cleanup; echo "[INFO] hashing stopped by signal (INT)"  >&2; exit 130' INT
+# v1.3.16 (peer-review finding #4): TERM/INT traps now signal the entire
+# process group so xargs, worker shells and hash commands all go down with
+# the parent. `kill -TERM -$$` targets pgid == our pid (we became the session
+# leader at startup via setsid). Wait briefly for descendants to exit before
+# cleanup so we don't remove files the workers are still writing to.
+_stop_group() {
+  # First, TERM the group (best effort). We reset the trap so re-entering
+  # this handler from our own signal doesn't loop.
+  trap - TERM INT
+  kill -TERM -$$ 2>/dev/null || true
+  # Give descendants up to ~3s to exit cleanly
+  local _i=0
+  while [[ $_i -lt 30 ]]; do
+    # any descendants still alive?
+    if ! pgrep -g $$ >/dev/null 2>&1; then break; fi
+    # count non-self processes in our group
+    local _n
+    _n="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+    [[ "${_n:-0}" -eq 0 ]] && break
+    sleep 0.1; _i=$((_i+1))
+  done
+  # Anything still up gets KILLed
+  kill -KILL -$$ 2>/dev/null || true
+}
+trap '_stop_group; cleanup; echo "[INFO] hashing stopped by signal (TERM)" >&2; exit 143' TERM
+trap '_stop_group; cleanup; echo "[INFO] hashing stopped by signal (INT)"  >&2; exit 130' INT
 
 # ───────────────────────── Main Hashing ────────────────────
 TOTAL=0
@@ -658,8 +770,33 @@ DONE=0
 FAIL=0
 
 main() {
-  # v1.3.3: claim the pidfile for this process. mkdir -p in case var/ is fresh.
+  # v1.3.16 (peer-review finding #3): acquire a concurrency lock BEFORE any
+  # work, using an atomic mkdir on the lockdir. Previously the pidfile was
+  # just overwritten with `printf > pidfile`, which is neither atomic nor a
+  # lock — direct-CLI or cron invocations bypassed the launcher's guard and
+  # could overlap freely. mkdir is atomic on every filesystem we care about
+  # (ext4/btrfs on DSM, APFS on macOS) and needs no `flock` binary.
+  # If the lockdir already exists: check whether its recorded PID is alive.
+  # If alive → refuse to start. If stale (crashed run) → adopt the lock.
   mkdir -p "$VAR_DIR" 2>/dev/null || true
+  local _lockdir="$VAR_DIR/hasher.lock"
+  if ! mkdir "$_lockdir" 2>/dev/null; then
+    local _lockpid=""
+    [[ -f "$_lockdir/pid" ]] && _lockpid="$(cat "$_lockdir/pid" 2>/dev/null || true)"
+    if [[ -n "$_lockpid" ]] && kill -0 "$_lockpid" 2>/dev/null; then
+      error "Another hasher run is already active (PID $_lockpid)."
+      error "Use the launcher's 'k) Stop hashing' to terminate it first, or"
+      error "wait for it to finish. Lock: $_lockdir"
+      exit 2
+    fi
+    warn "Stale lock at $_lockdir (PID ${_lockpid:-unknown} not running) — adopting."
+    rm -rf -- "$_lockdir" 2>/dev/null || true
+    mkdir "$_lockdir" 2>/dev/null || { error "Failed to acquire lock"; exit 2; }
+  fi
+  printf '%s\n' "$$" > "$_lockdir/pid" 2>/dev/null || true
+  HASHER_LOCKDIR="$_lockdir"   # picked up by cleanup()
+
+  # v1.3.3: also claim the pidfile (kept for launcher's is_hasher_running).
   printf '%s\n' "$$" > "$HASHER_PIDFILE" 2>/dev/null || true
   info "Run-ID: $RUN_ID"
   [[ -n "$CONFIG_FILE" ]] && info "Config file: $CONFIG_FILE"
