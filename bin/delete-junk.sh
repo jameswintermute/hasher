@@ -56,8 +56,9 @@ done
 info "Using junk list: $JUNK_FILE"
 info "Scanning paths from: $PATHS_FILE"
 
-# Build candidates
-: > "$LISTFILE"
+# Build candidates (NUL-delimited internally)
+LISTFILE_NUL="$LISTFILE.raw.nul"
+: > "$LISTFILE_NUL"
 while IFS= read -r root || [ -n "$root" ]; do
   case "$root" in \#*|"") continue ;; esac
   [ -d "$root" ] || continue
@@ -73,7 +74,35 @@ while IFS= read -r root || [ -n "$root" ]; do
         ;;
     esac
   done < "$JUNK_FILE"
-done < "$PATHS_FILE" | tr '\0' '\n' | sort -u > "$LISTFILE"
+done < "$PATHS_FILE" >> "$LISTFILE_NUL"
+
+# v1.3.18 (peer-review finding #1): apply the same TAB/LF/CR detect-and-skip
+# policy that hasher.sh uses. Newline-bearing paths would corrupt the tabular
+# LISTFILE ("size<TAB>path\n") and could cause the delete loop to remove a
+# COINCIDENTAL file whose relative path happens to match a fragment. Skipped
+# entries are recorded so the operator can rename and retry.
+SKIP_JUNK="${LISTFILE%.txt}-skipped-delimiter.log"
+: > "$SKIP_JUNK"
+SAFE_NUL="$LISTFILE.safe.nul"
+awk -v RS='\0' -v ORS='\0' -v skip="$SKIP_JUNK" '
+  /[\t\n\r]/ {
+    s = $0; gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
+    printf "%s\n", s >> skip
+    next
+  }
+  { print $0 }
+' "$LISTFILE_NUL" > "$SAFE_NUL"
+skipped_junk=$(wc -l < "$SKIP_JUNK" 2>/dev/null | tr -d ' ')
+if [ "${skipped_junk:-0}" -gt 0 ]; then
+  warn "Skipped $skipped_junk junk candidate(s) whose paths contain TAB/LF/CR."
+  warn "  See: $SKIP_JUNK"
+  warn "  Rename those files and re-run to include them."
+else
+  rm -f -- "$SKIP_JUNK" 2>/dev/null || true
+fi
+# Now safe to convert to newline text (sorted, uniq'd)
+tr '\0' '\n' < "$SAFE_NUL" | sort -u > "$LISTFILE"
+rm -f -- "$LISTFILE_NUL" "$SAFE_NUL" 2>/dev/null || true
 
 count=$(wc -l < "$LISTFILE" | tr -d ' ')
 [ "$count" -eq 0 ] && { info "No junk files found."; exit 0; }
