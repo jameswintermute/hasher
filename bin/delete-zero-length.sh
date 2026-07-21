@@ -140,6 +140,16 @@ elif [ "$MODE" = "csv" ]; then
     ' "$INPUT" > "$TMP_LIST"
 else
   info "Scanning filesystem for zero-length files (this may take a while)…"
+  # v1.3.18 (peer-review finding #1): use -print0 (NUL-delimited) during
+  # discovery and filter out any candidate whose path contains TAB/LF/CR
+  # before converting to the newline-delimited TMP_LIST. Previously -print
+  # emitted raw newlines; a path such as $'evil\nother.txt' would be split
+  # into two "candidates" and the second half might collide with an
+  # unrelated real file.
+  SCAN_NUL="$TMP_LIST.nul"
+  : > "$SCAN_NUL"
+  SKIP_ZL="${TMP_LIST%.txt}-skipped-delimiter.log"
+  : > "$SKIP_ZL"
   # Scope: if a paths file exists, use it; otherwise scan /volume1 (Synology default root) safely
   SCOPE_FILE=""
   for f in "$LOCAL_DIR/paths.txt" "$DEFAULT_DIR/paths.example.txt" "$DEFAULT_DIR/paths.txt"; do
@@ -149,7 +159,7 @@ else
     while IFS= read -r pth; do
       [ -z "$pth" ] && continue
       [ "${pth#\#}" != "$pth" ] && continue
-      find "$pth" -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
+      find "$pth" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
     done < "$SCOPE_FILE"
   else
     # FIX (v1.1.9): host-aware fallback. /volume1 is Synology-only; on
@@ -161,8 +171,27 @@ else
       SCAN_ROOT="/volume1"   # legacy default if lib missing
     fi
     warn "No paths file found; scanning $SCAN_ROOT (override with --input or local/paths.txt)"
-    find "$SCAN_ROOT" -type f -size 0 -print >> "$TMP_LIST" 2>/dev/null || true
+    find "$SCAN_ROOT" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
   fi
+  # Filter TAB/LF/CR paths (record for the operator), then convert to text
+  SAFE_NUL="$TMP_LIST.safe.nul"
+  awk -v RS='\0' -v ORS='\0' -v skip="$SKIP_ZL" '
+    /[\t\n\r]/ {
+      s = $0; gsub(/\t/, "<TAB>", s); gsub(/\n/, "<LF>", s); gsub(/\r/, "<CR>", s)
+      printf "%s\n", s >> skip
+      next
+    }
+    { print $0 }
+  ' "$SCAN_NUL" > "$SAFE_NUL"
+  skipped_zl=$(wc -l < "$SKIP_ZL" 2>/dev/null | tr -d ' ')
+  if [ "${skipped_zl:-0}" -gt 0 ]; then
+    warn "Skipped $skipped_zl zero-length candidate(s) whose paths contain TAB/LF/CR."
+    warn "  See: $SKIP_ZL"
+  else
+    rm -f -- "$SKIP_ZL" 2>/dev/null || true
+  fi
+  tr '\0' '\n' < "$SAFE_NUL" >> "$TMP_LIST"
+  rm -f -- "$SCAN_NUL" "$SAFE_NUL" 2>/dev/null || true
 fi
 
 COUNT="$(wc -l < "$TMP_LIST" | tr -d ' ')"

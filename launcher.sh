@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.17 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.18 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -424,7 +424,9 @@ run_hasher_nohup() {
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"") continue ;; esac
-      pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
+      # v1.3.18 (peer-review finding #2): pass patterns through unchanged;
+      # hasher.sh implements case-insensitive glob semantics itself.
+      pat="$(printf "%s" "$line" | sed 's/^[[:space:]]\{1,\}//; s/[[:space:]]\{1,\}$//')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
   fi
@@ -527,7 +529,9 @@ run_hasher_interactive() {
     # shellcheck disable=SC2162
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"") continue ;; esac
-      pat="$(printf "%s" "$line" | sed 's/\*//g; s://*:/:g; s:/*$::')"
+      # v1.3.18 (peer-review finding #2): pass patterns through unchanged;
+      # hasher.sh implements case-insensitive glob semantics itself.
+      pat="$(printf "%s" "$line" | sed 's/^[[:space:]]\{1,\}//; s/[[:space:]]\{1,\}$//')"
       [ -n "$pat" ] && set -- "$@" --exclude "$pat"
     done < "$efile"
   fi

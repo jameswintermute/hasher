@@ -109,36 +109,60 @@ if echo "TEST" >/dev/null 2>&1; then
 fi
 
 echo
-echo "Hashing tools (preferred → fallback to OpenSSL shims):"
+# v1.3.18 (peer-review finding #4): hasher.sh explicitly rejects non-SHA-256
+# algorithms since v1.3.16, so requiring sha1sum/sha512sum/md5sum was
+# misleading — those tools are never invoked. Only sha256sum (or shasum
+# with -a 256 fallback, or an OpenSSL shim) is actually needed for dedupe.
+echo "Hashing tool (SHA-256 is the only supported algorithm since v1.3.16):"
 HAVE_OPENSSL=0
 have openssl && HAVE_OPENSSL=1
 
 need_shim=0
-for algo in sha256 sha1 sha512 md5; do
-  tool="${algo}sum"
-  if have "$tool"; then
-    ok "$tool"
-  else
-    if [ "$HAVE_OPENSSL" -eq 1 ]; then
-      warn "$tool (missing) → will provide shim via OpenSSL"
-      need_shim=1
-    else
-      err "$tool (missing) and no OpenSSL available"
-      missing_req=1
-    fi
-  fi
-done
-
-# b2sum (optional)
-if have b2sum; then
-  ok "b2sum"
+if have sha256sum; then
+  ok "sha256sum"
+elif have shasum; then
+  ok "shasum (will use 'shasum -a 256')"
+elif [ "$HAVE_OPENSSL" -eq 1 ]; then
+  warn "sha256sum/shasum missing → will provide shim via OpenSSL"
+  need_shim=1
 else
-  warn "b2sum (optional, for BLAKE2) not found"
+  err "No SHA-256 implementation available (need sha256sum, shasum, or openssl)"
+  missing_req=1
 fi
+
+# b2sum, sha1sum, sha512sum, md5sum are NOT required or used.
+# Report their presence informationally only, no warn/err.
+for opt in b2sum sha1sum sha512sum md5sum; do
+  have "$opt" && ok "$opt (present; not used by dedupe)" || : # silent when absent
+done
 
 # niceness tools
 have nice   && ok "nice"   || warn "nice (missing)"
 have ionice && ok "ionice" || warn "ionice (optional; not always present on NAS)"
+
+echo
+# v1.3.18 (peer-review finding #4): parallel path and stop-hashing depend on
+# these; check them explicitly instead of hoping they're present.
+echo "Core runtime tools (required by the parallel path and 'k) Stop hashing'):"
+for t in xargs comm awk grep sed tr sort; do
+  if have "$t"; then ok "$t"; else err "$t (missing) — required"; missing_req=1; fi
+done
+
+echo
+echo "Process-control capabilities (used by 'k) Stop hashing' and TERM handling):"
+if have pgrep; then ok "pgrep"; else warn "pgrep (missing) — descendant-tree walk in the no-setsid fallback will not work"; fi
+if have setsid; then
+  ok "setsid — hasher runs in its own session (clean group-kill available)"
+else
+  warn "setsid (missing) — no session isolation; hasher falls back to descendant-tree walk on TERM. Reap of xargs workers is best-effort."
+fi
+# ps -o pgid= support (required for launcher's PGID checks)
+if ps -o pgid= -p $$ >/dev/null 2>&1; then
+  ok "ps -o pgid= (PGID query supported)"
+else
+  err "ps -o pgid= not supported — launcher cannot safely group-signal hashers"
+  missing_req=1
+fi
 
 # Try to install shims if requested
 if [ "$FIX" -eq 1 ] && [ "$need_shim" -eq 1 ] && [ "$HAVE_OPENSSL" -eq 1 ]; then

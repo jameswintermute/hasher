@@ -560,20 +560,73 @@ build_file_list() {
     had_input=true
   fi
 
-  # If stdin is a pipe, accept paths (NUL- or newline-delimited)
+  # If stdin is a pipe, accept paths (NUL- or newline-delimited).
+  #
+  # v1.3.18 (peer-review finding #5):
+  #   a) Only set had_input=true if stdin actually delivered at least one
+  #      record. Previously any non-TTY stdin — including `hasher.sh </dev/null`
+  #      or a pipe that turned out to be empty — flipped had_input to true,
+  #      producing a successful "Hashed 0/0 files" run with a header-only CSV.
+  #      Empty input should be a clean error, not a fake success.
+  #   b) Apply the SAME expansion to piped paths that the --pathfile branch
+  #      applies. Previously a piped directory was written verbatim to the
+  #      files list; the hash worker then failed to hash the directory and
+  #      the run "succeeded" with a failure count. Piped directories are
+  #      now recursively walked with find; piped files are added directly;
+  #      piped non-existent paths warn but don't abort.
   if [ ! -t 0 ]; then
-    had_input=true
     local tmp_in="$FILES_LIST.stdin.tmp"
     cat > "$tmp_in"
-    if IFS= read -r -d '' _peek < "$tmp_in"; then
-      cat "$tmp_in" >> "$FILES_LIST".tmp
+    if [[ ! -s "$tmp_in" ]]; then
+      rm -f -- "$tmp_in" 2>/dev/null || true
     else
-      while IFS= read -r p || [[ -n "$p" ]]; do
-        [[ -z "$p" ]] && continue
-        printf '%s\0' "$p"
-      done < "$tmp_in" >> "$FILES_LIST".tmp
+      had_input=true
+      # Decide NUL- vs newline-delimited by peeking for a NUL in the first record
+      local _delim='\n'
+      if IFS= read -r -d '' _peek < "$tmp_in" 2>/dev/null && [[ -n "$_peek" ]]; then
+        _delim='\0'
+      fi
+      # Emit each incoming path through the same expansion policy as --pathfile
+      local stdin_seen=0 stdin_valid=0
+      if [[ "$_delim" = '\0' ]]; then
+        while IFS= read -r -d '' path || [[ -n "$path" ]]; do
+          [[ -z "$path" ]] && continue
+          stdin_seen=$((stdin_seen + 1))
+          if [[ -d "$path" ]]; then
+            local _fs=0
+            find "$path" -type f -print0 2>/dev/null || _fs=$?
+            [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
+              || warn "find failed on piped path '$path' (exit $_fs) — skipping"
+          elif [[ -f "$path" ]]; then
+            printf '%s\0' "$path"
+            stdin_valid=$((stdin_valid + 1))
+          else
+            warn "Piped path does not exist: $path"
+          fi
+        done < "$tmp_in" >> "$FILES_LIST".tmp
+      else
+        while IFS= read -r path || [[ -n "$path" ]]; do
+          [[ -z "$path" ]] && continue
+          stdin_seen=$((stdin_seen + 1))
+          if [[ -d "$path" ]]; then
+            local _fs=0
+            find "$path" -type f -print0 2>/dev/null || _fs=$?
+            [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
+              || warn "find failed on piped path '$path' (exit $_fs) — skipping"
+          elif [[ -f "$path" ]]; then
+            printf '%s\0' "$path"
+            stdin_valid=$((stdin_valid + 1))
+          else
+            warn "Piped path does not exist: $path"
+          fi
+        done < "$tmp_in" >> "$FILES_LIST".tmp
+      fi
+      rm -f -- "$tmp_in" 2>/dev/null || true
+      if [[ "$stdin_seen" -gt 0 && "$stdin_valid" -eq 0 ]]; then
+        error "All $stdin_seen piped path(s) are missing or unreadable."
+        exit 3
+      fi
     fi
-    rm -f -- "$tmp_in" 2>/dev/null || true
   fi
 
   if ! $had_input; then
@@ -642,20 +695,75 @@ build_file_list() {
     [[ -n "$_p" ]] && patterns+=("$_p")
   done
   if (( ${#patterns[@]} > 0 )); then
-    # v1.3.16 (peer-review finding #1): CRITICAL fix.
-    # The previous body used `printf "%s", $0` — omitting the NUL delimiter that
-    # ORS='\0' was supposed to add — so the filtered output had zero NUL records.
-    # The old post-filter guard (see "Exclusion filter removed all…" warning
-    # below) then RESTORED the unfiltered list, silently re-including everything
-    # that had just been filtered out. Result: default excludes (@eaDir,
-    # #recycle, .part, .bak, /Cache, /.Trash, @tmp, @SynoResource, …) and any
-    # user-supplied excludes were no-ops for every parallel-safe run since the
-    # NUL-delimited pipeline landed. Use `print $0` under ORS='\0' so awk itself
-    # emits the record terminator.
+    # v1.3.18 (peer-review finding #2): implement the DOCUMENTED semantics
+    # for excludes.txt patterns — case-insensitive globs — instead of the
+    # previous case-sensitive literal substring match. The launcher used to
+    # strip `*` before passing patterns, which meant `*.part` in excludes.txt
+    # excluded `.part` under the launcher but NOT under direct/cron
+    # invocation (which saw the literal `*.part` that never matches).
+    # Ownership now lives in one place (hasher.sh); launcher no longer
+    # mangles patterns.
+    #
+    # Rules (documented so behaviour is predictable):
+    #   * `*` matches any run of characters (including empty)
+    #   * `?` matches exactly one character
+    #   * `.` is a literal dot
+    #   * matching is case-insensitive
+    #   * a pattern containing `/` matches against the FULL path;
+    #     otherwise it matches against the basename (last path component)
+    #     — this is the natural "extension/name" convention users expect
+    #   * a pattern with no glob metacharacters still works as a literal
+    #     substring match against the basename (backward compat with the
+    #     old behaviour for user-supplied bare words like "#recycle")
+    #
+    # v1.3.16 (finding #1): NUL delimiter preserved by using `print` under
+    # ORS='\0'. No fallback that restores excluded items.
     awk -v RS='\0' -v ORS='\0' -v N="${#patterns[@]}" '
-      BEGIN{ for(i=1;i<=N;i++){ pat[i]=ARGV[i]; ARGV[i]="" } }
-      { keep=1; for(i=1;i<=N;i++){ if (pat[i] != "" && index($0, pat[i])>0) { keep=0; break } }
-        if(keep) print $0 }
+      function _glob_to_regex(g,   r, c, i, out) {
+        # Convert a glob to an ERE, escaping regex metacharacters and
+        # translating * and ? to their regex equivalents.
+        out = ""
+        for (i = 1; i <= length(g); i++) {
+          c = substr(g, i, 1)
+          if      (c == "*") out = out ".*"
+          else if (c == "?") out = out "."
+          else if (index(".+^$()[]{}|\\", c) > 0) out = out "\\" c
+          else out = out c
+        }
+        return out
+      }
+      function _basename(p,   n, a) {
+        n = split(p, a, "/")
+        return a[n]
+      }
+      function _matches(path, pattern,   is_path_glob, subject, regex) {
+        # If pattern has no glob metacharacters at all, match it as a
+        # case-insensitive literal substring against the FULL PATH.
+        # This preserves the pre-v1.3.18 behaviour of patterns like
+        # "#recycle" or "@eaDir" — they matched a path component
+        # anywhere in the path, not just the basename.
+        if (pattern !~ /[*?]/) {
+          return index(tolower(path), tolower(pattern)) > 0
+        }
+        # Glob patterns:
+        #   - if pattern contains "/", match the full path
+        #   - otherwise, match the basename only
+        # Both anchored with ^ and $ (glob semantics: * covers "any run").
+        is_path_glob = (index(pattern, "/") > 0)
+        subject = is_path_glob ? path : _basename(path)
+        regex   = "^" _glob_to_regex(tolower(pattern)) "$"
+        return (tolower(subject) ~ regex)
+      }
+      BEGIN {
+        for (i = 1; i <= N; i++) { pat[i] = ARGV[i]; ARGV[i] = "" }
+      }
+      {
+        keep = 1
+        for (i = 1; i <= N; i++) {
+          if (pat[i] != "" && _matches($0, pat[i])) { keep = 0; break }
+        }
+        if (keep) print $0
+      }
     ' "${patterns[@]}" "$FILES_LIST".tmp > "$FILES_LIST"
   else
     mv -f -- "$FILES_LIST".tmp "$FILES_LIST"
@@ -1057,20 +1165,34 @@ main() {
     # rebuilds the hash_cmd array from HASH_CMD_STR and calls the worker.
     # -n 1 keeps the per-file granularity (simplest correct mapping); the
     # fork cost of bash -c is offset by the parallelism for large corpora.
-    xargs -0 -P "$jobs" -n 1 bash -c '
-      read -ra hash_cmd <<< "$HASH_CMD_STR"
-      _hash_worker "$1"
-    ' _ < "$FILES_LIST" \
-    | while IFS= read -r row; do
-        case "$row" in
-          $'\037'FAIL$'\037'*)
-            printf '%s\n' "$row" >> "$fail_file"
-            ;;
-          *)
-            printf '%s\n' "$row" >> "$OUTPUT"
-            ;;
-        esac
-      done
+    #
+    # v1.3.18 (peer-review finding #3): run the pipeline as a background
+    # job and `wait` for it. bash defers signal traps while a FOREGROUND
+    # pipeline runs — so `kill $(cat var/hasher.pid)` used to block until
+    # the pipeline finished. When wait is interrupted by a signal, the
+    # trap fires immediately, _stop_group reaps the group (including this
+    # backgrounded pipeline's job), and shutdown is prompt.
+    { xargs -0 -P "$jobs" -n 1 bash -c '
+        read -ra hash_cmd <<< "$HASH_CMD_STR"
+        _hash_worker "$1"
+      ' _ < "$FILES_LIST" \
+      | while IFS= read -r row; do
+          case "$row" in
+            $'\037'FAIL$'\037'*)
+              printf '%s\n' "$row" >> "$fail_file"
+              ;;
+            *)
+              printf '%s\n' "$row" >> "$OUTPUT"
+              ;;
+          esac
+        done
+    } &
+    HASHER_PIPELINE_PID=$!
+    # `wait` on a specific PID is interruptible by signals; the TERM/INT
+    # traps will run BEFORE this wait returns (their handlers exit the
+    # script, so control does not resume here after a signal).
+    wait "$HASHER_PIPELINE_PID" 2>/dev/null || true
+    HASHER_PIPELINE_PID=""
   else
     # Serial path: preserve exact historical behaviour, no bash -c overhead.
     while IFS= read -r -d '' f; do
