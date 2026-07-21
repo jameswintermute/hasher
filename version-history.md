@@ -1773,6 +1773,107 @@ process is visible in ps. Recommends 'k' (Stop hashing) first.
 Self-test: 40 passed, 0 warnings, 0 errors. All 20 files pass syntax.
 
 ---
+## 2026‑07 — v1.3.18
+**Peer-review recheck 1–5: housekeeping newline safety, real glob excludes, prompt TERM, right-sized diagnostics, honest stdin handling** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Five follow-ups after v1.3.17. All confirmed live; all five fixed here.
+
+### #1 (critical) — Housekeeping tools no longer delete unrelated files on newline paths
+
+`delete-junk.sh` and `delete-zero-length.sh --scan` both discovered
+candidates NUL-safely but then flattened them into newline-delimited text
+lists (`tr '\0' '\n'` and `find -print` respectively). A path containing
+an embedded newline split into two "candidates"; the delete loop then
+matched — and removed — an unrelated file whose relative name happened
+to coincide with a fragment. Both tools now apply the same TAB/LF/CR
+detect-and-skip policy the hasher already uses: newline-bearing
+candidates are filtered out and recorded to a `*-skipped-delimiter.log`
+sibling file for operator follow-up. The two safe tools then convert the
+already-filtered NUL stream to the text list they need.
+
+Live verification: created a file whose name literally contained `\n`
+alongside a coincidentally-matching real file — the newline file was
+listed in the skip log, the real file was correctly deleted, the
+unrelated file that a split would have matched was untouched.
+
+### #2 (high) — Cron/CLI/menu exclusions now share ONE implementation
+
+The launcher was silently mangling exclude patterns (`sed 's/\*//g;
+s://*:/:g; s:/*$::'`) before passing them to hasher.sh, and hasher.sh
+was applying case-sensitive literal-substring matching. Result:
+`*.part` in `local/excludes.txt` excluded `.part` under the menu (which
+stripped the `*`) but NOT under direct/cron (which saw the useless
+literal `*.part`). The claimed cron/menu parity in v1.3.17 was not real.
+
+Fix: hasher.sh now implements the DOCUMENTED semantics — case-insensitive
+globs — inside a single awk block that owns exclusion matching. Rules:
+
+- `*` matches any run of characters (including empty)
+- `?` matches exactly one character
+- `.` is a literal dot
+- matching is case-insensitive
+- a pattern containing `/` matches against the FULL path; otherwise
+  the basename only (the natural extension/name convention)
+- a pattern with NO glob metacharacters keeps the pre-v1.3.18 literal
+  substring semantics against the full path — so `#recycle`, `@eaDir`,
+  `.DS_Store` continue to work exactly as before
+
+The launcher stops translating patterns — it now only trims whitespace
+and forwards each line as-is. Live: `*.part` correctly excludes
+`file.part` from both direct-CLI and menu runs; `*.PART` case-insensitively
+does the same; `a?.log` excludes `a1.log` and `ab.log` but not `abc.log`;
+`#recycle` still catches `/tmp/foo/#recycle/x.txt`.
+
+### #3 (high) — `kill $(cat var/hasher.pid)` now stops promptly
+
+Bash defers signal traps while a FOREGROUND pipeline is running. The
+parallel path was `xargs -P N | while read row; ...` — a foreground
+pipeline — so sending TERM to the PID left the trap queued until the
+pipeline exited naturally. The launcher's group-kill worked (v1.3.17),
+but the advertised "just kill the PID" did not.
+
+Fix: run the parallel pipeline as a background job and `wait` on its
+PID. `wait` on a specific PID IS interruptible by signals, so the
+TERM/INT trap fires immediately and `_stop_group` reaps the backgrounded
+pipeline along with everything else in the group. Live verification: 22
+descendants running; `kill -TERM $(cat var/hasher.pid)`; parent gone in
+1 second (was 5+); 0 survivors; lock and pidfile both cleared.
+
+### #4 (medium-high) — Dependency diagnostics match the supported product
+
+`check-deps.sh` was still marking sha1sum/sha512sum/md5sum as REQUIRED
+and setting an error if they were missing — but hasher.sh has rejected
+those algorithms since v1.3.16. Meanwhile, tools we DO now depend on
+weren't tested at all.
+
+- Required: SHA-256 implementation (sha256sum, or shasum, or OpenSSL
+  shim); xargs, comm, awk, grep, sed, tr, sort; `ps -o pgid=` support.
+- Nice-to-have: pgrep (needed for descendant-tree walk in the no-setsid
+  fallback), setsid (needed for clean session isolation and one-signal
+  group kills). Missing pgrep/setsid warn with degraded-mode explanation.
+- Absent sha1sum/sha512sum/md5sum/b2sum: silent (not used).
+
+### #5 (medium-high) — Empty stdin errors; piped directories are walked
+
+Two bugs on the piped-input path:
+
+- `had_input=true` was set the moment stdin wasn't a TTY, before any
+  read. `hasher.sh </dev/null` returned rc=0 with a header-only manifest
+  and "Hashed 0/0 files". Empty input now exits rc=2 with a clear message.
+- Piped paths were forwarded verbatim to the file list. A directory
+  piped in was then handed to sha256sum, which failed on it — the run
+  still "succeeded" with a failure count. Piped paths are now expanded
+  the same way `--pathfile` entries are: directories → `find -type f
+  -print0`, regular files → added directly, non-existent → warn.
+  If EVERY piped path is missing/unreadable, exit rc=3.
+
+Live: empty stdin → rc=2; piped directory → 2 files hashed (both walked
+from the directory); piped file paths still work; piped NUL-delimited
+find output still works; nonexistent piped path → rc=3.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 20 files pass syntax.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
