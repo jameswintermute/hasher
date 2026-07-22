@@ -132,8 +132,8 @@ Stage 1 — Hash
    k) Stop hashing (terminate running hash jobs)
 
 Stage 2 — Identify  (run folders first — see note)
-   3) Find duplicate folders   ← recommended first
-   2) Find duplicate files
+   2) Find duplicate folders   ← recommended first
+   3) Find duplicate files
    f) Find file by hash (lookup)
       Note: dedup FOLDERS before FILES. Removing duplicate files first
       changes folders' contents, so identical folders may no longer match

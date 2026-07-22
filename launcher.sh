@@ -310,8 +310,8 @@ print_menu() {
   echo "   k) Stop hashing (terminate running hash jobs)"
   echo
   echo "${BOLD}Stage 2 — Identify${RST}  ${YEL}(run folders first — see note)${RST}"
-  echo "   3) Find duplicate folders   ${BOLD}← recommended first${RST}"
-  echo "   2) Find duplicate files"
+  echo "   2) Find duplicate folders   ${BOLD}← recommended first${RST}"
+  echo "   3) Find duplicate files"
   echo "   f) Find file by hash (lookup)"
   echo "      Note: dedup FOLDERS before FILES. Removing duplicate files first"
   echo "      changes folders' contents, so identical folders may no longer match"
@@ -1490,8 +1490,8 @@ while :; do
     k|K)     action_stop_hashing ;;
 
     # ── Stage 2: Identify ─────────────────────────────────────────────────
-    2)       action_find_duplicate_files ;;
-    3)       action_find_duplicate_folders ;;
+    2)       action_find_duplicate_folders ;;
+    3)       action_find_duplicate_files ;;
     f|F)     action_find_by_hash ;;
 
     # ── Stage 3: Review & clean ───────────────────────────────────────────
