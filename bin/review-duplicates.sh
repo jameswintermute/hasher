@@ -29,6 +29,16 @@ ORDER="size"  # size|sizesmall|name|newest|oldest|shortpath|longpath
 # stderr (stdout is the interactive UI); only the palette is shared. CDIM
 # (dim) is not in the shared palette, so it is built locally with the same
 # TTY condition.
+#
+# v1.3.19 (defect fix): reinstate is_tty() as a local helper. The v1.3.14
+# migration removed the previous inline is_tty() definition but left two
+# call sites (_progress_bar, _progress_review) referring to it. Result on a
+# real interactive run: "is_tty: command not found" printed once per group
+# indexed — for James's 25,897-group review, ~52,000 spurious error lines
+# flooded stderr. `set -e` isn't active in this script so functionality
+# survived (the `|| return 0` fallback still returned 0), but the noise was
+# indistinguishable from a real failure.
+is_tty() { [ -t 2 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ]; }
 if [ -r "$ROOT_DIR/lib/log.sh" ]; then
   . "$ROOT_DIR/lib/log.sh"
   C1="$CYN"; C2="$YEL"; COK="$GRN"; CERR="$RED"; C0="$RST"
