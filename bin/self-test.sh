@@ -15,9 +15,16 @@
 #   2  usage error
 #
 # Usage:
-#   bin/self-test.sh            # full report
-#   bin/self-test.sh --quiet    # print only warnings/errors + final summary
-#   bin/self-test.sh --strict   # treat warnings as failures (exit 1 on warn)
+#   bin/self-test.sh                       # full report
+#   bin/self-test.sh --quiet               # print only warnings/errors + final summary
+#   bin/self-test.sh --strict              # (alias: --installation-strict) — for deployed NAS
+#                                          # treats ALL warnings as failures, including
+#                                          # "paths.txt not configured"
+#   bin/self-test.sh --installation-strict # same as --strict; the explicit name
+#   bin/self-test.sh --ci-strict           # for CI / fresh checkout — treats warnings
+#                                          # as failures EXCEPT the "paths.txt not
+#                                          # configured" ones (a fresh clone has no
+#                                          # scan paths yet, and that's fine)
 #
 # set -u is safe here; we deliberately avoid -e because this script's whole job
 # is to keep going and collect every problem rather than stop at the first.
@@ -31,10 +38,20 @@ LOCAL_DIR="$ROOT_DIR/local"
 
 QUIET=0
 STRICT=0
+# v1.3.24 (lower-priority cleanup): `--strict` bundles too many concerns.
+# For CI on a fresh checkout, an empty paths.txt is expected (nobody has
+# configured any scan paths yet) — it should be a soft warn, not a hard
+# fail. For deployment validation on an installed NAS, an empty paths.txt
+# means "nothing to hash" and SHOULD fail. Two modes now:
+#   --ci-strict          — all checks except paths.txt content are fatal
+#   --installation-strict — old --strict; also fails on empty paths.txt
+# --strict is an alias for --installation-strict (backward-compat).
+CI_STRICT=0
 for a in "$@"; do
   case "$a" in
-    --quiet|-q)  QUIET=1 ;;
-    --strict)    STRICT=1 ;;
+    --quiet|-q)              QUIET=1 ;;
+    --strict|--installation-strict) STRICT=1 ;;
+    --ci-strict)             CI_STRICT=1 ;;
     -h|--help)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -268,11 +285,14 @@ for cand in "$LOCAL_DIR/paths.txt" "$ROOT_DIR/paths.txt"; do
 done
 if [ -z "$pf" ]; then
   warn "no paths.txt yet — run the launcher (first-run setup) or create local/paths.txt before hashing"
+  PATHS_WARN=1
 elif grep -qvE '^[[:space:]]*(#|$)' "$pf" 2>/dev/null; then
   pass "paths.txt has at least one scan path ($pf)"
 else
   warn "paths.txt exists but has no active scan paths ($pf)"
+  PATHS_WARN=1
 fi
+PATHS_WARN="${PATHS_WARN:-0}"
 
 # ── 8. Launcher colour-variable sanity ─────────────────────────────────────────
 # The launcher runs under `set -eu`, so a colour variable referenced in the menu
@@ -316,8 +336,17 @@ if [ "$ERR_N" -gt 0 ]; then
   exit 1
 fi
 if [ "$STRICT" -eq 1 ] && [ "$WARN_N" -gt 0 ]; then
-  printf '%sResult: FAIL (strict)%s — warnings treated as failures.\n' "$RED" "$RST"
+  printf '%sResult: FAIL (installation-strict)%s — warnings treated as failures.\n' "$RED" "$RST"
   exit 1
+fi
+# v1.3.24: CI-strict fails on warnings EXCEPT the "paths.txt not configured"
+# ones — a fresh checkout in CI has no scan paths yet, and that's expected.
+if [ "$CI_STRICT" -eq 1 ]; then
+  ci_warn=$(( WARN_N - PATHS_WARN ))
+  if [ "$ci_warn" -gt 0 ]; then
+    printf '%sResult: FAIL (ci-strict)%s — %d non-paths warning(s) treated as failures.\n' "$RED" "$RST" "$ci_warn"
+    exit 1
+  fi
 fi
 printf '%sResult: PASS%s\n' "$GRN" "$RST"
 exit 0
