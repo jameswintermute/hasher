@@ -2206,6 +2206,131 @@ no behaviour change there.
 Self-test: 40 passed, 0 warnings.
 
 ---
+## 2026‑07 — v1.3.23
+**Peer-review recheck 1–5 + 5 additional observations: pgrep behavioural probe, orphan-worker lock protection, post-hash re-stat, exit-code fidelity, dedup artefact per-run tagging, job cap, extended manifest validation, dead-code cleanup** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Ten items from the recheck. The recurring theme in this round was
+**class-extensions of earlier fixes that hadn't been fully propagated**.
+v1.3.20 #2 fixed pgrep-vs-ps at the enumerator sites but relied on
+`command -v` — reviewer's #1a: also behaviourally probe. v1.3.19 #5
+fixed the CSV_TAG in `hasher.sh` post_run_reports but not in
+`find-duplicates.sh` or `find-duplicate-folders.sh` — reviewer's #5:
+propagate. Recognising the pattern was as valuable as any single fix.
+
+### #1a (critical) — Behavioural pgrep probe
+
+`command -v pgrep` returns success as long as the binary exists. A broken
+build (missing /proc access, unimplemented -g/-P) would then pass the
+guard and every enumeration would silently return empty. Startup now runs
+`pgrep -g $PGID` and expects at least one PID back; `pgrep -P $$` must
+exit cleanly (0=matches, 1=no matches). If either check fails,
+`HASHER_USE_PGREP=0` and every subsequent enumeration takes the ps
+fallback path. `command -v` gate removed from the enum helpers. Fix
+along the way: `pgrep -P $$` returns exit 1 (no children) which `set -e`
+was treating as a script failure — added `|| _probe_p_rc=$?` guard.
+
+### #1b (high) — Bounded settle wait
+
+Previous shutdown used a fixed `sleep 0.5` before checking for
+surviving descendants. On a busy NAS the kernel may not have finished
+reaping KILL'd processes in 0.5s, and pgrep would count them as
+"survivors" — triggering the "descendants survived" error path and
+refusing to release the lock even after a clean shutdown. Now polls
+every 100ms up to 3 seconds, exits early when the count drops to 0.
+False-positive "survivor" errors go away; genuinely stuck workers
+still block lock release, as intended.
+
+### #2 (critical) — Rich lock ownership, orphan-worker protection
+
+Previous stale-lock adoption checked only whether the recorded PID was
+alive. If the operator `SIGKILL`'d the hasher parent, the workers
+survived under the old PGID but the parent PID was dead; a subsequent
+run saw a "stale" lock, removed it, and started fresh — with the OLD
+workers still reading the disk. Concurrent hashing on the same corpus.
+
+Lock now stores four fields: `pid`, `pgid`, `boot_id` (from
+`/proc/sys/kernel/random/boot_id` on Linux, `sysctl -n kern.boottime`
+on macOS/BSD), and `start_ts`. Adoption logic:
+
+- Recorded PID alive → refuse (as before).
+- Different boot ID → adopt cleanly (all old PIDs and PGIDs are
+  provably dead across reboots).
+- Same boot, dead PID, but PGID has live processes → refuse with
+  explicit instructions: `kill -TERM $orphans`, wait ~5s, then
+  `kill -KILL $orphans`, then `rm -rf $lockdir`.
+- Same boot, dead PID, PGID has no survivors → adopt with warning.
+
+Live-verified: `HASHER_SESSION_LEADER=1 hasher.sh --jobs 3` with
+uncooperative worker shim, `kill -9` the parent → 15 workers alive
+under stale PGID; second run correctly refused adoption (rc=2) with
+the exact "orphaned workers" message.
+
+### #3 (high) — Post-hash re-stat, best-effort record
+
+The worker previously stat'd once before hashing; a file modified
+DURING the hash produced a CSV row with old size + old mtime + new
+content hash. Now re-stats after hashing. If size or mtime drifted,
+the worker emits a `\036CHANGED\036` marker alongside its normal
+row; the main loop routes markers to `$changed_file`, which becomes
+`logs/hash-changed-$CSV_TAG.log` at run end. The CSV row still uses
+pre-hash values (best-effort policy — chosen over retry-and-skip)
+so no rows are dropped, but the operator sees which files were
+unstable and can re-hash them if a consistent snapshot matters.
+Live: 2 files mutated mid-hash by a sha256sum shim → 2 CHANGED
+entries logged with size/mtime diffs, WARN emitted, rc=0.
+
+### #4 (high) — Destructive tools return non-zero on failure
+
+`delete-zero-length.sh`, `apply-folder-plan.sh`, `delete-duplicates.sh`
+each tracked `fail` counters but ended with unconditional `exit 0`.
+Cron/automation saw "success" while files remained. Same class of
+bug fixed in `delete-junk.sh` at v1.3.19 that hadn't propagated.
+All three now `exit 1` if `fail > 0`. "Skipped because content
+changed" is treated as a safety outcome, not a failure — still
+returns 0 with a warning.
+
+### #5 (high) — Dedup artefacts get per-run tags
+
+`find-duplicates.sh` used `date +'%Y-%m-%d-%H%M%S'` and
+`find-duplicate-folders.sh` used `date +%F-%H%M%S` — both
+second-precision, no PID. Two runs within the same second (which
+absolutely happen in scripted workflows or menu chains) overwrote
+each other. Now both append `-$$` per the CSV_TAG convention
+established in v1.3.16 for `hasher.sh`. `find-duplicates.sh`
+canonical file also changed from
+`${date_tag}-duplicate-hashes.txt` (date only) to
+`duplicate-hashes-$timestamp.txt` (full run tag) with a
+`-latest.txt` symlink for stable next-step references. Mirrors
+`hasher.sh` post_run_reports pattern from v1.3.19.
+
+### Observations (5)
+
+- **Obs A**: `--jobs` accepted any positive integer, so `--jobs 99999`
+  or a config typo `jobs = 10000` would spawn thousands of workers.
+  Cap at `min(cores*2, 64)` using `nproc` or `sysctl -n hw.ncpu`
+  for detection, clamped values logged as WARN. Override via
+  `HASHER_MAX_JOBS=N` for deliberate operators.
+- **Obs B**: `find-duplicates.sh` preflight now validates the `algo`
+  column when present — every row must be `sha256` (case-insensitive).
+  Older manifests without an algo column still work (they get the
+  hash-length preflight only).
+- **Obs C**: malformed CSV rows (fewer columns than needed) were
+  silently ignored, so a truncated manifest could quietly drop files.
+  Preflight now COUNTS rejected rows and reports the first offending
+  line number to stderr. Non-fatal by default (proceeds with valid
+  rows); `HASHER_STRICT_ROWS=1` makes them fatal.
+- **Obs D**: `${ZERO_LENGTH_ONLY:+(zero-length-only mode) }` fired
+  whenever the variable was non-empty — including the string
+  "false". Every normal --nohup run displayed "(zero-length-only
+  mode)". Replaced with explicit `$ZERO_LENGTH_ONLY && ...` test.
+- **Obs E**: `_resolve_hash_cmd` had branches for sha1/sha512/md5/blake2
+  that were unreachable since v1.3.16's ALGO check. Removed dead
+  code and left an explicit "unreachable if callers validate first"
+  comment on the default arm.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
