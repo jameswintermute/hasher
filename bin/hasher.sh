@@ -101,16 +101,44 @@ fi
 # release the lock while xargs and workers keep running. Prefer pgrep; fall
 # back to ps; abort if neither works. This runs at every hasher.sh start —
 # tiny probe, no perf impact — so `k) Stop hashing` never silently degrades.
-if ! command -v pgrep >/dev/null 2>&1; then
-  # pgrep absent — check the ps fallback is usable
+# v1.3.23 (peer-review recheck finding #1a): behavioural probe of pgrep.
+# Previously we relied on `command -v pgrep` — but pgrep can EXIST while
+# being non-functional (broken build, missing kernel /proc access, doesn't
+# support -g/-P). In that case _stop_group silently returned empty
+# survivor lists and the shutdown was ineffective. Now we actually TEST
+# whether `pgrep -g $$` returns our own PID and `pgrep -P $$` runs
+# without error. If either fails, HASHER_USE_PGREP is set to 0 and every
+# subsequent enumeration uses the ps fallback.
+HASHER_USE_PGREP=0
+if command -v pgrep >/dev/null 2>&1; then
+  # v1.3.23 (recheck finding #1a): behavioural probe.
+  # Query our OWN process group (PGID), not our PID. pgrep -g takes a
+  # process-group ID; our shell's PGID may or may not match its PID
+  # depending on whether we're a session leader.
+  _probe_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  _probe_g="$(pgrep -g "${_probe_pgid:-$$}" 2>/dev/null || true)"
+  # -P self-test: guard `set -e` — pgrep exits 1 when no children match,
+  # which is not a failure. Use `|| _probe_p_rc=$?` to capture without
+  # tripping the trap.
+  _probe_p_rc=0
+  pgrep -P $$ >/dev/null 2>&1 || _probe_p_rc=$?
+  # Consider pgrep working if -g returns at least one entry (should
+  # include ourselves) and -P exits cleanly (0=matches, 1=no matches).
+  if [[ -n "$_probe_g" ]] && [[ "$_probe_p_rc" -eq 0 || "$_probe_p_rc" -eq 1 ]]; then
+    HASHER_USE_PGREP=1
+  fi
+fi
+if [[ "$HASHER_USE_PGREP" -eq 0 ]]; then
+  # pgrep absent OR non-functional — check the ps fallback is usable
   _probe="$(ps -eo pid=,pgid= 2>/dev/null | head -1)"
   if [ -z "$_probe" ]; then
-    printf '[ERROR] Neither pgrep nor `ps -eo pid=,pgid=` is available on this host.\n' >&2
+    printf '[ERROR] Neither functional pgrep nor `ps -eo pid=,pgid=` is available.\n' >&2
     printf '[ERROR] Hasher cannot safely stop parallel workers without one of them.\n' >&2
     printf '[ERROR] Install procps (pgrep) or a POSIX-ish ps, then re-run.\n' >&2
     exit 3
   fi
 fi
+export HASHER_USE_PGREP
 
 # ───────────────────────── Constants ───────────────────────
 HASHES_DIR="$ROOT_DIR/hashes"
@@ -183,6 +211,10 @@ else
 fi
 
 # Detect sha256sum vs shasum (macOS ships shasum, not sha256sum)
+# v1.3.23 (peer-review recheck observation E): only sha256 is supported
+# since v1.3.16. The sha1/sha512/md5/blake2 branches removed here were
+# unreachable (the ALGO check in main() rejects everything else before
+# calling this) and just added maintenance surface.
 _resolve_hash_cmd() {
   local algo="$1"
   case "$algo" in
@@ -195,41 +227,9 @@ _resolve_hash_cmd() {
         echo ""
       fi
       ;;
-    sha1)
-      if command -v sha1sum >/dev/null 2>&1; then
-        echo "sha1sum"
-      elif command -v shasum >/dev/null 2>&1; then
-        echo "shasum -a 1"
-      else
-        echo ""
-      fi
-      ;;
-    sha512)
-      if command -v sha512sum >/dev/null 2>&1; then
-        echo "sha512sum"
-      elif command -v shasum >/dev/null 2>&1; then
-        echo "shasum -a 512"
-      else
-        echo ""
-      fi
-      ;;
-    md5)
-      if command -v md5sum >/dev/null 2>&1; then
-        echo "md5sum"
-      elif command -v md5 >/dev/null 2>&1; then
-        echo "md5 -r"   # macOS md5 with -r gives same "hash  path" format
-      else
-        echo ""
-      fi
-      ;;
-    blake2)
-      if command -v b2sum >/dev/null 2>&1; then
-        echo "b2sum"
-      else
-        echo ""
-      fi
-      ;;
     *)
+      # Reached only if a caller bypasses the top-level ALGO gate.
+      # Return empty so the check-deps error path fires.
       echo ""
       ;;
   esac
@@ -526,7 +526,14 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
 
   nohup "${args[@]}" >>"$BACKGROUND_LOG" 2>&1 < /dev/null &
   bgpid=$!
-  echo "Hasher started with nohup (PID $bgpid). Output: ${ZERO_LENGTH_ONLY:+(zero-length-only mode) }$OUTPUT"
+  # v1.3.23 (peer-review recheck observation D): the previous form used
+  # ${ZERO_LENGTH_ONLY:+(zero-length-only mode) }, which fires whenever
+  # the variable is non-empty — including the literal string "false".
+  # Every normal run displayed "(zero-length-only mode)". Use an
+  # explicit boolean test instead.
+  local _mode_txt=""
+  $ZERO_LENGTH_ONLY && _mode_txt=" (zero-length-only mode)"
+  echo "Hasher started with nohup (PID $bgpid). Output:${_mode_txt} $OUTPUT"
   exit 0
 fi
 
@@ -1154,25 +1161,34 @@ _stop_group() {
     _kill_descendants_kill $$
   fi
 
-  # v1.3.20 (recheck additional observation): give the kernel a moment to
-  # reap the KILLed processes before we check for survivors. Otherwise on
-  # a busy host the verification below can catch descendants that are
-  # already dying and print a scary "descendants survived" warning even
-  # though the shutdown was clean.
-  sleep 0.5
+  # v1.3.23 (peer-review recheck finding #1b): bounded wait for the kernel
+  # to reap KILLed descendants. Previously a fixed 0.5s sleep, which was
+  # too short on a busy NAS — pgrep still saw dying/zombie processes as
+  # "survivors" and refused to release the lock. Now: poll every 0.1s
+  # for up to 3s, exit early as soon as the count drops to 0.
+  #
+  # A zombie process (pid still visible but exited) is functionally dead
+  # and unable to interfere with a new run; we could try `wait $pid` to
+  # reap tracked children, but many workers are grandchildren (xargs ->
+  # bash -c -> sha256sum) and bash cannot wait for those. Polling with a
+  # bounded wait is the portable answer.
+  local _settle_i=0
+  local _still=0
+  while [[ $_settle_i -lt 30 ]]; do
+    if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+      _still="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
+    else
+      _still="$(_count_descendants $$)"
+    fi
+    [[ "${_still:-0}" -eq 0 ]] && break
+    sleep 0.1; _settle_i=$((_settle_i + 1))
+  done
 
-  # Verify — if descendants are STILL alive, warn the caller so they know
-  # the lock/pidfile removal that follows may be premature.
-  # v1.3.20: also refuse to release the lock in that case — safer to leave
-  # the lock in place than to let a new run start alongside orphans.
-  local _still
-  if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-    _still="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
-  else
-    _still="$(_count_descendants $$)"
-  fi
+  # After the bounded wait, if descendants are STILL alive, warn the
+  # caller and refuse to release the lock — safer to leave the lock in
+  # place than to let a new run start alongside orphans.
   if [[ "${_still:-0}" -gt 0 ]]; then
-    printf '[ERROR] %d descendant(s) survived KILL escalation.\n' "$_still" >&2
+    printf '[ERROR] %d descendant(s) survived KILL escalation (bounded 3s wait).\n' "$_still" >&2
     printf '[ERROR]   Investigate: ps -eo pid,pgid,cmd | awk "\$2==%d"\n' "$$" >&2
     printf '[ERROR]   Lock/pidfile will NOT be released — clean up manually.\n' >&2
     export HASHER_STOP_INCOMPLETE=1
@@ -1196,7 +1212,7 @@ _stop_group() {
 # _enum_children  <ppid>        → direct children of a given PPID.
 _enum_group_pids() {
   local _pgid="$1"
-  if command -v pgrep >/dev/null 2>&1; then
+  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
     pgrep -g "$_pgid" 2>/dev/null | awk -v me="$$" '$1 != me' || true
   else
     # ps fallback. `-eo pid=,pgid=` prints two space-separated columns with
@@ -1207,7 +1223,7 @@ _enum_group_pids() {
 }
 _enum_children() {
   local _ppid="$1"
-  if command -v pgrep >/dev/null 2>&1; then
+  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
     pgrep -P "$_ppid" 2>/dev/null || true
   else
     ps -eo pid=,ppid= 2>/dev/null | awk -v p="$_ppid" '$2 == p {print $1}'
@@ -1256,25 +1272,92 @@ main() {
   # lock — direct-CLI or cron invocations bypassed the launcher's guard and
   # could overlap freely. mkdir is atomic on every filesystem we care about
   # (ext4/btrfs on DSM, APFS on macOS) and needs no `flock` binary.
-  # If the lockdir already exists: check whether its recorded PID is alive.
-  # If alive → refuse to start. If stale (crashed run) → adopt the lock.
+  # v1.3.23 (peer-review recheck finding #2): CRITICAL — the previous
+  # stale-lock adoption checked only whether the recorded PID was alive.
+  # If the operator SIGKILL'd the hasher parent, the workers survived
+  # under the old PGID but the parent PID was dead. A subsequent run saw
+  # a "stale" lock, removed it, and started fresh — with the OLD workers
+  # still reading the disk. Concurrent runs on the same corpus.
+  #
+  # Fix: store richer ownership info in the lock (PID, PGID, start time,
+  # boot ID) and BEFORE adopting a lock whose PID is dead, verify that
+  # the recorded PGID has NO surviving processes. If workers are still
+  # alive under the old PGID, refuse to start — the operator must
+  # explicitly clean up. Boot ID lets us short-circuit adoption cleanly
+  # after a reboot (all old PIDs and PGIDs are guaranteed dead).
   mkdir -p "$VAR_DIR" 2>/dev/null || true
   local _lockdir="$VAR_DIR/hasher.lock"
+  # Boot ID — /proc/sys/kernel/random/boot_id on Linux, `sysctl -n
+  # kern.boottime` on BSD/macOS (both distinct across boots). Falls back
+  # to `uptime` if neither is available.
+  local _boot_id=""
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    _boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    _boot_id="$(sysctl -n kern.boottime 2>/dev/null | tr -d ' ' || echo unknown)"
+  else
+    _boot_id="unknown"
+  fi
+  # Our own PGID (best effort — ps -o pgid= works on every target).
+  local _my_pgid
+  _my_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || echo $$)"
+  local _my_start
+  _my_start="$(date +%s)"
+
   if ! mkdir "$_lockdir" 2>/dev/null; then
-    local _lockpid=""
-    [[ -f "$_lockdir/pid" ]] && _lockpid="$(cat "$_lockdir/pid" 2>/dev/null || true)"
+    # Lock exists — parse ownership
+    local _lockpid="" _lockpgid="" _lockboot="" _locktime=""
+    [[ -f "$_lockdir/pid"      ]] && _lockpid="$(cat "$_lockdir/pid" 2>/dev/null || true)"
+    [[ -f "$_lockdir/pgid"     ]] && _lockpgid="$(cat "$_lockdir/pgid" 2>/dev/null || true)"
+    [[ -f "$_lockdir/boot_id"  ]] && _lockboot="$(cat "$_lockdir/boot_id" 2>/dev/null || true)"
+    [[ -f "$_lockdir/start_ts" ]] && _locktime="$(cat "$_lockdir/start_ts" 2>/dev/null || true)"
+
+    # Case 1: recorded PID is alive → active run, refuse.
     if [[ -n "$_lockpid" ]] && kill -0 "$_lockpid" 2>/dev/null; then
-      error "Another hasher run is already active (PID $_lockpid)."
-      error "Use the launcher's 'k) Stop hashing' to terminate it first, or"
-      error "wait for it to finish. Lock: $_lockdir"
+      error "Another hasher run is already active (PID $_lockpid, PGID ${_lockpgid:-?}, started ${_locktime:-?})."
+      error "Use the launcher's 'k) Stop hashing' to terminate it first, or wait for it to finish."
+      error "Lock: $_lockdir"
       exit 2
     fi
-    warn "Stale lock at $_lockdir (PID ${_lockpid:-unknown} not running) — adopting."
-    rm -rf -- "$_lockdir" 2>/dev/null || true
-    mkdir "$_lockdir" 2>/dev/null || { error "Failed to acquire lock"; exit 2; }
+
+    # Case 2: different boot → all old PIDs/PGIDs are guaranteed dead.
+    # Adopt cleanly.
+    if [[ -n "$_lockboot" && -n "$_boot_id" && "$_lockboot" != "unknown" && "$_boot_id" != "unknown" && "$_lockboot" != "$_boot_id" ]]; then
+      warn "Stale lock from previous boot — adopting (${_lockdir})."
+      rm -rf -- "$_lockdir" 2>/dev/null || true
+      mkdir "$_lockdir" 2>/dev/null || { error "Failed to acquire lock"; exit 2; }
+    else
+      # Case 3: same boot, dead parent PID. Check whether the recorded
+      # PGID has ANY live processes. If yes, workers may still be
+      # hashing — refuse.
+      local _orphans=""
+      if [[ -n "$_lockpgid" && "$_lockpgid" != "$_my_pgid" ]]; then
+        _orphans="$(_enum_group_pids "$_lockpgid" 2>/dev/null || true)"
+        # Filter out our own PID just in case (belt-and-braces)
+        _orphans="$(printf '%s\n' "$_orphans" | grep -v "^$$\$" | grep -v '^$' || true)"
+      fi
+      if [[ -n "$_orphans" ]]; then
+        error "Stale lock at $_lockdir — parent PID $_lockpid is dead,"
+        error "  but PGID $_lockpgid still has live processes:"
+        error "  $(printf '%s\n' "$_orphans" | tr '\n' ' ')"
+        error "  These are orphaned workers from the crashed run."
+        error "  Kill them explicitly before restarting:"
+        error "    kill -TERM $_orphans"
+        error "    (wait ~5s, then if still alive: kill -KILL $_orphans)"
+        error "  Then remove the lock: rm -rf $_lockdir"
+        exit 2
+      fi
+      warn "Stale lock at $_lockdir (PID ${_lockpid:-unknown} not running, PGID clean) — adopting."
+      rm -rf -- "$_lockdir" 2>/dev/null || true
+      mkdir "$_lockdir" 2>/dev/null || { error "Failed to acquire lock"; exit 2; }
+    fi
   fi
-  printf '%s\n' "$$" > "$_lockdir/pid" 2>/dev/null || true
-  HASHER_LOCKDIR="$_lockdir"   # picked up by cleanup()
+  # Write full ownership record atomically.
+  printf '%s\n' "$$"        > "$_lockdir/pid"      2>/dev/null || true
+  printf '%s\n' "$_my_pgid" > "$_lockdir/pgid"     2>/dev/null || true
+  printf '%s\n' "$_boot_id" > "$_lockdir/boot_id"  2>/dev/null || true
+  printf '%s\n' "$_my_start" > "$_lockdir/start_ts" 2>/dev/null || true
+  HASHER_LOCKDIR="$_lockdir"
 
   # v1.3.3: also claim the pidfile (kept for launcher's is_hasher_running).
   printf '%s\n' "$$" > "$HASHER_PIDFILE" 2>/dev/null || true
@@ -1380,6 +1463,30 @@ main() {
   # sanitise: must be a positive integer
   case "$jobs" in (''|*[!0-9]*) jobs=1 ;; esac
   [[ "$jobs" -lt 1 ]] && jobs=1
+  # v1.3.23 (peer-review recheck observation A): apply an upper bound.
+  # Previously any positive integer was accepted, so a config typo like
+  # `jobs = 10000` would spawn 10000 shells and hash processes on a NAS
+  # — likely OOM or fork-bomb the box. Cap at min(cores*2, 64). A
+  # deliberate operator can override via HASHER_MAX_JOBS.
+  local _cores _hardmax
+  if command -v nproc >/dev/null 2>&1; then
+    _cores=$(nproc 2>/dev/null || echo 4)
+  elif command -v sysctl >/dev/null 2>&1; then
+    _cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+  else
+    _cores=4
+  fi
+  [[ -z "$_cores" || "$_cores" -lt 1 ]] && _cores=4
+  _hardmax="${HASHER_MAX_JOBS:-}"
+  if [[ -z "$_hardmax" ]]; then
+    _hardmax=$(( _cores * 2 ))
+    [[ "$_hardmax" -gt 64 ]] && _hardmax=64
+  fi
+  if [[ "$jobs" -gt "$_hardmax" ]]; then
+    warn "Requested --jobs=$jobs exceeds safety cap ($_hardmax on this host); clamping."
+    warn "  To override, set HASHER_MAX_JOBS=N in the environment before invoking."
+    jobs="$_hardmax"
+  fi
 
   if [[ "$jobs" -gt 1 ]]; then
     info "Parallel hashing enabled: $jobs workers."
@@ -1391,7 +1498,7 @@ main() {
   # We pass ALGO and the hash command through the environment.
   _hash_worker() {
     local f="$1"
-    local size mtime line hash
+    local size mtime line hash size2 mtime2
     size=$(_stat_size "$f" 2>/dev/null || echo -1)
     mtime=$(_stat_mtime "$f" 2>/dev/null || echo -1)
     if [[ "$size" -lt 0 || "$mtime" -lt 0 ]]; then
@@ -1403,6 +1510,28 @@ main() {
       return 0
     fi
     hash="${line%% *}"
+    # v1.3.23 (peer-review recheck finding #3): re-stat AFTER hashing to
+    # detect files that changed during the hash operation. Best-effort
+    # policy (chosen over retry-and-skip): we record the pre-hash size
+    # and mtime with the hash — matching CSV convention — but emit a
+    # WARN so the operator knows this row may describe an inconsistent
+    # snapshot. Reasoning: retry-and-skip complicates the worker loop,
+    # and for the typical NAS use case (media library, backup archive)
+    # concurrent writes are rare and the operator wants the manifest
+    # written, not silently dropped rows.
+    #
+    # We check size and mtime only — checking inode would require stat -c
+    # / stat -f differences across Linux/macOS/DSM and add fragility for
+    # marginal benefit. A cp+atomic-rename that changes the inode without
+    # changing size or mtime is extremely rare.
+    size2=$(_stat_size "$f" 2>/dev/null || echo -1)
+    mtime2=$(_stat_mtime "$f" 2>/dev/null || echo -1)
+    if [[ "$size2" != "$size" || "$mtime2" != "$mtime" ]]; then
+      # \036 = record separator (rare in paths); handler in the main loop
+      # writes this to a "changed during hash" log so the operator can
+      # re-run those files if wanted.
+      printf '\036CHANGED\036%s\t%s->%s\t%s->%s\n' "$f" "$size" "$size2" "$mtime" "$mtime2"
+    fi
     # csv_escape inline (worker runs in a subshell that has the function)
     local esc="${f//\"/\"\"}"
     printf '"%s",%s,%s,%s,%s\n' "$esc" "$size" "$mtime" "$ALGO" "$hash"
@@ -1415,7 +1544,13 @@ main() {
   # Stream: NUL-delimited file list → xargs → workers → tee into a post-processor
   # that splits CSV rows (to $OUTPUT) from FAIL sentinels (counted).
   local fail_file="$VAR_DIR/hash-fails.$$"
+  # v1.3.23 (finding #3): sink for files whose size/mtime changed DURING
+  # hashing. Rows here are informational — the CSV still gets the row
+  # (with pre-hash stats), but the operator sees which files were
+  # unstable. Written to logs/ at the end alongside other artefacts.
+  local changed_file="$VAR_DIR/hash-changed.$$"
   : > "$fail_file"
+  : > "$changed_file"
 
   if [[ "$jobs" -gt 1 ]]; then
     # Parallel path via xargs -P. We invoke a tiny bash -c per file that
@@ -1438,6 +1573,9 @@ main() {
             $'\037'FAIL$'\037'*)
               printf '%s\n' "$row" >> "$fail_file"
               ;;
+            $'\036'CHANGED$'\036'*)
+              printf '%s\n' "$row" >> "$changed_file"
+              ;;
             *)
               printf '%s\n' "$row" >> "$OUTPUT"
               ;;
@@ -1452,17 +1590,26 @@ main() {
     HASHER_PIPELINE_PID=""
   else
     # Serial path: preserve exact historical behaviour, no bash -c overhead.
+    # v1.3.23 (finding #3): worker may emit two lines (CHANGED marker
+    # followed by the CSV row) — process each independently.
     while IFS= read -r -d '' f; do
       local out
       out="$(_hash_worker "$f")"
-      case "$out" in
-        $'\037'FAIL$'\037'*)
-          printf '%s\n' "$out" >> "$fail_file"
-          ;;
-        *)
-          printf '%s\n' "$out" >> "$OUTPUT"
-          ;;
-      esac
+      while IFS= read -r line; do
+        case "$line" in
+          $'\037'FAIL$'\037'*)
+            printf '%s\n' "$line" >> "$fail_file"
+            ;;
+          $'\036'CHANGED$'\036'*)
+            printf '%s\n' "$line" >> "$changed_file"
+            ;;
+          "")
+            : ;;
+          *)
+            printf '%s\n' "$line" >> "$OUTPUT"
+            ;;
+        esac
+      done <<< "$out"
     done < "$FILES_LIST"
   fi
 
@@ -1484,6 +1631,23 @@ main() {
     done < "$fail_file"
   fi
   rm -f -- "$fail_file" 2>/dev/null || true
+
+  # v1.3.23 (finding #3): summarize files that changed during hashing.
+  # Move the CHANGED log to logs/ with a run-tagged name so operators
+  # can review after the run. The CSV rows for these files are already
+  # written (with pre-hash stats) — this is informational only.
+  local changed_rows=0
+  changed_rows=$(wc -l < "$changed_file" 2>/dev/null | tr -d ' ' || echo 0)
+  [[ -z "$changed_rows" ]] && changed_rows=0
+  if [[ "$changed_rows" -gt 0 ]]; then
+    local changed_log="$LOGS_DIR/hash-changed-$CSV_TAG.log"
+    mv -f -- "$changed_file" "$changed_log" 2>/dev/null || true
+    warn "$changed_rows file(s) changed during hashing — CSV rows recorded with pre-hash size/mtime."
+    warn "  Review: $changed_log"
+    warn "  Consider re-hashing those files if a consistent snapshot is required."
+  else
+    rm -f -- "$changed_file" 2>/dev/null || true
+  fi
 
   DONE=$(( hashed_rows + fail_rows ))
   FAIL="$fail_rows"

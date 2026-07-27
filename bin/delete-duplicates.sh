@@ -286,4 +286,10 @@ if [ "$moves_skipped_changed" -gt 0 ]; then
   warn "These files changed between hashing and now — re-run hashing + dedup to re-evaluate them."
 fi
 info "Move complete: $moves_ok files moved to quarantine ($QUAR_DIR); $moves_fail failures."
+# v1.3.23 (peer-review recheck finding #4): return non-zero when any
+# move failed. Files "skipped because content changed" are a safety
+# outcome, not a failure — they exit 0 with a warning above.
+if [ "${moves_fail:-0}" -gt 0 ]; then
+  exit 1
+fi
 exit 0

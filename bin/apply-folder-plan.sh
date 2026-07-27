@@ -409,4 +409,11 @@ if [ "$skipped_verify" -gt 0 ]; then
 fi
 info "Audit record appended to: $ACTIONS_LOG"
 info "Review quarantine: $DEST_ROOT"
+# v1.3.23 (peer-review recheck finding #4): return non-zero when any
+# operation failed. Skipped-verify (files changed since plan generation)
+# is NOT treated as a failure — that's a safety refusal, and the plan
+# can be regenerated.
+if [ "${fail:-0}" -gt 0 ]; then
+  exit 1
+fi
 exit 0

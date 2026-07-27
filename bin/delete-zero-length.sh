@@ -314,4 +314,11 @@ if $QUARANTINE; then
 else
   ok "Deleted zero-length files: $okc | Failed: $fail | Log: $LOG_FILE"
 fi
+# v1.3.23 (peer-review recheck finding #4): return non-zero when any
+# operation failed so cron/automation can detect incomplete cleanup.
+# Convention: 0 = all succeeded; 1 = one or more failures; 2 = invalid
+# input or safety refusal (already used earlier in the script).
+if [ "${fail:-0}" -gt 0 ]; then
+  exit 1
+fi
 exit 0

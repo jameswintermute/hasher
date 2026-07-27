@@ -25,7 +25,8 @@ usage() {
 Usage: find-duplicates.sh [--input CSV] [--mode standard|bulk]
                           [--min-group-size N] [--keep-strategy shortest-path|oldest|newest|first]
 Outputs:
-  - Canonical: logs/YYYY-MM-DD-duplicate-hashes.txt   (for review-duplicates.sh --from-report)
+  - Canonical: logs/duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt   (per-run)
+  - Latest:    logs/duplicate-hashes-latest.txt                  (symlink to newest)
   - Summary:   logs/duplicate-groups-YYYY-MM-DD-HHMMSS.txt
   - Flat CSV:  logs/duplicates-YYYY-MM-DD-HHMMSS.csv
 Bulk mode also writes:
@@ -52,9 +53,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 date_tag="$(date +'%Y-%m-%d')"
-timestamp="$(date +'%Y-%m-%d-%H%M%S')"
+# v1.3.23 (peer-review recheck finding #5): include $$ in the timestamp
+# so two runs within the same second cannot overwrite each other's
+# artefacts. Matches the CSV_TAG convention hasher.sh has used since
+# v1.3.16 (F-HMS-PID).
+timestamp="$(date +'%Y-%m-%d-%H%M%S')-$$"
 
-OUT_CANON="$LOGS_DIR/${date_tag}-duplicate-hashes.txt"
+# v1.3.23 (peer-review recheck finding #5): the canonical file used to be
+# `${date_tag}-duplicate-hashes.txt` — date only, so a second same-day run
+# overwrote the first, potentially breaking next-step commands from earlier
+# runs. Now every derived file uses the full run tag; the -latest.txt
+# symlink is what next-step commands point at, so they remain stable while
+# per-run history accumulates. Mirrors the pattern hasher.sh post_run_reports
+# has used since v1.3.19.
+OUT_CANON="$LOGS_DIR/duplicate-hashes-$timestamp.txt"
 OUT_GROUPS="$LOGS_DIR/duplicate-groups-$timestamp.txt"
 OUT_CSV="$LOGS_DIR/duplicates-$timestamp.csv"
 OUT_PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"  # only when bulk
@@ -110,6 +122,13 @@ find_hdr_idx() {
 COL_HASH="$(find_hdr_idx 'hash|digest|checksum|sha256')"
 COL_PATH="$(find_hdr_idx 'path|filepath|file|fullpath')"
 COL_SIZE="$(find_hdr_idx 'size|size_bytes|bytes|filesize|size_mb')"
+# v1.3.23 (peer-review recheck observation B): also locate the algo column
+# if the CSV has one. hasher.sh writes 'algo' as column 4 in its default
+# layout. When present, every row's algo value must equal 'sha256' — an
+# external manifest that says algo=md5 but has 64-char values would
+# otherwise pass the hex/length preflight and enter dedupe with misleading
+# reports.
+COL_ALGO="$(find_hdr_idx 'algo|algorithm')"
 # If no SHA-256-capable column was found, check whether the CSV explicitly
 # names a non-SHA-256 hash algorithm — that's a clearer error message than
 # "no hash column found".
@@ -140,9 +159,20 @@ fi
 # containing commas (e.g. "a,b.txt") and only checked the FIRST row (so a
 # mixed manifest with a valid SHA-256 first row and later MD5 rows passed).
 if [[ -f "$INPUT" ]]; then
-  # awk block prints '[ERROR] <line> <reason>' to stderr and exits non-zero
-  # if any actionable row has a wrong-length or non-hex hash.
-  awk -v skip="$SKIP_HEADER" -v ch="$COL_HASH" -v DELIM="$DELIM" '
+  # v1.3.23 (peer-review recheck observations B & C): extended preflight —
+  #  - if COL_ALGO is present, each row's algo value must equal 'sha256'
+  #    (case-insensitive); mismatches reject the whole manifest
+  #  - malformed rows (fewer fields than expected) are COUNTED and the
+  #    first offending line is reported, rather than silently ignored,
+  #    so a truncated manifest can't quietly omit files. Non-fatal —
+  #    proceeds with valid rows and prints a summary. Set
+  #    HASHER_STRICT_ROWS=1 in the env to make malformed rows fatal.
+  #
+  # awk block prints reason to stderr and exits non-zero if any actionable
+  # row has a wrong-length or non-hex hash, or (when COL_ALGO is present)
+  # an algorithm that isn't sha256.
+  awk -v skip="$SKIP_HEADER" -v ch="$COL_HASH" -v ca="${COL_ALGO:-0}" \
+      -v cp="$COL_PATH" -v DELIM="$DELIM" -v strict="${HASHER_STRICT_ROWS:-0}" '
     function csv_split(s, sep,    i, c, nf, cur, inq, n) {
       n = length(s); nf = 0; cur = ""; inq = 0
       if (sep != ",") { nf = split(s, A, sep); for (i=1;i<=nf;i++) F[i]=A[i]; return nf }
@@ -162,11 +192,21 @@ if [[ -f "$INPUT" ]]; then
       F[++nf] = cur
       return nf
     }
+    function lc(s,    r) { r = tolower(s); return r }
     NR <= skip { next }
     {
       nf = csv_split($0, DELIM)
+      # Detect malformed rows: fewer fields than the maximum column index
+      # we need to read (hash, path, size, algo).
+      maxcol = ch
+      if (cp+0 > maxcol) maxcol = cp+0
+      if (ca+0 > maxcol) maxcol = ca+0
+      if (nf < maxcol) {
+        malformed++
+        if (malformed == 1) first_malformed_line = NR
+        next
+      }
       h = F[ch+0]
-      # Strip surrounding quotes if any survived the split (defence in depth)
       gsub(/^"|"$/, "", h)
       if (h == "") next  # blank rows are ignored, matching the main parser
       if (length(h) != 64) {
@@ -177,12 +217,33 @@ if [[ -f "$INPUT" ]]; then
         printf "[ERROR] Row %d: hash column contains non-hex characters: %s\n", NR, h > "/dev/stderr"
         bad = 1; exit 2
       }
+      # Algo validation — only when the CSV explicitly names the column.
+      # A missing algo column (older manifests) is fine.
+      if (ca+0 > 0) {
+        a = F[ca+0]
+        gsub(/^"|"$/, "", a)
+        if (a != "" && lc(a) != "sha256") {
+          printf "[ERROR] Row %d: algo column is %s (expected sha256).\n", NR, a > "/dev/stderr"
+          bad = 1; exit 2
+        }
+      }
+      valid++
     }
-    END { if (bad) exit 2 }
-  ' "$INPUT"
-  _rc=$?
-  if [[ "$_rc" -ne 0 ]]; then
+    END {
+      if (bad) exit 2
+      if (malformed > 0) {
+        printf "[WARN] Rejected rows: %d (first malformed at line %d)\n", malformed, first_malformed_line > "/dev/stderr"
+        printf "[WARN] Valid rows: %d — proceeding.\n", valid > "/dev/stderr"
+        if (strict != "0") { exit 3 }
+      }
+    }
+  ' "$INPUT" || _rc=$?
+  _rc=${_rc:-0}
+  if [[ "$_rc" -eq 2 ]]; then
     printf '[ERROR] Manifest failed SHA-256 preflight. Regenerate with bin/hasher.sh.\n' >&2
+    exit 2
+  elif [[ "$_rc" -eq 3 ]]; then
+    printf '[ERROR] HASHER_STRICT_ROWS=1 set and manifest contains malformed rows.\n' >&2
     exit 2
   fi
 fi
@@ -365,6 +426,11 @@ if [[ "$MODE" == "bulk" ]]; then
   fi
 else
   info "Next: run 'review-duplicates.sh --from-report \"$OUT_CANON\"' (or menu option 4)."
-  cp -f "$OUT_CANON" "$OUT_LATEST" 2>/dev/null || true
+  # v1.3.23 (finding #5): prefer symlink so the latest pointer always
+  # resolves to the newest run, without duplicating file content. Fall
+  # back to cp on filesystems that reject symlinks (rare NAS SMB shares).
+  if ln -sfn -- "$(basename "$OUT_CANON")" "$OUT_LATEST" 2>/dev/null; then :; else
+    cp -f -- "$OUT_CANON" "$OUT_LATEST" 2>/dev/null || true
+  fi
   info "Canonical report ready: $OUT_LATEST"
 fi
