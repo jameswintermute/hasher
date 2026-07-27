@@ -368,20 +368,28 @@ while IFS= read -r src; do
     fi
     continue
   fi
-  # Build a unique destination slot using the full source path, not just
-  # the basename.  Multiple sibling dirs named e.g. "RAW" would otherwise
-  # collide in the flat quarantine root, causing every mv after the first
-  # to fail with "Directory not empty".
-  #
-  # Strategy: strip the leading '/' and replace every remaining '/' with
-  # '__' to produce a flat, collision-free name that still encodes the
-  # full original path.  e.g.
-  #   /volume1/James/Photos/Switzerland/RAW  →  volume1__James__Photos__Switzerland__RAW
-  #   /volume1/James/Photos/Rhinefall/RAW    →  volume1__James__Photos__Rhinefall__RAW
-  slot="$(printf '%s\n' "$src" | sed 's|^/||; s|/|__|g')"
-  dest="$DEST_ROOT/$slot"
+  # v1.3.20 (peer-review recheck finding #5): mirror the source directory
+  # hierarchy under $DEST_ROOT rather than encoding path separators with
+  # `s|/|__|g`. The old encoding was NOT reversible — `/a/b__c` and
+  # `/a__b/c` both flatten to `a__b__c`, and the mv would silently
+  # replace/collide with the tool still reporting success. Use the same
+  # pattern as delete-duplicates.sh (v1.3.5): build the destination by
+  # joining $DEST_ROOT with the source's absolute path, and disambiguate
+  # collisions with `.dup{n}` rather than silent overwrite.
+  case "$src" in
+    /*) dest="$DEST_ROOT$src" ;;
+    *)  dest="$DEST_ROOT/$src" ;;
+  esac
+  dest_dir=$(dirname "$dest")
+  mkdir -p "$dest_dir"
+  if [ -e "$dest" ]; then
+    n=1
+    while [ -e "${dest}.dup${n}" ]; do n=$((n+1)); done
+    warn "Quarantine target exists; using ${dest}.dup${n}"
+    dest="${dest}.dup${n}"
+  fi
   work "($idx/$COUNT) $src -> $dest"
-  if mv -- "$src" "$dest" 2>>"$LOG_FILE"; then
+  if mv -- "$src" "$dest" 2>>"$LOG_FILE" && [ ! -e "$src" ]; then
     moved=$((moved+1)); ok "moved"
     _audit "QUARANTINED" "$src" "$dest" "$sz_kb"
   else

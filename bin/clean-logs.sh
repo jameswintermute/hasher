@@ -14,6 +14,7 @@ APP_HOME="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 LOGS_DIR="$APP_HOME/logs"
 VAR_DIR="$APP_HOME/var"
+ZERO_DIR="$VAR_DIR/zero-length"
 
 mkdir -p "$LOGS_DIR" "$VAR_DIR"
 
@@ -129,7 +130,14 @@ delete_empty_logs
 info "Applying retention rules…"
 
 # Keep last 5 daily duplicate-hashes (exclude duplicate-hashes-latest.txt)
-keep_latest_n "$LOGS_DIR"/20*-duplicate-hashes.txt 5 "duplicate-hashes report"
+# v1.3.20 (peer-review recheck observation): v1.3.19's post_run_reports
+# renamed these to `duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt`. The old
+# `20*-duplicate-hashes.txt` glob only matched the pre-v1.3.19 layout;
+# without this update the new per-run reports accumulate indefinitely.
+# Also legacy-cover any old-format files that may still exist on hosts
+# that were upgraded from v1.3.18-or-earlier.
+keep_latest_n "$LOGS_DIR"/duplicate-hashes-20*.txt 5 "duplicate-hashes report"
+keep_latest_n "$LOGS_DIR"/20*-duplicate-hashes.txt 5 "duplicate-hashes report (legacy)"
 
 # Keep last 5 duplicate-groups text reports
 keep_latest_n "$LOGS_DIR"/duplicate-groups-*.txt 5 "duplicate-groups report"
@@ -157,6 +165,14 @@ keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt 10 "reviewed fol
 keep_latest_n "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv 10 "reviewed folder groups TSV"
 keep_latest_n "$LOGS_DIR"/apply-folder-plan-*.log 10 "apply-folder-plan log"
 keep_latest_n "$LOGS_DIR"/delete-zero-length-*.log 10 "delete-zero-length log"
+
+# v1.3.20 (peer-review recheck observation): per-run zero-length reports
+# under var/zero-length/ now also get retention. Same 5-run policy as
+# duplicate-hashes; the -latest symlink is preserved. Covers both the new
+# CSV_TAG-based naming and any legacy date-only files.
+if [ -d "$ZERO_DIR" ]; then
+  keep_latest_n "$ZERO_DIR"/zero-length-20*.txt 5 "zero-length report"
+fi
 
 # 3) Rotate main logs if they grow too large (> 5 MiB)
 MAX_LOG_BYTES=$((5 * 1024 * 1024))

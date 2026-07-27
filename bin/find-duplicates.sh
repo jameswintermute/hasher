@@ -132,24 +132,58 @@ else
   COL_SIZE="${COL_SIZE:-2}"
 fi
 
-# v1.3.19 (peer-review finding #4): even if the hash column NAME looks
-# right, the values in it may be non-SHA-256 (MD5=32 hex, SHA1=40, SHA512=128).
-# Sample the first data row and refuse if the hash isn't 64 hex chars —
-# early failure with a clear message beats generating an unusable plan.
+# v1.3.19 (peer-review finding #4): the hash column NAME can look right
+# while values inside it are non-SHA-256 (MD5=32 hex, SHA1=40, SHA512=128).
+# v1.3.20 (recheck finding #1): validate the hash column of EVERY data row
+# using the same quote-aware CSV parser the main script uses. Previous
+# implementation had two bugs — used naïve `awk -F,` which mis-splits paths
+# containing commas (e.g. "a,b.txt") and only checked the FIRST row (so a
+# mixed manifest with a valid SHA-256 first row and later MD5 rows passed).
 if [[ -f "$INPUT" ]]; then
-  _first_data="$(awk -v skip="$SKIP_HEADER" -v NR_want=1 'NR>skip{print; exit}' "$INPUT" 2>/dev/null || true)"
-  if [[ -n "$_first_data" ]]; then
-    _hash_sample="$(printf '%s\n' "$_first_data" \
-      | awk -F"$DELIM" -v ch="$COL_HASH" '{gsub(/"/,"",$ch); print $ch}' 2>/dev/null || true)"
-    if [[ -n "$_hash_sample" ]]; then
-      _hlen=${#_hash_sample}
-      if [[ "$_hlen" -ne 64 ]] || ! [[ "$_hash_sample" =~ ^[0-9a-fA-F]+$ ]]; then
-        printf '[ERROR] First data row contains a non-SHA-256 hash (length=%d, expected 64 hex).\n' "$_hlen" >&2
-        printf '[ERROR] Sample: %s\n' "$_hash_sample" >&2
-        printf '[ERROR] Dedupe workflows require SHA-256 manifests. Regenerate with bin/hasher.sh.\n' >&2
-        exit 2
-      fi
-    fi
+  # awk block prints '[ERROR] <line> <reason>' to stderr and exits non-zero
+  # if any actionable row has a wrong-length or non-hex hash.
+  awk -v skip="$SKIP_HEADER" -v ch="$COL_HASH" -v DELIM="$DELIM" '
+    function csv_split(s, sep,    i, c, nf, cur, inq, n) {
+      n = length(s); nf = 0; cur = ""; inq = 0
+      if (sep != ",") { nf = split(s, A, sep); for (i=1;i<=nf;i++) F[i]=A[i]; return nf }
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (inq) {
+          if (c == "\"") {
+            if (substr(s, i+1, 1) == "\"") { cur = cur "\""; i++ }
+            else { inq = 0 }
+          } else { cur = cur c }
+        } else {
+          if (c == "\"") { inq = 1 }
+          else if (c == sep) { F[++nf] = cur; cur = "" }
+          else { cur = cur c }
+        }
+      }
+      F[++nf] = cur
+      return nf
+    }
+    NR <= skip { next }
+    {
+      nf = csv_split($0, DELIM)
+      h = F[ch+0]
+      # Strip surrounding quotes if any survived the split (defence in depth)
+      gsub(/^"|"$/, "", h)
+      if (h == "") next  # blank rows are ignored, matching the main parser
+      if (length(h) != 64) {
+        printf "[ERROR] Row %d: hash column has length %d (expected 64 hex): %s\n", NR, length(h), h > "/dev/stderr"
+        bad = 1; exit 2
+      }
+      if (h !~ /^[0-9a-fA-F]+$/) {
+        printf "[ERROR] Row %d: hash column contains non-hex characters: %s\n", NR, h > "/dev/stderr"
+        bad = 1; exit 2
+      }
+    }
+    END { if (bad) exit 2 }
+  ' "$INPUT"
+  _rc=$?
+  if [[ "$_rc" -ne 0 ]]; then
+    printf '[ERROR] Manifest failed SHA-256 preflight. Regenerate with bin/hasher.sh.\n' >&2
+    exit 2
   fi
 fi
 
