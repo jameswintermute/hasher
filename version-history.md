@@ -2424,6 +2424,147 @@ the choice so the next reviewer sees it was deliberate.
 Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
 
 ---
+## 2026‑07 — v1.3.25
+**Peer-review recheck 2, 3, 4, 5: symlink policy, exit-status fidelity, richer stability fingerprint, hard-link detection** *(assisted by Claude/Anthropic — Opus 4.8; folder-plan sidecar resolution patched by peer reviewer)*
+
+Fifth round of peer review. Reviewer flagged five items; #1 was a
+sidecar resolution regression they patched in-place (kept in this
+release) and four new findings. All four confirmed real, all four
+fixed.
+
+### Reviewer's #1 — folder-plan sidecar resolution (patched by reviewer)
+
+`find-duplicate-folders.sh` in v1.3.23 was updated to add PIDs to
+artefact timestamps (`duplicate-folders-plan-YYYY-MM-DD-HHMMSS-PID.txt`),
+but `apply-folder-plan.sh` was still deriving the matching sidecar via
+a regex that only captured the pre-PID portion — so every planned
+delete was skipped for lack of a keeper map. Reviewer patched
+`apply-folder-plan.sh` to derive the full suffix from the plan
+basename (`${_plan_base#duplicate-folders-plan-}` then `%.txt`) with
+`_stamp` and `_date` fallbacks for older artefacts. Retained in
+v1.3.25 as-shipped by the reviewer. Meta-observation: I should have
+audited every downstream parser when I introduced the PID in v1.3.23,
+not left it for the reviewer to catch.
+
+### #2 (critical) — Symlink policy
+
+Two problems, one policy. Symlinks explicitly listed in `paths.txt`
+were previously followed by `[[ -f "$path" ]]` (which follows
+symlinks) and hashed as though they were regular files — the CSV
+row then had the symlink's own stat with the target's content
+hash. Directory scans already skipped symlinks via `find -type f`.
+Separately, folder-dedup only fingerprinted regular files, so a
+folder containing a unique symlink alongside identical regular
+files matched an otherwise-similar folder — and applying the plan
+moved the whole folder including the unique symlink.
+
+Fix — the safer of the reviewer's two options:
+- Explicit symlinks in `paths.txt` and via stdin are refused with a
+  warning naming the target-real-path fix. All three input sites
+  (pathfile, stdin single-file, stdin expanded) now check `[[ -L ]]`
+  before `[[ -f ]]`. A `pathfile_syminv` counter feeds a specific
+  "All N paths are symlinks — refused" error when applicable, so
+  operators don't see the misleading "missing or unreadable"
+  message.
+- `find-duplicate-folders.sh` filters out any group where the KEEP
+  or DEL folder has direct non-regular children (symlinks, FIFOs,
+  sockets, devices) using `find -mindepth 1 -maxdepth 1 -type l/p/s/b/c
+  -print -quit`. Logs the exclusions to
+  `logs/duplicate-folders-excluded-<stamp>.log` with the exact
+  offending path so operators can inspect.
+
+Live-verified: explicit symlink → rc=3 with "All 1 path(s) are
+symlinks — refused" message; two folders identical except a
+unique symlink child → excluded from dedup with the specific
+symlink path logged.
+
+### #3 (high) — Exit-status fidelity
+
+`Completed. Hashed N/T (failures=F)` used to return rc=0 regardless
+of F, and a header-only CSV from a total-failure run was
+indistinguishable from a completed empty-input run. Automation
+could accept it as a successful snapshot.
+
+Fix:
+- Redesigned summary line: `Processed N/T files: hashed=X, failed=F,
+  unstable=U`. Each count separately visible.
+- New exit codes: `0` = all hashed, `1` = one or more hash/stat
+  failures, `4` = no hard failures but one or more files unstable
+  (partial snapshot). Reserved earlier: `2` invalid input/config,
+  `3` missing tools.
+- Loud "PARTIAL SNAPSHOT" warning block emitted BEFORE next-step
+  reports whenever failures or unstable rows > 0. Reviewer's
+  specific concern was that automation reads
+  "Duplicate report ready: ..." and assumes the snapshot is
+  complete — the banner now precedes those lines.
+- `HASHER_RUN_STATUS` global set by main hashing; cleanup trap
+  honours it on EXIT via a final `exit $status`.
+
+Live-verified: 3-file all-success → rc=0; sabotaged sha256sum
+(all-fail) → rc=1, PARTIAL SNAPSHOT banner; mutating shim
+(all-unstable) → rc=4, PARTIAL SNAPSHOT banner.
+
+### #4 (high) — Richer stability fingerprint
+
+v1.3.24's pre/post-hash check compared only size and whole-second
+mtime. Reviewer demonstrated a mutate + restore sequence (touch
+back to original mtime, same-size content) that slipped through
+undetected, yielding a CSV row whose hash didn't match the file's
+final content. Atomic replacements that preserve size and mtime
+also change the inode without being caught.
+
+Fix: new `_stat_fingerprint()` helper returns
+`size|mtime|ctime|dev|ino` across GNU and BSD stat variants.
+Worker captures pre-hash fingerprint before hashing and post-hash
+fingerprint after; any change in any field routes to CHANGED
+marker (no CSV row, no false hash). ctime bumps on ANY write even
+when size and mtime are restored, so the mutate+restore case is
+closed. Inode/device catch atomic renames and cross-filesystem
+substitution.
+
+Unstable log format updated to record the full pre/post
+fingerprints for diagnosis.
+
+Live-verified: shim mutates file content but preserves size + mtime
+via `touch -d @<orig_mtime>` → run rc=4, unstable log shows
+fingerprints matching in size/mtime/dev/ino but differing in
+ctime — the exact drift the reviewer's scenario was designed
+to detect.
+
+### #5 (medium-high) — Hard-link detection
+
+`find-duplicates.sh` treated hard links to the same inode as
+separate reclaimable duplicates. Reviewer demonstrated: two hard
+links to a 1 MiB file → plan says "quarantine one, reclaim 1 MiB"
+→ move one path → same inode with same link count remains, zero
+bytes reclaimed. If quarantine crosses a filesystem, the mv
+becomes a cp and DUPLICATES the data.
+
+Fix: after `OUT_CSV` is built (BEFORE canonical-report awk
+consumes it), stream through rows and collapse by
+`(hash, device, inode)` using portable `stat -c "%d %i"` /
+`stat -f "%d %i"`. Only the first path per physical object is
+kept; additional hard-link paths are logged to
+`logs/hardlinks-excluded-<stamp>.log` with clear `HARDLINK path
+same-inode-as keeper` notation. Runs in BOTH standard and bulk
+modes so the canonical group report agrees with the plan.
+
+Live-verified: 4 files, 3 sharing one inode via hard links + 1
+genuine independent duplicate → hard-links log has 2 entries,
+duplicates CSV contains only the first-seen hard-link path and
+the genuine duplicate. Bulk-mode plan generates one KEEP + one
+DEL for the genuine duplicate; no hard-linked paths in the plan.
+
+### Regression check
+
+Normal case: 4 files, no symlinks, no hard links, 2 genuine
+duplicates → run rc=0, "Processed 4/4 files: hashed=4, failed=0,
+unstable=0", 1 dedup group. No spurious PARTIAL SNAPSHOT banner,
+no false hard-link warning.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
