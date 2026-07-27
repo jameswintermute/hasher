@@ -2118,6 +2118,41 @@ functionality. Waiting until another Mac user materialises or a
 genuine need surfaces.
 
 ---
+## 2026‑07 — v1.3.21
+**Walk-phase heartbeat: no more silent minutes during discovery** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Field report from Mary's iMac: after `[INFO] Working dir: ...`, the
+background log stayed frozen for 10-15 minutes while `find` walked a
+large external drive. Process was alive, but tailing the log gave zero
+indication of that — indistinguishable from a hang.
+
+Root cause: `build_file_list()` runs `find` synchronously with no
+periodic output. On a small NAS share the walk completes in under a
+second and the silence is invisible; on a large Mac external volume
+it can genuinely take many minutes. Progress emission
+(`start_hash_progress`) only begins AFTER discovery finishes.
+
+Fix: new heartbeat subshell at the top of `build_file_list()`, killed
+at exit via both an explicit call and a `RETURN` trap (belt-and-braces
+in case an `error/exit` bails out mid-function). Every
+`$PROGRESS_INTERVAL` seconds (default 15s) it writes to `$BACKGROUND_LOG`:
+
+```
+[timestamp] [RUN uuid] [PROGRESS] Walking paths: N file(s) discovered so far | elapsed=00:00:15
+```
+
+The count is read from `$FILES_LIST.tmp` — where find output accumulates
+before exclusion filtering — by counting NUL delimiters. Zero on the
+first tick is normal (find still running); rises as the walk progresses;
+transitions to normal Hashing progress once discovery completes and
+the main loop starts.
+
+Applies universally — Mac, Synology, Linux — because the "silent walk"
+problem exists on any host with a large filesystem. On a small tree
+the walk completes before the first tick and nothing is emitted, so
+existing quick runs are unaffected. Self-test: 40 passed, 0 warnings.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
