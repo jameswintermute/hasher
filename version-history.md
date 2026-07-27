@@ -2153,6 +2153,59 @@ the walk completes before the first tick and nothing is emitted, so
 existing quick runs are unaffected. Self-test: 40 passed, 0 warnings.
 
 ---
+## 2026‑07 — v1.3.22
+**Sorted CSV output — deterministic, fail-safe, cross-run diffable** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+User request: sort the output CSV by path after hashing. Motivation:
+deterministic output for cross-run diffing (someone hashing quarterly
+can now `diff old.csv new.csv` and see exactly what changed), human
+scan-ability of the manifest, and reproducible outputs for
+hash-of-hash workflows. Currently rows land in worker-race order —
+useless for the above.
+
+Design principle: **the original CSV is NEVER touched until the sorted
+candidate has been fully validated.** A 5-hour hashing session must
+not be corrupted by a bad sort. Concretely:
+
+1. Snapshot pre-sort state: line count, byte count, header line.
+2. Sort to a sibling temp file (same directory, so `mv` is atomic).
+3. Validate: line count matches, header intact, byte-count within 1
+   byte of original (allowing for a trailing-newline difference).
+4. Only then atomic-rename onto the original.
+5. On any failure at any step, keep the original untouched and warn.
+
+Additional design choices:
+- `LC_ALL=C sort` — byte-order determinism across locales.
+- Full-row sort (not path-keyed) — sidesteps the CSV-quoted-comma
+  parsing trap. Works correctly because path is the first column;
+  in practice full-row sort ≈ path sort.
+- Refuse to sort if the header doesn't start with `path` — protects
+  against shuffling a rogue first data row into position when the
+  header is missing.
+
+Default on. Config toggle `sort_output = true|false` under `[logging]`
+in hasher.conf. CLI overrides `--sort` and `--no-sort`. First-run
+notice emitted to `$BACKGROUND_LOG` on the very first hashing run of
+a fresh install (marker file `var/.sort-notice-shown`), explaining
+the behaviour and how to disable it.
+
+Verified live:
+- **Normal case**: 13 files hashed in reverse-alphabetical order →
+  CSV output byte-identical to `LC_ALL=C sort`. First-run notice
+  appears on first run only.
+- **--no-sort flag**: rows preserved in worker-race order, no sort
+  attempted.
+- **Sort failure recovery**: PATH-shim exits `sort` with rc=1 →
+  three warnings logged, CSV survives unaltered with header + all
+  data rows intact. No corruption.
+
+Downstream tools (`find-duplicates.sh`, `find-duplicate-folders.sh`)
+already re-sort their inputs internally, so pre-sorted CSVs cause
+no behaviour change there.
+
+Self-test: 40 passed, 0 warnings.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
