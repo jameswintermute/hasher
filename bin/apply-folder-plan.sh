@@ -94,11 +94,18 @@ if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
       warn "Reviewed plan has no matching reviewed groups sidecar; deletions without a keeper mapping will be SKIPPED."
     fi
   else
-    # raw plan → use the original groups TSV written by the same run.
-    # v1.3.13 (recheck item 4): raw artefacts are now fully timestamped
-    # (YYYY-MM-DD-HHMMSS), so try the exact stamp first; fall back to the
-    # date-only name for artefacts created before v1.3.13.
-    if [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_stamp.tsv" ]; then
+    # raw plan → derive the matching groups TSV from the COMPLETE plan suffix.
+    # Current raw artefacts include timestamp + PID, for example:
+    #   duplicate-folders-plan-YYYY-MM-DD-HHMMSS-PID.txt
+    #   duplicate-folders-groups-YYYY-MM-DD-HHMMSS-PID.tsv
+    # Deriving the suffix from the basename avoids dropping the PID and silently
+    # failing to resolve the verification sidecar. Retain older fallbacks for
+    # pre-PID and date-only artefacts.
+    _raw_suffix="${_plan_base#duplicate-folders-plan-}"
+    _raw_suffix="${_raw_suffix%.txt}"
+    if [ "$_raw_suffix" != "$_plan_base" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_raw_suffix.tsv" ]; then
+      VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_raw_suffix.tsv"
+    elif [ -n "$_stamp" ] && [ -s "$LOGS_DIR/duplicate-folders-groups-$_stamp.tsv" ]; then
       VERIFY_TSV="$LOGS_DIR/duplicate-folders-groups-$_stamp.tsv"
     else
       _date="$(printf '%s\n' "$_plan_base" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)"
