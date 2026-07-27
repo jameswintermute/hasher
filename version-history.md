@@ -1975,6 +1975,149 @@ Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax
 (the +1 is the new `lib/awk-detect.sh`).
 
 ---
+## 2026‑07 — v1.3.20
+**Peer-review recheck 1–5 + 3 additional observations: quote-aware SHA-256 preflight, portable process enumeration, strict arg parsing, per-run zero-length reports, hierarchy-preserving quarantine** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Eight items after v1.3.19. All confirmed live; all fixed. #2 is the
+most important — safety controls silently disappearing when a
+dependency is absent is exactly the class of maturity defect this
+project has been iterating on.
+
+### #1 (high) — Whole-manifest quote-aware SHA-256 preflight
+
+The v1.3.19 preflight had two bugs: it used naïve `awk -F,` on the
+sample row (so a quoted path containing a comma like `"a,b.txt"` mis-split
+and reported a 6-character hash), and it only checked the first data row
+(so a mixed manifest with a valid SHA-256 first row and later MD5 rows
+was accepted). Reviewer reproduced both.
+
+Fix: replaced the sample parser with an awk block that uses the SAME
+quote-aware `csv_split` function the main parser uses, and validates
+EVERY actionable row — length exactly 64 and hex-only. Any row failing
+either check exits rc=2 with the row number and value. Live: comma-path
+CSVs accepted; mixed manifest rejected with `[ERROR] Row 4: hash column
+has length 32`.
+
+### #2 (critical) — Portable process enumeration; lock survives failed stop
+
+Every stop-path branch used `pgrep`; check-deps only *warned* if it was
+absent. On a host without pgrep, `pgrep -g $$` returned empty, no
+signals were sent, `_n=0` looked like a clean shutdown, cleanup ran and
+released the lock — while xargs, workers, and hash tools kept running.
+A fresh run could then start alongside orphans. Reviewer reproduced 12
+descendants surviving on a two-worker run with uncooperative TERM.
+
+Fix:
+- New `_enum_group_pids` and `_enum_children` helpers that prefer
+  `pgrep` but fall back to `ps -eo pid=,pgid=` / `ps -eo pid=,ppid=`.
+  ps output is present on every target (DSM BusyBox, macOS BSD, GNU procps).
+- Startup probe refuses to run (exit 3) if BOTH pgrep and ps-eo are
+  unusable — worker shutdown cannot silently degrade.
+- `check-deps.sh` promotes pgrep/ps-eo from "warn-if-missing" to "at
+  least one required".
+- `HASHER_STOP_INCOMPLETE=1` — if `_stop_group` verifies survivors after
+  the KILL escalation, cleanup **refuses to release the lock or pidfile**.
+  Operator cleanup required. Better a stuck lock than a fresh run
+  starting alongside orphaned workers.
+- 0.5s settle before the survivor verification (addresses reviewer's
+  additional observation about false-positive survivor warnings).
+
+Live: `PATH=/tmp/nopgrep bash bin/hasher.sh --jobs 3` with uncooperative
+workers → 18 group members before TERM, 0 survivors after.
+
+### #3 (high) — Strict arg parsing on delete-junk
+
+Argument parser had no default arm and no `-h`. Typo `--dryrun --force`
+silently ignored `--dryrun`, accepted `--force`, and deleted the file.
+Now: `-h/--help` prints usage; `--paths-file` requires a value; any
+unknown option exits rc=2. Live: `--dryrun --force` → rc=2 refused;
+`--dry-run --force` → rc=0 no-delete; `--help` → rc=0 usage; missing
+`--paths-file` value → rc=2 refused.
+
+### #4 (high) — Zero-length-only reports are per-run
+
+`post_run_reports` was updated in v1.3.19, but the fast zero-length-only
+path at line 1029 still used `DATE_TAG`. Two same-day zero-length-only
+scans overwrote each other. Now uses `CSV_TAG` (F-HMS-PID) and
+maintains `zero-length-latest.txt`, matching the normal-path convention.
+
+### #5 (medium-high) — Quarantine mirrors source hierarchy
+
+`delete-zero-length.sh` and `apply-folder-plan.sh` encoded destinations
+by replacing `/` with `__`. Not reversible: `/a/b__c/f1` and `/a__b/c/f2`
+both flatten to `a__b__c__f1`/etc, and the second mv silently
+replaced the first while the tool reported success. Reviewer confirmed
+the collision.
+
+Fix: mirror the source's absolute path under the quarantine root
+(the pattern `delete-duplicates.sh` has used since v1.3.5). Collisions
+disambiguated with `.dup{n}` suffix and warned, not silently overwritten.
+Also added the belt-and-braces `[ ! -e "$src" ]` post-condition check
+so a partial move never counts as successful. Live: reviewer's exact
+`b__c` / `a__b` reproduction → both files preserved with distinct
+hierarchical paths.
+
+### Additional observations (3)
+
+- **stdin blocking with --pathfile**: `[ ! -t 0 ]` triggered even when
+  `--pathfile` was supplied, so `cat > tmp_in` blocked on unrelated
+  parent stdin (SSH, orchestration wrappers). Now: if `--pathfile` is
+  set, stdin is left alone entirely.
+- **`--exclude` help text stale**: still described the semantics as
+  "literal substring match" from before v1.3.18. Updated to describe
+  the actual case-insensitive glob semantics with the `#recycle`-style
+  literal fallback.
+- **`clean-logs.sh` retention pattern stale**: `20*-duplicate-hashes.txt`
+  didn't match v1.3.19's `duplicate-hashes-YYYY-...` naming, so new
+  per-run reports would accumulate indefinitely. Added a matching
+  glob for the new naming + retention for per-run zero-length reports
+  under `var/zero-length/`. Legacy pattern kept for upgrade paths.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
+
+### Mac flexibility (Mary's iMac Tahoe report)
+
+Live diagnosis on a real macOS 15.x install revealed a v1.1.11-era
+regression that had made Hasher effectively unusable on Mac external
+volumes since 2024. `bash -x` trace showed the failure signature:
+`[[ -d "/Volumes/Photo-Disk/" ]]` succeeded, then
+`find "$path" -type f -print0` returned exit 1 because
+`.DocumentRevisions-V100` in the volume root has mode `d--x--x--x`
+(no read bit) and BSD find exits non-zero the moment ANY subtree
+fails, even when 99% of the walk succeeds.
+
+Two fixes:
+
+**Partial-walk acceptance in build_file_list.** `find`'s stderr is now
+captured. If exit is non-zero AND every stderr line is "Permission
+denied", the root is treated as valid with a warning like
+`4 subtree(s) skipped (permission denied on system dirs)`. If stderr
+contains other error classes, or is empty (I/O error / unmounted stub),
+we fall back to the old skip-this-root behaviour. Volumes with a mix
+of readable data and permission-locked system dirs now scan cleanly.
+
+**Host-specific find-prune arguments.** New `host_find_prune_args()`
+in `lib/host-detect.sh` emits a `-name X -type d -prune -o` clause
+per system dir per host. Loaded once at `build_file_list()` entry
+and applied to every find invocation. On macOS this prunes
+`.Spotlight-V100`, `.Trashes`, `.fseventsd`, `.DocumentRevisions-V100`,
+`.TemporaryItems`, `com.apple.TimeMachine.localsnapshots` — so find
+never descends into the permission-restricted dirs in the first
+place, eliminating the exit-1 condition at source. Synology hosts
+prune `@eaDir`, `#recycle`, `@tmp`, `@SynoResource` — massive
+speed-up on media volumes. Linux gets an empty prune list and
+find behaves normally. Bash 3.2 (macOS stock) compatible via
+`while read` rather than `mapfile`. Belt-and-braces companion to
+the existing case-insensitive glob excludes in `host_default_excludes`.
+
+Not addressed here (intentionally): guided-setup probing of
+`/Volumes/*` for menu-driven path selection, and quieter check-deps
+messaging for structurally-absent tools on macOS (setsid, ionice).
+Both are quality-of-life improvements, not gaps in load-bearing
+functionality. Waiting until another Mac user materialises or a
+genuine need surfaces.
+
+---
 ## Future Roadmap  
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
