@@ -105,7 +105,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.23**
+Started Dec 2022. Current version: **v1.3.24**
 For full history see: `version-history.md`
 
 ---

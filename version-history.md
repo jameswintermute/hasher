@@ -2331,7 +2331,101 @@ canonical file also changed from
 Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
 
 ---
+## 2026‑07 — v1.3.24
+**Peer-review recheck 2, 3, 4 + lower-priority cleanup: same-PGID orphan hole, snapshot-integrity exclude-and-log, TOTAL==0 short-circuit, SHA-256 policy tidy-up, self-test CI mode, sentinel-free unstable log** *(assisted by Claude/Anthropic — Opus 4.8)*
+
+Second recheck round on top of v1.3.23. Reviewer flagged five items;
+cross-check disqualified one and requested policy revision on another.
+
+**Reviewer's #1 (RETURN trap functrace leak)** — investigated and
+declined. Claim was that `set -E` enables `functrace`, so the
+`_stop_walk_hb` RETURN trap installed by `build_file_list` would
+fire from every subsequent function's return with `walk_hb_pid`
+unbound. Verified with `set -o | grep functrace`: bash's `set -E`
+enables `errtrace` only; `functrace` remains off. The RETURN trap
+correctly fires from `build_file_list` alone. No fix needed.
+
+**Reviewer's #2 (same-PGID orphan-check hole)** — CRITICAL, fixed.
+v1.3.23's stale-lock adoption only checked orphaned workers when
+the recorded PGID differed from ours: `if [[ ... "$_lockpgid" !=
+"$_my_pgid" ]]`. In the no-session-isolation code path (setsid
+absent or bypassed), two consecutive hasher invocations from the
+same terminal share a PGID — so the check was skipped and the
+lock adopted even if the previous run's workers were still alive
+inside the shared PGID. Fix: fail closed whenever the recorded
+parent is dead and the PGID has any live non-self PIDs, regardless
+of whether the PGID matches ours. The error message acknowledges
+that in the shared-PGID case we can't distinguish orphans from
+siblings — either way, we don't dare adopt. Live-verified with
+a fake sibling process in our PGID + a synthetic stale lock;
+second run correctly refused (rc=2).
+
+**Reviewer's #3 (files changing during hash)** — HIGH, policy
+revised. In v1.3.23 I chose "best-effort: warn but record with
+pre-hash stats" per user direction. Reviewer's counter-argument
+on data-integrity grounds: a CSV row
+`path,size=6,mtime=T,algo=sha256,hash=<of size-19 content>`
+describes a state that never existed as one consistent snapshot;
+downstream tools trust hash + size + mtime as a unit, so an
+inconsistent row is worse than a missing row. User accepted
+reversal. Fix: worker now emits ONLY the `\036CHANGED\036`
+marker (no CSV row) when pre/post-hash stats disagree. Main-loop
+dispatcher routes the marker to `logs/unstable-files-<run>.log`
+(renamed from hash-changed for accuracy). Sentinel is stripped
+before write, per lower-priority cleanup item. Completed
+message shows `unstable=N` when non-zero:
+`Completed. Hashed 5/5 files (failures=0, unstable=5)`.
+`DONE = hashed + failed + unstable`, so tally always sums to
+TOTAL. Live-verified with an sha256sum shim that mutates its
+input mid-hash: 5 files mutated → 0 CSV rows, unstable-files log
+lists all 5 with size/mtime diffs, rc=0.
+
+**Reviewer's #4 (empty dir with `--jobs 2`)** — HIGH, fixed.
+Root cause: `xargs` invoked with empty stdin behaves differently
+across platforms. GNU xargs with `-r` skips (which we can't
+rely on — BSD/macOS xargs has no `-r`). BSD xargs runs the
+command once with no arguments, so `_hash_worker $1` receives
+`$1=""`, stats fail, and the CSV summary reads
+`Completed. Hashed 1/0 files (failures=1)` — a fabrication.
+Fix: handle `TOTAL <= 0` before workers are spawned. Write the
+CSV header, run the sort pipeline (still fail-safe), skip the
+progress emitter entirely, run `post_run_reports` (which correctly
+reports 0 duplicates and 0 zero-length files), and return.
+Verified: empty dir + `--jobs 2` → rc=0, one INFO line
+`No files to hash (0 discovered). CSV contains header only`,
+header-only CSV, no fake failure count.
+
+**Reviewer's #5 (malformed rows warn-and-continue)** — declined
+as policy choice. Reviewer requested fatal-by-default with an
+`--allow-malformed-rows` opt-out. v1.3.23 shipped the inverse:
+non-fatal by default with `HASHER_STRICT_ROWS=1` opt-in. User
+retained the deployed default. Both are defensible; documenting
+the choice so the next reviewer sees it was deliberate.
+
+### Lower-priority cleanup
+
+- **ALGO comment**: `sha256|sha1|sha512|md5|blake2` line was
+  stale — SHA-256 has been the only supported algorithm since
+  v1.3.16. Updated to `# SHA-256 only since v1.3.16`.
+- **check-deps.sh --fix**: removed the sha1sum/sha512sum/md5sum
+  shim-creation calls that had been unreachable for many
+  releases. b2sum was never invoked. Doc header updated.
+- **self-test.sh modes**: `--strict` was unsuitable for CI on a
+  fresh checkout because an empty paths.txt is expected there
+  (nobody has configured scan paths yet). Split into
+  `--installation-strict` (old behaviour, alias for `--strict`,
+  suits deployed NAS) and `--ci-strict` (fails on all warnings
+  EXCEPT paths.txt-not-configured). Both live-verified.
+- **Unstable-files log**: internal `\036CHANGED\036` sentinel
+  stripped before the file is renamed into `logs/`, so `cat`
+  and `less` show clean paths. Header comment added with
+  format description and run tag.
+
+Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
+
+---
 ## Future Roadmap  
+
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
 - Parallel hashing engine  
