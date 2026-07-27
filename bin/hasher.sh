@@ -556,6 +556,66 @@ build_file_list() {
   : > "$FILES_LIST"
   local had_input=false
 
+  # v1.3.21 (Mary's Mac report): during discovery, `find` can walk for
+  # many minutes on a large external drive with no visible activity — the
+  # background log stays frozen at "[INFO] Working dir: ..." and users
+  # tailing the log cannot tell a slow-but-alive walk from a hang.
+  # Fix: start a lightweight heartbeat that writes to $BACKGROUND_LOG
+  # every $PROGRESS_INTERVAL seconds (default 15s), reporting how many
+  # candidates have been discovered so far. The heartbeat is stopped as
+  # soon as build_file_list finishes; if it fails to start (unlikely) the
+  # walk still completes correctly, just quietly.
+  #
+  # We deliberately DON'T use bglog here because that function timestamps
+  # the RUN_ID prefix consistently with other entries; the heartbeat uses
+  # the same format so tailers see one uniform stream.
+  local walk_hb_pid=0
+  local walk_start_ts
+  walk_start_ts=$(date +%s)
+  if [[ -n "${BACKGROUND_LOG:-}" ]] && [[ "${PROGRESS_INTERVAL:-15}" -gt 0 ]]; then
+    (
+      # Subshell inherits set -Eeuo pipefail — use `|| true` on anything
+      # that could legitimately return non-zero (empty tmp file, missing
+      # FILES_LIST during first tick, etc.) so the heartbeat never dies
+      # from a routine miss.
+      local hb_interval="${PROGRESS_INTERVAL:-15}"
+      while :; do
+        sleep "$hb_interval" || break
+        local hb_now hb_elapsed hb_seen=0
+        hb_now=$(date +%s)
+        hb_elapsed=$(( hb_now - walk_start_ts ))
+        # Count NUL-delimited entries collected so far in the working list.
+        # $FILES_LIST.tmp is where find output accumulates before exclusion
+        # filtering. Empty/missing => 0 (first tick, or filter has moved on).
+        if [[ -s "$FILES_LIST".tmp ]]; then
+          hb_seen=$(tr -cd '\0' < "$FILES_LIST".tmp 2>/dev/null | wc -c 2>/dev/null | tr -d ' ' || echo 0)
+        elif [[ -s "$FILES_LIST" ]]; then
+          # Post-filter path already produced; still worth reporting.
+          hb_seen=$(tr -cd '\0' < "$FILES_LIST" 2>/dev/null | wc -c 2>/dev/null | tr -d ' ' || echo 0)
+        fi
+        printf '[%s] [RUN %s] [PROGRESS] Walking paths: %s file(s) discovered so far | elapsed=%02d:%02d:%02d\n' \
+          "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "${hb_seen:-0}" \
+          $((hb_elapsed/3600)) $((hb_elapsed%3600/60)) $((hb_elapsed%60)) \
+          >> "$BACKGROUND_LOG" 2>/dev/null || true
+      done
+    ) &
+    walk_hb_pid=$!
+  fi
+  # Ensure the heartbeat is killed on ANY exit from this function —
+  # normal completion, error, or trap. The inline stop at the end of the
+  # function is the normal path; this trap is belt-and-braces so a bail-out
+  # from `error \"...\"; exit N` inside build_file_list doesn't leave the
+  # emitter running as an orphan writing to a log file the parent has
+  # closed. RETURN pseudo-signal fires when the function returns or exits.
+  _stop_walk_hb() {
+    if [[ "${walk_hb_pid:-0}" -gt 0 ]] && kill -0 "$walk_hb_pid" 2>/dev/null; then
+      kill "$walk_hb_pid" 2>/dev/null || true
+      wait "$walk_hb_pid" 2>/dev/null || true
+    fi
+    walk_hb_pid=0
+  }
+  trap '_stop_walk_hb' RETURN
+
   # v1.3.20 (Mary's Mac Tahoe report): compute host-specific find-prune
   # args ONCE and apply them to every find below. On macOS this prunes
   # .Spotlight-V100, .DocumentRevisions-V100, etc. so BSD find no longer
@@ -857,6 +917,11 @@ build_file_list() {
   if (( pre_count > 0 && post_count == 0 && ${#patterns[@]} > 0 )); then
     info "All $pre_count candidate(s) matched exclusion patterns; nothing to hash this run."
   fi
+
+  # v1.3.21: stop the walk heartbeat cleanly before the function returns.
+  # The RETURN trap above is the belt-and-braces safety net; this is the
+  # normal path.
+  _stop_walk_hb
 
   rm -f -- "$FILES_LIST".tmp 2>/dev/null || true
 }
