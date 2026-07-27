@@ -157,6 +157,25 @@ else
   SKIP_ZL="${TMP_LIST%.txt}-skipped-delimiter.log"
   : > "$SKIP_ZL"
   # Scope: if a paths file exists, use it; otherwise scan /volume1 (Synology default root) safely
+  # v1.3.20 (Mary's Mac): apply host prune-args so macOS system dirs like
+  # .Spotlight-V100 don't cause BSD find to exit non-zero here either.
+  # host-detect.sh may already be sourced above; guard for that.
+  # v1.3.20 patch: bash 3.2 (macOS stock) needs the file-mediated
+  # collection pattern and array-length branching used in hasher.sh.
+  if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+    . "$ROOT_DIR/lib/host-detect.sh"
+  fi
+  ZL_PRUNE=()
+  if command -v host_find_prune_args >/dev/null 2>&1; then
+    _zltmp="${TMP_LIST%.txt}.prune.$$"
+    host_find_prune_args > "$_zltmp" 2>/dev/null || true
+    if [ -s "$_zltmp" ]; then
+      while IFS= read -r _a || [ -n "$_a" ]; do
+        [ -n "$_a" ] && ZL_PRUNE[${#ZL_PRUNE[@]}]="$_a"
+      done < "$_zltmp"
+    fi
+    rm -f -- "$_zltmp" 2>/dev/null || true
+  fi
   SCOPE_FILE=""
   for f in "$LOCAL_DIR/paths.txt" "$DEFAULT_DIR/paths.example.txt" "$DEFAULT_DIR/paths.txt"; do
     [ -f "$f" ] && SCOPE_FILE="$f" && break
@@ -165,19 +184,22 @@ else
     while IFS= read -r pth; do
       [ -z "$pth" ] && continue
       [ "${pth#\#}" != "$pth" ] && continue
-      find "$pth" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+      if [ ${#ZL_PRUNE[@]} -gt 0 ]; then
+        find "$pth" "${ZL_PRUNE[@]}" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+      else
+        find "$pth" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+      fi
     done < "$SCOPE_FILE"
   else
     # FIX (v1.1.9): host-aware fallback. /volume1 is Synology-only; on
     # macOS or generic Linux it doesn't exist and find returns nothing.
-    if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
-      . "$ROOT_DIR/lib/host-detect.sh"
-      SCAN_ROOT="$(host_default_scan_root)"
-    else
-      SCAN_ROOT="/volume1"   # legacy default if lib missing
-    fi
+    SCAN_ROOT="$(host_default_scan_root 2>/dev/null || echo /volume1)"
     warn "No paths file found; scanning $SCAN_ROOT (override with --input or local/paths.txt)"
-    find "$SCAN_ROOT" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+    if [ ${#ZL_PRUNE[@]} -gt 0 ]; then
+      find "$SCAN_ROOT" "${ZL_PRUNE[@]}" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+    else
+      find "$SCAN_ROOT" -type f -size 0 -print0 >> "$SCAN_NUL" 2>/dev/null || true
+    fi
   fi
   SAFE_NUL="$TMP_LIST.safe.nul"
   # v1.3.19 (peer-review finding #1): use the lib helper (auto-selects bash
@@ -257,15 +279,30 @@ while IFS= read -r f; do
   fi
   if $QUARANTINE; then
     # FIX (v1.1.9): build the destination from the full source path,
-    # not just basename. Two empty files at /dirA/empty.log and
-    # /dirB/empty.log would otherwise both target $DEST/empty.log
-    # and the second mv would silently overwrite the first (or fail).
-    # Same fix pattern as apply-folder-plan.sh (v1.1.6): strip leading
-    # '/' and replace remaining '/' with '__' to encode the full path
-    # in a flat, collision-free name.
-    slot="$(printf '%s' "$f" | sed 's|^/||; s|/|__|g')"
-    tgt="$DEST/$slot"
-    if mv -- "$f" "$tgt" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
+    # v1.3.20 (peer-review recheck finding #5): mirror the source directory
+    # hierarchy under $DEST rather than encoding with `s|/|__|g`. The old
+    # encoding was NOT reversible: `/a/b__c` and `/a__b/c` both flattened
+    # to `a__b__c`, and the second mv silently replaced the first while
+    # the tool still reported "2 files moved". Use the same pattern that
+    # delete-duplicates.sh has used since v1.3.5: build the destination
+    # by joining $DEST with the source's absolute path (giving
+    # `$DEST/a/b/file`), and disambiguate collisions with `.dup{n}` suffix
+    # rather than silent overwrite. Two files with truly identical source
+    # paths cannot exist simultaneously, so any collision here indicates
+    # a re-run or manual copy — surface it, don't hide it.
+    case "$f" in
+      /*) tgt="$DEST$f" ;;
+      *)  tgt="$DEST/$f" ;;
+    esac
+    tgt_dir=$(dirname "$tgt")
+    mkdir -p "$tgt_dir"
+    if [ -e "$tgt" ]; then
+      n=1
+      while [ -e "${tgt}.dup${n}" ]; do n=$((n+1)); done
+      warn "Quarantine target exists; using ${tgt}.dup${n}"
+      tgt="${tgt}.dup${n}"
+    fi
+    if mv -- "$f" "$tgt" 2>>"$LOG_FILE" && [ ! -e "$f" ]; then okc=$((okc+1)); else fail=$((fail+1)); fi
   else
     if rm -f -- "$f" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
   fi

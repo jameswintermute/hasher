@@ -150,7 +150,18 @@ done
 
 echo
 echo "Process-control capabilities (used by 'k) Stop hashing' and TERM handling):"
-if have pgrep; then ok "pgrep"; else warn "pgrep (missing) — descendant-tree walk in the no-setsid fallback will not work"; fi
+# v1.3.20 (recheck finding #2): pgrep is preferred but not the only option.
+# ps -eo pid=,pgid= works as a POSIX-ish fallback on every target we care
+# about (DSM BusyBox, macOS BSD, GNU procps). At LEAST ONE of the two must
+# work or we cannot safely stop workers.
+if have pgrep; then
+  ok "pgrep (preferred process enumeration)"
+elif ps -eo pid=,pgid= >/dev/null 2>&1; then
+  ok "ps -eo pid=,pgid= (pgrep missing; using ps fallback)"
+else
+  err "Neither pgrep NOR 'ps -eo pid=,pgid=' works — 'k) Stop hashing' would not stop workers"
+  missing_req=1
+fi
 if have setsid; then
   ok "setsid — hasher runs in its own session (clean group-kill available)"
 else

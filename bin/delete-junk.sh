@@ -46,12 +46,41 @@ human_size() {
 }
 
 # read flags
+# v1.3.20 (peer-review recheck finding #3): strict argument parsing. A
+# destructive tool must never silently ignore an unrecognised safety-related
+# argument. Previously `--dryrun --force` (typo) fell through both cases and
+# proceeded to delete because --force matched next. Now every option is
+# validated, --paths-file requires a value, and unknown options exit rc=2.
+_usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--force] [--paths-file FILE] [-h|--help]
+
+Options:
+  --dry-run          List what would be deleted without touching any files.
+  --force            Skip the interactive confirmation prompt.
+  --paths-file FILE  Override the default paths file (local/paths.txt).
+  -h, --help         Show this help.
+
+Exit codes:
+  0  Success (all deletions completed, or --dry-run finished)
+  1  One or more deletions failed (see *-delete-failures.log)
+  2  Argument error (unknown option or missing value)
+EOF
+}
 DRY=0 FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
-    --force)  FORCE=1 ;;
-    --paths-file) PATHS_FILE="$2"; shift ;;
+    --force)   FORCE=1 ;;
+    --paths-file)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        err "--paths-file requires a value"; _usage >&2; exit 2
+      fi
+      PATHS_FILE="$2"; shift ;;
+    -h|--help) _usage; exit 0 ;;
+    --)        shift; break ;;
+    -*)        err "Unknown option: $1"; _usage >&2; exit 2 ;;
+    *)         err "Unexpected positional argument: $1"; _usage >&2; exit 2 ;;
   esac
   shift
 done
