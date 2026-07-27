@@ -173,6 +173,55 @@ host_default_excludes() {
   esac
 }
 
+# ── Host-specific find-prune arguments ─────────────────────────────────
+# Prints shell-safe `-name PATTERN -prune -o` fragments for the current
+# host, ONE ARG PER LINE. Callers read them into an array and inject
+# BEFORE the primary expression:
+#
+#   mapfile -t prune_args < <(host_find_prune_args)
+#   find "$path" "${prune_args[@]}" -type f -print0
+#
+# The prune fragment for each dir is `( -name X -prune )` OR'd against the
+# rest of the expression. Any directory whose basename matches will be
+# skipped WITHOUT find descending into it — so BSD find no longer returns
+# exit 1 for volumes containing .Spotlight-V100 / .DocumentRevisions-V100
+# (Mary's Mac reproduction). This is the belt-and-braces companion to
+# host_default_excludes: prune stops us LOOKING at the dirs; excludes
+# stop any leaked entries reaching the CSV.
+#
+# Empty output on hosts with no special dirs is fine — callers get an
+# empty array and find behaves normally.
+#
+# v1.3.20 (Mary's Mac Tahoe report): added to fix the "BSD find exit 1
+# on external volumes" class of failure at source.
+host_find_prune_args() {
+  detect_host
+  local d
+  case "$HASHER_HOST" in
+    macos)
+      # Same dirs as host_default_excludes emits for macos, but PRUNE'd
+      # so find never descends. Kept as a static list rather than parsed
+      # from host_default_excludes so that a future glob-in-excludes
+      # (e.g. `*.part`) doesn't accidentally become a prune expression —
+      # prune only takes literal names.
+      for d in .Spotlight-V100 .Trashes .fseventsd \
+               .DocumentRevisions-V100 .TemporaryItems \
+               com.apple.TimeMachine.localsnapshots ; do
+        printf -- '(\n-name\n%s\n-type\nd\n-prune\n)\n-o\n' "$d"
+      done
+      ;;
+    synology)
+      # @eaDir is present in every folder Synology has indexed for search;
+      # pruning it saves a LOT of walk time on media volumes.
+      for d in @eaDir '#recycle' @tmp @SynoResource ; do
+        printf -- '(\n-name\n%s\n-type\nd\n-prune\n)\n-o\n' "$d"
+      done
+      ;;
+    linux|*)
+      : ;;
+  esac
+}
+
 # ── Default scan root if no paths.txt is configured ────────────────────
 # Returns a directory path appropriate to start scanning when the user
 # has not provided a paths file. Used by delete-zero-length.sh --scan
