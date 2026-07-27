@@ -204,10 +204,21 @@ if stat -c "%s" /dev/null >/dev/null 2>&1; then
   # GNU stat (Linux, BusyBox, Synology DSM)
   _stat_size()  { stat -c "%s" -- "$1"; }
   _stat_mtime() { stat -c "%Y" -- "$1"; }
+  # v1.3.25 (peer-review recheck #4): identity fingerprint for the
+  # stability check. Reviewer demonstrated that a file whose content
+  # was replaced and then restored with the same size + whole-second
+  # mtime slipped through the check. Adding ctime, inode, and device
+  # closes the loop: an atomic rename changes the inode; any write
+  # (even one restoring identical size/mtime) bumps ctime.
+  # Format: size|mtime|ctime|dev|ino
+  # %Z = ctime (integer seconds), %d = device, %i = inode on GNU stat
+  _stat_fingerprint() { stat -c "%s|%Y|%Z|%d|%i" -- "$1"; }
 else
   # BSD stat (macOS)
   _stat_size()  { stat -f "%z" -- "$1"; }
   _stat_mtime() { stat -f "%m" -- "$1"; }
+  # BSD stat: %z=size, %m=mtime, %c=ctime, %d=device, %i=inode
+  _stat_fingerprint() { stat -f "%z|%m|%c|%d|%i" -- "$1"; }
 fi
 
 # Detect sha256sum vs shasum (macOS ships shasum, not sha256sum)
@@ -674,6 +685,7 @@ build_file_list() {
   # We now exit non-zero with a clear message when no paths were valid.
   local pathfile_seen=0     # non-blank, non-comment lines in paths.txt
   local pathfile_valid=0    # of those, how many were a readable dir or file
+  local pathfile_syminv=0   # v1.3.25: explicitly-listed symlinks refused
 
   if [[ -n "$PATHFILE" ]]; then
     if [[ ! -r "$PATHFILE" ]]; then
@@ -755,6 +767,15 @@ build_file_list() {
           fi
         fi
         rm -f -- "$find_err" 2>/dev/null || true
+      elif [[ -L "$path" ]]; then
+        # v1.3.25 (peer-review recheck #2): refuse explicitly-listed symlinks.
+        # Reviewer showed that previously an explicit symlink was hashed
+        # as a file (symlink stat + target content), yielding a CSV row
+        # that lies about what was hashed. Directory scans already skip
+        # symlinks via `find -type f`; matching that behaviour for
+        # explicitly listed symlinks is the honest fix.
+        warn "Symlink refused (list the target's real path instead): $path"
+        pathfile_syminv=$((pathfile_syminv + 1))
       elif [[ -f "$path" ]]; then
         printf '%s\0' "$path"
         pathfile_valid=$((pathfile_valid + 1))
@@ -812,6 +833,8 @@ build_file_list() {
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
+          elif [[ -L "$path" ]]; then
+            warn "Symlink refused via stdin (list the target's real path instead): $path"
           elif [[ -f "$path" ]]; then
             printf '%s\0' "$path"
             stdin_valid=$((stdin_valid + 1))
@@ -834,6 +857,8 @@ build_file_list() {
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
+          elif [[ -L "$path" ]]; then
+            warn "Symlink refused via stdin (list the target's real path instead): $path"
           elif [[ -f "$path" ]]; then
             printf '%s\0' "$path"
             stdin_valid=$((stdin_valid + 1))
@@ -858,10 +883,21 @@ build_file_list() {
   # listed in it is missing or unreadable. Stdin-piped invocations bypass
   # this check (we can't tell a legitimately-empty stream from an
   # all-missing one, and stdin is the advanced path).
+  #
+  # v1.3.25 (peer-review recheck #2): distinguish "all refused symlinks"
+  # from "all missing / unreadable" — the message and remediation differ.
   if [[ "$pathfile_seen" -gt 0 && "$pathfile_valid" -eq 0 ]]; then
-    error "All $pathfile_seen path(s) listed in '$PATHFILE' are missing or unreadable."
-    error "Common causes: external drive not mounted, typo in volume name, NAS share not connected."
-    error "Check 'ls /Volumes' (macOS), 'ls /mnt' or 'ls /media' (Linux), or 'ls /volume1' (Synology)."
+    if [[ "$pathfile_syminv" -gt 0 && "$pathfile_syminv" -eq "$pathfile_seen" ]]; then
+      error "All $pathfile_seen path(s) in '$PATHFILE' are symlinks — refused."
+      error "Symlinks are refused because hashing them would record the symlink's"
+      error "  own metadata alongside the target's content, producing an inconsistent"
+      error "  CSV row. List each target's REAL path instead (readlink -f, or resolve"
+      error "  with your file manager)."
+    else
+      error "All $pathfile_seen path(s) listed in '$PATHFILE' are missing or unreadable."
+      error "Common causes: external drive not mounted, typo in volume name, NAS share not connected."
+      error "Check 'ls /Volumes' (macOS), 'ls /mnt' or 'ls /media' (Linux), or 'ls /volume1' (Synology)."
+    fi
     exit 3
   fi
 
@@ -1105,6 +1141,13 @@ cleanup() {
     _lp="$(cat "$HASHER_LOCKDIR/pid" 2>/dev/null || true)"
     [ "$_lp" = "$$" ] && rm -rf -- "$HASHER_LOCKDIR" 2>/dev/null || true
   fi
+  # v1.3.25 (peer-review recheck #3): honour the run status set by the
+  # main hashing block. If the shell is already exiting non-zero from a
+  # trap (e.g. TERM handler), leave that intact; otherwise exit with the
+  # status we chose.
+  if [[ -n "${HASHER_RUN_STATUS:-}" ]] && [[ "${HASHER_RUN_STATUS}" != "0" ]]; then
+    exit "$HASHER_RUN_STATUS"
+  fi
 }
 trap cleanup EXIT
 # v1.3.16 (peer-review finding #4): TERM/INT traps now signal the entire
@@ -1265,6 +1308,7 @@ TOTAL=0
 DONE=0
 FAIL=0
 UNSTABLE=0   # v1.3.24: files that changed during hashing (excluded from CSV)
+HASHER_RUN_STATUS=0  # v1.3.25: 0=all hashed, 1=hash/stat failures, 4=unstable-only
 
 main() {
   # v1.3.16 (peer-review finding #3): acquire a concurrency lock BEFORE any
@@ -1554,54 +1598,46 @@ main() {
   # We pass ALGO and the hash command through the environment.
   _hash_worker() {
     local f="$1"
-    local size mtime line hash size2 mtime2
+    local size mtime line hash fp1 fp2
     size=$(_stat_size "$f" 2>/dev/null || echo -1)
     mtime=$(_stat_mtime "$f" 2>/dev/null || echo -1)
     if [[ "$size" -lt 0 || "$mtime" -lt 0 ]]; then
       printf '\037FAIL\037stat\t%s\n' "$f"   # \037 = unit separator, unlikely in paths
       return 0
     fi
+    # v1.3.25 (peer-review recheck #4): capture full identity fingerprint
+    # before hashing (device, inode, size, mtime, ctime). Compare after
+    # hashing. Reviewer demonstrated that comparing only size and
+    # second-resolution mtime allowed a mutate+restore cycle to slip
+    # through with the wrong hash. Any of the five fields changing
+    # is treated as instability. Atomic replacement changes inode;
+    # any write bumps ctime even if size and mtime are restored.
+    fp1=$(_stat_fingerprint "$f" 2>/dev/null || echo "STAT_FAIL")
     if ! line=$("${hash_cmd[@]}" -- "$f" 2>/dev/null); then
       printf '\037FAIL\037hash\t%s\n' "$f"
       return 0
     fi
     hash="${line%% *}"
-    # v1.3.24 (peer-review recheck finding #3): re-stat AFTER hashing to
-    # detect files that changed during the hash operation. Policy
-    # revised from v1.3.23 best-effort to EXCLUDE-AND-LOG on reviewer's
-    # data-integrity grounds:
-    #
-    #   A CSV row `path,size=6,mtime=T,algo=sha256,hash=<of size-19 content>`
-    #   describes a file state that never existed as one consistent
-    #   snapshot. Downstream tools (dedup discovery, restore verification)
-    #   will match on the hash and assume the size/mtime are true — so
-    #   an inconsistent row is worse than a missing row.
-    #
-    # If size or mtime drifted between pre-hash and post-hash stats, we
-    # emit ONLY the CHANGED marker (no CSV row) and let the main-loop
-    # dispatcher route it to `logs/unstable-files-<run>.log`. The file
-    # is left OUT of the authoritative manifest; the operator sees the
-    # exclusion and can re-hash if wanted.
-    #
-    # We check size and mtime only — checking inode would require stat -c
-    # / stat -f differences across Linux/macOS/DSM and add fragility for
-    # marginal benefit. A cp+atomic-rename that changes the inode without
-    # changing size or mtime is extremely rare.
-    size2=$(_stat_size "$f" 2>/dev/null || echo -1)
-    mtime2=$(_stat_mtime "$f" 2>/dev/null || echo -1)
-    if [[ "$size2" != "$size" || "$mtime2" != "$mtime" ]]; then
+    # v1.3.24 (peer-review recheck finding #3), extended v1.3.25 #4:
+    # re-fingerprint after hashing. If ANY of size/mtime/ctime/dev/ino
+    # drifted, emit ONLY the CHANGED marker (no CSV row) and let the
+    # main-loop dispatcher route it to `logs/unstable-files-<run>.log`.
+    fp2=$(_stat_fingerprint "$f" 2>/dev/null || echo "STAT_FAIL")
+    if [[ "$fp1" != "$fp2" ]]; then
       # \036 = record separator (rare in paths); handler in the main loop
       # writes this to an "unstable files" log. NO CSV row is emitted —
       # the file is excluded from the authoritative manifest.
-      printf '\036CHANGED\036%s\t%s->%s\t%s->%s\n' "$f" "$size" "$size2" "$mtime" "$mtime2"
+      # Log the pre/post fingerprints so operators can diagnose which
+      # attribute drifted (size|mtime|ctime|dev|ino format).
+      printf '\036CHANGED\036%s\t%s\t%s\n' "$f" "$fp1" "$fp2"
       return 0
     fi
-    # Stable snapshot: pre/post stats agree. Write the CSV row.
+    # Stable snapshot: pre/post fingerprints agree. Write the CSV row.
     # csv_escape inline (worker runs in a subshell that has the function)
     local esc="${f//\"/\"\"}"
     printf '"%s",%s,%s,%s,%s\n' "$esc" "$size" "$mtime" "$ALGO" "$hash"
   }
-  export -f _hash_worker _stat_size _stat_mtime 2>/dev/null || true
+  export -f _hash_worker _stat_size _stat_mtime _stat_fingerprint 2>/dev/null || true
   export ALGO
   # hash_cmd is an array; export its serialised form and rebuild in workers
   export HASH_CMD_STR="${hash_cmd[*]}"
@@ -1715,7 +1751,8 @@ main() {
     # format after stripping: `<path>\t<size_pre>-><size_post>\t<mtime_pre>-><mtime_post>`
     {
       printf '# Unstable files — excluded from the CSV manifest.\n'
-      printf '# Format: path<TAB>size_pre->size_post<TAB>mtime_pre->mtime_post\n'
+      printf '# Format: path<TAB>fingerprint_pre<TAB>fingerprint_post\n'
+      printf '# Fingerprint fields: size|mtime|ctime|dev|ino\n'
       printf '# Generated: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')"
       printf '# Run tag: %s\n' "$CSV_TAG"
       # \036 is octal 036 → sed \x1e
@@ -1747,10 +1784,18 @@ main() {
 
   # v1.3.24 (finding #3): mention unstable file count when non-zero so
   # DONE=$hashed_rows+$fail_rows+$changed_rows adds up transparently
-  # for anyone reading the log.
-  local _unstable_txt=""
-  [[ "$UNSTABLE" -gt 0 ]] && _unstable_txt=", unstable=$UNSTABLE"
-  info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL${_unstable_txt}) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
+  # v1.3.25 (peer-review recheck #3): report SEPARATE counts so
+  # automation can distinguish outcomes. Previous format
+  # `Hashed N/T files (failures=F, unstable=U)` was easily read as
+  # "success" even when F or U == T. Exit codes now reflect reality:
+  #   0 = all discovered files hashed successfully to the CSV
+  #   1 = one or more stat/hash failures occurred
+  #   4 = no hard failures, but one or more files unstable (excluded)
+  # Reserved: 2 for invalid input/config, 3 for missing tools (kept from
+  # earlier releases).
+  local _successful=$(( DONE - FAIL - UNSTABLE ))
+  [[ "$_successful" -lt 0 ]] && _successful=0
+  info "Completed. Processed $DONE/$TOTAL files: hashed=$_successful, failed=$FAIL, unstable=$UNSTABLE. Elapsed: $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
   # v1.3.22: sort the CSV by path for deterministic output and clean
   # cross-run diffing. Fail-safe: original is never touched until the
@@ -1762,7 +1807,34 @@ main() {
     info "CSV sort skipped (SORT_OUTPUT=$SORT_OUTPUT). Rows in worker-race order."
   fi
 
+  # v1.3.25 (peer-review recheck #3): warn LOUDLY before publishing
+  # next-step reports if the run is incomplete. Reviewer's concern:
+  # automation and users can see the "Duplicate report ready: ..."
+  # line and assume the snapshot is complete.
+  if [[ "$FAIL" -gt 0 || "$UNSTABLE" -gt 0 ]]; then
+    warn "========================================"
+    warn "PARTIAL SNAPSHOT: CSV does NOT reflect the full input set."
+    [[ "$FAIL"     -gt 0 ]] && warn "  - $FAIL file(s) failed to hash (see fail_file above)."
+    [[ "$UNSTABLE" -gt 0 ]] && warn "  - $UNSTABLE file(s) excluded because they changed during hashing."
+    warn "Downstream reports below are generated from this PARTIAL manifest."
+    warn "Re-run hasher when writes have settled if a complete snapshot is required."
+    warn "========================================"
+  fi
+
   post_run_reports "$OUTPUT" "$CSV_TAG"
+
+  # v1.3.25 (peer-review recheck #3): set the exit disposition. cleanup()
+  # trap runs on EXIT and honours this via $HASHER_RUN_STATUS. Failures
+  # trump unstable (a run with both is a failed run).
+  if [[ "$FAIL" -gt 0 ]]; then
+    HASHER_RUN_STATUS=1
+    warn "Run completed with $FAIL hash/stat failure(s) — CSV is INCOMPLETE. Exit status: 1"
+  elif [[ "$UNSTABLE" -gt 0 ]]; then
+    HASHER_RUN_STATUS=4
+    warn "Run completed but $UNSTABLE file(s) excluded as unstable — CSV is a PARTIAL snapshot. Exit status: 4"
+  else
+    HASHER_RUN_STATUS=0
+  fi
 }
 
 # ───────────────────────── Post-run Reports ────────────────

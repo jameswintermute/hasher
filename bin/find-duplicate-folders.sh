@@ -278,6 +278,55 @@ LC_ALL=C sort -t '	' -k1,1 -k2,2 "$TMP_BASE.sig_dir_size.tsv" | awk -F '	' -v MI
 # 5) write plan
 LC_ALL=C sort -nr -k1,1 "$TMP_GROUPS" > "$TMP_BASE.groups.sorted.tsv"
 
+# v1.3.25 (peer-review recheck #2): filter out any group where the
+# KEEP or DEL folder contains non-regular entries (symlinks, FIFOs,
+# sockets, devices, ...) directly in it. Rationale: the folder
+# signature only captures regular-file basename+hash+size, so two
+# folders that agree on regular files but differ in symlinks/FIFOs
+# look identical to the algorithm. If we then move one to quarantine,
+# we lose the unique non-regular entry. Safest policy per reviewer:
+# exclude the entire group from dedup and log why. Operators who
+# really want to dedup such folders can do so manually.
+_folders_filter_tsv() {
+  local in="$1" out="$2" ex="$3"
+  : > "$out"; : > "$ex"
+  local kept=0 dropped=0
+  while IFS=$'\t' read -r sz keepdir deldir; do
+    [ -z "${keepdir:-}" ] && continue
+    # Scan direct children only (matches signature scope) for non-regular
+    # entries. `find -mindepth 1 -maxdepth 1 ! -type f` catches
+    # symlinks, dirs, FIFOs, sockets, devices in one pass.
+    # Directories are OK here (the leaf check upstream excludes non-leaves).
+    # We look specifically for symlinks/FIFOs/sockets/devices/blocks/chars.
+    local k_nonreg d_nonreg
+    k_nonreg="$(find "$keepdir" -mindepth 1 -maxdepth 1 \
+      \( -type l -o -type p -o -type s -o -type b -o -type c \) \
+      -print -quit 2>/dev/null)"
+    d_nonreg="$(find "$deldir" -mindepth 1 -maxdepth 1 \
+      \( -type l -o -type p -o -type s -o -type b -o -type c \) \
+      -print -quit 2>/dev/null)"
+    if [ -n "$k_nonreg" ] || [ -n "$d_nonreg" ]; then
+      printf 'EXCLUDED\t%s\t%s\treason=non-regular-entry\tkeep_hit=%s\tdel_hit=%s\n' \
+        "$keepdir" "$deldir" "${k_nonreg:-}" "${d_nonreg:-}" >> "$ex"
+      dropped=$(( dropped + 1 ))
+    else
+      printf '%s\t%s\t%s\n' "$sz" "$keepdir" "$deldir" >> "$out"
+      kept=$(( kept + 1 ))
+    fi
+  done < "$in"
+  printf '%s %s\n' "$kept" "$dropped"
+}
+_nonreg_excluded="$LOGS_DIR/duplicate-folders-excluded-$DATE_TAG.log"
+_read=$(_folders_filter_tsv "$TMP_BASE.groups.sorted.tsv" "$TMP_BASE.groups.filtered.tsv" "$_nonreg_excluded")
+_kept="${_read%% *}"; _dropped="${_read##* }"
+if [ "${_dropped:-0}" -gt 0 ]; then
+  warn "$_dropped folder pair(s) excluded from dedup: non-regular entries present (symlinks/FIFOs/sockets/devices)."
+  warn "  Details: $_nonreg_excluded"
+  warn "  (Rationale: signature only compares regular files; moving would drop the unique non-regular entries.)"
+fi
+mv -f -- "$TMP_BASE.groups.filtered.tsv" "$TMP_BASE.groups.sorted.tsv"
+[ -s "$_nonreg_excluded" ] || rm -f -- "$_nonreg_excluded" 2>/dev/null || true
+
 groups_count="$(wc -l < "$TMP_BASE.groups.sorted.tsv" | tr -d ' ')"
 [ -n "$groups_count" ] || groups_count=0
 

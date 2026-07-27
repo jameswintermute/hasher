@@ -345,6 +345,61 @@ awk -F'\t' '
   ($1 in want)                       # second file: keep rows whose col-1 hash matches
 ' "$HASHES_TMP" "$TMP" > "$OUT_CSV" || true
 
+# v1.3.25 (peer-review recheck #5): before OUT_CSV is consumed by the
+# canonical-report awk or the bulk-mode planner, detect groups where
+# two or more paths are hard links to the same physical inode.
+# Reviewer demonstrated that moving one hard link to quarantine
+# reclaims ZERO bytes (the inode still has all its other links) and,
+# if quarantine crosses filesystems, may COPY the data — reclaim
+# calculation is a lie and the operation may increase usage.
+#
+# Policy: within a hash-group, keep the first path per (device,inode)
+# and log the rest as hard-linked to the keeper. This runs in BOTH
+# standard and bulk modes so the canonical group report matches the
+# plan generated later.
+_stat_dev_ino() {
+  if stat -c "%d %i" /dev/null >/dev/null 2>&1; then
+    stat -c "%d %i" -- "$1" 2>/dev/null | tr ' ' '|'
+  else
+    stat -f "%d %i" -- "$1" 2>/dev/null | tr ' ' '|'
+  fi
+}
+_hardlinks_log="$LOGS_DIR/hardlinks-excluded-$timestamp.log"
+_hl_csv="$OUT_CSV.hlfilt.$$"
+: > "$_hardlinks_log"
+: > "$_hl_csv"
+{
+  declare -A hl_seen  # hash|dev|ino -> first-kept path
+  while IFS=$'\t' read -r h p s; do
+    [[ -z "$h" || -z "$p" ]] && continue
+    di="$(_stat_dev_ino "$p" 2>/dev/null || true)"
+    if [[ -z "$di" ]]; then
+      # stat failed — pass through (treat as unique physical object)
+      printf '%s\t%s\t%s\n' "$h" "$p" "$s"
+      continue
+    fi
+    k="$h|$di"
+    if [[ -n "${hl_seen[$k]:-}" ]]; then
+      printf 'HARDLINK\t%s\tsame-inode-as\t%s\n' "$p" "${hl_seen[$k]}" >> "$_hardlinks_log"
+    else
+      hl_seen[$k]="$p"
+      printf '%s\t%s\t%s\n' "$h" "$p" "$s"
+    fi
+  done < "$OUT_CSV"
+} > "$_hl_csv" 2>/dev/null || true
+
+_hl_lines=$(wc -l < "$_hardlinks_log" 2>/dev/null | tr -d ' ' || echo 0)
+[[ -z "$_hl_lines" ]] && _hl_lines=0
+if [[ "$_hl_lines" -gt 0 ]]; then
+  warn "$_hl_lines path(s) excluded: hard links to a kept file."
+  warn "  Details: $_hardlinks_log"
+  warn "  (Moving these would NOT reclaim space; they share an inode with the KEEP path.)"
+  mv -f -- "$_hl_csv" "$OUT_CSV" 2>/dev/null || true
+else
+  rm -f -- "$_hardlinks_log" 2>/dev/null || true
+  rm -f -- "$_hl_csv" 2>/dev/null || true
+fi
+
 # Single-pass AWK to render canonical + groups; avoids bash loops under set -e
 # (intermediate is TAB-separated since v1.3.1)
 awk -F'\t' -v min="$MIN_GROUP" \
