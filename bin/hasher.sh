@@ -140,6 +140,11 @@ PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
 LOG_LEVEL="info"     # info|warn|error
+# v1.3.22: sort the output CSV by path after hashing completes. Default on
+# for deterministic output and cross-run diffing. The sort is fail-safe:
+# original CSV is NEVER touched until the sorted candidate has been fully
+# validated (row count matches, header intact). See sort_output_csv().
+SORT_OUTPUT="true"
 ZERO_LENGTH_ONLY=false
 
 # Optional config (CLI can override)
@@ -360,6 +365,15 @@ load_config() {
           logs_dir)      LOGS_DIR="$val" ;;
           level)         LOG_LEVEL="$val" ;;
           interval|background-interval) PROGRESS_INTERVAL="$val" ;;
+          # v1.3.22: sort CSV by path after hashing. Accepts true/false/1/0.
+          sort_output|sort-output)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) SORT_OUTPUT="false" ;;
+              1|true|yes|on)  SORT_OUTPUT="true"  ;;
+              *)              : ;;  # ignore garbage, keep default
+            esac
+            ;;
           exclude)       EXTRA_EXCLUDES+=("$val") ;;
           __bare__)      : ;;
           *)             : ;;
@@ -475,6 +489,9 @@ while [[ $# -gt 0 ]]; do
     --nohup)    RUN_IN_BACKGROUND=true ;;
     --level)    LOG_LEVEL="${2:-}"; shift ;;
     --interval) PROGRESS_INTERVAL="${2:-}"; shift ;;
+    # v1.3.22: opt out of CSV sorting for this one run.
+    --no-sort)  SORT_OUTPUT="false" ;;
+    --sort)     SORT_OUTPUT="true"  ;;
     --jobs)     HASH_JOBS="${2:-1}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
@@ -1480,7 +1497,161 @@ main() {
 
   info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
+  # v1.3.22: sort the CSV by path for deterministic output and clean
+  # cross-run diffing. Fail-safe: original is never touched until the
+  # sorted candidate is validated. See sort_output_csv().
+  if [[ "$SORT_OUTPUT" = "true" ]]; then
+    _first_run_sort_notice
+    sort_output_csv "$OUTPUT" || warn "CSV sort failed; unsorted output retained (see warnings above)"
+  else
+    info "CSV sort skipped (SORT_OUTPUT=$SORT_OUTPUT). Rows in worker-race order."
+  fi
+
   post_run_reports "$OUTPUT" "$CSV_TAG"
+}
+
+# ───────────────────────── Post-run Reports ────────────────
+# ───────────────────────── CSV Sort (v1.3.22) ──────────────
+# First-run notice: on the very first hashing run of a fresh install,
+# tell the user about the new sort behaviour and how to turn it off if
+# they don't want it. Marker file in var/ so we only print it once.
+_first_run_sort_notice() {
+  local marker="$VAR_DIR/.sort-notice-shown"
+  [[ -f "$marker" ]] && return 0
+  info ""
+  info "─── First-run notice: CSV sorting ──────────────────────────────"
+  info "Since v1.3.22, Hasher sorts the output CSV by path after hashing."
+  info "This makes cross-run diffing possible and produces deterministic"
+  info "output. The sort is fail-safe: the original CSV is never touched"
+  info "until the sorted candidate has been fully validated (row count,"
+  info "header, byte count). If validation fails, you keep the unsorted"
+  info "CSV and a warning is logged — no possibility of corruption."
+  info ""
+  info "To disable: set 'sort_output = false' under [logging] in"
+  info "  local/hasher.conf, or pass --no-sort on the command line."
+  info "────────────────────────────────────────────────────────────────"
+  info ""
+  # Best-effort marker creation. If var/ isn't writable we just show the
+  # notice again next run — harmless.
+  mkdir -p "$VAR_DIR" 2>/dev/null || true
+  : > "$marker" 2>/dev/null || true
+}
+
+
+#
+#   1. NEVER touch the original CSV until the sorted candidate has been
+#      fully written AND validated. A 5-hour hashing run must not be
+#      corrupted by a bad sort. If anything goes wrong, we leave the
+#      unsorted file exactly as the workers produced it and warn.
+#
+#   2. Sort to the SAME directory as the output CSV. Rename via `mv` is
+#      then atomic (same filesystem = single inode rename), and the
+#      temp file lands on the same volume — no cross-filesystem risk,
+#      no /tmp space concerns.
+#
+#   3. Validate before replacing. Row count of sorted must equal row
+#      count of original. Header must be intact on line 1. If either
+#      check fails, discard the sorted file and keep the original.
+#
+#   4. Use LC_ALL=C for byte-order determinism across locales — critical
+#      for cross-run diffing (the main reason to sort at all).
+#
+#   5. Sort by full row (opaque line comparison), not by parsed path
+#      column. Full-row sort ≈ path sort in practice because path is
+#      the first column, and it avoids the CSV-quoted-comma parsing
+#      trap. The v1.3.22 discussion considered a keyed sort with
+#      awk-preprocessed prefix; deferred as unnecessary complexity.
+#
+# Returns 0 on success (CSV replaced with sorted version), non-zero on
+# any failure (original untouched). Non-zero exits are LOGGED but not
+# fatal — hashing succeeded, sorting is a nice-to-have.
+sort_output_csv() {
+  local csv="$1"
+  [[ -f "$csv" ]] || { warn "sort: CSV not found: $csv"; return 1; }
+  [[ -s "$csv" ]] || { warn "sort: CSV empty, skipping"; return 1; }
+
+  # 1. Snapshot the pre-sort state (lines + first-line header + size)
+  local orig_lines orig_size orig_header
+  orig_lines=$(wc -l < "$csv" 2>/dev/null | tr -d ' ' || echo 0)
+  orig_size=$(wc -c < "$csv" 2>/dev/null | tr -d ' ' || echo 0)
+  orig_header=$(head -n1 "$csv" 2>/dev/null || echo "")
+
+  if [[ "$orig_lines" -lt 2 ]]; then
+    # Header only, no data rows. Nothing to sort but not an error.
+    info "sort: CSV has no data rows (${orig_lines} line(s)); nothing to sort."
+    return 0
+  fi
+
+  # 2. Verify the header looks like a header. Expected first column is 'path'.
+  #    If the header is missing (unusual but possible from tampering), refuse
+  #    to sort — we don't want to shuffle a rogue first data row into place.
+  if [[ "${orig_header:0:4}" != "path" ]]; then
+    warn "sort: CSV first line does not start with 'path'; refusing to sort"
+    warn "  first line was: ${orig_header:0:80}"
+    return 1
+  fi
+
+  # 3. Produce sorted candidate in the SAME directory (atomic rename later).
+  local sort_tmp="${csv}.sort-tmp.$$"
+  local sort_err="${csv}.sort-err.$$"
+
+  # Header first, then LC_ALL=C sort of the data rows. tail -n +2 gives us
+  # rows without the header; sort them opaquely.
+  {
+    printf '%s\n' "$orig_header"
+    tail -n +2 "$csv" | LC_ALL=C sort
+  } > "$sort_tmp" 2>"$sort_err"
+  local sort_rc=$?
+
+  if [[ "$sort_rc" -ne 0 ]]; then
+    warn "sort: sort command failed with exit $sort_rc; keeping unsorted CSV"
+    [[ -s "$sort_err" ]] && warn "  sort stderr: $(head -n1 "$sort_err")"
+    rm -f -- "$sort_tmp" "$sort_err" 2>/dev/null || true
+    return 1
+  fi
+  rm -f -- "$sort_err" 2>/dev/null || true
+
+  # 4. VALIDATE the candidate before touching the original.
+  local new_lines new_size new_header
+  new_lines=$(wc -l < "$sort_tmp" 2>/dev/null | tr -d ' ' || echo 0)
+  new_size=$(wc -c < "$sort_tmp" 2>/dev/null | tr -d ' ' || echo 0)
+  new_header=$(head -n1 "$sort_tmp" 2>/dev/null || echo "")
+
+  # 4a. Row count must match exactly.
+  if [[ "$new_lines" != "$orig_lines" ]]; then
+    warn "sort: line count changed after sort (was $orig_lines, now $new_lines); keeping unsorted CSV"
+    rm -f -- "$sort_tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  # 4b. Header must be intact — same string, position 1.
+  if [[ "$new_header" != "$orig_header" ]]; then
+    warn "sort: header changed after sort; keeping unsorted CSV"
+    rm -f -- "$sort_tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  # 4c. Size sanity: sorted file should be within 1 byte of original
+  #      (allow one trailing-newline difference from sort implementations).
+  local size_diff=$(( new_size - orig_size ))
+  [[ "$size_diff" -lt 0 ]] && size_diff=$(( -size_diff ))
+  if [[ "$size_diff" -gt 1 ]]; then
+    warn "sort: byte count differs by $size_diff (orig=$orig_size, sorted=$new_size); keeping unsorted CSV"
+    rm -f -- "$sort_tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  # 5. All checks passed. Atomic rename onto the original — same-directory
+  #    mv is a single inode rename, either fully succeeds or leaves the
+  #    original untouched. No possibility of a half-written CSV.
+  if ! mv -f -- "$sort_tmp" "$csv"; then
+    warn "sort: atomic rename failed; keeping unsorted CSV"
+    rm -f -- "$sort_tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  info "sort: CSV sorted by path ($((orig_lines - 1)) data rows, ${new_size} bytes)"
+  return 0
 }
 
 # ───────────────────────── Post-run Reports ────────────────
