@@ -84,6 +84,34 @@ if [ -r "$ROOT_DIR/lib/awk-detect.sh" ]; then
   hasher_detect_awk_nul_safety
 fi
 
+# v1.3.20 patch (Mary's Mac Tahoe report): source host-detect.sh so
+# build_file_list can pull host_find_prune_args. Previously only the
+# launcher sourced this; when hasher.sh runs as a nohup child (which is
+# ALWAYS on Mary's Mac, because that's what option 1 does), host-detect
+# wasn't loaded — so `command -v host_find_prune_args` returned false
+# and the macOS system-dir prune never activated. Now it always loads.
+if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+  . "$ROOT_DIR/lib/host-detect.sh"
+  detect_host
+fi
+
+# v1.3.20 (peer-review recheck finding #2): verify we have a way to enumerate
+# our own process group members BEFORE main() runs. Without either pgrep or
+# `ps -eo pid=,pgid=`, _stop_group cannot see workers to kill; a TERM would
+# release the lock while xargs and workers keep running. Prefer pgrep; fall
+# back to ps; abort if neither works. This runs at every hasher.sh start —
+# tiny probe, no perf impact — so `k) Stop hashing` never silently degrades.
+if ! command -v pgrep >/dev/null 2>&1; then
+  # pgrep absent — check the ps fallback is usable
+  _probe="$(ps -eo pid=,pgid= 2>/dev/null | head -1)"
+  if [ -z "$_probe" ]; then
+    printf '[ERROR] Neither pgrep nor `ps -eo pid=,pgid=` is available on this host.\n' >&2
+    printf '[ERROR] Hasher cannot safely stop parallel workers without one of them.\n' >&2
+    printf '[ERROR] Install procps (pgrep) or a POSIX-ish ps, then re-run.\n' >&2
+    exit 3
+  fi
+fi
+
 # ───────────────────────── Constants ───────────────────────
 HASHES_DIR="$ROOT_DIR/hashes"
 LOGS_DIR="$ROOT_DIR/logs"
@@ -422,7 +450,11 @@ Options:
   --nohup            Re-exec under nohup (background) with logs to $BACKGROUND_LOG.
   --level LEVEL      Log level threshold (info|warn|error). Default: info.
   --interval N       Progress update interval seconds (default: $PROGRESS_INTERVAL).
-  --exclude P        Extra exclude pattern(s). Repeatable. (Literal substring match)
+  --exclude P        Extra exclude pattern(s). Repeatable. Case-insensitive glob:
+                     * matches any run of chars, ? matches one; a pattern with '/'
+                     matches the full path, else the basename; a pattern with no
+                     glob metacharacters matches as a literal substring against
+                     the full path (so "#recycle", "@eaDir" still work).
   --zero-length-only Scan and output zero-length file list only, then exit (no hashing).
   --config FILE      Load settings from FILE (default: local/hasher.conf if present).
   --help             Show this help.
@@ -523,6 +555,33 @@ command -v "${hash_cmd[0]}" >/dev/null 2>&1 || { error "Hash tool '${hash_cmd[0]
 build_file_list() {
   : > "$FILES_LIST"
   local had_input=false
+
+  # v1.3.20 (Mary's Mac Tahoe report): compute host-specific find-prune
+  # args ONCE and apply them to every find below. On macOS this prunes
+  # .Spotlight-V100, .DocumentRevisions-V100, etc. so BSD find no longer
+  # exits 1 when it can't descend into permission-restricted system dirs.
+  # On Synology this prunes @eaDir which massively speeds up media-volume
+  # walks. On generic Linux the array is empty and find behaves normally.
+  #
+  # v1.3.20 patch: Bash 3.2 (macOS stock) treats empty arrays as UNSET
+  # under `set -u`, so we (a) collect into a temp file rather than a
+  # process substitution (which the 3.2 array-assignment quirk breaks
+  # differently), and (b) always expand as "${arr[@]:-}" at use sites.
+  # The 3.2 `arr=()` declaration alone can leave the array unset; the
+  # portable idiom is to seed a placeholder and then rebuild.
+  local prune_args
+  prune_args=()
+  if command -v host_find_prune_args >/dev/null 2>&1; then
+    local _prune_tmp="$VAR_DIR/prune-args.$$"
+    host_find_prune_args > "$_prune_tmp" 2>/dev/null || true
+    if [[ -s "$_prune_tmp" ]]; then
+      while IFS= read -r _a || [[ -n "$_a" ]]; do
+        [[ -n "$_a" ]] && prune_args[${#prune_args[@]}]="$_a"
+      done < "$_prune_tmp"
+    fi
+    rm -f -- "$_prune_tmp" 2>/dev/null || true
+  fi
+
   # FIX (v1.1.10): track how many pathfile entries actually resolved to
   # something on disk. Previously, if every path in paths.txt was missing
   # (e.g. the external disk wasn't mounted), each one warned, the script
@@ -537,26 +596,81 @@ build_file_list() {
       error "Cannot read --pathfile '$PATHFILE'"; exit 1
     fi
     while IFS= read -r raw || [[ -n "$raw" ]]; do
+      # v1.3.20: strip trailing CR before anything else. A paths.txt saved
+      # from a Windows editor, or copy-pasted from a web page, can carry
+      # CRLF line endings; `read` strips the LF but leaves the CR glued to
+      # the last field. `[[ -d "/Volumes/Photo-Disk/\r" ]]` fails silently,
+      # producing the "All N paths missing" error even though the path is
+      # perfectly valid. Do this BEFORE whitespace trimming so we don't
+      # care whether the CR sits mid-run or at the end.
+      raw="${raw%$'\r'}"
       local path="${raw#"${raw%%[![:space:]]*}"}"; path="${path%"${path##*[![:space:]]}"}"
       [[ -z "$path" || "${path:0:1}" == "#" ]] && continue
+      # v1.3.20: strip matched surrounding quotes. The example line in the
+      # default paths.txt shows a single-quoted style (`'/volume1/Media'`),
+      # so users copying that pattern end up with quoted entries; the
+      # previous parser treated the quotes as part of the pathname and
+      # every entry failed the [[ -d ]] check. Strip a single matched pair
+      # of leading/trailing quotes (single OR double); mismatched quotes
+      # are left alone so a legitimately-quoted-only-on-one-side pathname
+      # is still surfaced as "does not exist" rather than silently altered.
+      case "$path" in
+        \'*\')  path="${path#\'}"; path="${path%\'}" ;;
+        \"*\")  path="${path#\"}"; path="${path%\"}" ;;
+      esac
       pathfile_seen=$((pathfile_seen + 1))
       if [[ -d "$path" ]]; then
-        # FIX (v1.1.11): find can return non-zero on paths that pass [[ -d ]]
-        # but can't actually be walked. The most common trigger is the macOS
-        # phantom-mount-point pattern: an unmounted external volume leaves
-        # an empty stub directory under /Volumes/ that satisfies [[ -d ]]
-        # but I/O-errors when find descends into it. BSD find also returns
-        # 1 on permission-denied subtrees. Without the '|| true' guard,
-        # set -e kills the script silently with no error reaching the log
-        # — which is exactly what users have hit. The 2>/dev/null suppresses
-        # the noise on stderr; we capture failure into a flag and warn.
+        # v1.1.11 catch reworked in v1.3.20 (Mary's Mac Tahoe report):
+        # `find` returns exit 1 whenever ANY subtree is unreadable, even if
+        # the rest of the walk produced thousands of files. On macOS this
+        # is the norm, not an error: every external volume has system dirs
+        # like .DocumentRevisions-V100 / .Spotlight-V100 / .TemporaryItems /
+        # .Trashes with restrictive modes (d--x--x--x etc). The v1.1.11
+        # code treated ANY non-zero as fatal and skipped the whole root —
+        # so a valid external drive with a single permission-denied system
+        # dir produced "All 1 path(s) missing or unreadable" and hashed
+        # nothing.
+        #
+        # New policy: distinguish "root is unreachable" (fatal) from "some
+        # subtree unreadable" (accept, warn, continue with what we got).
+        #
+        # A permission-denied subtree causes find to write to stderr
+        # ("Permission denied"). We capture stderr to a temp file; if the
+        # exit is non-zero AND stderr is empty, the ROOT itself is
+        # unreachable (unmounted volume stub, I/O error at the top). If
+        # stderr has content, it's just per-subtree noise — we accept the
+        # partial results and let the operator know how many were skipped.
         local find_status=0
-        find "$path" -type f -print0 2>/dev/null || find_status=$?
-        if [[ "$find_status" -ne 0 ]]; then
-          warn "find failed on '$path' (exit $find_status) — possibly an unmounted volume stub or unreadable subtree. Skipping."
+        local find_err="$FILES_LIST.finderr.$$"
+        # v1.3.20 patch: bash 3.2 (macOS stock) expands "${arr[@]:-}" as a
+        # SINGLE EMPTY ARGUMENT when the array is empty, which would break
+        # find. Branch explicitly instead — a tiny amount of duplication
+        # is safer than a subtle cross-version quirk.
+        if [[ ${#prune_args[@]} -gt 0 ]]; then
+          find "$path" "${prune_args[@]}" -type f -print0 2>"$find_err" || find_status=$?
         else
-          pathfile_valid=$((pathfile_valid + 1))
+          find "$path" -type f -print0 2>"$find_err" || find_status=$?
         fi
+        if [[ "$find_status" -eq 0 ]]; then
+          pathfile_valid=$((pathfile_valid + 1))
+        else
+          # count Permission-denied lines (BSD find and GNU find both use
+          # the same English text at the end of the line)
+          local deny_count=0
+          [[ -s "$find_err" ]] && deny_count=$(grep -c 'Permission denied' "$find_err" 2>/dev/null || true)
+          local other_err=$(( $(wc -l < "$find_err" 2>/dev/null || echo 0) - deny_count ))
+          if (( deny_count > 0 && other_err <= 0 )); then
+            # Only permission-denied noise — treat root as valid, partial walk.
+            warn "'$path': $deny_count subtree(s) skipped (permission denied on system dirs). Continuing with the rest."
+            pathfile_valid=$((pathfile_valid + 1))
+          else
+            # Root itself is unreachable, or some other error class.
+            warn "find failed on '$path' (exit $find_status)."
+            [[ -s "$find_err" ]] && warn "  first find error: $(head -n1 "$find_err")"
+            warn "  possibly an unmounted volume stub. Skipping this root."
+          fi
+        fi
+        rm -f -- "$find_err" 2>/dev/null || true
       elif [[ -f "$path" ]]; then
         printf '%s\0' "$path"
         pathfile_valid=$((pathfile_valid + 1))
@@ -581,7 +695,13 @@ build_file_list() {
   #      the run "succeeded" with a failure count. Piped directories are
   #      now recursively walked with find; piped files are added directly;
   #      piped non-existent paths warn but don't abort.
-  if [ ! -t 0 ]; then
+  # v1.3.20 (peer-review recheck additional observation): if --pathfile was
+  # supplied, don't consume stdin. Previously `cat > tmp_in` blocked on ANY
+  # non-TTY stdin, even when the operator had explicitly given a pathfile.
+  # A long-lived pipe, SSH parent shell, or orchestration wrapper could
+  # make hasher appear to hang indefinitely. If both are given, --pathfile
+  # wins; stdin is left alone.
+  if [ ! -t 0 ] && [[ -z "$PATHFILE" ]]; then
     local tmp_in="$FILES_LIST.stdin.tmp"
     cat > "$tmp_in"
     if [[ ! -s "$tmp_in" ]]; then
@@ -601,7 +721,11 @@ build_file_list() {
           stdin_seen=$((stdin_seen + 1))
           if [[ -d "$path" ]]; then
             local _fs=0
-            find "$path" -type f -print0 2>/dev/null || _fs=$?
+            if [[ ${#prune_args[@]} -gt 0 ]]; then
+              find "$path" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+            else
+              find "$path" -type f -print0 2>/dev/null || _fs=$?
+            fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
           elif [[ -f "$path" ]]; then
@@ -613,11 +737,17 @@ build_file_list() {
         done < "$tmp_in" >> "$FILES_LIST".tmp
       else
         while IFS= read -r path || [[ -n "$path" ]]; do
+          # v1.3.20: strip trailing CR (see pathfile-loop comment above)
+          path="${path%$'\r'}"
           [[ -z "$path" ]] && continue
           stdin_seen=$((stdin_seen + 1))
           if [[ -d "$path" ]]; then
             local _fs=0
-            find "$path" -type f -print0 2>/dev/null || _fs=$?
+            if [[ ${#prune_args[@]} -gt 0 ]]; then
+              find "$path" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+            else
+              find "$path" -type f -print0 2>/dev/null || _fs=$?
+            fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
           elif [[ -f "$path" ]]; then
@@ -870,6 +1000,13 @@ cleanup() {
   # success, error, or signal) so the duplicate-run guard reflects reality.
   # Only remove it if it still holds OUR pid — avoids deleting a pidfile a
   # newer run may have written if PIDs were somehow reused.
+  # v1.3.20 (recheck finding #2): if _stop_group detected surviving
+  # descendants, refuse to release the lock or pidfile — leaving them in
+  # place blocks a fresh run from starting alongside the orphans. Operator
+  # cleanup is required (the [ERROR] message above tells them how).
+  if [[ "${HASHER_STOP_INCOMPLETE:-0}" = "1" ]]; then
+    return
+  fi
   if [ -n "${HASHER_PIDFILE:-}" ] && [ -f "$HASHER_PIDFILE" ]; then
     _pf="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
     [ "$_pf" = "$$" ] && rm -f -- "$HASHER_PIDFILE" 2>/dev/null || true
@@ -890,14 +1027,16 @@ _stop_group() {
   # v1.3.19 (peer-review finding #2): CRITICAL — do NOT run `kill -TERM -$$`
   # inside our own handler. That signals every member of our process group,
   # which INCLUDES us — bash terminates this handler at the kill line,
-  # skipping the wait/KILL escalation and the descendant verification. With
-  # uncooperative workers (e.g. a hash tool that ignores TERM), the parent
-  # exits while the workers keep running; a fresh run can then start while
-  # orphaned workers are still reading disks.
+  # skipping the wait/KILL escalation and the descendant verification.
   #
-  # Fix: enumerate group members EXCLUDING $$, and signal only those.
-  # The launcher's `kill -TERM -PGID` from OUTSIDE the group is still fine —
-  # the launcher runs in a different group and won't self-kill.
+  # v1.3.20 (recheck finding #2): the v1.3.19 handler enumerated group
+  # members with pgrep. On hosts without pgrep, `pgrep -g $$` returned the
+  # empty string, no signals were sent, `_n=0` looked like success, and
+  # cleanup ran while workers were still alive. `pgrep` is now still
+  # preferred, but we ALSO have a portable ps-based fallback (below) that
+  # works on any POSIX ps with -o support (DSM's BusyBox ps, macOS BSD ps,
+  # GNU procps). If BOTH are unavailable, hasher.sh refuses to start (see
+  # startup probe further up). Enumeration cannot silently return empty.
   #
   # First, reset the trap so nothing re-enters this handler.
   trap - TERM INT
@@ -905,7 +1044,7 @@ _stop_group() {
   local _survivors _i
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
     # Signal every group member except ourselves
-    _survivors="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" || true)"
+    _survivors="$(_enum_group_pids $$)"
     for _pid in $_survivors; do kill -TERM "$_pid" 2>/dev/null || true; done
   else
     # No session isolation: walk our descendant tree
@@ -917,7 +1056,7 @@ _stop_group() {
   while [[ $_i -lt 30 ]]; do
     local _n=0
     if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-      _n="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+      _n="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
     else
       _n="$(_count_descendants $$)"
     fi
@@ -927,29 +1066,78 @@ _stop_group() {
 
   # Anything still up gets KILLed — again, excluding $$
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-    _survivors="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" || true)"
+    _survivors="$(_enum_group_pids $$)"
     for _pid in $_survivors; do kill -KILL "$_pid" 2>/dev/null || true; done
   else
     _kill_descendants_kill $$
   fi
 
+  # v1.3.20 (recheck additional observation): give the kernel a moment to
+  # reap the KILLed processes before we check for survivors. Otherwise on
+  # a busy host the verification below can catch descendants that are
+  # already dying and print a scary "descendants survived" warning even
+  # though the shutdown was clean.
+  sleep 0.5
+
   # Verify — if descendants are STILL alive, warn the caller so they know
   # the lock/pidfile removal that follows may be premature.
+  # v1.3.20: also refuse to release the lock in that case — safer to leave
+  # the lock in place than to let a new run start alongside orphans.
   local _still
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-    _still="$(pgrep -g $$ 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ')"
+    _still="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
   else
     _still="$(_count_descendants $$)"
   fi
   if [[ "${_still:-0}" -gt 0 ]]; then
-    printf '[WARN] %d descendant(s) survived KILL escalation; lock will still be released.\n' "$_still" >&2
-    printf '[WARN]   Investigate with: pgrep -g %d\n' "$$" >&2
+    printf '[ERROR] %d descendant(s) survived KILL escalation.\n' "$_still" >&2
+    printf '[ERROR]   Investigate: ps -eo pid,pgid,cmd | awk "\$2==%d"\n' "$$" >&2
+    printf '[ERROR]   Lock/pidfile will NOT be released — clean up manually.\n' >&2
+    export HASHER_STOP_INCOMPLETE=1
   fi
 }
-# Descendant-walking helpers used only in the no-setsid fallback path.
+
+# ── v1.3.20 (peer-review recheck finding #2) — process enumeration helpers ──
+# Every stop-path branch needs a reliable way to see our own group / child
+# processes. Previously used only `pgrep`, but pgrep is not universally
+# present (BusyBox builds ship without it; macOS has it, DSM depends on
+# package). Order of preference:
+#   1) pgrep  (fastest, exact semantics)
+#   2) ps -eo pid=,pgid=,ppid=  (POSIX-ish, present on every target we care
+#      about — DSM BusyBox, macOS BSD, GNU procps)
+# If BOTH are absent (extremely rare — busybox with ps applet stripped),
+# the startup probe below aborts before main() runs so no worker ever
+# escapes our reach.
+#
+# _enum_group_pids <pgid>       → PIDs in that group, one per line, excluding
+#                                 the caller's own $$ (never signal self).
+# _enum_children  <ppid>        → direct children of a given PPID.
+_enum_group_pids() {
+  local _pgid="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -g "$_pgid" 2>/dev/null | awk -v me="$$" '$1 != me' || true
+  else
+    # ps fallback. `-eo pid=,pgid=` prints two space-separated columns with
+    # no header. Works identically on DSM BusyBox, macOS BSD, and procps.
+    ps -eo pid=,pgid= 2>/dev/null \
+      | awk -v pg="$_pgid" -v me="$$" '$2 == pg && $1 != me {print $1}'
+  fi
+}
+_enum_children() {
+  local _ppid="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$_ppid" 2>/dev/null || true
+  else
+    ps -eo pid=,ppid= 2>/dev/null | awk -v p="$_ppid" '$2 == p {print $1}'
+  fi
+}
+
+# Descendant-walking helpers used in the no-setsid fallback path.
+# v1.3.20: route through _enum_children so the ps-fallback is used when
+# pgrep is unavailable.
 _count_descendants() {
   local p="$1" c=0
-  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  local kids; kids="$(_enum_children "$p")"
   for k in $kids; do
     c=$((c + 1 + $(_count_descendants "$k")))
   done
@@ -957,7 +1145,7 @@ _count_descendants() {
 }
 _kill_descendants_term() {
   local p="$1"
-  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  local kids; kids="$(_enum_children "$p")"
   for k in $kids; do
     _kill_descendants_term "$k"
     kill -TERM "$k" 2>/dev/null || true
@@ -965,7 +1153,7 @@ _kill_descendants_term() {
 }
 _kill_descendants_kill() {
   local p="$1"
-  local kids; kids="$(pgrep -P "$p" 2>/dev/null)"
+  local kids; kids="$(_enum_children "$p")"
   for k in $kids; do
     _kill_descendants_kill "$k"
     kill -KILL "$k" 2>/dev/null || true
@@ -1026,7 +1214,15 @@ main() {
 
   # ───── Fast path: zero-length-only (no hashing) ──────────
   if $ZERO_LENGTH_ONLY; then
-    local out="$ZERO_DIR/zero-length-$DATE_TAG.txt"
+    # v1.3.20 (peer-review recheck finding #4): use the full run tag
+    # (F-HMS-PID) rather than DATE_TAG. Previously two zero-length-only
+    # scans on the same day overwrote each other's report while the
+    # command printed to the operator still referenced that pathname —
+    # so re-running the first command could act on the SECOND scan's
+    # files. Mirror the normal-path convention: run-specific report +
+    # -latest symlink for stable next-step references.
+    local out="$ZERO_DIR/zero-length-$CSV_TAG.txt"
+    local out_latest="$ZERO_DIR/zero-length-latest.txt"
     : > "$out"
     local n=0 m=0 nr=0
     local scanned=0
@@ -1051,6 +1247,12 @@ main() {
     info  "  • Zero-length files now: $n"
     info  "  • Missing paths: $m | Not regular files: $nr"
     info  "  • Report: $out"
+
+    # v1.3.20 (finding #4): keep zero-length-latest pointer aligned with
+    # the run-tagged report, mirroring the normal-path behaviour.
+    if ln -sfn -- "$(basename "$out")" "$out_latest" 2>/dev/null; then :; else
+      cp -f -- "$out" "$out_latest" 2>/dev/null || true
+    fi
 
     bglog INFO "Zero-length-only scan complete: zero=$n, missing=$m, not_regular=$nr, report=$out"
     bglog INFO "NEXT: Review (dry-run): bin/delete-zero-length.sh --report \"$out\" --dry-run"
