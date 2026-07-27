@@ -8,7 +8,7 @@
 # Usage: bin/check-deps.sh [--fix]
 #  - Verifies required tools and directory layout
 #  - Reports CPU cores and basic environment
-#  - If --fix and OpenSSL is available, creates shims for *sum tools (sha256sum, sha1sum, sha512sum, md5sum)
+#  - If --fix and OpenSSL is available, creates a sha256sum shim (only sha256 is supported since v1.3.16)
 
 set -eu
 
@@ -191,10 +191,11 @@ EOF
     chmod +x "$path"
     ok "shim: $name -> openssl -$ossl_flag"
   }
+  # v1.3.24: only sha256sum is supported since v1.3.16. Removed shim
+  # calls for sha1sum/sha512sum/md5sum — those algorithms have been
+  # unreachable through Hasher for many releases and their shims
+  # served no purpose but to be misleading. b2sum was never invoked.
   have sha256sum || mk_shim sha256sum sha256
-  have sha1sum   || mk_shim sha1sum   sha1
-  have sha512sum || mk_shim sha512sum sha512
-  have md5sum    || mk_shim md5sum    md5
 fi
 
 echo

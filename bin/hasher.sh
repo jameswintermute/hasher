@@ -163,7 +163,7 @@ DATE_TAG="$(date +'%Y-%m-%d')"
 CSV_TAG="$(date +'%F-%H%M%S')-$$"
 OUTPUT="$HASHES_DIR/hasher-$CSV_TAG.csv"
 
-ALGO="sha256"        # sha256|sha1|sha512|md5|blake2
+ALGO="sha256"        # SHA-256 only since v1.3.16
 PATHFILE=""
 RUN_IN_BACKGROUND=false
 IS_CHILD=false       # set when re-exec'ed under nohup
@@ -1264,6 +1264,7 @@ trap '_stop_group; cleanup; echo "[INFO] hashing stopped by signal (INT)"  >&2; 
 TOTAL=0
 DONE=0
 FAIL=0
+UNSTABLE=0   # v1.3.24: files that changed during hashing (excluded from CSV)
 
 main() {
   # v1.3.16 (peer-review finding #3): acquire a concurrency lock BEFORE any
@@ -1330,23 +1331,58 @@ main() {
       # Case 3: same boot, dead parent PID. Check whether the recorded
       # PGID has ANY live processes. If yes, workers may still be
       # hashing — refuse.
+      #
+      # v1.3.24 (peer-review recheck finding #2): CRITICAL bug in v1.3.23
+      # policy. Previously we only checked orphans when `_lockpgid !=
+      # _my_pgid`. In the no-session-isolation code path (setsid absent,
+      # or explicitly bypassed) two consecutive hasher invocations from
+      # the same terminal share the same PGID. In that case, the
+      # `_lockpgid == _my_pgid` branch skipped the orphan check entirely
+      # and adopted the lock — even if the previous run's workers were
+      # still alive in that shared PGID. Concurrent hashing on the same
+      # corpus.
+      #
+      # Fix: fail closed when PGIDs match AND the recorded parent is
+      # dead. We cannot distinguish our shell's own descendants (there
+      # are none yet — we haven't started xargs) from orphaned workers
+      # of the previous run inside a shared PGID by process-group
+      # membership alone. The safest and simplest response is to refuse
+      # to auto-adopt this ambiguous state; the operator must
+      # explicitly clean up.
       local _orphans=""
-      if [[ -n "$_lockpgid" && "$_lockpgid" != "$_my_pgid" ]]; then
+      if [[ -n "$_lockpgid" ]]; then
         _orphans="$(_enum_group_pids "$_lockpgid" 2>/dev/null || true)"
-        # Filter out our own PID just in case (belt-and-braces)
+        # Filter out our own PID (belt-and-braces — _enum_group_pids
+        # already excludes $$, but a broken pgrep on some platforms
+        # returned it, so filter defensively).
         _orphans="$(printf '%s\n' "$_orphans" | grep -v "^$$\$" | grep -v '^$' || true)"
       fi
       if [[ -n "$_orphans" ]]; then
+        # There ARE processes under the recorded PGID besides us. Whether
+        # they're leftover workers from a previous run or (in the shared-
+        # PGID case) our shell's siblings, we can't tell — either way
+        # we don't dare adopt.
         error "Stale lock at $_lockdir — parent PID $_lockpid is dead,"
         error "  but PGID $_lockpgid still has live processes:"
         error "  $(printf '%s\n' "$_orphans" | tr '\n' ' ')"
-        error "  These are orphaned workers from the crashed run."
-        error "  Kill them explicitly before restarting:"
-        error "    kill -TERM $_orphans"
-        error "    (wait ~5s, then if still alive: kill -KILL $_orphans)"
-        error "  Then remove the lock: rm -rf $_lockdir"
+        error "  These may be orphaned workers from the crashed run,"
+        error "  or (if you launched from a shell that shares the"
+        error "  same process group) sibling processes we cannot"
+        error "  safely distinguish from workers."
+        error "  Options:"
+        error "    (a) If those PIDs are stale hasher workers, kill them:"
+        error "        kill -TERM $_orphans"
+        error "        (wait ~5s, then if still alive: kill -KILL $_orphans)"
+        error "        Then remove the lock: rm -rf $_lockdir"
+        error "    (b) If you launched from a shell that shares your PGID,"
+        error "        invoke via the launcher (setsid isolates the group)"
+        error "        or use setsid explicitly."
         exit 2
       fi
+      # No orphans OR they're indistinguishable from siblings AND our
+      # PGID differs — refuse only if we can't confirm the PGID is
+      # empty of non-self processes. Reaching here means _orphans is
+      # empty, so we know no PIDs remain under the recorded PGID.
       warn "Stale lock at $_lockdir (PID ${_lockpid:-unknown} not running, PGID clean) — adopting."
       rm -rf -- "$_lockdir" 2>/dev/null || true
       mkdir "$_lockdir" 2>/dev/null || { error "Failed to acquire lock"; exit 2; }
@@ -1436,6 +1472,26 @@ main() {
 
   # ───── Normal hashing path ───────────────────────────────
   write_csv_header
+
+  # v1.3.24 (peer-review recheck finding #4): short-circuit when no files
+  # were discovered. Without this, an empty FILES_LIST would still spin
+  # up xargs — and on macOS/BSD, xargs without -r invokes the command
+  # once with an empty argument list. That fabricates a `[FAIL]stat`
+  # row for the empty path, producing the misleading
+  # `Completed. Hashed 1/0 files (failures=1)` line reported in the
+  # v1.3.24 recheck. `xargs -r` is GNU-only, so we cannot rely on it.
+  # Answer: handle TOTAL==0 explicitly and cleanly here — produce a
+  # header-only CSV and report accurate 0/0/0 counts.
+  if [[ "$TOTAL" -le 0 ]]; then
+    info "No files to hash (0 discovered). CSV contains header only: $OUTPUT"
+    if [[ "$SORT_OUTPUT" = "true" ]]; then
+      _first_run_sort_notice
+      sort_output_csv "$OUTPUT" || warn "CSV sort failed; header-only output retained"
+    fi
+    post_run_reports "$OUTPUT" "$CSV_TAG"
+    return
+  fi
+
   start_hash_progress
 
   local start_ts
@@ -1510,15 +1566,22 @@ main() {
       return 0
     fi
     hash="${line%% *}"
-    # v1.3.23 (peer-review recheck finding #3): re-stat AFTER hashing to
-    # detect files that changed during the hash operation. Best-effort
-    # policy (chosen over retry-and-skip): we record the pre-hash size
-    # and mtime with the hash — matching CSV convention — but emit a
-    # WARN so the operator knows this row may describe an inconsistent
-    # snapshot. Reasoning: retry-and-skip complicates the worker loop,
-    # and for the typical NAS use case (media library, backup archive)
-    # concurrent writes are rare and the operator wants the manifest
-    # written, not silently dropped rows.
+    # v1.3.24 (peer-review recheck finding #3): re-stat AFTER hashing to
+    # detect files that changed during the hash operation. Policy
+    # revised from v1.3.23 best-effort to EXCLUDE-AND-LOG on reviewer's
+    # data-integrity grounds:
+    #
+    #   A CSV row `path,size=6,mtime=T,algo=sha256,hash=<of size-19 content>`
+    #   describes a file state that never existed as one consistent
+    #   snapshot. Downstream tools (dedup discovery, restore verification)
+    #   will match on the hash and assume the size/mtime are true — so
+    #   an inconsistent row is worse than a missing row.
+    #
+    # If size or mtime drifted between pre-hash and post-hash stats, we
+    # emit ONLY the CHANGED marker (no CSV row) and let the main-loop
+    # dispatcher route it to `logs/unstable-files-<run>.log`. The file
+    # is left OUT of the authoritative manifest; the operator sees the
+    # exclusion and can re-hash if wanted.
     #
     # We check size and mtime only — checking inode would require stat -c
     # / stat -f differences across Linux/macOS/DSM and add fragility for
@@ -1528,10 +1591,12 @@ main() {
     mtime2=$(_stat_mtime "$f" 2>/dev/null || echo -1)
     if [[ "$size2" != "$size" || "$mtime2" != "$mtime" ]]; then
       # \036 = record separator (rare in paths); handler in the main loop
-      # writes this to a "changed during hash" log so the operator can
-      # re-run those files if wanted.
+      # writes this to an "unstable files" log. NO CSV row is emitted —
+      # the file is excluded from the authoritative manifest.
       printf '\036CHANGED\036%s\t%s->%s\t%s->%s\n' "$f" "$size" "$size2" "$mtime" "$mtime2"
+      return 0
     fi
+    # Stable snapshot: pre/post stats agree. Write the CSV row.
     # csv_escape inline (worker runs in a subshell that has the function)
     local esc="${f//\"/\"\"}"
     printf '"%s",%s,%s,%s,%s\n' "$esc" "$size" "$mtime" "$ALGO" "$hash"
@@ -1636,20 +1701,41 @@ main() {
   # Move the CHANGED log to logs/ with a run-tagged name so operators
   # can review after the run. The CSV rows for these files are already
   # written (with pre-hash stats) — this is informational only.
+  # v1.3.24 (finding #3 + lower-priority cleanup): the log is renamed
+  # from hash-changed-* to unstable-files-* because these rows are now
+  # EXCLUDED from the manifest, not just annotated. Strip the internal
+  # \036CHANGED\036 sentinel before moving to logs/ so operators can
+  # cat/less the file without shell garbling.
   local changed_rows=0
   changed_rows=$(wc -l < "$changed_file" 2>/dev/null | tr -d ' ' || echo 0)
   [[ -z "$changed_rows" ]] && changed_rows=0
   if [[ "$changed_rows" -gt 0 ]]; then
-    local changed_log="$LOGS_DIR/hash-changed-$CSV_TAG.log"
-    mv -f -- "$changed_file" "$changed_log" 2>/dev/null || true
-    warn "$changed_rows file(s) changed during hashing — CSV rows recorded with pre-hash size/mtime."
-    warn "  Review: $changed_log"
-    warn "  Consider re-hashing those files if a consistent snapshot is required."
+    local unstable_log="$LOGS_DIR/unstable-files-$CSV_TAG.log"
+    # Strip the leading \036CHANGED\036 sentinel from each line. Output
+    # format after stripping: `<path>\t<size_pre>-><size_post>\t<mtime_pre>-><mtime_post>`
+    {
+      printf '# Unstable files — excluded from the CSV manifest.\n'
+      printf '# Format: path<TAB>size_pre->size_post<TAB>mtime_pre->mtime_post\n'
+      printf '# Generated: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')"
+      printf '# Run tag: %s\n' "$CSV_TAG"
+      # \036 is octal 036 → sed \x1e
+      sed 's/^\x1eCHANGED\x1e//' "$changed_file" 2>/dev/null || cat "$changed_file"
+    } > "$unstable_log" 2>/dev/null || true
+    rm -f -- "$changed_file" 2>/dev/null || true
+    warn "$changed_rows file(s) changed during hashing — EXCLUDED from CSV manifest."
+    warn "  Review: $unstable_log"
+    warn "  These files are missing from the CSV to preserve snapshot consistency."
+    warn "  Re-run hasher on those paths when writes have settled."
   else
     rm -f -- "$changed_file" 2>/dev/null || true
   fi
 
-  DONE=$(( hashed_rows + fail_rows ))
+  # v1.3.24 (finding #3): unstable files are counted toward DONE so
+  # DONE + not-yet-processed == TOTAL. FAIL still means stat/hash
+  # errors only. `unstable` is reported separately in the summary.
+  DONE=$(( hashed_rows + fail_rows + changed_rows ))
+  FAIL="$fail_rows"
+  UNSTABLE="$changed_rows"
   FAIL="$fail_rows"
 
   local end_ts elapsed sH sM sS
@@ -1659,7 +1745,12 @@ main() {
 
   stop_hash_progress
 
-  info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
+  # v1.3.24 (finding #3): mention unstable file count when non-zero so
+  # DONE=$hashed_rows+$fail_rows+$changed_rows adds up transparently
+  # for anyone reading the log.
+  local _unstable_txt=""
+  [[ "$UNSTABLE" -gt 0 ]] && _unstable_txt=", unstable=$UNSTABLE"
+  info "Completed. Hashed $DONE/$TOTAL files (failures=$FAIL${_unstable_txt}) in $(printf '%02d:%02d:%02d' "$sH" "$sM" "$sS"). CSV: $OUTPUT"
 
   # v1.3.22: sort the CSV by path for deterministic output and clean
   # cross-run diffing. Fail-safe: original is never touched until the
