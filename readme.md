@@ -62,9 +62,11 @@ enough to trust with a root-level deletion role on a NAS.
 ## How the integrity monitoring works
 
 Hasher itself does not diff one run against another — that is out of scope, and keeping
-it out is what keeps the core small. Instead, **every hash run writes a timestamped CSV**
-to `hashes/` (`hasher-YYYY-MM-DD-HHMM.csv`): one row per file, recording its path, size,
-modification time, algorithm, and hash.
+it out is what keeps the core small. Instead, **every successful hash run writes a
+timestamped CSV** to `hashes/` (`hasher-YYYY-MM-DD-HHMMSS-PID.csv`): one row per file,
+recording its canonical path, size, modification time, algorithm, and hash. Incomplete
+runs are retained separately as `partial-hasher-*.csv` for diagnosis and are not selected
+by the normal dedupe workflow.
 
 Those CSVs are the substrate for integrity monitoring. Because each is a complete,
 dated snapshot of the catalogue, comparing two of them reveals exactly what changed:
@@ -105,7 +107,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.25**
+Started Dec 2022. Current version: **v1.3.26**
 For full history see: `version-history.md`
 
 ---

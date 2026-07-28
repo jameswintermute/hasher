@@ -96,7 +96,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.25 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.26 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -857,6 +857,14 @@ action_find_duplicate_folders(){
   warn "Edit local/hasher.conf to change this default, or run find-duplicate-folders.sh directly for custom flags."
   echo
 
+  # Snapshot the existing raw artefact names. The finder uses unique
+  # timestamp+PID names, so the set difference after this invocation identifies
+  # the CURRENT run's output without ever resurrecting an older plan when the
+  # new scan finds no duplicates.
+  _plans_before="$(mktemp "${TMPDIR:-/tmp}/hasher-folder-plans-before.XXXXXX")"
+  _plans_after="$(mktemp "${TMPDIR:-/tmp}/hasher-folder-plans-after.XXXXXX")"
+  find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_before"
+
   run_script "$BIN_DIR/find-duplicate-folders.sh" \
     --input "$input"        \
     --mode plan             \
@@ -865,8 +873,18 @@ action_find_duplicate_folders(){
     --keep shortest-path    \
     || true
 
-  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-  groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
+  find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_after"
+  plan="$(comm -13 "$_plans_before" "$_plans_after" 2>/dev/null | tail -n1 || true)"
+  rm -f -- "$_plans_before" "$_plans_after" 2>/dev/null || true
+
+  groups=""
+  if [ -n "$plan" ]; then
+    _plan_base="$(basename -- "$plan")"
+    _plan_suffix="${_plan_base#duplicate-folders-plan-}"
+    _plan_suffix="${_plan_suffix%.txt}"
+    _matching_groups="$LOGS_DIR/duplicate-folders-groups-$_plan_suffix.tsv"
+    [ -s "$_matching_groups" ] && groups="$_matching_groups"
+  fi
   # FIX (v1.3.5 — peer-review item 4): test -s (non-empty FILE), not -n
   # (non-empty string/path). An empty plan file would otherwise be offered for
   # review. find-duplicate-folders.sh no longer writes empty plans, but this

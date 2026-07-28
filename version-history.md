@@ -2565,6 +2565,91 @@ no false hard-link warning.
 Self-test: 40 passed, 0 warnings, 0 errors. All 21 files pass syntax.
 
 ---
+## 2026‑07 — v1.3.26
+**Critical safety and workflow fixes: immutable reports, apply-time special-entry checks, canonical quarantine paths, current-run folder plans, and partial-manifest isolation**
+
+This release addresses five operational findings confirmed during the
+v1.3.25 review.
+
+### 1. Duplicate-report history is now immutable
+
+`find-duplicates.sh` previously opened
+`logs/duplicate-hashes-latest.txt` for writing before the new report was
+complete. Because that pathname was normally a symlink, the open followed
+the link and truncated the preceding run-specific report. A no-duplicates
+run could therefore erase the previous report entirely.
+
+The finder now writes only to the new immutable run-specific report. Once
+rendering and optional bulk-plan generation have completed, it creates a
+temporary symlink (or copy on filesystems without symlink support) and
+atomically renames that temporary pathname over the latest pointer. Standard,
+bulk and no-results runs all use the same safe publication path.
+
+### 2. Folder apply rechecks non-regular entries
+
+Folder-plan generation already excluded leaf folders containing symlinks,
+FIFOs, sockets or device nodes, but a folder could gain one of those entries
+after planning. Apply-time verification compared regular-file signatures only
+and would then move the whole directory, including the unexamined entry.
+
+`apply-folder-plan.sh` now repeats the special-entry check immediately before
+moving both the planned delete folder and its keeper. Any newly introduced
+non-regular child causes a fail-safe skip and an audit-log entry.
+
+### 3. Canonical paths and quarantine containment
+
+Raw manifest spellings containing `.` or `..` could previously be joined
+directly to the quarantine root. Filesystem path resolution could then place
+the destination outside the configured quarantine directory while the tool
+reported a successful quarantine.
+
+New shared helpers in `lib/host-detect.sh` canonicalise existing paths without
+making GNU `realpath` a mandatory dependency, verify component-aware path
+containment, and construct hierarchy-preserving quarantine destinations only
+after their physical parent path is proven to remain below the quarantine
+root. `hasher.sh` records canonical paths at discovery, and all file, folder
+and zero-length quarantine workflows use the shared containment check. Final
+component symlinks are refused before canonicalisation so a plan cannot be
+redirected to, and then move, the symlink target.
+
+### 4. Folder detection only advertises the current run's plan
+
+After a folder scan, the launcher previously selected the newest plan from all
+historical files. If the current scan found no duplicates, an older plan could
+be presented as though the new run had created it.
+
+The launcher now snapshots raw folder-plan filenames before invocation and
+uses the exact set difference afterwards. It resolves the groups sidecar from
+that new plan's complete timestamp-and-PID suffix. A no-results run therefore
+offers nothing historical for review or application.
+
+### 5. Partial manifests are no longer promoted
+
+Hash failures or unstable files already produced non-zero exit statuses, but
+the incomplete CSV still used the normal `hasher-*.csv` naming pattern,
+updated `*-latest` report pointers and printed destructive next-step commands.
+The launcher could then select it as the newest actionable snapshot.
+
+Incomplete default manifests are now retained under a `partial-hasher-*.csv`
+name (custom output paths receive a `.partial` marker). Their run-specific
+diagnostic reports are retained, but latest pointers are not updated and no
+dedupe or cleanup commands are recommended. Only a fully successful run is
+published into the normal actionable workflow.
+
+### Validation
+
+- Shell syntax passed for `launcher.sh`, all `bin/*.sh` and all `lib/*.sh`.
+- Historical duplicate reports remained unchanged across duplicate and
+  no-duplicate finder runs.
+- A planned folder that gained a symlink was skipped at apply time.
+- `..`-bearing source spellings were canonicalised and quarantined strictly
+  beneath the configured root in file, folder and zero-length workflows.
+- A no-results folder run did not resurrect a historical plan.
+- A forced hashing failure returned non-zero, created only a
+  `partial-hasher-*.csv`, preserved the previous latest pointers and printed
+  no actionable cleanup commands.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
