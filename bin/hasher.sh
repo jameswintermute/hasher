@@ -715,7 +715,19 @@ build_file_list() {
         \"*\")  path="${path#\"}"; path="${path%\"}" ;;
       esac
       pathfile_seen=$((pathfile_seen + 1))
-      if [[ -d "$path" ]]; then
+      if [[ -L "$path" ]]; then
+        # Refuse the final component before canonicalisation. Resolving and
+        # hashing the target would make the manifest path describe a different
+        # filesystem object from the one the user supplied.
+        warn "Symlink refused (list the target's real path instead): $path"
+        pathfile_syminv=$((pathfile_syminv + 1))
+      elif [[ -d "$path" ]]; then
+        local path_real
+        path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+        if [[ -z "$path_real" || ! -d "$path_real" ]]; then
+          warn "Could not canonicalise directory path: $path"
+          continue
+        fi
         # v1.1.11 catch reworked in v1.3.20 (Mary's Mac Tahoe report):
         # `find` returns exit 1 whenever ANY subtree is unreadable, even if
         # the rest of the walk produced thousands of files. On macOS this
@@ -743,9 +755,9 @@ build_file_list() {
         # find. Branch explicitly instead — a tiny amount of duplication
         # is safer than a subtle cross-version quirk.
         if [[ ${#prune_args[@]} -gt 0 ]]; then
-          find "$path" "${prune_args[@]}" -type f -print0 2>"$find_err" || find_status=$?
+          find "$path_real" "${prune_args[@]}" -type f -print0 2>"$find_err" || find_status=$?
         else
-          find "$path" -type f -print0 2>"$find_err" || find_status=$?
+          find "$path_real" -type f -print0 2>"$find_err" || find_status=$?
         fi
         if [[ "$find_status" -eq 0 ]]; then
           pathfile_valid=$((pathfile_valid + 1))
@@ -767,18 +779,15 @@ build_file_list() {
           fi
         fi
         rm -f -- "$find_err" 2>/dev/null || true
-      elif [[ -L "$path" ]]; then
-        # v1.3.25 (peer-review recheck #2): refuse explicitly-listed symlinks.
-        # Reviewer showed that previously an explicit symlink was hashed
-        # as a file (symlink stat + target content), yielding a CSV row
-        # that lies about what was hashed. Directory scans already skip
-        # symlinks via `find -type f`; matching that behaviour for
-        # explicitly listed symlinks is the honest fix.
-        warn "Symlink refused (list the target's real path instead): $path"
-        pathfile_syminv=$((pathfile_syminv + 1))
       elif [[ -f "$path" ]]; then
-        printf '%s\0' "$path"
-        pathfile_valid=$((pathfile_valid + 1))
+        local path_real
+        path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+        if [[ -n "$path_real" && -f "$path_real" ]]; then
+          printf '%s\0' "$path_real"
+          pathfile_valid=$((pathfile_valid + 1))
+        else
+          warn "Could not canonicalise file path: $path"
+        fi
       else
         warn "Path does not exist: $path"
       fi
@@ -824,20 +833,32 @@ build_file_list() {
         while IFS= read -r -d '' path || [[ -n "$path" ]]; do
           [[ -z "$path" ]] && continue
           stdin_seen=$((stdin_seen + 1))
-          if [[ -d "$path" ]]; then
+          if [[ -L "$path" ]]; then
+            warn "Symlink refused via stdin (list the target's real path instead): $path"
+          elif [[ -d "$path" ]]; then
+            local path_real
+            path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+            if [[ -z "$path_real" || ! -d "$path_real" ]]; then
+              warn "Could not canonicalise piped directory: $path"
+              continue
+            fi
             local _fs=0
             if [[ ${#prune_args[@]} -gt 0 ]]; then
-              find "$path" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
             else
-              find "$path" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" -type f -print0 2>/dev/null || _fs=$?
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
-          elif [[ -L "$path" ]]; then
-            warn "Symlink refused via stdin (list the target's real path instead): $path"
           elif [[ -f "$path" ]]; then
-            printf '%s\0' "$path"
-            stdin_valid=$((stdin_valid + 1))
+            local path_real
+            path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+            if [[ -n "$path_real" && -f "$path_real" ]]; then
+              printf '%s\0' "$path_real"
+              stdin_valid=$((stdin_valid + 1))
+            else
+              warn "Could not canonicalise piped file: $path"
+            fi
           else
             warn "Piped path does not exist: $path"
           fi
@@ -848,20 +869,32 @@ build_file_list() {
           path="${path%$'\r'}"
           [[ -z "$path" ]] && continue
           stdin_seen=$((stdin_seen + 1))
-          if [[ -d "$path" ]]; then
+          if [[ -L "$path" ]]; then
+            warn "Symlink refused via stdin (list the target's real path instead): $path"
+          elif [[ -d "$path" ]]; then
+            local path_real
+            path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+            if [[ -z "$path_real" || ! -d "$path_real" ]]; then
+              warn "Could not canonicalise piped directory: $path"
+              continue
+            fi
             local _fs=0
             if [[ ${#prune_args[@]} -gt 0 ]]; then
-              find "$path" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
             else
-              find "$path" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" -type f -print0 2>/dev/null || _fs=$?
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
-          elif [[ -L "$path" ]]; then
-            warn "Symlink refused via stdin (list the target's real path instead): $path"
           elif [[ -f "$path" ]]; then
-            printf '%s\0' "$path"
-            stdin_valid=$((stdin_valid + 1))
+            local path_real
+            path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
+            if [[ -n "$path_real" && -f "$path_real" ]]; then
+              printf '%s\0' "$path_real"
+              stdin_valid=$((stdin_valid + 1))
+            else
+              warn "Could not canonicalise piped file: $path"
+            fi
           else
             warn "Piped path does not exist: $path"
           fi
@@ -1773,7 +1806,6 @@ main() {
   DONE=$(( hashed_rows + fail_rows + changed_rows ))
   FAIL="$fail_rows"
   UNSTABLE="$changed_rows"
-  FAIL="$fail_rows"
 
   local end_ts elapsed sH sM sS
   end_ts=$(date +%s)
@@ -1821,11 +1853,8 @@ main() {
     warn "========================================"
   fi
 
-  post_run_reports "$OUTPUT" "$CSV_TAG"
-
-  # v1.3.25 (peer-review recheck #3): set the exit disposition. cleanup()
-  # trap runs on EXIT and honours this via $HASHER_RUN_STATUS. Failures
-  # trump unstable (a run with both is a failed run).
+  # Set the exit disposition BEFORE publishing reports. Failures trump
+  # unstable (a run with both is a failed run).
   if [[ "$FAIL" -gt 0 ]]; then
     HASHER_RUN_STATUS=1
     warn "Run completed with $FAIL hash/stat failure(s) — CSV is INCOMPLETE. Exit status: 1"
@@ -1835,6 +1864,40 @@ main() {
   else
     HASHER_RUN_STATUS=0
   fi
+
+  # v1.3.26: incomplete snapshots must not look like normal `hasher-*.csv`
+  # files, because the launcher and direct duplicate tools intentionally pick
+  # that pattern as the latest actionable manifest. Retain the diagnostic CSV
+  # under a `partial-` prefix and leave a marker beside custom output paths.
+  local publish_latest=true
+  if [[ "$HASHER_RUN_STATUS" -ne 0 ]]; then
+    publish_latest=false
+    local _out_dir _out_base _partial_out _n
+    _out_dir="$(dirname -- "$OUTPUT")"
+    _out_base="$(basename -- "$OUTPUT")"
+    if [[ "$_out_base" == hasher-*.csv ]]; then
+      _partial_out="$_out_dir/partial-$_out_base"
+      if [[ -e "$_partial_out" ]]; then
+        _n=1
+        while [[ -e "${_partial_out}.dup${_n}" ]]; do _n=$((_n+1)); done
+        _partial_out="${_partial_out}.dup${_n}"
+      fi
+      if mv -f -- "$OUTPUT" "$_partial_out"; then
+        OUTPUT="$_partial_out"
+      else
+        warn "Could not rename partial manifest; marking it with ${OUTPUT}.partial"
+        : > "${OUTPUT}.partial" 2>/dev/null || true
+      fi
+    else
+      : > "${OUTPUT}.partial" 2>/dev/null || true
+    fi
+    warn "Partial manifest retained for diagnosis only: $OUTPUT"
+    warn "It was NOT promoted as the latest actionable snapshot."
+  else
+    rm -f -- "${OUTPUT}.partial" 2>/dev/null || true
+  fi
+
+  post_run_reports "$OUTPUT" "$CSV_TAG" "$publish_latest"
 }
 
 # ───────────────────────── Post-run Reports ────────────────
@@ -1986,6 +2049,7 @@ post_run_reports() {
   local csv="$1"
   local run_tag="$2"  # v1.3.19 (finding #5): full run tag (F-HMS-PID),
                        # not just DATE_TAG. Same-day runs no longer overwrite.
+  local publish_latest="${3:-true}"
 
   mkdir -p "$LOGS_DIR" "$ZERO_DIR"
 
@@ -2053,14 +2117,17 @@ post_run_reports() {
     }
   ' "$csv" > "$dupes_txt" || true
 
-  # v1.3.19 (finding #5): update -latest pointers atomically. Use symlinks
-  # where supported; fall back to a rewritten copy for filesystems that
-  # reject symlinks (rare NAS shares over SMB).
-  if ln -sfn -- "$(basename "$zero_txt")" "$zero_latest" 2>/dev/null; then :; else
-    cp -f -- "$zero_txt" "$zero_latest" 2>/dev/null || true
-  fi
-  if ln -sfn -- "$(basename "$dupes_txt")" "$dupes_latest" 2>/dev/null; then :; else
-    cp -f -- "$dupes_txt" "$dupes_latest" 2>/dev/null || true
+  # Only complete snapshots may replace the stable latest pointers. Partial
+  # run-specific reports are retained for diagnosis but never promoted.
+  if [[ "$publish_latest" = "true" ]]; then
+    if ln -sfn -- "$(basename "$zero_txt")" "$zero_latest" 2>/dev/null; then :; else
+      rm -f -- "$zero_latest" 2>/dev/null || true
+      cp -f -- "$zero_txt" "$zero_latest" 2>/dev/null || true
+    fi
+    if ln -sfn -- "$(basename "$dupes_txt")" "$dupes_latest" 2>/dev/null; then :; else
+      rm -f -- "$dupes_latest" 2>/dev/null || true
+      cp -f -- "$dupes_txt" "$dupes_latest" 2>/dev/null || true
+    fi
   fi
 
   local zero_count=0 dupe_groups=0 dupe_files=0
@@ -2076,15 +2143,20 @@ post_run_reports() {
   info "  • Zero-length files: $zero_count (see: $zero_txt)"
   info "  • Duplicate groups: $dupe_groups (files involved: $dupe_files) (see: $dupes_txt)"
   echo
-  echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
-  echo "  1) Find duplicate folders (highest value, lowest risk):"
-  echo "       bin/find-duplicate-folders.sh --input \"$csv\""
-  echo "  2) Find and review duplicate files:"
-  echo "       bin/find-duplicates.sh --input \"$csv\""
-  echo "       bin/review-duplicates.sh --from-report \"$dupes_txt\""
-  echo "  3) Remove zero-length files (review first, no changes):"
-  echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --dry-run"
-  echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --force"
+  if [[ "$publish_latest" = "true" ]]; then
+    echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
+    echo "  1) Find duplicate folders (highest value, lowest risk):"
+    echo "       bin/find-duplicate-folders.sh --input \"$csv\""
+    echo "  2) Find and review duplicate files:"
+    echo "       bin/find-duplicates.sh --input \"$csv\""
+    echo "       bin/review-duplicates.sh --from-report \"$dupes_txt\""
+    echo "  3) Remove zero-length files (review first, no changes):"
+    echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --dry-run"
+    echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --force"
+  else
+    warn "No dedupe or cleanup commands are recommended from this partial snapshot."
+    warn "Re-run hashing successfully before using the normal review/apply workflow."
+  fi
   echo
 }
 

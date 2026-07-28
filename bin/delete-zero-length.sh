@@ -272,8 +272,23 @@ idx=0; okc=0; fail=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   idx=$((idx+1))
+  if [ -L "$f" ]; then
+    warn "Zero-length candidate is now a symlink — skipping for safety: $f"
+    fail=$((fail+1))
+    continue
+  fi
+  if command -v canonical_existing_path >/dev/null 2>&1; then
+    f_real="$(canonical_existing_path "$f" 2>/dev/null || true)"
+  else
+    f_real="$f"
+  fi
+  if [ -z "$f_real" ] || [ ! -f "$f_real" ]; then
+    warn "Could not canonicalise zero-length candidate — skipping: $f"
+    fail=$((fail+1))
+    continue
+  fi
   # Re-verify zero size to be safe
-  sz="$(stat -c %s -- "$f" 2>/dev/null || stat -f %z -- "$f" 2>/dev/null || echo 1)"
+  sz="$(stat -c %s -- "$f_real" 2>/dev/null || stat -f %z -- "$f_real" 2>/dev/null || echo 1)"
   if [ "${sz:-1}" != "0" ]; then
     continue
   fi
@@ -290,21 +305,30 @@ while IFS= read -r f; do
     # rather than silent overwrite. Two files with truly identical source
     # paths cannot exist simultaneously, so any collision here indicates
     # a re-run or manual copy — surface it, don't hide it.
-    case "$f" in
-      /*) tgt="$DEST$f" ;;
-      *)  tgt="$DEST/$f" ;;
-    esac
-    tgt_dir=$(dirname "$tgt")
-    mkdir -p "$tgt_dir"
+    if command -v safe_quarantine_destination >/dev/null 2>&1; then
+      tgt="$(safe_quarantine_destination "$DEST" "$f_real" 2>/dev/null || true)"
+    else
+      case "$f_real" in
+        /*) tgt="$DEST$f_real" ;;
+        *)  tgt="$DEST/$f_real" ;;
+      esac
+      tgt_dir=$(dirname "$tgt")
+      mkdir -p "$tgt_dir"
+    fi
+    if [ -z "$tgt" ]; then
+      warn "Quarantine containment check failed — refusing to move: $f"
+      fail=$((fail+1))
+      continue
+    fi
     if [ -e "$tgt" ]; then
       n=1
       while [ -e "${tgt}.dup${n}" ]; do n=$((n+1)); done
       warn "Quarantine target exists; using ${tgt}.dup${n}"
       tgt="${tgt}.dup${n}"
     fi
-    if mv -- "$f" "$tgt" 2>>"$LOG_FILE" && [ ! -e "$f" ]; then okc=$((okc+1)); else fail=$((fail+1)); fi
+    if mv -- "$f_real" "$tgt" 2>>"$LOG_FILE" && [ ! -e "$f_real" ]; then okc=$((okc+1)); else fail=$((fail+1)); fi
   else
-    if rm -f -- "$f" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
+    if rm -f -- "$f_real" 2>>"$LOG_FILE"; then okc=$((okc+1)); else fail=$((fail+1)); fi
   fi
   if [ $((idx % 200)) -eq 0 ]; then work "processed $idx/$COUNT"; fi
 done < "$TMP_LIST"

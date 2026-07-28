@@ -225,6 +225,23 @@ while IFS= read -r line || [ -n "$line" ]; do
       [ -z "$DEL_PATH" ] && continue
       [ -e "$DEL_PATH" ] || continue
 
+      if [ -L "$DEL_PATH" ]; then
+        warn "Planned path is now a symlink — SKIPPING for safety: $DEL_PATH"
+        moves_fail=$((moves_fail+1))
+        continue
+      fi
+
+      if command -v canonical_existing_path >/dev/null 2>&1; then
+        DEL_REAL="$(canonical_existing_path "$DEL_PATH" 2>/dev/null || true)"
+      else
+        DEL_REAL="$DEL_PATH"
+      fi
+      if [ -z "$DEL_REAL" ] || [ ! -f "$DEL_REAL" ]; then
+        warn "Could not canonicalise planned file — SKIPPING for safety: $DEL_PATH"
+        moves_fail=$((moves_fail+1))
+        continue
+      fi
+
       # v1.2.0: re-verify content hash before quarantining
       if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
         # v1.3.17 (finding #2 belt-and-braces): if the pre-flight classified
@@ -236,7 +253,7 @@ while IFS= read -r line || [ -n "$line" ]; do
           moves_skipped_changed=$((moves_skipped_changed+1))
           continue
         fi
-        actual="$($HASH_CMD_DD -- "$DEL_PATH" 2>/dev/null | awk '{print $1}')"
+        actual="$($HASH_CMD_DD -- "$DEL_REAL" 2>/dev/null | awk '{print $1}')"
         if [ -z "$actual" ]; then
           warn "Could not re-hash (skipping for safety): $DEL_PATH"
           moves_skipped_changed=$((moves_skipped_changed+1))
@@ -251,13 +268,23 @@ while IFS= read -r line || [ -n "$line" ]; do
         fi
       fi
 
-      # Build destination path
-      case "$DEL_PATH" in
-        /*) dest="$QUAR_DIR$DEL_PATH" ;;
-        *)  dest="$QUAR_DIR/$DEL_PATH" ;;
-      esac
-      dest_dir=$(dirname "$dest")
-      mkdir -p "$dest_dir"
+      # Build and validate a hierarchy-preserving destination. The source path
+      # is canonicalised first so `..` components cannot escape QUAR_DIR.
+      if command -v safe_quarantine_destination >/dev/null 2>&1; then
+        dest="$(safe_quarantine_destination "$QUAR_DIR" "$DEL_REAL" 2>/dev/null || true)"
+      else
+        case "$DEL_REAL" in
+          /*) dest="$QUAR_DIR$DEL_REAL" ;;
+          *)  dest="$QUAR_DIR/$DEL_REAL" ;;
+        esac
+        dest_dir=$(dirname "$dest")
+        mkdir -p "$dest_dir"
+      fi
+      if [ -z "$dest" ]; then
+        warn "Quarantine containment check failed — refusing to move: $DEL_PATH"
+        moves_fail=$((moves_fail+1))
+        continue
+      fi
 
       # FIX (v1.3.5 — peer-review item 5): `mv -n` can return success while
       # silently NOT moving when the destination already exists, which would be
@@ -271,7 +298,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         warn "Quarantine target already exists; using ${dest}.dup${n}"
         dest="${dest}.dup${n}"
       fi
-      if mv -- "$DEL_PATH" "$dest" 2>/dev/null && [ ! -e "$DEL_PATH" ]; then
+      if mv -- "$DEL_REAL" "$dest" 2>/dev/null && [ ! -e "$DEL_REAL" ]; then
         moves_ok=$((moves_ok+1))
       else
         warn "Failed to move (source still present): $DEL_PATH"

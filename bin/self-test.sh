@@ -110,7 +110,7 @@ lib/log.sh
 "
 
 # Commands the tool needs to function at all.
-REQUIRED_CMDS="bash awk sed grep find stat wc tr cut sort head tail date du mktemp"
+REQUIRED_CMDS="bash awk sed grep find stat wc tr cut sort comm head tail date du mktemp"
 
 printf '%sHasher self-test%s — %s\n' "$BOLD" "$RST" "$ROOT_DIR"
 

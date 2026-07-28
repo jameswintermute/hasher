@@ -171,6 +171,14 @@ has_child_dirs() {
   find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .
 }
 
+# Return true when DIR contains an immediate entry that is neither a regular
+# file nor a directory (symlink, FIFO, socket, block/character device, etc.).
+# Folder signatures intentionally cover regular files only, so these entries
+# must be rechecked at APPLY time as well as plan-generation time.
+has_nonregular_children() {
+  find "$1" -mindepth 1 -maxdepth 1 ! -type f ! -type d -print -quit 2>/dev/null | grep -q .
+}
+
 # keeper_for DEL  → prints the mapped keeper dir (exact match), or empty.
 keeper_for() {
   [ -n "$KEEP_MAP" ] && [ -s "$KEEP_MAP" ] || { printf ''; return; }
@@ -298,8 +306,27 @@ while IFS= read -r src; do
   case "$src" in \#*) continue ;; esac
   idx=$((idx+1))
 
+  src_plan="$src"
+  if [ -L "$src_plan" ]; then
+    warn "($idx/$COUNT) planned folder path is now a symlink — refusing to follow it: $src_plan"
+    fail=$((fail+1))
+    _audit "SOURCE_SYMLINK_REFUSED" "$src_plan" "" ""
+    continue
+  fi
+  if command -v canonical_existing_path >/dev/null 2>&1; then
+    src_real="$(canonical_existing_path "$src_plan" 2>/dev/null || true)"
+  else
+    src_real="$src_plan"
+  fi
+  if [ -z "$src_real" ] || [ ! -d "$src_real" ]; then
+    warn "($idx/$COUNT) source folder is missing or cannot be canonicalised: $src_plan"
+    fail=$((fail+1))
+    _audit "SOURCE_INVALID" "$src_plan" "" ""
+    continue
+  fi
+
   # per-folder size (best-effort, for the audit record)
-  sz_kb="$(du -sk -- "$src" 2>/dev/null | awk 'NR==1{print $1}')"
+  sz_kb="$(du -sk -- "$src_real" 2>/dev/null | awk 'NR==1{print $1}')"
   [[ "$sz_kb" =~ ^[0-9]+$ ]] || sz_kb=""
 
   # FIX (v1.3.5 — item 2): apply-time content re-verification. If we have a
@@ -317,32 +344,70 @@ while IFS= read -r src; do
   # data is outside what a leaf-level tool ever proved. --allow-unverified is the
   # single documented escape hatch.
   if [ "$ALLOW_UNVERIFIED" != true ]; then
-    _keep_for_leaf="$(keeper_for "$src" 2>/dev/null || true)"
-    if has_child_dirs "$src"; then
-      warn "($idx/$COUNT) SKIP — no longer a leaf folder (gained sub-folders since planning): $src"
+    _keep_for_leaf="$(keeper_for "$src_plan" 2>/dev/null || true)"
+    _keep_real=""
+    if [ -n "$_keep_for_leaf" ]; then
+      if [ -L "$_keep_for_leaf" ]; then
+        warn "($idx/$COUNT) SKIP — keeper path is now a symlink: $_keep_for_leaf"
+        skipped_verify=$((skipped_verify+1))
+        _audit "SKIPPED_KEEP_SYMLINK" "$src_plan" "$_keep_for_leaf" "$sz_kb"
+        continue
+      fi
+      if command -v canonical_existing_path >/dev/null 2>&1; then
+        _keep_real="$(canonical_existing_path "$_keep_for_leaf" 2>/dev/null || true)"
+      else
+        _keep_real="$_keep_for_leaf"
+      fi
+    fi
+    if has_child_dirs "$src_real"; then
+      warn "($idx/$COUNT) SKIP — no longer a leaf folder (gained sub-folders since planning): $src_plan"
       warn "   moving it would relocate nested data that was never compared."
       skipped_verify=$((skipped_verify+1))
-      _audit "SKIPPED_NONLEAF_DEL" "$src" "${_keep_for_leaf:-}" "$sz_kb"
+      _audit "SKIPPED_NONLEAF_DEL" "$src_plan" "${_keep_for_leaf:-}" "$sz_kb"
       continue
     fi
-    if [ -n "$_keep_for_leaf" ] && has_child_dirs "$_keep_for_leaf"; then
+    if has_nonregular_children "$src_real"; then
+      warn "($idx/$COUNT) SKIP — folder gained a symlink or other non-regular entry since planning: $src_plan"
+      warn "   that entry was never covered by the duplicate signature."
+      skipped_verify=$((skipped_verify+1))
+      _audit "SKIPPED_NONREGULAR_DEL" "$src_plan" "${_keep_for_leaf:-}" "$sz_kb"
+      continue
+    fi
+    if [ -n "$_keep_real" ] && has_child_dirs "$_keep_real"; then
       warn "($idx/$COUNT) SKIP — keeper is no longer a leaf folder: $_keep_for_leaf"
       skipped_verify=$((skipped_verify+1))
-      _audit "SKIPPED_NONLEAF_KEEP" "$src" "$_keep_for_leaf" "$sz_kb"
+      _audit "SKIPPED_NONLEAF_KEEP" "$src_plan" "$_keep_for_leaf" "$sz_kb"
+      continue
+    fi
+    if [ -n "$_keep_real" ] && has_nonregular_children "$_keep_real"; then
+      warn "($idx/$COUNT) SKIP — keeper gained a symlink or other non-regular entry: $_keep_for_leaf"
+      skipped_verify=$((skipped_verify+1))
+      _audit "SKIPPED_NONREGULAR_KEEP" "$src_plan" "$_keep_for_leaf" "$sz_kb"
       continue
     fi
   fi
 
   if [ "$VERIFY_ACTIVE" = true ]; then
-    keep="$(keeper_for "$src")"
+    keep="$(keeper_for "$src_plan")"
     if [ -n "$keep" ]; then
-      del_sig="$(dir_signature "$src")"
-      keep_sig="$(dir_signature "$keep")"
+      if command -v canonical_existing_path >/dev/null 2>&1; then
+        keep_real="$(canonical_existing_path "$keep" 2>/dev/null || true)"
+      else
+        keep_real="$keep"
+      fi
+      if [ -z "$keep_real" ] || [ ! -d "$keep_real" ]; then
+        warn "($idx/$COUNT) SKIP — keeper is missing or cannot be canonicalised: $keep"
+        skipped_verify=$((skipped_verify+1))
+        _audit "SKIPPED_KEEP_INVALID" "$src_plan" "$keep" "$sz_kb"
+        continue
+      fi
+      del_sig="$(dir_signature "$src_real")"
+      keep_sig="$(dir_signature "$keep_real")"
       if [ "$del_sig" != "$keep_sig" ]; then
-        warn "($idx/$COUNT) SKIP — contents no longer match keeper: $src"
+        warn "($idx/$COUNT) SKIP — contents no longer match keeper: $src_plan"
         warn "   keeper: $keep"
         skipped_verify=$((skipped_verify+1))
-        _audit "SKIPPED_VERIFY_MISMATCH" "$src" "$keep" "$sz_kb"
+        _audit "SKIPPED_VERIFY_MISMATCH" "$src_plan" "$keep" "$sz_kb"
         continue
       fi
     else
@@ -352,26 +417,26 @@ while IFS= read -r src; do
       # can override with --allow-unverified (proceed despite no mapping) or
       # --no-verify (disable verification entirely).
       if [ "$ALLOW_UNVERIFIED" = true ]; then
-        warn "($idx/$COUNT) no keeper mapping; proceeding anyway (--allow-unverified): $src"
-        _audit "VERIFY_NO_KEEPER_ALLOWED" "$src" "" "$sz_kb"
+        warn "($idx/$COUNT) no keeper mapping; proceeding anyway (--allow-unverified): $src_plan"
+        _audit "VERIFY_NO_KEEPER_ALLOWED" "$src_plan" "" "$sz_kb"
       else
-        warn "($idx/$COUNT) SKIP — no keeper mapping to verify against: $src"
+        warn "($idx/$COUNT) SKIP — no keeper mapping to verify against: $src_plan"
         warn "   (use --allow-unverified to move it anyway, or --no-verify to disable checks)"
         skipped_verify=$((skipped_verify+1))
-        _audit "SKIPPED_NO_KEEPER" "$src" "" "$sz_kb"
+        _audit "SKIPPED_NO_KEEPER" "$src_plan" "" "$sz_kb"
         continue
       fi
     fi
   fi
 
-  if [ "$DELETE_METADATA" = true ] && printf '%s\n' "$src" | grep -Eq '/(@eaDir|\.AppleDouble)(/|$)'; then
-    work "($idx/$COUNT) delete metadata: $src"
-    if rm -rf -- "$src" 2>>"$LOG_FILE"; then
+  if [ "$DELETE_METADATA" = true ] && printf '%s\n' "$src_real" | grep -Eq '/(@eaDir|\.AppleDouble)(/|$)'; then
+    work "($idx/$COUNT) delete metadata: $src_real"
+    if rm -rf -- "$src_real" 2>>"$LOG_FILE"; then
       removed=$((removed+1)); ok "deleted"
-      _audit "DELETE_METADATA" "$src" "" "$sz_kb"
+      _audit "DELETE_METADATA" "$src_plan" "" "$sz_kb"
     else
       warn "delete failed — see log"; fail=$((fail+1))
-      _audit "DELETE_METADATA_FAILED" "$src" "" "$sz_kb"
+      _audit "DELETE_METADATA_FAILED" "$src_plan" "" "$sz_kb"
     fi
     continue
   fi
@@ -383,25 +448,35 @@ while IFS= read -r src; do
   # pattern as delete-duplicates.sh (v1.3.5): build the destination by
   # joining $DEST_ROOT with the source's absolute path, and disambiguate
   # collisions with `.dup{n}` rather than silent overwrite.
-  case "$src" in
-    /*) dest="$DEST_ROOT$src" ;;
-    *)  dest="$DEST_ROOT/$src" ;;
-  esac
-  dest_dir=$(dirname "$dest")
-  mkdir -p "$dest_dir"
+  if command -v safe_quarantine_destination >/dev/null 2>&1; then
+    dest="$(safe_quarantine_destination "$DEST_ROOT" "$src_real" 2>/dev/null || true)"
+  else
+    case "$src_real" in
+      /*) dest="$DEST_ROOT$src_real" ;;
+      *)  dest="$DEST_ROOT/$src_real" ;;
+    esac
+    dest_dir=$(dirname "$dest")
+    mkdir -p "$dest_dir"
+  fi
+  if [ -z "$dest" ]; then
+    warn "($idx/$COUNT) quarantine containment check failed — refusing to move: $src_plan"
+    fail=$((fail+1))
+    _audit "QUARANTINE_PATH_REFUSED" "$src_plan" "" "$sz_kb"
+    continue
+  fi
   if [ -e "$dest" ]; then
     n=1
     while [ -e "${dest}.dup${n}" ]; do n=$((n+1)); done
     warn "Quarantine target exists; using ${dest}.dup${n}"
     dest="${dest}.dup${n}"
   fi
-  work "($idx/$COUNT) $src -> $dest"
-  if mv -- "$src" "$dest" 2>>"$LOG_FILE" && [ ! -e "$src" ]; then
+  work "($idx/$COUNT) $src_real -> $dest"
+  if mv -- "$src_real" "$dest" 2>>"$LOG_FILE" && [ ! -e "$src_real" ]; then
     moved=$((moved+1)); ok "moved"
-    _audit "QUARANTINED" "$src" "$dest" "$sz_kb"
+    _audit "QUARANTINED" "$src_plan" "$dest" "$sz_kb"
   else
     warn "move failed — see log"; fail=$((fail+1))
-    _audit "QUARANTINE_FAILED" "$src" "$dest" "$sz_kb"
+    _audit "QUARANTINE_FAILED" "$src_plan" "$dest" "$sz_kb"
   fi
 done < "$PLAN_CLEAN"
 
