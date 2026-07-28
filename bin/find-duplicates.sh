@@ -72,6 +72,21 @@ OUT_CSV="$LOGS_DIR/duplicates-$timestamp.csv"
 OUT_PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"  # only when bulk
 OUT_LATEST="$LOGS_DIR/duplicate-hashes-latest.txt"
 
+# Publish the completed run-specific report without ever opening the existing
+# latest pointer for writing.  v1.3.25 truncated the previous historical report
+# because `: > "$OUT_LATEST"` followed the symlink, then AWK wrote new content
+# through the same link.  Build a replacement beside it and atomically rename.
+publish_latest_report() {
+  local tmp_latest="$OUT_LATEST.tmp.$$"
+  rm -f -- "$tmp_latest" 2>/dev/null || true
+  if ln -s -- "$(basename "$OUT_CANON")" "$tmp_latest" 2>/dev/null; then
+    mv -f -- "$tmp_latest" "$OUT_LATEST"
+  else
+    cp -f -- "$OUT_CANON" "$tmp_latest" || return 1
+    mv -f -- "$tmp_latest" "$OUT_LATEST"
+  fi
+}
+
 pick_latest_csv() {
   ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true
 }
@@ -322,7 +337,6 @@ cut -d"$(printf '\t')" -f1 "$TMP" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=
 
 : > "$OUT_CANON"
 : > "$OUT_GROUPS"
-: > "$OUT_LATEST"
 : > "$OUT_CSV"
 
 if [[ ! -s "$HASHES_TMP" ]]; then
@@ -330,6 +344,7 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   info "Canonical report (empty): $OUT_CANON"
   info "Group summary:           $OUT_GROUPS"
   : > "$OUT_CSV"
+  publish_latest_report || warn "Could not update latest report pointer: $OUT_LATEST"
   exit 0
 fi
 
@@ -448,21 +463,19 @@ rm -f -- "$_hl_paths0" "$_hl_stats" 2>/dev/null || true
 # Single-pass AWK to render canonical + groups; avoids bash loops under set -e
 # (intermediate is TAB-separated since v1.3.1)
 awk -F'\t' -v min="$MIN_GROUP" \
-  -v canon="$OUT_CANON" -v latest="$OUT_LATEST" -v groups="$OUT_GROUPS" '
+  -v canon="$OUT_CANON" -v groups="$OUT_GROUPS" '
   function flush(h,   n,i,p,s) {
     n = cnt[h]; if (n < min) return
     group++
     printf "HASH %s (N=%d)\n", h, n >> canon
-    printf "HASH %s (N=%d)\n", h, n >> latest
     printf "─ Group #%d — hash: %s\n", group, h >> groups
     for (i=1;i<=idx[h];i++) {
       p = order[h,i]; s = size[h,p]
       printf "  %s\n", p >> canon
-      printf "  %s\n", p >> latest
       if (s != "") printf "   %2d) %s  (size: %s)\n", i, p, s >> groups
       else         printf "   %2d) %s\n", i, p >> groups
     }
-    printf "\n" >> canon; printf "\n" >> latest; printf "\n" >> groups
+    printf "\n" >> canon; printf "\n" >> groups
   }
   {
     h=$1; p=$2; s=$3
@@ -526,11 +539,12 @@ if [[ "$MODE" == "bulk" ]]; then
   fi
 else
   info "Next: run 'review-duplicates.sh --from-report \"$OUT_CANON\"' (or menu option 4)."
-  # v1.3.23 (finding #5): prefer symlink so the latest pointer always
-  # resolves to the newest run, without duplicating file content. Fall
-  # back to cp on filesystems that reject symlinks (rare NAS SMB shares).
-  if ln -sfn -- "$(basename "$OUT_CANON")" "$OUT_LATEST" 2>/dev/null; then :; else
-    cp -f -- "$OUT_CANON" "$OUT_LATEST" 2>/dev/null || true
-  fi
+fi
+
+# Standard and bulk modes both publish the immutable run-specific canonical
+# report only after all rendering/planning work has completed.
+if publish_latest_report; then
   info "Canonical report ready: $OUT_LATEST"
+else
+  warn "Could not update latest report pointer: $OUT_LATEST"
 fi

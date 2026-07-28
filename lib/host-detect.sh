@@ -278,3 +278,86 @@ resolve_quarantine_dir() {
   fi
   printf '%s\n' "$_rqd_val"
 }
+
+# ── Canonical-path and quarantine containment helpers (v1.3.26) ──────
+#
+# These helpers are shared by the hasher and every quarantine-capable tool.
+# They deliberately avoid making `realpath` a hard dependency: Synology DSM,
+# macOS and generic Linux expose slightly different utility sets.
+
+# canonical_existing_path PATH
+# Print an absolute, physical path for an entry that currently exists.
+# Directory symlinks and `.` / `..` components are resolved.  The caller can
+# still reject a final-component symlink before invoking this helper when that
+# distinction matters (hasher.sh does so).
+canonical_existing_path() {
+  [ "$#" -eq 1 ] || return 2
+  _cep_input=$1
+  [ -e "$_cep_input" ] || [ -L "$_cep_input" ] || return 1
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -- "$_cep_input" 2>/dev/null && return 0
+    realpath "$_cep_input" 2>/dev/null && return 0
+  fi
+
+  if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    readlink -f -- "$_cep_input" 2>/dev/null && return 0
+    readlink -f "$_cep_input" 2>/dev/null && return 0
+  fi
+
+  if [ -d "$_cep_input" ]; then
+    (CDPATH= cd -P -- "$_cep_input" 2>/dev/null && pwd -P)
+    return $?
+  fi
+
+  _cep_dir=$(dirname -- "$_cep_input" 2>/dev/null || dirname "$_cep_input") || return 1
+  _cep_base=$(basename -- "$_cep_input" 2>/dev/null || basename "$_cep_input") || return 1
+  _cep_real_dir=$(CDPATH= cd -P -- "$_cep_dir" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "${_cep_real_dir%/}" "$_cep_base"
+}
+
+# path_is_within CHILD ROOT
+# Return success when CHILD is ROOT itself or lies below ROOT.  Both arguments
+# must already be absolute/canonical; this is a component-aware prefix test.
+path_is_within() {
+  [ "$#" -eq 2 ] || return 2
+  _piw_child=$1
+  _piw_root=$2
+  if [ "$_piw_root" = "/" ]; then
+    case "$_piw_child" in /*) return 0 ;; *) return 1 ;; esac
+  fi
+  case "$_piw_child" in
+    "$_piw_root"|"$_piw_root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# safe_quarantine_destination ROOT SOURCE
+# Create SOURCE's mirrored parent hierarchy below ROOT and print a destination
+# that is proven to remain inside ROOT after physical-path resolution.  This
+# prevents raw manifest spellings containing `..` — or a symlink planted in
+# the quarantine hierarchy — from escaping the configured quarantine root.
+safe_quarantine_destination() {
+  [ "$#" -eq 2 ] || return 2
+  _sqd_root=$1
+  _sqd_source=$2
+
+  mkdir -p -- "$_sqd_root" 2>/dev/null || mkdir -p "$_sqd_root" || return 1
+  _sqd_root_real=$(canonical_existing_path "$_sqd_root") || return 1
+  _sqd_source_real=$(canonical_existing_path "$_sqd_source") || return 1
+
+  # Refuse recursive/self-quarantine layouts.
+  path_is_within "$_sqd_source_real" "$_sqd_root_real" && return 3
+  path_is_within "$_sqd_root_real" "$_sqd_source_real" && return 3
+
+  _sqd_rel=${_sqd_source_real#/}
+  _sqd_candidate="${_sqd_root_real%/}/$_sqd_rel"
+  _sqd_parent=$(dirname -- "$_sqd_candidate" 2>/dev/null || dirname "$_sqd_candidate") || return 1
+  _sqd_base=$(basename -- "$_sqd_source_real" 2>/dev/null || basename "$_sqd_source_real") || return 1
+
+  mkdir -p -- "$_sqd_parent" 2>/dev/null || mkdir -p "$_sqd_parent" || return 1
+  _sqd_parent_real=$(canonical_existing_path "$_sqd_parent") || return 1
+  path_is_within "$_sqd_parent_real" "$_sqd_root_real" || return 4
+
+  printf '%s/%s\n' "${_sqd_parent_real%/}" "$_sqd_base"
+}
