@@ -136,7 +136,8 @@ info "Applying retention rules…"
 # without this update the new per-run reports accumulate indefinitely.
 # Also legacy-cover any old-format files that may still exist on hosts
 # that were upgraded from v1.3.18-or-earlier.
-keep_latest_n "$LOGS_DIR"/duplicate-hashes-20*.txt 5 "duplicate-hashes report"
+keep_latest_n "$LOGS_DIR"/duplicate-hashes-20*.txt 5 "verified duplicate-hashes report"
+keep_latest_n "$LOGS_DIR"/hash-scan-duplicate-summary-20*.txt 5 "preliminary hash-scan duplicate summary"
 keep_latest_n "$LOGS_DIR"/20*-duplicate-hashes.txt 5 "duplicate-hashes report (legacy)"
 
 # Keep last 5 duplicate-groups text reports

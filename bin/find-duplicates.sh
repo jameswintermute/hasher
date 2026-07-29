@@ -337,7 +337,10 @@ fi
 HASHES_TMP="$(mktemp)"; trap 'rm -f "$TMP" "$HASHES_TMP"' EXIT
 cut -d"$(printf '\t')" -f1 "$TMP" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$HASHES_TMP"
 
-: > "$OUT_CANON"
+# v1.3.28: embed provenance in the canonical report. Review and auto-dedup
+# refuse reports that were not produced by this finder, preventing the raw
+# post-hash duplicate summary from bypassing hard-link filtering.
+printf '# HASHER_VERIFIED_DUPLICATE_REPORT v1\n# source-csv: %s\n' "$INPUT" > "$OUT_CANON"
 : > "$OUT_GROUPS"
 : > "$OUT_CSV"
 
@@ -346,6 +349,7 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   info "Canonical report (empty): $OUT_CANON"
   info "Group summary:           $OUT_GROUPS"
   : > "$OUT_CSV"
+  printf '# hardlink-filter: not-required\n' >> "$OUT_CANON"
   publish_latest_report || warn "Could not update latest report pointer: $OUT_LATEST"
   exit 0
 fi
@@ -401,7 +405,9 @@ elif stat -f $'%d\t%i\t%N' /dev/null >/dev/null 2>&1; then
   _stat_fmt=$'%d\t%i\t%N'
 fi
 
+_hl_filter_status="not-required"
 if [[ "$_hl_candidates" -gt 0 && -n "$_stat_style" ]]; then
+  _hl_filter_status="applied"
   info "Checking $_hl_candidates duplicate candidate path(s) for hard links..."
 
   # xargs batches paths so stat is invoked once per block rather than once per
@@ -445,6 +451,7 @@ if [[ "$_hl_candidates" -gt 0 && -n "$_stat_style" ]]; then
   ' "$_hl_stats" "$OUT_CSV" > "$_hl_csv"
 else
   if [[ "$_hl_candidates" -gt 0 ]]; then
+    _hl_filter_status="skipped"
     warn "Could not detect a compatible stat format; hard-link filtering skipped."
   fi
   cp -f -- "$OUT_CSV" "$_hl_csv"
@@ -461,6 +468,7 @@ else
 fi
 mv -f -- "$_hl_csv" "$OUT_CSV"
 rm -f -- "$_hl_paths0" "$_hl_stats" 2>/dev/null || true
+printf '# hardlink-filter: %s\n' "$_hl_filter_status" >> "$OUT_CANON"
 
 # Single-pass AWK to render canonical + groups; avoids bash loops under set -e
 # (intermediate is TAB-separated since v1.3.1)
@@ -498,7 +506,7 @@ info "Group summary:    $OUT_GROUPS"
 
 if [[ "$MODE" == "bulk" ]]; then
   # Build a naive plan honouring KEEP_STRATEGY.
-  # FIX (v1.1.9): emit KEEP|path / DEL|path lines so delete-duplicates.sh
+  # FIX (v1.1.9): emit KEEP/DEL plan lines so delete-duplicates.sh
   # actually consumes the plan. Previously this wrote bare paths and
   # delete-duplicates.sh silently ignored every entry (it only acts on
   # lines matching '^DEL|').
@@ -523,9 +531,9 @@ if [[ "$MODE" == "bulk" ]]; then
         if (idx[h] >= 2) {
           k=best[h]
           # Emit KEEP first, then DEL for every other path in the group.
-          # v1.2.0: DEL lines carry the group hash (h) as a third field so
-          # delete-duplicates.sh can re-verify content before quarantining.
-          printf "KEEP|%s\n", k
+          # v1.3.28: KEEP and DEL lines carry the group hash so apply can
+          # re-verify both the surviving keeper and each quarantined file.
+          printf "KEEP|%s|%s\n", k, h
           for (i=1;i<=idx[h];i++) { p=paths[h,i]; if (p!=k) printf "DEL|%s|%s\n", p, h }
         }
       }

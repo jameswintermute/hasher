@@ -105,6 +105,21 @@ _split_del_line() {
   fi
 }
 
+# v1.3.28 plans include the group hash on KEEP entries as well. Older hashed
+# plans used KEEP|path only; those are supported by associating the pending
+# keeper with the next DEL hash in the grouped plan order.
+_split_keep_line() {
+  local body="${1#KEEP|}"
+  local tail="${body##*|}"
+  if [ "${#tail}" -eq 64 ] && printf '%s' "$tail" | grep -qiE '^[0-9a-f]{64}$'; then
+    KEEP_PATH="${body%|*}"
+    KEEP_HASH="$tail"
+  else
+    KEEP_PATH="$body"
+    KEEP_HASH=""
+  fi
+}
+
 # Count DEL entries
 TOTAL_DEL=$(grep -c '^DEL|' "$PLAN_FILE" 2>/dev/null || true)
 if [ "$TOTAL_DEL" -eq 0 ]; then
@@ -185,6 +200,65 @@ else
   fi
 fi
 
+# v1.3.28: build a hash -> keeper map before any move. Each hashed duplicate
+# group must have exactly one KEEP. New plans carry KEEP|path|hash; older plans
+# are inferred from the grouped KEEP followed by DEL|path|hash order.
+KEEPER_MAP=""
+_cleanup_keeper_map() { [ -n "${KEEPER_MAP:-}" ] && rm -f -- "$KEEPER_MAP" 2>/dev/null || true; }
+trap _cleanup_keeper_map EXIT
+if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
+  KEEPER_MAP="$(mktemp "${TMPDIR:-/tmp}/hasher-keepers.XXXXXX")" || { error "Could not create keeper map."; exit 1; }
+  : > "$KEEPER_MAP"
+  _pending_keep=""; _pending_keep_hash=""; _current_hash=""
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in
+      KEEP\|*)
+        _split_keep_line "$_line"
+        if [ -z "$KEEP_PATH" ]; then
+          error "Malformed KEEP entry in plan: $_line"; exit 2
+        fi
+        if [ -n "$_pending_keep" ]; then
+          error "Multiple KEEP entries before a duplicate group was identified."
+          error "Refusing ambiguous plan: $PLAN_FILE"
+          exit 2
+        fi
+        _pending_keep="$KEEP_PATH"
+        _pending_keep_hash="$KEEP_HASH"
+        ;;
+      DEL\|*)
+        _split_del_line "$_line"
+        [ -n "$DEL_HASH" ] || continue
+        if [ "$DEL_HASH" != "$_current_hash" ]; then
+          _current_hash="$DEL_HASH"
+          if [ -n "$_pending_keep" ]; then
+            if [ -n "$_pending_keep_hash" ] && [ "$_pending_keep_hash" != "$DEL_HASH" ]; then
+              error "KEEP hash does not match its DEL group: $_pending_keep"
+              exit 2
+            fi
+            if awk -F '\t' -v h="$DEL_HASH" '$1==h{found=1} END{exit !found}' "$KEEPER_MAP"; then
+              error "Duplicate/ambiguous KEEP mapping for hash $DEL_HASH"
+              exit 2
+            fi
+            printf '%s\t%s\n' "$DEL_HASH" "$_pending_keep" >> "$KEEPER_MAP"
+            _pending_keep=""; _pending_keep_hash=""
+          fi
+        elif [ -n "$_pending_keep" ]; then
+          error "A second KEEP appeared inside hash group $DEL_HASH"
+          exit 2
+        fi
+        ;;
+    esac
+  done < "$PLAN_FILE"
+  if [ -n "$_pending_keep" ]; then
+    warn "KEEP entry has no following DEL group and will not be used: $_pending_keep"
+  fi
+fi
+
+keeper_for_hash() {
+  [ -n "${KEEPER_MAP:-}" ] && [ -s "$KEEPER_MAP" ] || return 0
+  awk -F '\t' -v h="$1" '$1==h {print $2; exit}' "$KEEPER_MAP"
+}
+
 # Pass 1: count existing vs missing
 existing=0
 missing=0
@@ -242,8 +316,43 @@ while IFS= read -r line || [ -n "$line" ]; do
         continue
       fi
 
-      # v1.2.0: re-verify content hash before quarantining
+      # v1.3.28: verify that the planned keeper still exists and still has
+      # the group's expected content before moving any DEL entry. A surviving
+      # DEL is not expendable if its keeper disappeared or changed.
       if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
+        GROUP_KEEP="$(keeper_for_hash "$DEL_HASH" 2>/dev/null || true)"
+        if [ -z "$GROUP_KEEP" ]; then
+          warn "No unique KEEP mapping for hash $DEL_HASH — SKIPPING group candidate: $DEL_PATH"
+          moves_skipped_changed=$((moves_skipped_changed+1))
+          continue
+        fi
+        if [ "$GROUP_KEEP" = "$DEL_PATH" ] || [ -L "$GROUP_KEEP" ]; then
+          warn "Keeper is invalid or is the DEL path — SKIPPING: $DEL_PATH"
+          moves_skipped_changed=$((moves_skipped_changed+1))
+          continue
+        fi
+        if command -v canonical_existing_path >/dev/null 2>&1; then
+          KEEP_REAL="$(canonical_existing_path "$GROUP_KEEP" 2>/dev/null || true)"
+        else
+          KEEP_REAL="$GROUP_KEEP"
+        fi
+        if [ -z "$KEEP_REAL" ] || [ ! -f "$KEEP_REAL" ]; then
+          warn "Keeper is missing or not a regular file — SKIPPING: $DEL_PATH"
+          warn "  keeper: $GROUP_KEEP"
+          moves_skipped_changed=$((moves_skipped_changed+1))
+          continue
+        fi
+        keeper_actual="$($HASH_CMD_DD -- "$KEEP_REAL" 2>/dev/null | awk '{print $1}')"
+        if [ -z "$keeper_actual" ] || [ "$keeper_actual" != "$DEL_HASH" ]; then
+          warn "Keeper changed or could not be re-hashed — SKIPPING: $DEL_PATH"
+          warn "  keeper:   $GROUP_KEEP"
+          warn "  expected: $DEL_HASH"
+          [ -n "$keeper_actual" ] && warn "  actual:   $keeper_actual"
+          moves_skipped_changed=$((moves_skipped_changed+1))
+          continue
+        fi
+
+        # v1.2.0: re-verify DEL content hash before quarantining
         # v1.3.17 (finding #2 belt-and-braces): if the pre-flight classified
         # the plan as hashed but we somehow reach here with an empty DEL_HASH,
         # that is a pre-flight bug or a race — safety-skip rather than move
@@ -309,14 +418,15 @@ while IFS= read -r line || [ -n "$line" ]; do
 done <"$PLAN_FILE"
 
 if [ "$moves_skipped_changed" -gt 0 ]; then
-  warn "$moves_skipped_changed file(s) skipped because their content no longer matched the plan."
-  warn "These files changed between hashing and now — re-run hashing + dedup to re-evaluate them."
+  warn "$moves_skipped_changed file(s) skipped because the DEL or its keeper could not be safely re-verified."
+  warn "Re-run hashing and duplicate discovery to rebuild a current plan."
 fi
-info "Move complete: $moves_ok files moved to quarantine ($QUAR_DIR); $moves_fail failures."
-# v1.3.23 (peer-review recheck finding #4): return non-zero when any
-# move failed. Files "skipped because content changed" are a safety
-# outcome, not a failure — they exit 0 with a warning above.
+info "Move complete: $moves_ok files moved to quarantine ($QUAR_DIR); $moves_fail failures; $moves_skipped_changed safety skips."
 if [ "${moves_fail:-0}" -gt 0 ]; then
   exit 1
+fi
+# v1.3.28: safety refusal is distinct from complete success.
+if [ "${moves_skipped_changed:-0}" -gt 0 ]; then
+  exit 4
 fi
 exit 0

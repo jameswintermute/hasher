@@ -17,7 +17,7 @@
 #   oldest         keep the least recently modified copy
 #
 # The plan file produced is identical in format to the one produced by
-# review-duplicates.sh (KEEP|path / DEL|path lines) and is consumed by
+# review-duplicates.sh (KEEP|path|hash / DEL|path|hash lines) and is consumed by
 # delete-duplicates.sh unchanged.
 #
 # Usage:
@@ -73,7 +73,7 @@ Usage: $(basename "$0") [OPTIONS]
   --force              Skip the confirmation prompt
   -h, --help           Show this help
 
-The plan file is compatible with delete-duplicates.sh (KEEP|path / DEL|path).
+The plan file is compatible with delete-duplicates.sh (KEEP|path|hash / DEL|path|hash).
 Review it before applying:
   cat  <plan-file>
   bin/delete-duplicates.sh <plan-file>
@@ -100,6 +100,19 @@ esac
 
 # ── Validate inputs ────────────────────────────────────────────────────────────
 [ -r "$REPORT" ] || { err "Report not found: $REPORT"; err "Run option 2 (Find duplicate files) first."; exit 1; }
+# v1.3.28: accept only a hard-link-safe report emitted by find-duplicates.sh.
+# The preliminary summary written by hasher.sh deliberately uses a different
+# filename and has no provenance marker.
+if ! grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$REPORT" 2>/dev/null; then
+  err "Report is not a verified find-duplicates.sh report: $REPORT"
+  err "Run option 2 (Find duplicate files) before auto-dedup."
+  exit 2
+fi
+if ! grep -Eq '^# hardlink-filter: (applied|not-required)$' "$REPORT" 2>/dev/null; then
+  err "Report does not confirm successful hard-link filtering: $REPORT"
+  err "Re-run option 2 on a host with compatible stat support."
+  exit 2
+fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
   touch "$PLAN_OUT" 2>/dev/null || { err "Cannot write plan file: $PLAN_OUT"; exit 1; }
@@ -238,7 +251,7 @@ flush_group() {
     [ -z "$_fp" ] && continue
     if [ "$_fp" = "$keeper" ]; then
       if [ "$DRY_RUN" -eq 0 ]; then
-        printf 'KEEP|%s\n' "$_fp" >> "$PLAN_OUT"
+        printf 'KEEP|%s|%s\n' "$_fp" "$cur_hash" >> "$PLAN_OUT"
       else
         detail "KEEP  $_fp"
       fi

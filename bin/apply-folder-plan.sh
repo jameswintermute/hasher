@@ -118,23 +118,48 @@ if [ "$NO_VERIFY" != true ] && [ -z "$VERIFY_TSV" ]; then
   fi
 fi
 
-# Compute the direct-file signature of a directory from disk: for each file
-# immediately inside DIR (not recursing), "basename|sha|size", sorted by
-# basename, joined by newslines. Empty string if dir missing/empty.
+# v1.3.28: resolve SHA-256 once. Verified folder apply must never degrade to
+# empty hashes when the command is absent or a file cannot be hashed.
+FOLDER_HASH_STYLE=""
+if command -v sha256sum >/dev/null 2>&1; then
+  FOLDER_HASH_STYLE="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  FOLDER_HASH_STYLE="shasum"
+fi
+
+# Compute the direct-file signature of a directory from disk. Returns non-zero
+# if discovery, stat or hashing fails for any direct regular file.
 dir_signature() {
   d="$1"
-  [ -d "$d" ] || { printf ''; return; }
-  # hash tool: prefer sha256sum, fall back to shasum -a 256
-  find "$d" -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+  [ -d "$d" ] || return 1
+  [ -n "$FOLDER_HASH_STYLE" ] || return 1
+
+  _sig_list="$(mktemp "${TMPDIR:-/tmp}/folder-sig-list.XXXXXX")" || return 1
+  _sig_out="$(mktemp "${TMPDIR:-/tmp}/folder-sig-out.XXXXXX")" || { rm -f -- "$_sig_list"; return 1; }
+  if ! find "$d" -maxdepth 1 -type f -print 2>/dev/null | LC_ALL=C sort > "$_sig_list"; then
+    rm -f -- "$_sig_list" "$_sig_out"; return 1
+  fi
+  : > "$_sig_out"
+  while IFS= read -r f || [ -n "$f" ]; do
+    [ -n "$f" ] || continue
+    [ -f "$f" ] && [ ! -L "$f" ] || { rm -f -- "$_sig_list" "$_sig_out"; return 1; }
     b="$(basename "$f")"
-    sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
-    if command -v sha256sum >/dev/null 2>&1; then
-      h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')"
+    sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')" || { rm -f -- "$_sig_list" "$_sig_out"; return 1; }
+    case "$sz" in ''|*[!0-9]*) rm -f -- "$_sig_list" "$_sig_out"; return 1 ;; esac
+    if [ "$FOLDER_HASH_STYLE" = "sha256sum" ]; then
+      h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" || h=""
     else
-      h="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')"
+      h="$(shasum -a 256 -- "$f" 2>/dev/null | awk '{print $1}')" || h=""
     fi
-    printf '%s|%s|%s\n' "$b" "$h" "$sz"
-  done
+    if [ "${#h}" -ne 64 ] || ! printf '%s' "$h" | grep -qiE '^[0-9a-f]{64}$'; then
+      rm -f -- "$_sig_list" "$_sig_out"; return 1
+    fi
+    printf '%s|%s|%s\n' "$b" "$h" "$sz" >> "$_sig_out" || { rm -f -- "$_sig_list" "$_sig_out"; return 1; }
+  done < "$_sig_list"
+  cat "$_sig_out"
+  _sig_rc=$?
+  rm -f -- "$_sig_list" "$_sig_out"
+  return "$_sig_rc"
 }
 
 # Build a lookup of DEL -> KEEP from the groups TSV, if available.
@@ -163,6 +188,11 @@ else
   fi
 fi
 [ "$ALLOW_UNVERIFIED" = true ] && warn "--allow-unverified: deletes without a keeper mapping will PROCEED unverified."
+if [ "$VERIFY_ACTIVE" = true ] && [ -z "$FOLDER_HASH_STYLE" ]; then
+  error "Apply-time verification requires sha256sum or shasum, but neither is available."
+  error "Refusing to apply the folder plan without content hashes."
+  exit 2
+fi
 
 # has_child_dirs DIR → returns 0 (true) if DIR contains at least one immediate
 # subdirectory. Used for the apply-time leaf check (concern: a folder that was a
@@ -401,8 +431,18 @@ while IFS= read -r src; do
         _audit "SKIPPED_KEEP_INVALID" "$src_plan" "$keep" "$sz_kb"
         continue
       fi
-      del_sig="$(dir_signature "$src_real")"
-      keep_sig="$(dir_signature "$keep_real")"
+      if ! del_sig="$(dir_signature "$src_real")"; then
+        warn "($idx/$COUNT) SKIP — could not calculate a complete SHA-256 signature: $src_plan"
+        fail=$((fail+1))
+        _audit "SKIPPED_SIGNATURE_ERROR_DEL" "$src_plan" "$keep" "$sz_kb"
+        continue
+      fi
+      if ! keep_sig="$(dir_signature "$keep_real")"; then
+        warn "($idx/$COUNT) SKIP — could not calculate keeper SHA-256 signature: $keep"
+        fail=$((fail+1))
+        _audit "SKIPPED_SIGNATURE_ERROR_KEEP" "$src_plan" "$keep" "$sz_kb"
+        continue
+      fi
       if [ "$del_sig" != "$keep_sig" ]; then
         warn "($idx/$COUNT) SKIP — contents no longer match keeper: $src_plan"
         warn "   keeper: $keep"
@@ -491,11 +531,12 @@ if [ "$skipped_verify" -gt 0 ]; then
 fi
 info "Audit record appended to: $ACTIONS_LOG"
 info "Review quarantine: $DEST_ROOT"
-# v1.3.23 (peer-review recheck finding #4): return non-zero when any
-# operation failed. Skipped-verify (files changed since plan generation)
-# is NOT treated as a failure — that's a safety refusal, and the plan
-# can be regenerated.
 if [ "${fail:-0}" -gt 0 ]; then
   exit 1
+fi
+# v1.3.28: a safety skip means the plan was not fully applied. Return a
+# distinct status so the launcher and automation cannot report full success.
+if [ "${skipped_verify:-0}" -gt 0 ]; then
+  exit 4
 fi
 exit 0

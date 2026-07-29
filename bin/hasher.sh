@@ -2191,9 +2191,13 @@ post_run_reports() {
   # — that's what next-step commands print, so they stay stable while
   # historical reports accumulate.
   local zero_txt="$ZERO_DIR/zero-length-$run_tag.txt"
-  local dupes_txt="$LOGS_DIR/duplicate-hashes-$run_tag.txt"
+  # v1.3.28: this is a preliminary summary from the raw hash manifest, not
+  # the hard-link-filtered report produced by find-duplicates.sh. Keep the
+  # namespaces separate so review/auto-dedup can consume only verified finder
+  # output.
+  local dupes_txt="$LOGS_DIR/hash-scan-duplicate-summary-$run_tag.txt"
   local zero_latest="$ZERO_DIR/zero-length-latest.txt"
-  local dupes_latest="$LOGS_DIR/duplicate-hashes-latest.txt"
+  local dupes_latest="$LOGS_DIR/hash-scan-duplicate-summary-latest.txt"
 
   if [[ -f "$csv" ]]; then
     awk '
@@ -2281,7 +2285,7 @@ post_run_reports() {
     echo "       bin/find-duplicate-folders.sh --input \"$csv\""
     echo "  2) Find and review duplicate files:"
     echo "       bin/find-duplicates.sh --input \"$csv\""
-    echo "       bin/review-duplicates.sh --from-report \"$dupes_txt\""
+    echo "       bin/review-duplicates.sh --from-report \"$LOGS_DIR/duplicate-hashes-latest.txt\""
     echo "  3) Remove zero-length files (review first, no changes):"
     echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --dry-run"
     echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --force"
