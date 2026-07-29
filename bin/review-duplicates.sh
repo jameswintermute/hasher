@@ -173,6 +173,17 @@ case "$ORDER" in
 esac
 
 [ -r "$REPORT" ] || { error "Report not found: $REPORT"; exit 1; }
+# v1.3.28: interactive review must consume the finder report after hard-link
+# filtering, never hasher.sh's preliminary duplicate summary.
+if ! grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$REPORT" 2>/dev/null; then
+  error "Report is not a verified find-duplicates.sh report: $REPORT"
+  error "Run option 2 (Find duplicate files) before reviewing."
+  exit 2
+fi
+if ! grep -Eq '^# hardlink-filter: (applied|not-required)$' "$REPORT" 2>/dev/null; then
+  error "Report does not confirm successful hard-link filtering: $REPORT"
+  exit 2
+fi
 touch "$PLAN_OUT" 2>/dev/null || { error "Cannot write plan: $PLAN_OUT"; exit 1; }
 
 # FIX: use awk instead of wc -l to avoid whitespace/padding differences across platforms
@@ -446,7 +457,7 @@ present_group(){
     echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
     echo "  - s = skip group (decide later)"
     echo "  - A = add this hash to exceptions list and skip this group"
-    echo "  - D = delete ALL copies in this group"
+    echo "  - D = delete all (disabled in verified plans — one live keeper is required)"
     echo "  - q = quit (plan so far is preserved)"
     printf "Your choice: "
     if [ -t 0 ]; then
@@ -481,35 +492,8 @@ present_group(){
         ;;
 
       [dD])
-        printf "Please confirm that you wish to delete all copies of this file (this entire group) [y/N] "
-        if [ -t 0 ]; then
-          if ! IFS= read -r confirm; then
-            confirm="n"
-          fi
-        else
-          if ! IFS= read -r confirm </dev/tty; then
-            confirm="n"
-          fi
-        fi
-        case "$confirm" in
-          [yY])
-            # shellcheck disable=SC2162
-            while IFS= read -r fp || [ -n "$fp" ]; do
-              [ -z "$fp" ] && continue
-              # v1.2.0: emit group hash for re-verification at quarantine time
-              if [ -n "${group_hash:-}" ]; then
-                printf "DEL|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
-              else
-                printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
-              fi
-            done <"$ORDERED"
-            echo "   -> All copies in this group have been marked for deletion in the plan."
-            break
-            ;;
-          *)
-            echo "   -> Delete-all cancelled; please choose again."
-            ;;
-        esac
+        warn "Delete-all is disabled for verified dedupe plans because apply-time safety requires one live keeper."
+        echo "   -> Choose a file to keep, or skip this group."
         ;;
 
       *)
@@ -530,7 +514,7 @@ present_group(){
                 [ -z "$fp" ] && continue
                 idx=$((idx+1))
                 if [ "$idx" -eq "$sel" ]; then
-                  printf "KEEP|%s\n" "$fp" >>"$PLAN_OUT"
+                  printf "KEEP|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
                 else
                   # v1.2.0: emit group hash for re-verification
                   if [ -n "${group_hash:-}" ]; then

@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.27 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.28 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -1149,7 +1149,10 @@ action_apply_plan(){
           info "File plan applied successfully."
         else
           _apply_rc=$?
-          err "File-plan apply failed or completed partially (exit $_apply_rc)."
+          case "$_apply_rc" in
+            4) warn "File plan completed with safety skips; it was not fully applied." ;;
+            *) err "File-plan apply failed (exit $_apply_rc)." ;;
+          esac
         fi
       else
         err "$BIN_DIR/delete-duplicates.sh not found or not executable."
@@ -1176,7 +1179,10 @@ action_apply_plan(){
           info "Folder plan applied successfully."
         else
           _apply_rc=$?
-          err "Folder-plan apply failed or completed partially (exit $_apply_rc)."
+          case "$_apply_rc" in
+            4) warn "Folder plan completed with safety skips; it was not fully applied." ;;
+            *) err "Folder-plan apply failed (exit $_apply_rc)." ;;
+          esac
         fi
       else
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
@@ -1501,11 +1507,25 @@ action_auto_dedup() {
   info "Running auto-dedup with strategy: $KEEP"
   echo
 
-  run_script "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" || true
+  # v1.3.28: give this invocation an exact output path and honour its return
+  # status. A failed run must never fall through to an older historical plan.
+  _auto_run_id="$(date +%Y%m%d-%H%M%S)-$$"
+  plan_file="$LOGS_DIR/auto-dedup-plan-$(date +%F)-$_auto_run_id.txt"
+  rm -f -- "$plan_file" 2>/dev/null || true
+  if run_script "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" --plan-out "$plan_file"; then
+    _auto_rc=0
+  else
+    _auto_rc=$?
+  fi
+  if [ "$_auto_rc" -ne 0 ]; then
+    err "Auto-dedup failed (exit $_auto_rc). No plan will be offered for application."
+    rm -f -- "$plan_file" 2>/dev/null || true
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
 
-  # Offer to apply the plan immediately
+  # Offer to apply only the exact plan created by this invocation.
   echo
-  plan_file="$(ls -1t "$LOGS_DIR"/auto-dedup-plan-*.txt 2>/dev/null | head -n1 || true)"
   if [ -n "$plan_file" ] && [ -s "$plan_file" ]; then
     del_count="$(grep -c '^DEL|' "$plan_file" 2>/dev/null || echo 0)"
     echo "Plan contains $del_count file(s) marked for quarantine."
@@ -1515,7 +1535,15 @@ action_auto_dedup() {
       y|yes)
         info "Applying plan: $plan_file"
         if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
-          "$BIN_DIR/delete-duplicates.sh" "$plan_file" || true
+          if "$BIN_DIR/delete-duplicates.sh" "$plan_file"; then
+            info "File plan applied successfully."
+          else
+            _apply_rc=$?
+            case "$_apply_rc" in
+              4) warn "File plan completed with safety skips. Re-hash and rebuild the plan before retrying." ;;
+              *) err "File-plan apply failed (exit $_apply_rc)." ;;
+            esac
+          fi
         else
           err "$BIN_DIR/delete-duplicates.sh not found or not executable."
         fi

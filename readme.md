@@ -107,7 +107,7 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.27**
+Started Dec 2022. Current version: **v1.3.28**
 For full history see: `version-history.md`
 
 ---
@@ -209,7 +209,7 @@ per-group review, option 5 handles file dedup in one step. **Do folders first**
 2. Run **option 3** — find duplicate folders, then **option r** to review and
    **option 6 → d** to apply the folder plan
 3. Run **option 2** — find duplicate files (now far fewer)
-4. Run **option 5** — auto-dedup the remaining files (generates plan + offers to apply)
+4. Run **option 5** — auto-dedup the remaining files (uses only the verified, hard-link-filtered option 2 report; generates a plan and offers to apply it)
 
 Auto-dedup keeps the copy with the **shortest file path** in each duplicate group
 and quarantines the others. Configurable to longest-path, newest, or oldest.
