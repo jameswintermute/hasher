@@ -2650,6 +2650,79 @@ published into the normal actionable workflow.
   no actionable cleanup commands.
 
 ---
+## 2026‑07 — v1.3.27
+**Manifest completeness, run-consistent plan selection, reliable shutdown cleanup, and overlapping-root correctness**
+
+This release addresses five findings confirmed during the live v1.3.26 review.
+
+### 1. Overlapping and repeated scan roots are de-duplicated
+
+A parent directory and one of its descendants could both be configured as scan
+roots, causing the same canonical file to be hashed more than once. Besides
+wasting disk I/O, repeated CSV rows could make otherwise-identical folder
+signatures differ and hide valid duplicate-folder matches.
+
+After delimiter-unsafe paths are removed, `hasher.sh` now de-duplicates the
+NUL-delimited discovery list using a portable newline sort (safe at that point
+because TAB/LF/CR paths have already been rejected). The run reports how many
+repeated discovery paths were removed.
+
+### 2. Folder plans and groups remain tied to one scan
+
+The folder reviewer previously selected the newest plan and newest groups TSV
+independently. The apply menu also preferred any reviewed plan even when a
+newer raw scan existed.
+
+The launcher now derives a raw groups sidecar from the plan's complete
+timestamp-and-PID suffix. The review action uses the newest raw plan and its
+exact sidecar. The apply action compares raw and reviewed plan modification
+times and surfaces the newer run, warning when that newest plan is unreviewed.
+
+### 3. Malformed manifests fail closed
+
+Both file and folder duplicate discovery could skip malformed rows and still
+produce actionable plans from the remaining records. A truncated manifest can
+therefore appear complete while silently omitting files.
+
+Malformed rows now stop plan generation by default. The explicit
+`--allow-malformed-rows` option remains available for forensic or recovery use;
+SHA-256 validation is never relaxed.
+
+### 4. Signal cleanup reaps the tracked pipeline and ignores zombies
+
+TERM/KILL escalation could successfully stop every worker but retain the lock
+because the final count included exited processes awaiting reaping, or because
+the last count was taken immediately before the final polling sleep.
+
+The signal handler now waits for its tracked pipeline after escalation,
+filters zombie processes from group/child enumeration, and performs a final
+fresh count after the bounded wait before deciding whether the lock must be
+retained.
+
+### 5. Launcher helper failures are no longer presented as success
+
+The duplicate-finder, reviewer and plan-apply paths previously discarded many
+helper exit statuses with `|| true`. A failed scan could consequently be
+followed by normal success or no-results wording.
+
+The launcher now captures and reports return codes for the principal file and
+folder dedupe workflows. It distinguishes a completed no-results scan from a
+failed scan and reports partial or failed plan application explicitly.
+
+### Validation
+
+- Shell syntax passed for `launcher.sh`, all `bin/*.sh`, and all `lib/*.sh`.
+- Overlapping roots produced one manifest row per canonical file.
+- File and folder finders rejected malformed manifests by default and accepted
+  them only with the explicit recovery option.
+- Folder plan review used the exact timestamp-and-PID sidecar, and a newer raw
+  plan took precedence over an older reviewed plan.
+- TERM escalation reaped the tracked pipeline and released the lock when no
+  live non-zombie workers remained.
+- Launcher discovery failures were reported as failures rather than as
+  successful no-results runs.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

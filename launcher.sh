@@ -88,6 +88,19 @@ run_script() {
   fi
 }
 
+# v1.3.27: keep folder-plan decisions run-consistent. A plan and its raw
+# groups sidecar share the complete timestamp-and-PID suffix. Never combine
+# independently selected "latest" files from different scans.
+raw_folder_groups_for_plan() {
+  local _plan="$1" _base _suffix _groups
+  _base="$(basename -- "$_plan")"
+  _suffix="${_base#duplicate-folders-plan-}"
+  _suffix="${_suffix%.txt}"
+  _groups="$LOGS_DIR/duplicate-folders-groups-$_suffix.tsv"
+  [ -s "$_groups" ] && printf '%s' "$_groups"
+}
+
+
 header() {
   printf "%s" "$MAG"
   printf "%s\n" " _   _           _               "
@@ -96,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.26 - July 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.27 - July 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -865,25 +878,31 @@ action_find_duplicate_folders(){
   _plans_after="$(mktemp "${TMPDIR:-/tmp}/hasher-folder-plans-after.XXXXXX")"
   find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_before"
 
-  run_script "$BIN_DIR/find-duplicate-folders.sh" \
+  _folder_find_rc=0
+  if run_script "$BIN_DIR/find-duplicate-folders.sh" \
     --input "$input"        \
     --mode plan             \
     --scope leaf-folders    \
     --min-group-size 2      \
-    --keep shortest-path    \
-    || true
+    --keep shortest-path; then
+    :
+  else
+    _folder_find_rc=$?
+  fi
 
   find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_after"
   plan="$(comm -13 "$_plans_before" "$_plans_after" 2>/dev/null | tail -n1 || true)"
   rm -f -- "$_plans_before" "$_plans_after" 2>/dev/null || true
 
+  if [ "$_folder_find_rc" -ne 0 ]; then
+    err "Duplicate-folder scan failed (exit $_folder_find_rc). No result has been presented as a successful no-duplicates scan."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
   groups=""
   if [ -n "$plan" ]; then
-    _plan_base="$(basename -- "$plan")"
-    _plan_suffix="${_plan_base#duplicate-folders-plan-}"
-    _plan_suffix="${_plan_suffix%.txt}"
-    _matching_groups="$LOGS_DIR/duplicate-folders-groups-$_plan_suffix.tsv"
-    [ -s "$_matching_groups" ] && groups="$_matching_groups"
+    groups="$(raw_folder_groups_for_plan "$plan" || true)"
   fi
   # FIX (v1.3.5 — peer-review item 4): test -s (non-empty FILE), not -n
   # (non-empty string/path). An empty plan file would otherwise be offered for
@@ -899,7 +918,12 @@ action_find_duplicate_folders(){
       read -r ans || ans="y"
       case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
         ""|y|yes)
-          run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan" || true
+          if run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan"; then
+            info "Folder-plan review completed."
+          else
+            _review_rc=$?
+            err "Folder-plan review failed or was interrupted (exit $_review_rc)."
+          fi
           ;;
         *)
           info "OK — review later with menu option 'r', or apply raw plan via option 6."
@@ -916,9 +940,19 @@ action_find_duplicate_folders(){
 
 # NEW (v1.1.13): interactive reviewer for the folder-dedup plan
 action_review_folder_plan(){
-  groups="$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-*.tsv 2>/dev/null | head -n1 || true)"
+  # Review the newest RAW plan and derive its exact groups sidecar. Reviewed
+  # plans have already passed through this step and must not be independently
+  # paired with a newer/older groups TSV.
+  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
+  if [ ! -s "$plan" ]; then
+    err "No unreviewed duplicate-folder plan found. Run option 2 (Find duplicate folders) first."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  groups="$(raw_folder_groups_for_plan "$plan" || true)"
   if [ ! -s "$groups" ]; then
-    err "No duplicate-folder groups found. Run option 3 (Find duplicate folders) first."
+    err "The matching groups sidecar is missing for: $plan"
+    err "Refusing to combine this plan with context from another scan."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
@@ -927,8 +961,14 @@ action_review_folder_plan(){
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
-  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-*.txt 2>/dev/null | head -n1 || true)"
-  run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" ${plan:+--plan "$plan"} || true
+  info "Reviewing raw folder plan: $plan"
+  info "Using matching context:   $groups"
+  if run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan"; then
+    info "Folder-plan review completed."
+  else
+    _review_rc=$?
+    err "Folder-plan review failed or was interrupted (exit $_review_rc)."
+  fi
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -963,31 +1003,39 @@ folders_first_guard() {
 action_find_duplicate_files(){
   folders_first_guard "FILE dedup" || { printf "Press Enter to continue... "; read -r _ || true; return; }
 
-  if [ -x "$BIN_DIR/run-find-duplicates.sh" ]; then
-    "$BIN_DIR/run-find-duplicates.sh" || true
+  _file_find_rc=0
+  if script_runnable "$BIN_DIR/run-find-duplicates.sh"; then
+    if run_script "$BIN_DIR/run-find-duplicates.sh"; then :; else _file_find_rc=$?; fi
   else
     input="$(latest_hashes_csv)"
     [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
     info "Using hashes file: $input"
-    if [ -x "$BIN_DIR/find-duplicates.sh" ]; then
-      "$BIN_DIR/find-duplicates.sh" --input "$input" || true
+    if script_runnable "$BIN_DIR/find-duplicates.sh"; then
+      if run_script "$BIN_DIR/find-duplicates.sh" --input "$input"; then :; else _file_find_rc=$?; fi
     else
-      err "$BIN_DIR/find-duplicates.sh not found or not executable."
+      err "$BIN_DIR/find-duplicates.sh not found or not readable."
+      _file_find_rc=127
     fi
+  fi
+  if [ "$_file_find_rc" -eq 0 ]; then
+    info "Duplicate-file scan completed."
+  else
+    err "Duplicate-file scan failed (exit $_file_find_rc). Review the error above; no successful result is implied."
   fi
   printf "Press Enter to continue... "; read -r _ || true
 }
 
 action_review_duplicates(){
-  if [ -x "$BIN_DIR/launch-review.sh" ]; then
-    "$BIN_DIR/launch-review.sh" || true
+  _review_rc=0
+  if script_runnable "$BIN_DIR/launch-review.sh"; then
+    if run_script "$BIN_DIR/launch-review.sh"; then :; else _review_rc=$?; fi
+  elif script_runnable "$BIN_DIR/review-duplicates.sh"; then
+    if run_script "$BIN_DIR/review-duplicates.sh"; then :; else _review_rc=$?; fi
   else
-    if [ -x "$BIN_DIR/review-duplicates.sh" ]; then
-      "$BIN_DIR/review-duplicates.sh" || true
-    else
-      err "$BIN_DIR/review-duplicates.sh not found or not executable."
-    fi
+    err "$BIN_DIR/review-duplicates.sh not found or readable."
+    _review_rc=127
   fi
+  [ "$_review_rc" -eq 0 ] || err "Duplicate-file review failed or was interrupted (exit $_review_rc)."
   printf "Press Enter to continue... "; read -r _ || true
 }
 
@@ -1018,7 +1066,18 @@ action_apply_plan(){
   folder_plan_raw="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
 
   folder_plan=""; _folder_src=""
-  if [ -n "$folder_plan_reviewed" ]; then
+  if [ -n "$folder_plan_reviewed" ] && [ -n "$folder_plan_raw" ]; then
+    # A reviewed plan is not automatically newer than the latest raw scan.
+    # Prefer it only when it is at least as new; otherwise surface the newer
+    # raw plan and warn that it has not yet been reviewed.
+    if [ "$folder_plan_raw" -nt "$folder_plan_reviewed" ]; then
+      folder_plan="$folder_plan_raw"
+      _folder_src="raw (unreviewed)"
+    else
+      folder_plan="$folder_plan_reviewed"
+      _folder_src="reviewed"
+    fi
+  elif [ -n "$folder_plan_reviewed" ]; then
     folder_plan="$folder_plan_reviewed"
     _folder_src="reviewed"
   elif [ -n "$folder_plan_raw" ]; then
@@ -1086,7 +1145,12 @@ action_apply_plan(){
       fi
       info "Applying FILE plan: $file_plan"
       if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
-        "$BIN_DIR/delete-duplicates.sh" "$file_plan" || true
+        if "$BIN_DIR/delete-duplicates.sh" "$file_plan"; then
+          info "File plan applied successfully."
+        else
+          _apply_rc=$?
+          err "File-plan apply failed or completed partially (exit $_apply_rc)."
+        fi
       else
         err "$BIN_DIR/delete-duplicates.sh not found or not executable."
       fi
@@ -1108,7 +1172,12 @@ action_apply_plan(){
       fi
       info "Applying FOLDER plan: $folder_plan"
       if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
-        "$BIN_DIR/apply-folder-plan.sh" --plan "$folder_plan" --force || true
+        if "$BIN_DIR/apply-folder-plan.sh" --plan "$folder_plan" --force; then
+          info "Folder plan applied successfully."
+        else
+          _apply_rc=$?
+          err "Folder-plan apply failed or completed partially (exit $_apply_rc)."
+        fi
       else
         err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
       fi
