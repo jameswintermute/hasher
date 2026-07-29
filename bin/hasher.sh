@@ -966,6 +966,31 @@ build_file_list() {
     fi
   fi
 
+  # v1.3.27: collapse duplicate discovery entries before hashing. Overlapping
+  # roots (for example /volume1/Family and /volume1/Family/Photos) can cause
+  # `find` to emit the same canonical file path more than once. Besides wasting
+  # I/O, duplicate rows can make otherwise-identical folder signatures differ.
+  # Paths containing TAB/LF/CR have already been removed above, so it is safe
+  # and portable to use a newline sort here and restore NUL delimiters after it.
+  if [[ -s "$FILES_LIST".tmp ]]; then
+    local _dedupe_before _dedupe_after _dedupe_removed
+    local _dedupe_tmp="$FILES_LIST.tmp.unique"
+    _dedupe_before=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
+    {
+      tr '\0' '\n' < "$FILES_LIST".tmp \
+        | LC_ALL=C sort -u \
+        | while IFS= read -r _unique_path; do
+            [[ -n "$_unique_path" ]] && printf '%s\0' "$_unique_path"
+          done
+    } > "$_dedupe_tmp"
+    _dedupe_after=$(tr -cd '\0' < "$_dedupe_tmp" | wc -c | tr -d ' ')
+    mv -f -- "$_dedupe_tmp" "$FILES_LIST".tmp
+    _dedupe_removed=$((_dedupe_before - _dedupe_after))
+    if [[ "$_dedupe_removed" -gt 0 ]]; then
+      warn "Removed $_dedupe_removed duplicate discovery path(s) caused by overlapping or repeated scan roots."
+    fi
+  fi
+
   # Apply excludes (literal substring match)
   # FIX (v1.1.10): "${EXTRA_EXCLUDES[@]}" raises 'unbound variable' under
   # set -u on bash 3.2 (Apple stock /bin/bash, Synology DSM) when the
@@ -1100,9 +1125,17 @@ start_hash_progress() {
 
 stop_hash_progress() {
   if [[ "$hash_progress_pid" -gt 0 ]] && kill -0 "$hash_progress_pid" 2>/dev/null; then
-    kill "$hash_progress_pid" 2>/dev/null || true
+    # Capture and terminate the ticker's current sleep before killing the
+    # ticker shell; otherwise the sleep can be reparented to init and remain
+    # in our process group after an otherwise clean stop.
+    local _kids _k
+    _kids="$(_enum_children "$hash_progress_pid" 2>/dev/null || true)"
+    for _k in $_kids; do kill -TERM "$_k" 2>/dev/null || true; done
+    kill -TERM "$hash_progress_pid" 2>/dev/null || true
     wait "$hash_progress_pid" 2>/dev/null || true
+    for _k in $_kids; do kill -KILL "$_k" 2>/dev/null || true; done
   fi
+  hash_progress_pid=0
 }
 
 start_zero_progress() {
@@ -1143,9 +1176,14 @@ start_zero_progress() {
 
 stop_zero_progress() {
   if [[ "$zero_progress_pid" -gt 0 ]] && kill -0 "$zero_progress_pid" 2>/dev/null; then
-    kill "$zero_progress_pid" 2>/dev/null || true
+    local _kids _k
+    _kids="$(_enum_children "$zero_progress_pid" 2>/dev/null || true)"
+    for _k in $_kids; do kill -TERM "$_k" 2>/dev/null || true; done
+    kill -TERM "$zero_progress_pid" 2>/dev/null || true
     wait "$zero_progress_pid" 2>/dev/null || true
+    for _k in $_kids; do kill -KILL "$_k" 2>/dev/null || true; done
   fi
+  zero_progress_pid=0
   [[ -n "$ZERO_PROGRESS_FILE" ]] && rm -f -- "$ZERO_PROGRESS_FILE" 2>/dev/null || true
 }
 
@@ -1206,6 +1244,12 @@ _stop_group() {
   # First, reset the trap so nothing re-enters this handler.
   trap - TERM INT
 
+  # Stop progress tickers before group enumeration. Their inner `sleep`
+  # processes must be collected while the ticker shells are still their
+  # parents; killing only the shell can leave an orphaned sleep behind.
+  stop_hash_progress
+  stop_zero_progress
+
   local _survivors _i
   if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
     # Signal every group member except ourselves
@@ -1221,7 +1265,7 @@ _stop_group() {
   while [[ $_i -lt 30 ]]; do
     local _n=0
     if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-      _n="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
+      _n="$(_count_group_pids $$)"
     else
       _n="$(_count_descendants $$)"
     fi
@@ -1237,6 +1281,16 @@ _stop_group() {
     _kill_descendants_kill $$
   fi
 
+  # v1.3.27: reap the tracked top-level pipeline after escalation. This is
+  # our direct child, so `wait` removes its zombie entry and allows the final
+  # process-group check to distinguish genuinely live workers from exited
+  # processes awaiting collection. Grandchildren are filtered by process state
+  # in _enum_group_pids/_enum_children below.
+  if [[ -n "${HASHER_PIPELINE_PID:-}" ]]; then
+    wait "$HASHER_PIPELINE_PID" 2>/dev/null || true
+    HASHER_PIPELINE_PID=""
+  fi
+
   # v1.3.23 (peer-review recheck finding #1b): bounded wait for the kernel
   # to reap KILLed descendants. Previously a fixed 0.5s sleep, which was
   # too short on a busy NAS — pgrep still saw dying/zombie processes as
@@ -1250,9 +1304,11 @@ _stop_group() {
   # bounded wait is the portable answer.
   local _settle_i=0
   local _still=0
-  while [[ $_settle_i -lt 30 ]]; do
+  # Allow up to five seconds after KILL. On a busy NAS the process table can
+  # briefly show exiting shells as live before their parent/reaper collects them.
+  while [[ $_settle_i -lt 50 ]]; do
     if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
-      _still="$(_enum_group_pids $$ | wc -l | tr -d ' ')"
+      _still="$(_count_group_pids $$)"
     else
       _still="$(_count_descendants $$)"
     fi
@@ -1260,11 +1316,20 @@ _stop_group() {
     sleep 0.1; _settle_i=$((_settle_i + 1))
   done
 
+  # Re-evaluate once more after the final sleep. The previous loop retained
+  # the count taken before its last 0.1s delay, which could leave a false lock
+  # even though the final workers exited during that delay.
+  if [[ "${IS_SESSION_LEADER:-0}" = "1" ]]; then
+    _still="$(_count_group_pids $$)"
+  else
+    _still="$(_count_descendants $$)"
+  fi
+
   # After the bounded wait, if descendants are STILL alive, warn the
   # caller and refuse to release the lock — safer to leave the lock in
   # place than to let a new run start alongside orphans.
   if [[ "${_still:-0}" -gt 0 ]]; then
-    printf '[ERROR] %d descendant(s) survived KILL escalation (bounded 3s wait).\n' "$_still" >&2
+    printf '[ERROR] %d descendant(s) survived KILL escalation (bounded 5s wait).\n' "$_still" >&2
     printf '[ERROR]   Investigate: ps -eo pid,pgid,cmd | awk "\$2==%d"\n' "$$" >&2
     printf '[ERROR]   Lock/pidfile will NOT be released — clean up manually.\n' >&2
     export HASHER_STOP_INCOMPLETE=1
@@ -1286,24 +1351,91 @@ _stop_group() {
 # _enum_group_pids <pgid>       → PIDs in that group, one per line, excluding
 #                                 the caller's own $$ (never signal self).
 # _enum_children  <ppid>        → direct children of a given PPID.
+_pid_is_live_nonzombie() {
+  local _pid="$1" _state=""
+  kill -0 "$_pid" 2>/dev/null || return 1
+  # `ps -o stat=` is available on GNU/BSD procps and modern BusyBox. If a
+  # minimal ps cannot provide state, conservatively treat the process as live.
+  _state="$(ps -o stat= -p "$_pid" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  case "$_state" in
+    Z*|*Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 _enum_group_pids() {
-  local _pgid="$1"
-  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
-    pgrep -g "$_pgid" 2>/dev/null | awk -v me="$$" '$1 != me' || true
-  else
-    # ps fallback. `-eo pid=,pgid=` prints two space-separated columns with
-    # no header. Works identically on DSM BusyBox, macOS BSD, and procps.
-    ps -eo pid=,pgid= 2>/dev/null \
-      | awk -v pg="$_pgid" -v me="$$" '$2 == pg && $1 != me {print $1}'
+  local _pgid="$1" _extra_exclude="${2:-}" _self_pid _candidates="" _p
+  local _stat _rest _state _ppid _pgrp
+  _self_pid="$(sh -c 'printf %s "$PPID"')"
+
+  # Linux and Synology DSM expose process metadata through /proc. Reading it
+  # with Bash builtins avoids creating pgrep/ps/awk/wc helper processes inside
+  # the very process group we are trying to count and terminate.
+  if [[ -d /proc/$$ ]]; then
+    for _stat in /proc/[0-9]*/stat; do
+      [[ -r "$_stat" ]] || continue
+      _p="${_stat#/proc/}"; _p="${_p%/stat}"
+      [[ "$_p" = "$$" || "$_p" = "$_self_pid" || ( -n "$_extra_exclude" && "$_p" = "$_extra_exclude" ) ]] && continue
+      IFS= read -r _rest < "$_stat" 2>/dev/null || continue
+      _rest="${_rest##*) }"
+      read -r _state _ppid _pgrp _ <<< "$_rest"
+      [[ "$_pgrp" = "$_pgid" ]] || continue
+      [[ "$_state" = "Z" ]] && continue
+      printf '%s\n' "$_p"
+    done
+    return 0
   fi
+
+  # BSD/macOS fallback. Exclude the enumeration subshell and its caller so
+  # helper processes cannot be mistaken for surviving hash workers.
+  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
+    _candidates="$(pgrep -g "$_pgid" 2>/dev/null || true)"
+  else
+    _candidates="$(ps -eo pid=,pgid= 2>/dev/null \
+      | awk -v pg="$_pgid" '$2 == pg {print $1}')"
+  fi
+  for _p in $_candidates; do
+    [[ "$_p" = "$$" || "$_p" = "$_self_pid" || ( -n "$_extra_exclude" && "$_p" = "$_extra_exclude" ) ]] && continue
+    _pid_is_live_nonzombie "$_p" && printf '%s\n' "$_p"
+  done
+  return 0
+}
+_count_group_pids() {
+  local _pgid="$1" _self_pid _list="" _p _count=0
+  _self_pid="$(sh -c 'printf %s "$PPID"')"
+  _list="$(_enum_group_pids "$_pgid" "$_self_pid")"
+  while IFS= read -r _p; do
+    [[ -n "$_p" ]] && _count=$((_count + 1))
+  done <<< "$_list"
+  printf '%s' "$_count"
 }
 _enum_children() {
-  local _ppid="$1"
-  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
-    pgrep -P "$_ppid" 2>/dev/null || true
-  else
-    ps -eo pid=,ppid= 2>/dev/null | awk -v p="$_ppid" '$2 == p {print $1}'
+  local _parent="$1" _self_pid _candidates="" _p
+  local _stat _rest _state _ppid _pgrp
+  _self_pid="$(sh -c 'printf %s "$PPID"')"
+  if [[ -d /proc/$$ ]]; then
+    for _stat in /proc/[0-9]*/stat; do
+      [[ -r "$_stat" ]] || continue
+      _p="${_stat#/proc/}"; _p="${_p%/stat}"
+      [[ "$_p" = "$_self_pid" ]] && continue
+      IFS= read -r _rest < "$_stat" 2>/dev/null || continue
+      _rest="${_rest##*) }"
+      read -r _state _ppid _pgrp _ <<< "$_rest"
+      [[ "$_ppid" = "$_parent" ]] || continue
+      [[ "$_state" = "Z" ]] && continue
+      printf '%s\n' "$_p"
+    done
+    return 0
   fi
+  if [[ "${HASHER_USE_PGREP:-0}" -eq 1 ]]; then
+    _candidates="$(pgrep -P "$_parent" 2>/dev/null || true)"
+  else
+    _candidates="$(ps -eo pid=,ppid= 2>/dev/null | awk -v p="$_parent" '$2 == p {print $1}')"
+  fi
+  for _p in $_candidates; do
+    [[ "$_p" = "$_self_pid" ]] && continue
+    _pid_is_live_nonzombie "$_p" && printf '%s\n' "$_p"
+  done
+  return 0
 }
 
 # Descendant-walking helpers used in the no-setsid fallback path.
