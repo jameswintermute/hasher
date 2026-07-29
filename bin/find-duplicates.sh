@@ -24,13 +24,14 @@ usage() {
   cat <<'EOF'
 Usage: find-duplicates.sh [--input CSV] [--mode standard|bulk]
                           [--min-group-size N] [--keep-strategy shortest-path|oldest|newest|first]
+                          [--allow-malformed-rows]
 Outputs:
   - Canonical: logs/duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt   (per-run)
   - Latest:    logs/duplicate-hashes-latest.txt                  (symlink to newest)
-  - Summary:   logs/duplicate-groups-YYYY-MM-DD-HHMMSS.txt
-  - Flat CSV:  logs/duplicates-YYYY-MM-DD-HHMMSS.csv
+  - Summary:   logs/duplicate-groups-YYYY-MM-DD-HHMMSS-PID.txt
+  - Flat CSV:  logs/duplicates-YYYY-MM-DD-HHMMSS-PID.csv
 Bulk mode also writes:
-  - Plan:      logs/review-dedupe-plan-YYYY-MM-DD-HHMMSS.txt
+  - Plan:      logs/review-dedupe-plan-YYYY-MM-DD-HHMMSS-PID.txt
 EOF
 }
 
@@ -39,6 +40,7 @@ INPUT=""
 MODE="standard"        # standard | bulk
 MIN_GROUP=2
 KEEP_STRATEGY="shortest-path"
+ALLOW_MALFORMED=0
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="${2:-}"; shift 2 ;;
     --min-group-size) MIN_GROUP="${2:-}"; shift 2 ;;
     --keep-strategy) KEEP_STRATEGY="${2:-}"; shift 2 ;;
+    --allow-malformed-rows) ALLOW_MALFORMED=1; shift ;;
     *) err "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
@@ -174,20 +177,16 @@ fi
 # containing commas (e.g. "a,b.txt") and only checked the FIRST row (so a
 # mixed manifest with a valid SHA-256 first row and later MD5 rows passed).
 if [[ -f "$INPUT" ]]; then
-  # v1.3.23 (peer-review recheck observations B & C): extended preflight —
-  #  - if COL_ALGO is present, each row's algo value must equal 'sha256'
-  #    (case-insensitive); mismatches reject the whole manifest
-  #  - malformed rows (fewer fields than expected) are COUNTED and the
-  #    first offending line is reported, rather than silently ignored,
-  #    so a truncated manifest can't quietly omit files. Non-fatal —
-  #    proceeds with valid rows and prints a summary. Set
-  #    HASHER_STRICT_ROWS=1 in the env to make malformed rows fatal.
+  # v1.3.27: malformed rows are fatal by default. A partially written or
+  # damaged manifest must not produce an actionable deletion plan while silently
+  # omitting records. `--allow-malformed-rows` is available only for explicit
+  # forensic/recovery use and never changes the SHA-256 validation policy.
   #
   # awk block prints reason to stderr and exits non-zero if any actionable
   # row has a wrong-length or non-hex hash, or (when COL_ALGO is present)
   # an algorithm that isn't sha256.
   awk -v skip="$SKIP_HEADER" -v ch="$COL_HASH" -v ca="${COL_ALGO:-0}" \
-      -v cp="$COL_PATH" -v DELIM="$DELIM" -v strict="${HASHER_STRICT_ROWS:-0}" '
+      -v cp="$COL_PATH" -v DELIM="$DELIM" -v allow="$ALLOW_MALFORMED" '
     function csv_split(s, sep,    i, c, nf, cur, inq, n) {
       n = length(s); nf = 0; cur = ""; inq = 0
       if (sep != ",") { nf = split(s, A, sep); for (i=1;i<=nf;i++) F[i]=A[i]; return nf }
@@ -247,9 +246,12 @@ if [[ -f "$INPUT" ]]; then
     END {
       if (bad) exit 2
       if (malformed > 0) {
-        printf "[WARN] Rejected rows: %d (first malformed at line %d)\n", malformed, first_malformed_line > "/dev/stderr"
-        printf "[WARN] Valid rows: %d — proceeding.\n", valid > "/dev/stderr"
-        if (strict != "0") { exit 3 }
+        if (allow == "0") {
+          printf "[ERROR] Malformed rows: %d (first malformed at line %d). Refusing to generate a plan.\n", malformed, first_malformed_line > "/dev/stderr"
+          exit 3
+        }
+        printf "[WARN] Malformed rows: %d (first malformed at line %d) — explicitly allowed.\n", malformed, first_malformed_line > "/dev/stderr"
+        printf "[WARN] Valid rows retained: %d.\n", valid > "/dev/stderr"
       }
     }
   ' "$INPUT" || _rc=$?
@@ -258,7 +260,7 @@ if [[ -f "$INPUT" ]]; then
     printf '[ERROR] Manifest failed SHA-256 preflight. Regenerate with bin/hasher.sh.\n' >&2
     exit 2
   elif [[ "$_rc" -eq 3 ]]; then
-    printf '[ERROR] HASHER_STRICT_ROWS=1 set and manifest contains malformed rows.\n' >&2
+    printf '[ERROR] Manifest contains malformed rows. Regenerate it, or use --allow-malformed-rows only for forensic recovery.\n' >&2
     exit 2
   fi
 fi

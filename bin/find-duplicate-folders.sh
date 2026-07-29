@@ -18,6 +18,7 @@ MIN_GROUP=2
 KEEP="shortest-path"
 SCOPE="leaf-folders"
 SIGNATURE="name+content"   # printed for info only
+ALLOW_MALFORMED=0
 
 # Colours + logging from the shared module (v1.3.11), the single source of truth.
 if [ -r "$ROOT_DIR/lib/log.sh" ]; then
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
     -k|--keep)            KEEP="${2-}"; shift 2;;
     -s|--scope)           SCOPE="${2-}"; shift 2;;
     --signature)          SIGNATURE="${2-}"; shift 2;; # accepted but not used; for CLI compatibility
+    --allow-malformed-rows) ALLOW_MALFORMED=1; shift;;
     -h|--help) usage; exit 0;;
     *) err "Unknown arg: $1"; usage; exit 2;;
   esac
@@ -96,21 +98,25 @@ info "Mode: $MODE  | Min group size: $MIN_GROUP  | Scope: $SCOPE (matches direct
 info "Using size_bytes from CSV/TSV (fast path)."
 
 # 1) explode CSV into (dir, basename, hash, size). Header-aware; supports 4 or 5 columns.
-awk '
+# v1.3.27: malformed rows are fatal by default. Folder plans must not be
+# generated from a partially parsed manifest because skipped records can make
+# two incomplete directory signatures appear identical. The explicit
+# --allow-malformed-rows option is reserved for forensic/recovery use.
+_parse_rc=0
+awk -v allow="$ALLOW_MALFORMED" '
   function rsplit_commas(s,   n,pos,i){ n=0; pos=0; while ( (i=index(substr(s,pos+1),",")) > 0 ){ pos+=i; n++; c[n]=pos } return n }
   function unquote_path(p){ if (p ~ /^".*"$/){ sub(/^"/,"",p); sub(/"$/,"",p); gsub(/""/,"\"",p) } return p }
+  function reject(reason){ malformed++; if (malformed==1){ first_bad=NR; first_reason=reason } }
   BEGIN{ NRrec=0 }
   NR==1{
     line=$0; t=line; gsub(/[ \t\r\n]/,"",t);
-    # FIX (v1.1.12): /^path,/i is invalid awk — the trailing 'i' flag is
-    # Perl/grep flavour, neither GNU nor BSD awk support it, so this test
-    # was silently always-false. Use tolower() for portable case-insensitive
-    # header detection.
     if (tolower(t) ~ /^path,/){ has_header=1; next } else { has_header=0 }
   }
   {
-    s=$0; n=rsplit_commas(s);
-    if (n<3) next;
+    s=$0;
+    if (s ~ /^[[:space:]]*$/) next;
+    n=rsplit_commas(s);
+    if (n<3){ reject("too few columns"); next }
     if (n>=4){
       c1=c[n-3]; c2=c[n-2]; c3=c[n-1]; c4=c[n];
       path=substr(s,1,c1-1);
@@ -125,23 +131,31 @@ awk '
     path=unquote_path(path);
     gsub(/^[ \t]+|[ \t]+$/,"",hash);
     gsub(/^[ \t]+|[ \t]+$/,"",size);
+    if (path==""){ reject("empty path"); next }
+    if (size !~ /^[0-9]+$/){ reject("invalid size"); next }
+    if (length(hash)!=64 || hash !~ /^[0-9a-fA-F]+$/){ reject("invalid SHA-256 hash"); next }
     # derive dir and basename
-    # FIX (v1.1.12): the regex /[^/]*$/ contains a literal forward slash
-    # inside a character class inside a /.../-delimited regex. BSD awk
-    # (macOS stock /usr/bin/awk, "one-true-awk" lineage) parses the inner
-    # / as the end-of-regex delimiter and then chokes on the remainder:
-    #   awk: extra ] at source line 27
-    #   awk: nonterminated character class [^
-    # GNU awk accepts it. Escaping the slash with a backslash is the
-    # POSIX-portable form and works in BSD awk, GNU awk, and mawk.
     p=path; lastslash=match(p,/[^\/]*$/); base=substr(p,lastslash); dir=substr(p,1,lastslash-2);
+    if (dir=="" || base==""){ reject("path has no parent directory or basename"); next }
     gsub(/\t/,"\\t",dir); gsub(/\n/," ",dir);
     gsub(/\t/,"\\t",base); gsub(/\n/," ",base);
-    if (size ~ /^[0-9]+$/) ; else size=0;
     printf "%s\t%s\t%s\t%s\n", dir, base, hash, size;
     NRrec++;
   }
-' "$INPUT" > "$TMP_FILES"
+  END{
+    if (malformed>0){
+      if (allow=="0"){
+        printf "[ERROR] Malformed manifest rows: %d (first at line %d: %s). Refusing to generate a folder plan.\n", malformed, first_bad, first_reason > "/dev/stderr";
+        exit 3;
+      }
+      printf "[WARN] Malformed manifest rows: %d (first at line %d: %s) — explicitly allowed.\n", malformed, first_bad, first_reason > "/dev/stderr";
+    }
+  }
+' "$INPUT" > "$TMP_FILES" || _parse_rc=$?
+if [ "$_parse_rc" -ne 0 ]; then
+  err "Manifest validation failed. Regenerate it, or use --allow-malformed-rows only for forensic recovery."
+  exit 2
+fi
 
 total_lines="$(wc -l < "$TMP_FILES" | tr -d ' ')"
 info "[WORK] indexing files 100% ($total_lines/$total_lines)"
