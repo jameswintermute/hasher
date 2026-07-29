@@ -2723,6 +2723,61 @@ failed scan and reports partial or failed plan application explicitly.
   successful no-results runs.
 
 ---
+## 2026‑07 — v1.3.28
+**Keeper re-verification, fail-closed folder signatures, report provenance, and truthful partial-apply status**
+
+This release addresses five findings confirmed during the live v1.3.27 review.
+
+### 1. File plans re-verify the keeper
+
+File-plan apply now ties every hashed `DEL` group to exactly one `KEEP` entry.
+Immediately before each planned move, the keeper must still exist as a regular
+non-symlink file and its current SHA-256 must match the group hash. Missing,
+changed, unreadable, duplicate or ambiguous keepers cause the group to be
+safety-skipped. Newly generated plans include the group hash on both `KEEP`
+and `DEL` entries; older hashed plans remain supported by inferring the keeper
+from the grouped plan order. The interactive “delete all copies” action is
+disabled because a verified dedupe group must retain one keeper.
+
+### 2. Folder signatures fail closed
+
+`apply-folder-plan.sh` resolves a SHA-256 implementation before verified apply.
+`dir_signature()` now returns failure if discovery, stat or hashing fails for
+any direct file. The delete folder is skipped and the command returns non-zero
+rather than degrading to filename-and-size comparison with empty hashes.
+
+### 3. Preliminary and verified duplicate reports are separated
+
+The quick summary emitted after hashing is now named
+`hash-scan-duplicate-summary-*`. Only `find-duplicates.sh` publishes
+`duplicate-hashes-latest.txt`. Finder reports carry an embedded provenance
+marker and hard-link-filter status; interactive review and auto-dedup refuse
+reports without those safety markers.
+
+### 4. Auto-dedup cannot resurrect an older plan
+
+The launcher supplies an exact run-specific `--plan-out` path, checks the
+helper return code, and offers only that invocation's plan. A failed or aborted
+auto-dedup run cannot fall through to a historical plan.
+
+### 5. Safety skips have a distinct exit status
+
+File and folder plan apply return status `4` when verification causes one or
+more entries to be skipped. The launcher reports this as “completed with
+safety skips” rather than claiming the plan was fully applied. Operation
+failures continue to return status `1`; invalid or unsafe input returns `2`.
+
+### Validation
+
+- Keeper removal and keeper content drift prevented all corresponding file
+  moves and returned status `4`.
+- A forced folder hash-command failure moved no folder and returned non-zero.
+- Hashing no longer overwrote the verified duplicate-report pointer.
+- Review and auto-dedup rejected unmarked preliminary reports.
+- A failed auto-dedup invocation did not offer a historical plan.
+- File and folder verification skips were surfaced distinctly by the launcher.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
