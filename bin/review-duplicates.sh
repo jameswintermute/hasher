@@ -507,21 +507,27 @@ present_group(){
             if [ "$sel" -lt 1 ] || [ "$sel" -gt "$files_in_group" ]; then
               echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, D, q."
             else
-              # KEEP selected index, DELETE others
+              # Write a canonical group layout: KEEP first, followed by every
+              # DEL entry. The apply tool is order-independent, but a stable layout
+              # is easier to audit and remains compatible with older readers.
+              keeper_path="$(sed -n "${sel}p" "$ORDERED")"
+              if [ -z "$keeper_path" ]; then
+                error "Could not resolve selected keeper #$sel for group hash $group_hash"
+                break
+              fi
+              printf "KEEP|%s|%s\n" "$keeper_path" "$group_hash" >>"$PLAN_OUT"
+
               idx=0
               # shellcheck disable=SC2162
               while IFS= read -r fp || [ -n "$fp" ]; do
                 [ -z "$fp" ] && continue
                 idx=$((idx+1))
-                if [ "$idx" -eq "$sel" ]; then
-                  printf "KEEP|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
+                [ "$idx" -eq "$sel" ] && continue
+                # v1.2.0: emit group hash for re-verification
+                if [ -n "${group_hash:-}" ]; then
+                  printf "DEL|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
                 else
-                  # v1.2.0: emit group hash for re-verification
-                  if [ -n "${group_hash:-}" ]; then
-                    printf "DEL|%s|%s\n" "$fp" "$group_hash" >>"$PLAN_OUT"
-                  else
-                    printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
-                  fi
+                  printf "DEL|%s\n" "$fp" >>"$PLAN_OUT"
                 fi
               done <"$ORDERED"
               echo "   -> Choice recorded: keeping #$sel, others marked for deletion."

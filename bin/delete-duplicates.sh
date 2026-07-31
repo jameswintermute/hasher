@@ -26,6 +26,22 @@ mkdir -p "$QUAR_DIR"
 PLAN_FILE=""
 ALLOW_UNVERIFIED_PLAN=0
 
+# Hotfix: persist every apply/preflight message so plan failures can be diagnosed
+# after the terminal session has closed. The log is created before argument
+# parsing so even invalid-option errors are retained.
+APPLY_TAG="$(date +'%F-%H%M%S')-$$"
+APPLY_LOG="$LOGS_DIR/delete-duplicates-apply-$APPLY_TAG.log"
+: > "$APPLY_LOG" 2>/dev/null || APPLY_LOG="${TMPDIR:-/tmp}/delete-duplicates-apply-$APPLY_TAG.log"
+: > "$APPLY_LOG" 2>/dev/null || true
+_emit() {
+  _level="$1"; shift
+  printf '[%s] %s\n' "$_level" "$*" >&2
+  [ -n "${APPLY_LOG:-}" ] && printf '[%s] %s\n' "$_level" "$*" >> "$APPLY_LOG" 2>/dev/null || true
+}
+info()  { _emit INFO  "$*"; }
+warn()  { _emit WARN  "$*"; }
+error() { _emit ERROR "$*"; }
+
 # v1.3.16 (peer-review finding #5): parse args explicitly. Previously $1 was
 # taken as the plan path unconditionally; we now accept --plan/-p and add
 # --allow-unverified-plan to explicitly opt in to applying old-format plans
@@ -53,10 +69,6 @@ EOF
   esac
 done
 
-info()  { printf "[INFO] %s\n"  "$1" >&2; }
-warn()  { printf "[WARN] %s\n"  "$1" >&2; }
-error() { printf "[ERROR] %s\n" "$1" >&2; }
-
 if [ -z "$PLAN_FILE" ]; then
   # fall back to latest review plan if not explicitly given
   PLAN_FILE="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
@@ -66,6 +78,7 @@ fi
 [ -r "$PLAN_FILE" ] || { error "Plan file not readable: $PLAN_FILE"; exit 1; }
 
 info "Using FILE delete plan: $PLAN_FILE"
+info "Detailed apply log: $APPLY_LOG"
 
 # ── v1.2.0: just-in-time re-verification ─────────────────────────────────────
 # Plans produced by v1.2.0+ carry the expected content hash as a third field:
@@ -200,58 +213,117 @@ else
   fi
 fi
 
-# v1.3.28: build a hash -> keeper map before any move. Each hashed duplicate
-# group must have exactly one KEEP. New plans carry KEEP|path|hash; older plans
-# are inferred from the grouped KEEP followed by DEL|path|hash order.
+# v1.3.28 hotfix: build the hash -> keeper map independently of plan line
+# order. Modern plans carry the hash on BOTH KEEP and DEL entries, so the hash
+# itself is the group identity. The previous implementation held a KEEP as
+# "pending" until a later DEL was seen; a valid reviewed group written as
+# DEL|path|hash followed by KEEP|path|hash therefore left the keeper pending
+# and falsely rejected the next group's KEEP as "multiple KEEP entries".
+#
+# Older hashed plans with KEEP|path (no hash) retain the old grouped-order
+# fallback. All modern KEEP|path|hash entries are mapped immediately and may
+# appear before, between, or after their DEL entries.
 KEEPER_MAP=""
-_cleanup_keeper_map() { [ -n "${KEEPER_MAP:-}" ] && rm -f -- "$KEEPER_MAP" 2>/dev/null || true; }
+DEL_GROUPS=""
+_cleanup_keeper_map() {
+  [ -n "${KEEPER_MAP:-}" ] && rm -f -- "$KEEPER_MAP" 2>/dev/null || true
+  [ -n "${DEL_GROUPS:-}" ] && rm -f -- "$DEL_GROUPS" 2>/dev/null || true
+}
 trap _cleanup_keeper_map EXIT
 if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
   KEEPER_MAP="$(mktemp "${TMPDIR:-/tmp}/hasher-keepers.XXXXXX")" || { error "Could not create keeper map."; exit 1; }
+  DEL_GROUPS="$(mktemp "${TMPDIR:-/tmp}/hasher-delgroups.XXXXXX")" || { error "Could not create DEL-group map."; exit 1; }
   : > "$KEEPER_MAP"
-  _pending_keep=""; _pending_keep_hash=""; _current_hash=""
+  : > "$DEL_GROUPS"
+
+  _pending_legacy_keep=""
+  _pending_legacy_line=""
+  _line_no=0
   while IFS= read -r _line || [ -n "$_line" ]; do
+    _line_no=$((_line_no + 1))
     case "$_line" in
       KEEP\|*)
         _split_keep_line "$_line"
         if [ -z "$KEEP_PATH" ]; then
-          error "Malformed KEEP entry in plan: $_line"; exit 2
-        fi
-        if [ -n "$_pending_keep" ]; then
-          error "Multiple KEEP entries before a duplicate group was identified."
-          error "Refusing ambiguous plan: $PLAN_FILE"
+          error "Malformed KEEP entry at plan line $_line_no."
+          error "  entry: $_line"
           exit 2
         fi
-        _pending_keep="$KEEP_PATH"
-        _pending_keep_hash="$KEEP_HASH"
+
+        if [ -n "$KEEP_HASH" ]; then
+          _existing="$(awk -F '\t' -v h="$KEEP_HASH" '$1==h {print; exit}' "$KEEPER_MAP")"
+          if [ -n "$_existing" ]; then
+            _old_path="$(printf '%s\n' "$_existing" | awk -F '\t' '{print $2}')"
+            _old_line="$(printf '%s\n' "$_existing" | awk -F '\t' '{print $3}')"
+            error "Hash group $KEEP_HASH contains more than one KEEP entry."
+            error "  first KEEP: line $_old_line: $_old_path"
+            error "  next KEEP:  line $_line_no: $KEEP_PATH"
+            error "Refusing ambiguous plan: $PLAN_FILE"
+            exit 2
+          fi
+          printf '%s\t%s\t%s\n' "$KEEP_HASH" "$KEEP_PATH" "$_line_no" >> "$KEEPER_MAP"
+        else
+          if [ -n "$_pending_legacy_keep" ]; then
+            error "Two legacy KEEP entries appeared without an intervening hashed DEL group."
+            error "  first KEEP: line $_pending_legacy_line: $_pending_legacy_keep"
+            error "  next KEEP:  line $_line_no: $KEEP_PATH"
+            exit 2
+          fi
+          _pending_legacy_keep="$KEEP_PATH"
+          _pending_legacy_line="$_line_no"
+        fi
         ;;
+
       DEL\|*)
         _split_del_line "$_line"
         [ -n "$DEL_HASH" ] || continue
-        if [ "$DEL_HASH" != "$_current_hash" ]; then
-          _current_hash="$DEL_HASH"
-          if [ -n "$_pending_keep" ]; then
-            if [ -n "$_pending_keep_hash" ] && [ "$_pending_keep_hash" != "$DEL_HASH" ]; then
-              error "KEEP hash does not match its DEL group: $_pending_keep"
-              exit 2
-            fi
-            if awk -F '\t' -v h="$DEL_HASH" '$1==h{found=1} END{exit !found}' "$KEEPER_MAP"; then
-              error "Duplicate/ambiguous KEEP mapping for hash $DEL_HASH"
-              exit 2
-            fi
-            printf '%s\t%s\n' "$DEL_HASH" "$_pending_keep" >> "$KEEPER_MAP"
-            _pending_keep=""; _pending_keep_hash=""
+
+        if ! awk -F '\t' -v h="$DEL_HASH" '$1==h {found=1} END{exit !found}' "$DEL_GROUPS"; then
+          printf '%s\t%s\t%s\n' "$DEL_HASH" "$_line_no" "$DEL_PATH" >> "$DEL_GROUPS"
+        fi
+
+        if [ -n "$_pending_legacy_keep" ]; then
+          _existing="$(awk -F '\t' -v h="$DEL_HASH" '$1==h {print; exit}' "$KEEPER_MAP")"
+          if [ -n "$_existing" ]; then
+            error "Hash group $DEL_HASH has both a hashed KEEP and a legacy KEEP."
+            error "  legacy KEEP: line $_pending_legacy_line: $_pending_legacy_keep"
+            exit 2
           fi
-        elif [ -n "$_pending_keep" ]; then
-          error "A second KEEP appeared inside hash group $DEL_HASH"
-          exit 2
+          printf '%s\t%s\t%s\n' "$DEL_HASH" "$_pending_legacy_keep" "$_pending_legacy_line" >> "$KEEPER_MAP"
+          _pending_legacy_keep=""
+          _pending_legacy_line=""
         fi
         ;;
     esac
   done < "$PLAN_FILE"
-  if [ -n "$_pending_keep" ]; then
-    warn "KEEP entry has no following DEL group and will not be used: $_pending_keep"
+
+  if [ -n "$_pending_legacy_keep" ]; then
+    error "Legacy KEEP entry at line $_pending_legacy_line has no following hashed DEL group."
+    error "  keeper: $_pending_legacy_keep"
+    exit 2
   fi
+
+  _group_count=0
+  _missing_keeper_count=0
+  while IFS=$'\t' read -r _group_hash _first_del_line _first_del_path || [ -n "${_group_hash:-}" ]; do
+    [ -n "${_group_hash:-}" ] || continue
+    _group_count=$((_group_count + 1))
+    _keeper_record="$(awk -F '\t' -v h="$_group_hash" '$1==h {print; exit}' "$KEEPER_MAP")"
+    if [ -z "$_keeper_record" ]; then
+      _missing_keeper_count=$((_missing_keeper_count + 1))
+      error "Hash group $_group_hash has DEL entries but no KEEP entry."
+      error "  first DEL: line $_first_del_line: $_first_del_path"
+    fi
+  done < "$DEL_GROUPS"
+
+  if [ "$_missing_keeper_count" -gt 0 ]; then
+    error "Plan validation failed: $_missing_keeper_count group(s) have no unique keeper."
+    error "Regenerate or re-review the plan before applying it."
+    exit 2
+  fi
+
+  _keeper_count="$(awk 'END{print NR+0}' "$KEEPER_MAP")"
+  info "Plan structure valid: $_group_count hash groups, $_keeper_count unique KEEP entries, $TOTAL_DEL DEL candidates."
 fi
 
 keeper_for_hash() {
