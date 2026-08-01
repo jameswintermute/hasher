@@ -173,6 +173,11 @@ LOG_LEVEL="info"     # info|warn|error
 # original CSV is NEVER touched until the sorted candidate has been fully
 # validated (row count matches, header intact). See sort_output_csv().
 SORT_OUTPUT="true"
+# v1.3.29: automatically run duplicate-folder and duplicate-file discovery
+# after a successful hash run. Results are ready in logs/ when the user
+# returns — no 20-minute interactive wait on option 3/4. Only runs when
+# the hash completed cleanly (rc=0); partial manifests are never analysed.
+AUTO_DISCOVER="true"
 ZERO_LENGTH_ONLY=false
 
 # Optional config (CLI can override)
@@ -385,6 +390,15 @@ load_config() {
               *)              : ;;  # ignore garbage, keep default
             esac
             ;;
+          # v1.3.29: auto-discover duplicates after hashing
+          auto_discover|auto-discover)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_DISCOVER="false" ;;
+              1|true|yes|on)  AUTO_DISCOVER="true"  ;;
+              *)              : ;;
+            esac
+            ;;
           exclude)       EXTRA_EXCLUDES+=("$val") ;;
           __bare__)      : ;;
           *)             : ;;
@@ -503,6 +517,9 @@ while [[ $# -gt 0 ]]; do
     # v1.3.22: opt out of CSV sorting for this one run.
     --no-sort)  SORT_OUTPUT="false" ;;
     --sort)     SORT_OUTPUT="true"  ;;
+    # v1.3.29: control post-hash duplicate discovery
+    --no-discover)  AUTO_DISCOVER="false" ;;
+    --discover)     AUTO_DISCOVER="true"  ;;
     --jobs)     HASH_JOBS="${2:-1}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
@@ -2030,6 +2047,27 @@ main() {
   fi
 
   post_run_reports "$OUTPUT" "$CSV_TAG" "$publish_latest"
+
+  # v1.3.29: automatic post-hash duplicate discovery. Runs folder discovery
+  # first (recommended ordering — dedup folders before files), then file
+  # discovery. Both use the CSV that was just produced. Results land in
+  # logs/ with the same timestamp convention, ready for immediate review
+  # when the user returns.
+  #
+  # Safety: NEVER run discovery on a partial manifest. A CSV with failures
+  # or unstable exclusions would produce misleading duplicate groups.
+  # Also skip if the CSV has no data rows (header-only / empty-input run).
+  if [[ "$AUTO_DISCOVER" = "true" ]]; then
+    if [[ "$HASHER_RUN_STATUS" -ne 0 ]]; then
+      bglog INFO "Post-hash discovery: SKIPPED — manifest is partial (status=$HASHER_RUN_STATUS)."
+      info "Post-hash discovery skipped: manifest is partial. Run discovery manually after a complete hash."
+    elif [[ "$(wc -l < "$OUTPUT" 2>/dev/null | tr -d ' ')" -lt 2 ]]; then
+      bglog INFO "Post-hash discovery: SKIPPED — CSV has no data rows."
+      info "Post-hash discovery skipped: CSV has no data rows."
+    else
+      _run_post_hash_discovery "$OUTPUT"
+    fi
+  fi
 }
 
 # ───────────────────────── Post-run Reports ────────────────
@@ -2174,6 +2212,86 @@ sort_output_csv() {
 
   info "sort: CSV sorted by path ($((orig_lines - 1)) data rows, ${new_size} bytes)"
   return 0
+}
+
+# ───────────────────────── Post-hash Discovery (v1.3.29) ───
+# Automatically run duplicate-folder and duplicate-file discovery after a
+# successful hash run, so reports are waiting in logs/ when the user returns.
+# Called only when AUTO_DISCOVER=true AND the manifest is complete (rc=0).
+#
+# Each tool is invoked as a subprocess with --input pointing at the CSV that
+# was just produced. Failures are logged as warnings but do NOT change the
+# hash run's exit status — the CSV is the primary deliverable.
+#
+# Ordering: folders first, then files — matching the menu note that says
+# "dedup FOLDERS before FILES."
+_run_post_hash_discovery() {
+  local _csv="$1"
+  local _disc_start _disc_end _disc_elapsed
+  _disc_start=$(date +%s)
+
+  info ""
+  info "───────────────────────────────────────────────────────────────"
+  info "Post-hash discovery: analysing manifest for duplicates..."
+  info "  (disable with 'auto_discover = false' in hasher.conf, or --no-discover)"
+  info "───────────────────────────────────────────────────────────────"
+  bglog INFO "Post-hash discovery starting: input=$_csv"
+
+  # 1. Duplicate folders
+  local _folder_rc=0
+  if [[ -x "$ROOT_DIR/bin/find-duplicate-folders.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicate-folders.sh" ]]; then
+    info ""
+    info "Post-hash discovery [1/2]: finding duplicate folders..."
+    bglog INFO "Post-hash discovery: running find-duplicate-folders.sh"
+    if bash "$ROOT_DIR/bin/find-duplicate-folders.sh" \
+        --input "$_csv" \
+        --mode plan \
+        --keep shortest-path; then
+      bglog INFO "Post-hash discovery: folder scan completed successfully."
+    else
+      _folder_rc=$?
+      bglog WARN "Post-hash discovery: folder scan exited with rc=$_folder_rc"
+      warn "Post-hash folder discovery returned rc=$_folder_rc (see warnings above)."
+      warn "  This does not affect the hash manifest. Run option 2 manually to investigate."
+    fi
+  else
+    bglog INFO "Post-hash discovery: find-duplicate-folders.sh not found; skipping folder scan."
+  fi
+
+  # 2. Duplicate files
+  local _file_rc=0
+  if [[ -x "$ROOT_DIR/bin/find-duplicates.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicates.sh" ]]; then
+    info ""
+    info "Post-hash discovery [2/2]: finding duplicate files..."
+    bglog INFO "Post-hash discovery: running find-duplicates.sh"
+    if bash "$ROOT_DIR/bin/find-duplicates.sh" \
+        --input "$_csv"; then
+      bglog INFO "Post-hash discovery: file scan completed successfully."
+    else
+      _file_rc=$?
+      bglog WARN "Post-hash discovery: file scan exited with rc=$_file_rc"
+      warn "Post-hash file discovery returned rc=$_file_rc (see warnings above)."
+      warn "  This does not affect the hash manifest. Run option 3 manually to investigate."
+    fi
+  else
+    bglog INFO "Post-hash discovery: find-duplicates.sh not found; skipping file scan."
+  fi
+
+  _disc_end=$(date +%s)
+  _disc_elapsed=$(( _disc_end - _disc_start ))
+  local _dM=$(( _disc_elapsed / 60 )) _dS=$(( _disc_elapsed % 60 ))
+
+  info ""
+  info "───────────────────────────────────────────────────────────────"
+  info "Post-hash discovery complete (${_dM}m ${_dS}s)."
+  if [[ "$_folder_rc" -eq 0 && "$_file_rc" -eq 0 ]]; then
+    info "  Results are in logs/ — use option r (folders) or 4 (files) to review."
+  else
+    warn "  One or both discovery scans had issues (see warnings above)."
+    warn "  Hash manifest is unaffected. Re-run options 2/3 manually if needed."
+  fi
+  info "───────────────────────────────────────────────────────────────"
+  bglog INFO "Post-hash discovery finished in ${_dM}m ${_dS}s (folders=$_folder_rc, files=$_file_rc)"
 }
 
 # ───────────────────────── Post-run Reports ────────────────
