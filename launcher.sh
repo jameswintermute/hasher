@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.29 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.32 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -313,7 +313,142 @@ action_stop_hashing() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
-print_menu() {
+print_analysis_summary() {
+  _meta="$LOGS_DIR/post-hash-analysis-latest.meta"
+  [ -r "$_meta" ] || return 0
+
+  _source_csv=""; _completed=""; _files=""; _folder_status=""; _folder_groups=""; _file_status=""; _file_groups=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      source_csv) _source_csv="$_v" ;;
+      completed) _completed="$_v" ;;
+      files_hashed) _files="$_v" ;;
+      folder_status) _folder_status="$_v" ;;
+      folder_groups) _folder_groups="$_v" ;;
+      file_status) _file_status="$_v" ;;
+      file_groups) _file_groups="$_v" ;;
+    esac
+  done < "$_meta"
+
+  _latest_csv="$(latest_hashes_csv)"
+  [ -n "$_latest_csv" ] && [ "$_source_csv" = "$_latest_csv" ] || return 0
+
+  echo
+  printf '%sLast successful hash — %s%s\n' "$BOLD" "${_completed:-unknown}" "$RST"
+  printf '   Files hashed:       %s\n' "${_files:-unknown}"
+  case "$_folder_status" in
+    ready)    printf '   Duplicate folders:  %s groups ready\n' "${_folder_groups:-0}" ;;
+    disabled) printf '   Duplicate folders:  analysis disabled\n' ;;
+    failed)   printf '   Duplicate folders:  analysis failed\n' ;;
+    *)        printf '   Duplicate folders:  analysis pending\n' ;;
+  esac
+  case "$_file_status" in
+    ready)    printf '   Duplicate files:    %s groups ready\n' "${_file_groups:-0}" ;;
+    disabled) printf '   Duplicate files:    analysis disabled\n' ;;
+    failed)   printf '   Duplicate files:    analysis failed\n' ;;
+    *)        printf '   Duplicate files:    analysis pending\n' ;;
+  esac
+  echo
+
+  if [ "$_folder_status" = "ready" ] && [ "${_folder_groups:-0}" -gt 0 ] 2>/dev/null; then
+    printf '%sNext: review duplicate folders — option 2%s\n' "$BOLD" "$RST"
+  elif [ "$_file_status" = "ready" ] && [ "${_file_groups:-0}" -gt 0 ] 2>/dev/null; then
+    printf '%sNext: review duplicate files — option 3%s\n' "$BOLD" "$RST"
+  elif [ "$_folder_status" = "failed" ] || [ "$_file_status" = "failed" ]; then
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+  else
+    printf '%sNext: no duplicate groups are waiting for review%s\n' "$BOLD" "$RST"
+  fi
+}
+
+# v1.3.32: the configured workflow controls which main menu is shown.
+# Automatic mode presents prepared review work. Manual mode retains the
+# traditional discovery-first menu. local/hasher.conf overrides the default.
+analysis_mode() {
+  local _file _section="" _line _key _val _mode=""
+  for _file in "$LOCAL_DIR/hasher.conf" "$ROOT_DIR/default/hasher.conf"; do
+    [ -r "$_file" ] || continue
+    _section=""
+    while IFS= read -r _line || [ -n "$_line" ]; do
+      _line="$(printf '%s' "$_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      case "$_line" in ''|'#'*|';'*) continue ;; esac
+      case "$_line" in
+        \[*\]) _section="$(printf '%s' "${_line#[}" | sed 's/]$//' | tr '[:upper:]' '[:lower:]')"; continue ;;
+      esac
+      [ "$_section" = "post_hash" ] || [ "$_section" = "post-hash" ] || continue
+      case "$_line" in *=*) ;; *) continue ;; esac
+      _key="${_line%%=*}"; _val="${_line#*=}"
+      _key="$(printf '%s' "$_key" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+      _val="$(printf '%s' "$_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' | tr '[:upper:]' '[:lower:]')"
+      case "$_key" in
+        analysis_mode|analysis-mode)
+          case "$_val" in automatic|manual) _mode="$_val"; break ;; esac
+          ;;
+      esac
+    done < "$_file"
+    [ -n "$_mode" ] && { printf '%s' "$_mode"; return; }
+  done
+  printf 'automatic'
+}
+
+set_analysis_mode() {
+  local _mode="$1" _cfg="$LOCAL_DIR/hasher.conf" _tmp
+  case "$_mode" in automatic|manual) ;; *) return 2 ;; esac
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || return 1
+  _tmp="$_cfg.tmp.$$"
+  if [ -r "$_cfg" ]; then
+    awk -v mode="$_mode" '
+      BEGIN { section=""; written=0; have_post=0 }
+      /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+        if (section=="post_hash" && !written) { print "analysis_mode = " mode; written=1 }
+        raw=$0; sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec); section=tolower(sec)
+        if (section=="post_hash" || section=="post-hash") have_post=1
+        print raw; next
+      }
+      (section=="post_hash" || section=="post-hash") && /^[[:space:]]*(analysis_mode|analysis-mode)[[:space:]]*=/ {
+        if (!written) { print "analysis_mode = " mode; written=1 }
+        next
+      }
+      { print }
+      END {
+        if (!have_post) { print ""; print "[post_hash]"; print "analysis_mode = " mode }
+        else if (!written) print "analysis_mode = " mode
+      }
+    ' "$_cfg" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  else
+    {
+      printf '# Local Hasher configuration\n\n[post_hash]\nanalysis_mode = %s\n' "$_mode"
+    } > "$_tmp" || return 1
+  fi
+  mv -f "$_tmp" "$_cfg"
+}
+
+choose_analysis_mode() {
+  local _choice _mode
+  echo
+  echo "${BOLD}Automatic duplicate analysis${RST}"
+  echo
+  echo "Hasher can prepare duplicate-folder and duplicate-file results after each"
+  echo "successful hash run. This saves time by doing the analysis while the NAS is"
+  echo "already working, so review results are ready when you return."
+  echo
+  echo "No files are removed automatically — review and quarantine remain separate."
+  echo
+  echo "  1) Automatic — recommended; prepare results after every successful hash"
+  echo "  2) Manual    — run duplicate discovery yourself from the main menu"
+  echo
+  printf "Choose analysis mode [1]: "
+  read -r _choice || _choice="1"
+  [ -z "$_choice" ] && _choice="1"
+  case "$_choice" in 2|m|M|manual) _mode="manual" ;; *) _mode="automatic" ;; esac
+  if set_analysis_mode "$_mode"; then
+    info "Analysis mode saved: $_mode"
+  else
+    warn "Could not save analysis mode; the default automatic mode will be used."
+  fi
+}
+
+print_menu_automatic() {
   echo
   echo "${BOLD}Stage 1 — Hash${RST}"
   echo "   1) Start hashing (NAS-safe defaults)"
@@ -322,24 +457,21 @@ print_menu() {
   echo "   p) Performance settings (parallel hashing)"
   echo "   k) Stop hashing (terminate running hash jobs)"
   echo
-  echo "${BOLD}Stage 2 — Identify${RST}  ${YEL}(run folders first — see note)${RST}"
-  echo "   2) Find duplicate folders   ${BOLD}← recommended first${RST}"
-  echo "   3) Find duplicate files"
+  echo "${BOLD}Stage 2 — Review & quarantine${RST}"
+  echo "   2) Review duplicate folders"
+  echo "   3) Review duplicate files"
+  echo "   4) Apply reviewed plan"
+  echo "   5) Auto-dedup files (keep shortest path — no prompts)"
   echo "   f) Find file by hash (lookup)"
-  echo "      Note: dedup FOLDERS before FILES. Removing duplicate files first"
-  echo "      changes folders' contents, so identical folders may no longer match"
-  echo "      and you lose the bigger, one-decision folder cleanup."
   echo
-  echo "${BOLD}Stage 3 — Review & clean${RST}"
-  echo "   4) Review duplicate FILES (interactive)"
-  echo "   r) Review duplicate FOLDERS plan (interactive)"
-  echo "   5) Auto-dedup (keep shortest path — no prompts)"
-  echo "   6) Apply dedup plan (FILE or FOLDER)"
-  echo "   7) Delete zero-length files"
-  echo "   8) Delete junk (uses local/junk-extensions.txt)"
-  echo "   9) Clean cache files & @eaDir (safe)"
+  echo "${BOLD}Stage 3 — Clean${RST}"
+  echo "   6) Review zero-length files"
+  echo "   7) Delete junk (uses local/junk-extensions.txt)"
+  echo "   8) Clean cache files & @eaDir (safe)"
   echo
   echo "${BOLD}Other${RST}"
+  echo "   r) Rerun duplicate analysis"
+  echo "   m) Change analysis mode (automatic/manual)"
   echo "   d) System diagnostics (deps & readiness)"
   echo "   x) Self-test (integrity preflight)"
   echo "   l) Follow logs (tail -f background.log)"
@@ -350,6 +482,51 @@ print_menu() {
   echo "   q) Quit"
   echo
   printf "Select an option: "
+}
+
+print_menu_manual() {
+  echo
+  echo "${BOLD}Stage 1 — Hash${RST}"
+  echo "   1) Start hashing (NAS-safe defaults)"
+  echo "   a) Advanced / custom hashing"
+  echo "   s) Hashing status"
+  echo "   p) Performance settings (parallel hashing)"
+  echo "   k) Stop hashing (terminate running hash jobs)"
+  echo
+  echo "${BOLD}Stage 2 — Identify${RST}"
+  echo "   2) Find duplicate folders"
+  echo "   3) Find duplicate files"
+  echo "   f) Find file by hash (lookup)"
+  echo
+  echo "${BOLD}Stage 3 — Review & clean${RST}"
+  echo "   4) Review duplicate files (interactive)"
+  echo "   r) Review duplicate folders plan (interactive)"
+  echo "   5) Auto-dedup files (keep shortest path — no prompts)"
+  echo "   6) Apply dedup plan (FILE or FOLDER)"
+  echo "   7) Delete zero-length files"
+  echo "   8) Delete junk (uses local/junk-extensions.txt)"
+  echo "   9) Clean cache files & @eaDir (safe)"
+  echo
+  echo "${BOLD}Other${RST}"
+  echo "   m) Change analysis mode (automatic/manual)"
+  echo "   d) System diagnostics (deps & readiness)"
+  echo "   x) Self-test (integrity preflight)"
+  echo "   l) Follow logs (tail -f background.log)"
+  echo "   t) Stats & scheduling hints"
+  echo "   v) Clean internal working files (var/)"
+  echo "   c) Clean logs (rotate & prune)"
+  echo
+  echo "   q) Quit"
+  echo
+  printf "Select an option: "
+}
+
+print_menu() {
+  if [ "$(analysis_mode)" = "manual" ]; then
+    print_menu_manual
+  else
+    print_menu_automatic
+  fi
 }
 
 latest_hashes_csv() {
@@ -686,7 +863,7 @@ firstrun_performance() {
   recommended="$cores"; [ "$recommended" -gt 4 ] && recommended=4
 
   echo
-  echo "${BOLD}Step 2 of 4 — Performance (parallel hashing)${RST}"
+  echo "${BOLD}Step 2 of 5 — Performance (parallel hashing)${RST}"
   echo
   echo "Hashing can use multiple workers in parallel. More workers are faster"
   echo "on multi-core systems with SSD or SHR/RAID storage. On a single spinning"
@@ -717,7 +894,7 @@ firstrun_performance() {
 # Step: ensure paths.txt has at least one real scan root.
 firstrun_paths() {
   echo
-  echo "${BOLD}Step 3 of 4 — Scan paths${RST}"
+  echo "${BOLD}Step 3 of 5 — Scan paths${RST}"
   echo
   pfile="$(determine_paths_file)"
   # "configured" = a paths file exists with at least one non-comment, non-blank line
@@ -758,7 +935,7 @@ firstrun_paths() {
 # Step: confirm where quarantine will live (read-only; reassurance, not a change).
 firstrun_quarantine() {
   echo
-  echo "${BOLD}Step 4 of 4 — Quarantine location${RST}"
+  echo "${BOLD}Step 4 of 5 — Quarantine location${RST}"
   echo
   qroot=""
   if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
@@ -803,7 +980,7 @@ first_run_setup() {
 
   # Step 1 — dependencies (reuse check-deps.sh)
   echo
-  echo "${BOLD}Step 1 of 4 — Dependencies & readiness${RST}"
+  echo "${BOLD}Step 1 of 5 — Dependencies & readiness${RST}"
   echo
   if [ -x "$BIN_DIR/check-deps.sh" ]; then
     "$BIN_DIR/check-deps.sh" || true
@@ -832,6 +1009,12 @@ first_run_setup() {
 
   # Step 4 — quarantine
   firstrun_quarantine
+  printf "Press Enter for the final setup choice... "; read -r _ || true
+
+  # Step 5 — automatic or manual duplicate-analysis workflow
+  echo
+  echo "${BOLD}Step 5 of 5 — Duplicate-analysis workflow${RST}"
+  choose_analysis_mode
   echo
   echo "${BOLD}Setup complete.${RST} You're ready to hash (menu option 1)."
   mark_setup_complete
@@ -926,16 +1109,41 @@ action_find_duplicate_folders(){
           fi
           ;;
         *)
-          info "OK — review later with menu option 'r', or apply raw plan via option 6."
+          info "OK — review later with option 2, or apply a reviewed plan with option 4."
           ;;
       esac
     else
-      info "Review later with menu option 'r', or apply raw plan via option 6."
+      info "Review later with option 2, or apply a reviewed plan with option 4."
     fi
   else
     info "No duplicate folders found — nothing to review or apply."
   fi
   printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_rerun_analysis_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    header
+    echo
+    echo "${BOLD}Rerun duplicate analysis${RST}"
+    echo
+    echo "   1) Rerun duplicate-folder analysis"
+    echo "   2) Rerun duplicate-file analysis (includes review index)"
+    echo "   3) Rerun all analysis for latest successful hash"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _analysis_choice || return 0
+    case "${_analysis_choice:-}" in
+      1) action_find_duplicate_folders ;;
+      2) action_find_duplicate_files ;;
+      3) action_find_duplicate_folders; action_find_duplicate_files ;;
+      b|B|'') return 0 ;;
+      *) warn "Unknown option: $_analysis_choice"; sleep 1 ;;
+    esac
+  done
 }
 
 # NEW (v1.1.13): interactive reviewer for the folder-dedup plan
@@ -945,7 +1153,7 @@ action_review_folder_plan(){
   # paired with a newer/older groups TSV.
   plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
   if [ ! -s "$plan" ]; then
-    err "No unreviewed duplicate-folder plan found. Run option 2 (Find duplicate folders) first."
+    err "No unreviewed duplicate-folder plan found. Use option 'r' to rerun duplicate-folder analysis first."
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
@@ -985,18 +1193,18 @@ folders_first_guard() {
     return 0
   fi
   echo
-  warn "You haven't run duplicate-FOLDER detection yet (option 3)."
+  warn "No duplicate-folder analysis is available for the latest hash."
   warn "Recommended order is FOLDERS first, then FILES. Removing duplicate"
   warn "files now changes folders' contents, so identical folders may no longer"
   warn "match — and you lose the bigger, one-decision folder cleanup. This"
   warn "cannot be undone by re-running afterwards."
   echo
-  info "Tip: choose 'n', run option 3 (and review with 'r'), then come back."
+  info "Tip: choose 'n', use option 'r' to rerun folder analysis, then review with option 2."
   printf "Continue with %s anyway? [y/N]: " "$_what"
   read -r _ans || _ans=""
   case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
     y|yes) return 0 ;;
-    *) info "Good call — run option 3 (Find duplicate folders) first."; return 1 ;;
+    *) info "Good call — rerun folder analysis from option 'r' first."; return 1 ;;
   esac
 }
 
@@ -1583,7 +1791,7 @@ if [ -r "$BIN_DIR/self-test.sh" ]; then
   fi
 fi
 
-# ── First-run guided setup (v1.3.0) ──────────────────────────────────────────
+# ── First-run guided setup ────────────────────────────────────────────────────
 # Runs once on the first launch of a new install (sentinel: local/.setup-complete).
 if is_first_run; then
   first_run_setup
@@ -1593,46 +1801,62 @@ fi
 while :; do
   clear 2>/dev/null || true
   header
+  if [ "$(analysis_mode)" = "automatic" ]; then
+    print_analysis_summary
+  fi
   print_menu
   read -r choice || { echo; exit 0; }
 
+  _menu_mode="$(analysis_mode)"
   case "${choice:-}" in
-    # ── Stage 1: Hash ─────────────────────────────────────────────────────
     1)       action_start_hashing ;;
     a|A)     action_custom_hashing ;;
     s|S)     action_check_status ;;
     p|P)     action_performance_settings ;;
     k|K)     action_stop_hashing ;;
-
-    # ── Stage 2: Identify ─────────────────────────────────────────────────
-    2)       action_find_duplicate_folders ;;
-    3)       action_find_duplicate_files ;;
     f|F)     action_find_by_hash ;;
-
-    # ── Stage 3: Review & clean ───────────────────────────────────────────
-    4)       action_review_duplicates ;;
-    r|R)     action_review_folder_plan ;;
-    5)       action_auto_dedup ;;
-    6)       action_apply_plan ;;
-    7)       action_delete_zero_length ;;
-    8)       action_delete_junk ;;
-    9)       action_clean_caches ;;
-
-    # ── Other ─────────────────────────────────────────────────────────────
+    m|M)
+      clear 2>/dev/null || true
+      header
+      printf 'Current analysis mode: %s%s%s
+' "$BOLD" "$_menu_mode" "$RST"
+      choose_analysis_mode
+      printf "Press Enter to continue... "; read -r _ || true
+      ;;
     d|D)     action_system_check ;;
     x|X)     action_self_test ;;
     l|L)     action_view_logs_follow ;;
     t|T)     action_stats_and_cron ;;
     v|V)     action_clean_internal ;;
     c|C)     action_clean_logs ;;
-
-    q|Q)
-        echo "Bye."
-        exit 0
-        ;;
+    q|Q)     echo "Bye."; exit 0 ;;
     *)
-        echo "Unknown option: $choice"
-        sleep 1
-        ;;
+      if [ "$_menu_mode" = "manual" ]; then
+        case "${choice:-}" in
+          2) action_find_duplicate_folders ;;
+          3) action_find_duplicate_files ;;
+          4) action_review_duplicates ;;
+          r|R) action_review_folder_plan ;;
+          5) action_auto_dedup ;;
+          6) action_apply_plan ;;
+          7) action_delete_zero_length ;;
+          8) action_delete_junk ;;
+          9) action_clean_caches ;;
+          *) echo "Unknown option: $choice"; sleep 1 ;;
+        esac
+      else
+        case "${choice:-}" in
+          2) action_review_folder_plan ;;
+          3) action_review_duplicates ;;
+          4) action_apply_plan ;;
+          5) action_auto_dedup ;;
+          6) action_delete_zero_length ;;
+          7) action_delete_junk ;;
+          8) action_clean_caches ;;
+          r|R) action_rerun_analysis_menu ;;
+          *) echo "Unknown option: $choice"; sleep 1 ;;
+        esac
+      fi
+      ;;
   esac
 done

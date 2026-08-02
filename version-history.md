@@ -1,3 +1,29 @@
+# v1.3.32 — 2026-08-02
+
+**Automatic/manual analysis workflow selection**
+
+- Added a final first-run setup choice for automatic or manual duplicate analysis.
+- Uses positive, safety-explicit guidance: automatic analysis saves user time while
+  never reviewing, quarantining, or deleting files automatically.
+- Added `[post_hash] analysis_mode = automatic|manual`; automatic is the shipped default.
+- Automatic mode shows the compact statistics-led review menu introduced in v1.3.31.
+- Manual mode preserves the traditional discovery-first menu and option numbering.
+- Added launcher option `m` so the workflow can be changed later; the choice is persisted
+  in `local/hasher.conf`.
+- `hasher.sh` now skips post-hash discovery when manual mode is selected.
+
+## 2026‑08 — v1.3.31
+
+### Statistics-led launcher workflow
+
+- Added a compact summary beneath the existing ASCII header for the latest successful hash and its matched post-hash analysis.
+- Shows files hashed, duplicate-folder groups ready, duplicate-file groups ready, and one recommended next action.
+- Promoted review and quarantine actions into the primary workflow: folder review, file review, plan application and auto-dedup.
+- Moved manual duplicate discovery into a dedicated **Rerun duplicate analysis** submenu.
+- Removed the duplicated folders-first explanation from the main screen; the dynamic recommendation provides the single primary prompt.
+- Post-hash discovery now publishes a run-specific metadata summary used by the launcher, and log cleanup recognises these metadata files.
+- Updated option references printed after post-hash analysis to match the new menu.
+
 # Version History
 Contact: **jameswintermute@protonmail.ch**
 ---
@@ -2776,6 +2802,70 @@ failures continue to return status `1`; invalid or unsafe input returns `2`.
 - Review and auto-dedup rejected unmarked preliminary reports.
 - A failed auto-dedup invocation did not offer a historical plan.
 - File and folder verification skips were surfaced distinctly by the launcher.
+
+---
+## 2026‑08 — v1.3.29
+**Automatic post-hash duplicate discovery**
+
+- Added automatic duplicate-folder and duplicate-file discovery after a fully
+  successful hash run. Partial manifests and header-only manifests are never
+  analysed.
+- Discovery uses the exact CSV produced by the current run, performs folder
+  discovery first, and records finder failures as post-processing warnings
+  without changing the successful hash-manifest status.
+- Added the `auto_discover` configuration switch and matching command-line
+  controls.
+
+---
+## 2026‑08 — v1.3.30
+**Prepared duplicate-review indexes and independently configurable post-hash analysis**
+
+Automatic discovery removed the manual option-3 wait, but interactive review
+still re-read every group and stat-ed one live file per group to calculate
+potential savings. On a 24,955-group report this could add roughly 15–20
+minutes before the first group was shown.
+
+### Prepared review index
+
+- `find-duplicates.sh` now builds
+  `logs/duplicate-review-index-YYYY-MM-DD-HHMMSS-PID.tsv` by default.
+- The index is generated in the same AWK rendering pass as the canonical
+  report, so group numbers, hashes and member counts belong to exactly the same
+  finder run.
+- Potential reclaim is calculated from manifest sizes already present in the
+  hard-link-filtered intermediate, avoiding tens of thousands of NAS `stat()`
+  calls.
+- `duplicate-review-index-latest.tsv` is published atomically beside
+  `duplicate-hashes-latest.txt`; historical indexes remain immutable.
+- `review-duplicates.sh` derives the exact index from the report's complete
+  timestamp/PID suffix, verifies both source report and source CSV, applies the
+  current exceptions list, and skips the expensive live indexing pass.
+- Older or manually copied reports remain supported. When no matching valid
+  index exists, review falls back to the previous safe live-indexing workflow.
+
+### Independent post-hash controls
+
+The combined v1.3.29 switch is supplemented by:
+
+```ini
+[post_hash]
+auto_find_duplicate_folders = true
+auto_find_duplicate_files = true
+auto_build_review_index = true
+```
+
+This lets installations that have completed folder cleanup disable only folder
+discovery while still preparing file reports and the review index. The older
+`auto_discover` key remains accepted for backward compatibility. The v1.3.29
+shipped placement of `auto_discover` and `sort_output` under `[logging]` is also
+honoured during upgrades.
+
+### Retention and documentation
+
+- `clean-logs.sh` retains the five newest immutable review indexes while
+  preserving the latest pointer.
+- Updated command help, README configuration guidance, release metadata and
+  this version history.
 
 ---
 ## Future Roadmap  
