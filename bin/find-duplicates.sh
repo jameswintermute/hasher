@@ -25,11 +25,14 @@ usage() {
 Usage: find-duplicates.sh [--input CSV] [--mode standard|bulk]
                           [--min-group-size N] [--keep-strategy shortest-path|oldest|newest|first]
                           [--allow-malformed-rows]
+                          [--build-review-index|--no-review-index]
 Outputs:
   - Canonical: logs/duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt   (per-run)
   - Latest:    logs/duplicate-hashes-latest.txt                  (symlink to newest)
   - Summary:   logs/duplicate-groups-YYYY-MM-DD-HHMMSS-PID.txt
-  - Flat CSV:  logs/duplicates-YYYY-MM-DD-HHMMSS-PID.csv
+  - Flat TSV:  logs/duplicates-YYYY-MM-DD-HHMMSS-PID.csv
+  - Review index: logs/duplicate-review-index-YYYY-MM-DD-HHMMSS-PID.tsv
+                  (sorted by potential reclaim; built by default)
 Bulk mode also writes:
   - Plan:      logs/review-dedupe-plan-YYYY-MM-DD-HHMMSS-PID.txt
 EOF
@@ -41,6 +44,7 @@ MODE="standard"        # standard | bulk
 MIN_GROUP=2
 KEEP_STRATEGY="shortest-path"
 ALLOW_MALFORMED=0
+BUILD_REVIEW_INDEX=1
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -51,6 +55,8 @@ while [[ $# -gt 0 ]]; do
     --min-group-size) MIN_GROUP="${2:-}"; shift 2 ;;
     --keep-strategy) KEEP_STRATEGY="${2:-}"; shift 2 ;;
     --allow-malformed-rows) ALLOW_MALFORMED=1; shift ;;
+    --build-review-index) BUILD_REVIEW_INDEX=1; shift ;;
+    --no-review-index) BUILD_REVIEW_INDEX=0; shift ;;
     *) err "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
@@ -73,6 +79,8 @@ OUT_CANON="$LOGS_DIR/duplicate-hashes-$timestamp.txt"
 OUT_GROUPS="$LOGS_DIR/duplicate-groups-$timestamp.txt"
 OUT_CSV="$LOGS_DIR/duplicates-$timestamp.csv"
 OUT_PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"  # only when bulk
+OUT_INDEX="$LOGS_DIR/duplicate-review-index-$timestamp.tsv"
+OUT_INDEX_LATEST="$LOGS_DIR/duplicate-review-index-latest.tsv"
 OUT_LATEST="$LOGS_DIR/duplicate-hashes-latest.txt"
 
 # Publish the completed run-specific report without ever opening the existing
@@ -88,6 +96,26 @@ publish_latest_report() {
     cp -f -- "$OUT_CANON" "$tmp_latest" || return 1
     mv -f -- "$tmp_latest" "$OUT_LATEST"
   fi
+}
+
+publish_latest_index() {
+  local tmp_latest="$OUT_INDEX_LATEST.tmp.$$"
+  rm -f -- "$tmp_latest" 2>/dev/null || true
+  if ln -s -- "$(basename "$OUT_INDEX")" "$tmp_latest" 2>/dev/null; then
+    mv -f -- "$tmp_latest" "$OUT_INDEX_LATEST"
+  else
+    cp -f -- "$OUT_INDEX" "$tmp_latest" || return 1
+    mv -f -- "$tmp_latest" "$OUT_INDEX_LATEST"
+  fi
+}
+
+write_review_index_header() {
+  {
+    printf '# HASHER_DUPLICATE_REVIEW_INDEX v1\n'
+    printf '# source-report: %s\n' "$(basename "$OUT_CANON")"
+    printf '# source-csv: %s\n' "$INPUT"
+    printf '# columns: group_no\tpotential_bytes\tmember_count\tfirst_path\thash\tbase_size\n'
+  } > "$OUT_INDEX"
 }
 
 pick_latest_csv() {
@@ -334,7 +362,9 @@ if [[ ! -s "$TMP" ]]; then
 fi
 
 # Pre-compute counts by hash (>= MIN_GROUP)
-HASHES_TMP="$(mktemp)"; trap 'rm -f "$TMP" "$HASHES_TMP"' EXIT
+HASHES_TMP="$(mktemp)"
+OUT_INDEX_RAW="$(mktemp "$VAR_DIR/review-index-raw.XXXXXX")"
+trap 'rm -f "$TMP" "$HASHES_TMP" "$OUT_INDEX_RAW" "${_hl_csv:-}" "${_hl_paths0:-}" "${_hl_stats:-}"' EXIT
 cut -d"$(printf '\t')" -f1 "$TMP" | sort | uniq -c | awk -v m="$MIN_GROUP" '$1>=m {print $2}' > "$HASHES_TMP"
 
 # v1.3.28: embed provenance in the canonical report. Review and auto-dedup
@@ -351,6 +381,11 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   : > "$OUT_CSV"
   printf '# hardlink-filter: not-required\n' >> "$OUT_CANON"
   publish_latest_report || warn "Could not update latest report pointer: $OUT_LATEST"
+  if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
+    write_review_index_header
+    publish_latest_index || warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
+    info "Review index (empty):    $OUT_INDEX"
+  fi
   exit 0
 fi
 
@@ -380,7 +415,7 @@ _hardlinks_log="$LOGS_DIR/hardlinks-excluded-$timestamp.log"
 _hl_csv="$OUT_CSV.hlfilt.$$"
 _hl_paths0="$(mktemp)"
 _hl_stats="$(mktemp)"
-trap 'rm -f "$TMP" "$HASHES_TMP" "${_hl_csv:-}" "${_hl_paths0:-}" "${_hl_stats:-}"' EXIT
+trap 'rm -f "$TMP" "$HASHES_TMP" "$OUT_INDEX_RAW" "${_hl_csv:-}" "${_hl_paths0:-}" "${_hl_stats:-}"' EXIT
 : > "$_hardlinks_log"
 : > "$_hl_csv"
 : > "$_hl_paths0"
@@ -473,18 +508,24 @@ printf '# hardlink-filter: %s\n' "$_hl_filter_status" >> "$OUT_CANON"
 # Single-pass AWK to render canonical + groups; avoids bash loops under set -e
 # (intermediate is TAB-separated since v1.3.1)
 awk -F'\t' -v min="$MIN_GROUP" \
-  -v canon="$OUT_CANON" -v groups="$OUT_GROUPS" '
-  function flush(h,   n,i,p,s) {
+  -v canon="$OUT_CANON" -v groups="$OUT_GROUPS" \
+  -v buildindex="$BUILD_REVIEW_INDEX" -v indexraw="$OUT_INDEX_RAW" '
+  function flush(h,   n,i,p,s,base,pot) {
     n = cnt[h]; if (n < min) return
     group++
     printf "HASH %s (N=%d)\n", h, n >> canon
     printf "─ Group #%d — hash: %s\n", group, h >> groups
+    base=0
     for (i=1;i<=idx[h];i++) {
       p = order[h,i]; s = size[h,p]
+      if (i == 1 && s ~ /^[0-9]+$/) base=s+0
       printf "  %s\n", p >> canon
       if (s != "") printf "   %2d) %s  (size: %s)\n", i, p, s >> groups
       else         printf "   %2d) %s\n", i, p >> groups
     }
+    pot=(n-1)*base
+    if (buildindex == 1)
+      printf "%d\t%.0f\t%d\t%s\t%s\t%.0f\n", group, pot, n, order[h,1], h, base >> indexraw
     printf "\n" >> canon; printf "\n" >> groups
   }
   {
@@ -496,6 +537,19 @@ awk -F'\t' -v min="$MIN_GROUP" \
     for (h in cnt) flush(h)
   }
 ' "$OUT_CSV"
+
+# v1.3.30: the finder already has each group hash, count and manifest size,
+# so create the reusable savings index here instead of making interactive
+# review stat one live file for every group. The group number is emitted by
+# the same AWK flush that writes the canonical report, keeping both artefacts
+# structurally tied to this exact finder run.
+if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
+  write_review_index_header
+  if [[ -s "$OUT_INDEX_RAW" ]]; then
+    LC_ALL=C sort -t $'\t' -nr -k2,2 -k1,1 "$OUT_INDEX_RAW" >> "$OUT_INDEX"
+  fi
+  info "Review index:     $OUT_INDEX"
+fi
 
 # Footer
 groups_count="$(grep -c '^HASH ' "$OUT_CANON" || true)"
@@ -557,4 +611,11 @@ if publish_latest_report; then
   info "Canonical report ready: $OUT_LATEST"
 else
   warn "Could not update latest report pointer: $OUT_LATEST"
+fi
+if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
+  if publish_latest_index; then
+    info "Prepared review index ready: $OUT_INDEX_LATEST"
+  else
+    warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
+  fi
 fi
