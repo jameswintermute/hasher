@@ -143,6 +143,10 @@ keep_latest_n "$LOGS_DIR"/20*-duplicate-hashes.txt 5 "duplicate-hashes report (l
 # Keep last 5 duplicate-groups text reports
 keep_latest_n "$LOGS_DIR"/duplicate-groups-*.txt 5 "duplicate-groups report"
 
+# v1.3.30: prepared review indexes are paired with verified duplicate reports.
+# Preserve the latest pointer and retain the five newest immutable indexes.
+keep_latest_n "$LOGS_DIR"/duplicate-review-index-20*.tsv 5 "duplicate review index"
+
 # Keep last 5 duplicates CSVs
 keep_latest_n "$LOGS_DIR"/duplicates-*.csv 5 "duplicates CSV"
 

@@ -107,7 +107,27 @@ configures is also reachable from the menu afterwards.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.29**
+Started Dec 2022. Current version: **v1.3.32**
+
+### Guided main menu
+
+After a complete hash and post-hash analysis, the launcher displays compact counts for the latest run and recommends the next safe review action. Manual duplicate discovery is available under **Rerun duplicate analysis** rather than occupying the primary workflow.
+
+### Automatic or manual analysis workflow
+
+On first-run setup, Hasher asks whether duplicate analysis should run automatically
+after each successful complete hash. **Automatic** is the recommended default because
+it prepares folder, file, and review-index results while the NAS is already working;
+it never reviews, quarantines, or deletes anything automatically.
+
+```ini
+[post_hash]
+analysis_mode = automatic   # or manual
+```
+
+Automatic mode shows the compact statistics-led review menu. Manual mode retains the
+traditional discovery-first menu. Change modes later from launcher option `m`, or edit
+`local/hasher.conf`.
 For full history see: `version-history.md`
 
 ---
@@ -416,6 +436,32 @@ paths are sane. Exit status is `0` on pass, `1` if any errors are found. It exis
 to catch — at launch rather than in production — the class of problem where a
 correct change lands in a file the running code doesn't load, a script arrives
 without its executable bit, or the conf version drifts out of sync.
+
+---
+
+## Automatic post-hash analysis
+
+After a complete successful hash run, Hasher can prepare duplicate results
+while the NAS is still working unattended. The finder stages never review,
+quarantine, or delete anything; they only create verified reports and indexes.
+
+```ini
+[post_hash]
+auto_find_duplicate_folders = true
+auto_find_duplicate_files = true
+auto_build_review_index = true
+```
+
+`find-duplicates.sh` creates a run-matched
+`duplicate-review-index-*.tsv` using file sizes already stored in the manifest.
+Option 4 verifies that the index belongs to its selected report, applies the
+current exceptions list, and starts from the prepared savings order instead of
+stat-ing every duplicate group again. If the index is absent or mismatched, the
+reviewer safely falls back to its original live-indexing behaviour.
+
+For systems where duplicate-folder cleanup is already complete, set
+`auto_find_duplicate_folders = false` to avoid repeating that scan. Post-hash
+analysis is skipped for partial manifests.
 
 ---
 

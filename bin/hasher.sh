@@ -173,11 +173,13 @@ LOG_LEVEL="info"     # info|warn|error
 # original CSV is NEVER touched until the sorted candidate has been fully
 # validated (row count matches, header intact). See sort_output_csv().
 SORT_OUTPUT="true"
-# v1.3.29: automatically run duplicate-folder and duplicate-file discovery
-# after a successful hash run. Results are ready in logs/ when the user
-# returns — no 20-minute interactive wait on option 3/4. Only runs when
-# the hash completed cleanly (rc=0); partial manifests are never analysed.
-AUTO_DISCOVER="true"
+# v1.3.30: post-hash analysis stages are independently configurable.
+# The v1.3.29 auto_discover key remains supported as a compatibility alias
+# controlling both finder stages together.
+AUTO_FIND_DUPLICATE_FOLDERS="true"
+AUTO_FIND_DUPLICATE_FILES="true"
+AUTO_BUILD_REVIEW_INDEX="true"
+ANALYSIS_MODE="automatic"
 ZERO_LENGTH_ONLY=false
 
 # Optional config (CLI can override)
@@ -390,12 +392,12 @@ load_config() {
               *)              : ;;  # ignore garbage, keep default
             esac
             ;;
-          # v1.3.29: auto-discover duplicates after hashing
+          # v1.3.29 compatibility: control both discovery finders together.
           auto_discover|auto-discover)
             v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
             case "$v" in
-              0|false|no|off) AUTO_DISCOVER="false" ;;
-              1|true|yes|on)  AUTO_DISCOVER="true"  ;;
+              0|false|no|off) AUTO_FIND_DUPLICATE_FOLDERS="false"; AUTO_FIND_DUPLICATE_FILES="false" ;;
+              1|true|yes|on)  AUTO_FIND_DUPLICATE_FOLDERS="true";  AUTO_FIND_DUPLICATE_FILES="true"  ;;
               *)              : ;;
             esac
             ;;
@@ -408,6 +410,22 @@ load_config() {
         case "$key" in
           level)         LOG_LEVEL="$val" ;;
           background-interval|interval) PROGRESS_INTERVAL="$val" ;;
+          # v1.3.30: honour the v1.3.29 shipped placement under [logging]
+          # as well as the documented [setup]/[post_hash] locations.
+          sort_output|sort-output)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) SORT_OUTPUT="false" ;;
+              1|true|yes|on)  SORT_OUTPUT="true"  ;;
+            esac
+            ;;
+          auto_discover|auto-discover)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_FIND_DUPLICATE_FOLDERS="false"; AUTO_FIND_DUPLICATE_FILES="false" ;;
+              1|true|yes|on)  AUTO_FIND_DUPLICATE_FOLDERS="true";  AUTO_FIND_DUPLICATE_FILES="true"  ;;
+            esac
+            ;;
           xtrace)
             v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
             case "$v" in
@@ -415,6 +433,43 @@ load_config() {
             esac
             ;;
           *)             : ;;
+        esac
+        ;;
+      "post_hash"|"post-hash")
+        case "$key" in
+          analysis_mode|analysis-mode)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in automatic|manual) ANALYSIS_MODE="$v" ;; esac
+            ;;
+          auto_find_duplicate_folders|auto-find-duplicate-folders)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_FIND_DUPLICATE_FOLDERS="false" ;;
+              1|true|yes|on)  AUTO_FIND_DUPLICATE_FOLDERS="true"  ;;
+            esac
+            ;;
+          auto_find_duplicate_files|auto-find-duplicate-files)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_FIND_DUPLICATE_FILES="false" ;;
+              1|true|yes|on)  AUTO_FIND_DUPLICATE_FILES="true"  ;;
+            esac
+            ;;
+          auto_build_review_index|auto-build-review-index)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_BUILD_REVIEW_INDEX="false" ;;
+              1|true|yes|on)  AUTO_BUILD_REVIEW_INDEX="true"  ;;
+            esac
+            ;;
+          auto_discover|auto-discover)
+            v="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+            case "$v" in
+              0|false|no|off) AUTO_FIND_DUPLICATE_FOLDERS="false"; AUTO_FIND_DUPLICATE_FILES="false" ;;
+              1|true|yes|on)  AUTO_FIND_DUPLICATE_FOLDERS="true";  AUTO_FIND_DUPLICATE_FILES="true"  ;;
+            esac
+            ;;
+          *) : ;;
         esac
         ;;
       "exclusions")
@@ -480,7 +535,9 @@ usage() {
   cat <<EOF
 Usage: $0 [--pathfile FILE] [--algo sha256] [--output CSV]
           [--nohup] [--level info|warn|error] [--interval SECONDS]
-          [--exclude PATTERN ...] [--zero-length-only] [--config FILE] [--help]
+          [--exclude PATTERN ...] [--zero-length-only] [--config FILE]
+          [--discover|--no-discover] [--no-folder-discovery]
+          [--no-file-discovery] [--no-review-index] [--help]
 
 Options:
   --pathfile FILE    File containing one path (dir or file) per line. Required unless paths are piped.
@@ -496,6 +553,11 @@ Options:
                      the full path (so "#recycle", "@eaDir" still work).
   --zero-length-only Scan and output zero-length file list only, then exit (no hashing).
   --config FILE      Load settings from FILE (default: local/hasher.conf if present).
+  --discover         Enable post-hash folder and file discovery.
+  --no-discover      Disable both post-hash duplicate finder stages.
+  --no-folder-discovery  Skip duplicate-folder discovery for this run.
+  --no-file-discovery    Skip duplicate-file discovery for this run.
+  --no-review-index      Do not build the prepared interactive-review index.
   --help             Show this help.
 
 Behavior:
@@ -517,9 +579,15 @@ while [[ $# -gt 0 ]]; do
     # v1.3.22: opt out of CSV sorting for this one run.
     --no-sort)  SORT_OUTPUT="false" ;;
     --sort)     SORT_OUTPUT="true"  ;;
-    # v1.3.29: control post-hash duplicate discovery
-    --no-discover)  AUTO_DISCOVER="false" ;;
-    --discover)     AUTO_DISCOVER="true"  ;;
+    # v1.3.30: independently control post-hash analysis stages.
+    --no-discover)  AUTO_FIND_DUPLICATE_FOLDERS="false"; AUTO_FIND_DUPLICATE_FILES="false" ;;
+    --discover)     AUTO_FIND_DUPLICATE_FOLDERS="true";  AUTO_FIND_DUPLICATE_FILES="true"  ;;
+    --no-folder-discovery) AUTO_FIND_DUPLICATE_FOLDERS="false" ;;
+    --folder-discovery)    AUTO_FIND_DUPLICATE_FOLDERS="true"  ;;
+    --no-file-discovery)   AUTO_FIND_DUPLICATE_FILES="false"   ;;
+    --file-discovery)      AUTO_FIND_DUPLICATE_FILES="true"    ;;
+    --no-review-index)     AUTO_BUILD_REVIEW_INDEX="false" ;;
+    --review-index)        AUTO_BUILD_REVIEW_INDEX="true"  ;;
     --jobs)     HASH_JOBS="${2:-1}"; shift ;;
     --exclude)  EXTRA_EXCLUDES+=("${2:-}"); shift ;;
     --zero-length-only) ZERO_LENGTH_ONLY=true ;;
@@ -544,6 +612,9 @@ if $RUN_IN_BACKGROUND && ! $IS_CHILD; then
   [[ -n "$CONFIG_FILE" ]] && args+=( --config "$CONFIG_FILE" )
   [[ -n "$PATHFILE"   ]] && args+=( --pathfile "$PATHFILE" )
   args+=( --algo "$ALGO" --output "$OUTPUT" --level "$LOG_LEVEL" --interval "$PROGRESS_INTERVAL" --jobs "$HASH_JOBS" )
+  [[ "$AUTO_FIND_DUPLICATE_FOLDERS" = "true" ]] || args+=( --no-folder-discovery )
+  [[ "$AUTO_FIND_DUPLICATE_FILES" = "true" ]]   || args+=( --no-file-discovery )
+  [[ "$AUTO_BUILD_REVIEW_INDEX" = "true" ]]     || args+=( --no-review-index )
   # FIX (v1.1.10): "${arr[@]}" on an empty array errors under set -u in
   # bash 3.2 (Apple's stock /bin/bash) and 4.0–4.3. The :- guard is the
   # portable form for safe-on-empty array iteration. Same fix as line ~425.
@@ -2057,7 +2128,7 @@ main() {
   # Safety: NEVER run discovery on a partial manifest. A CSV with failures
   # or unstable exclusions would produce misleading duplicate groups.
   # Also skip if the CSV has no data rows (header-only / empty-input run).
-  if [[ "$AUTO_DISCOVER" = "true" ]]; then
+  if [[ "$AUTO_FIND_DUPLICATE_FOLDERS" = "true" || "$AUTO_FIND_DUPLICATE_FILES" = "true" ]]; then
     if [[ "$HASHER_RUN_STATUS" -ne 0 ]]; then
       bglog INFO "Post-hash discovery: SKIPPED — manifest is partial (status=$HASHER_RUN_STATUS)."
       info "Post-hash discovery skipped: manifest is partial. Run discovery manually after a complete hash."
@@ -2065,7 +2136,12 @@ main() {
       bglog INFO "Post-hash discovery: SKIPPED — CSV has no data rows."
       info "Post-hash discovery skipped: CSV has no data rows."
     else
-      _run_post_hash_discovery "$OUTPUT"
+      if [[ "$ANALYSIS_MODE" = "automatic" ]]; then
+        _run_post_hash_discovery "$OUTPUT"
+      else
+        info "Post-hash duplicate analysis is set to manual; discovery not run."
+        bglog INFO "Post-hash discovery skipped: analysis_mode=manual"
+      fi
     fi
   fi
 }
@@ -2228,18 +2304,26 @@ sort_output_csv() {
 _run_post_hash_discovery() {
   local _csv="$1"
   local _disc_start _disc_end _disc_elapsed
+  local _folder_groups=0 _file_groups=0
+  local _folder_status=disabled _file_status=disabled
+  local _folder_before="" _folder_after="" _file_report="" _file_source=""
   _disc_start=$(date +%s)
+  _folder_before=$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-[0-9]*.tsv 2>/dev/null | head -n1 || true)
 
   info ""
   info "───────────────────────────────────────────────────────────────"
   info "Post-hash discovery: analysing manifest for duplicates..."
-  info "  (disable with 'auto_discover = false' in hasher.conf, or --no-discover)"
+  info "  folders=$AUTO_FIND_DUPLICATE_FOLDERS files=$AUTO_FIND_DUPLICATE_FILES review-index=$AUTO_BUILD_REVIEW_INDEX"
   info "───────────────────────────────────────────────────────────────"
   bglog INFO "Post-hash discovery starting: input=$_csv"
 
   # 1. Duplicate folders
   local _folder_rc=0
-  if [[ -x "$ROOT_DIR/bin/find-duplicate-folders.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicate-folders.sh" ]]; then
+  if [[ "$AUTO_FIND_DUPLICATE_FOLDERS" != "true" ]]; then
+    _folder_status=disabled
+    bglog INFO "Post-hash discovery: duplicate-folder scan disabled."
+    info "Post-hash discovery [1/2]: duplicate-folder scan disabled."
+  elif [[ -x "$ROOT_DIR/bin/find-duplicate-folders.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicate-folders.sh" ]]; then
     info ""
     info "Post-hash discovery [1/2]: finding duplicate folders..."
     bglog INFO "Post-hash discovery: running find-duplicate-folders.sh"
@@ -2247,33 +2331,55 @@ _run_post_hash_discovery() {
         --input "$_csv" \
         --mode plan \
         --keep shortest-path; then
+      _folder_status=ready
+      _folder_after=$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-[0-9]*.tsv 2>/dev/null | head -n1 || true)
+      if [[ -n "$_folder_after" && "$_folder_after" != "$_folder_before" ]]; then
+        _folder_groups=$(wc -l < "$_folder_after" 2>/dev/null | tr -d ' ' || echo 0)
+      fi
       bglog INFO "Post-hash discovery: folder scan completed successfully."
     else
       _folder_rc=$?
+      _folder_status=failed
       bglog WARN "Post-hash discovery: folder scan exited with rc=$_folder_rc"
       warn "Post-hash folder discovery returned rc=$_folder_rc (see warnings above)."
-      warn "  This does not affect the hash manifest. Run option 2 manually to investigate."
+      warn "  This does not affect the hash manifest. Use launcher option 'r' to rerun folder analysis."
     fi
   else
+    _folder_status=failed
     bglog INFO "Post-hash discovery: find-duplicate-folders.sh not found; skipping folder scan."
   fi
 
   # 2. Duplicate files
   local _file_rc=0
-  if [[ -x "$ROOT_DIR/bin/find-duplicates.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicates.sh" ]]; then
+  if [[ "$AUTO_FIND_DUPLICATE_FILES" != "true" ]]; then
+    _file_status=disabled
+    bglog INFO "Post-hash discovery: duplicate-file scan disabled."
+    info "Post-hash discovery [2/2]: duplicate-file scan disabled."
+  elif [[ -x "$ROOT_DIR/bin/find-duplicates.sh" ]] || [[ -r "$ROOT_DIR/bin/find-duplicates.sh" ]]; then
     info ""
     info "Post-hash discovery [2/2]: finding duplicate files..."
     bglog INFO "Post-hash discovery: running find-duplicates.sh"
-    if bash "$ROOT_DIR/bin/find-duplicates.sh" \
-        --input "$_csv"; then
+    _file_args=( --input "$_csv" )
+    [[ "$AUTO_BUILD_REVIEW_INDEX" = "true" ]] || _file_args+=( --no-review-index )
+    if bash "$ROOT_DIR/bin/find-duplicates.sh" "${_file_args[@]}"; then
+      _file_status=ready
+      _file_report="$LOGS_DIR/duplicate-hashes-latest.txt"
+      if [[ -r "$_file_report" ]]; then
+        _file_source=$(awk -F': ' '/^# source-csv: /{print $2; exit}' "$_file_report" 2>/dev/null || true)
+        if [[ "$_file_source" = "$_csv" ]]; then
+          _file_groups=$(grep -c '^HASH ' "$_file_report" 2>/dev/null || true)
+        fi
+      fi
       bglog INFO "Post-hash discovery: file scan completed successfully."
     else
       _file_rc=$?
+      _file_status=failed
       bglog WARN "Post-hash discovery: file scan exited with rc=$_file_rc"
       warn "Post-hash file discovery returned rc=$_file_rc (see warnings above)."
-      warn "  This does not affect the hash manifest. Run option 3 manually to investigate."
+      warn "  This does not affect the hash manifest. Use launcher option 'r' to rerun file analysis."
     fi
   else
+    _file_status=failed
     bglog INFO "Post-hash discovery: find-duplicates.sh not found; skipping file scan."
   fi
 
@@ -2285,12 +2391,35 @@ _run_post_hash_discovery() {
   info "───────────────────────────────────────────────────────────────"
   info "Post-hash discovery complete (${_dM}m ${_dS}s)."
   if [[ "$_folder_rc" -eq 0 && "$_file_rc" -eq 0 ]]; then
-    info "  Results are in logs/ — use option r (folders) or 4 (files) to review."
+    info "  Results are in logs/ — use option 2 (folders) or 3 (files) to review."
+    if [[ "$AUTO_FIND_DUPLICATE_FILES" = "true" && "$AUTO_BUILD_REVIEW_INDEX" = "true" ]]; then
+      info "  File review index is prepared; option 3 should skip the long indexing stage."
+    fi
   else
     warn "  One or both discovery scans had issues (see warnings above)."
     warn "  Hash manifest is unaffected. Re-run options 2/3 manually if needed."
   fi
   info "───────────────────────────────────────────────────────────────"
+
+  # v1.3.32: publish a compact, run-matched summary for the launcher menu.
+  local _summary_tag _summary_file _summary_tmp _files_hashed
+  _summary_tag=$(basename "$_csv" .csv)
+  _summary_file="$LOGS_DIR/post-hash-analysis-${_summary_tag}.meta"
+  _summary_tmp="$LOGS_DIR/post-hash-analysis-latest.meta.tmp.$$"
+  _files_hashed=$(( $(wc -l < "$_csv" 2>/dev/null | tr -d ' ' || echo 1) - 1 ))
+  (( _files_hashed < 0 )) && _files_hashed=0
+  {
+    printf '# HASHER_POST_HASH_ANALYSIS v1\n'
+    printf 'source_csv=%s\n' "$_csv"
+    printf 'completed=%s\n' "$(date '+%F %H:%M')"
+    printf 'files_hashed=%s\n' "$_files_hashed"
+    printf 'folder_status=%s\n' "$_folder_status"
+    printf 'folder_groups=%s\n' "${_folder_groups:-0}"
+    printf 'file_status=%s\n' "$_file_status"
+    printf 'file_groups=%s\n' "${_file_groups:-0}"
+  } > "$_summary_file"
+  cp -f -- "$_summary_file" "$_summary_tmp" && mv -f -- "$_summary_tmp" "$LOGS_DIR/post-hash-analysis-latest.meta"
+
   bglog INFO "Post-hash discovery finished in ${_dM}m ${_dS}s (folders=$_folder_rc, files=$_file_rc)"
 }
 
@@ -2398,12 +2527,25 @@ post_run_reports() {
   info "  • Duplicate groups: $dupe_groups (files involved: $dupe_files) (see: $dupes_txt)"
   echo
   if [[ "$publish_latest" = "true" ]]; then
-    echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
-    echo "  1) Find duplicate folders (highest value, lowest risk):"
-    echo "       bin/find-duplicate-folders.sh --input \"$csv\""
-    echo "  2) Find and review duplicate files:"
-    echo "       bin/find-duplicates.sh --input \"$csv\""
-    echo "       bin/review-duplicates.sh --from-report \"$LOGS_DIR/duplicate-hashes-latest.txt\""
+    if [[ "$AUTO_FIND_DUPLICATE_FOLDERS" = "true" || "$AUTO_FIND_DUPLICATE_FILES" = "true" ]]; then
+      echo -e "${GREEN}[POST-HASH ANALYSIS]${NC}"
+      [[ "$AUTO_FIND_DUPLICATE_FOLDERS" = "true" ]] && echo "  • Duplicate-folder discovery will run next."
+      [[ "$AUTO_FIND_DUPLICATE_FILES" = "true" ]] && echo "  • Duplicate-file discovery will run next."
+      [[ "$AUTO_FIND_DUPLICATE_FILES" = "true" && "$AUTO_BUILD_REVIEW_INDEX" = "true" ]] \
+        && echo "  • The interactive review index will be prepared for option 4."
+      echo "  • Discovery creates reports only; it never reviews, quarantines, or deletes files."
+      echo
+      echo -e "${GREEN}[AFTER DISCOVERY]${NC}"
+      [[ "$AUTO_FIND_DUPLICATE_FOLDERS" = "true" ]] && echo "  1) Review duplicate folders with menu option r."
+      [[ "$AUTO_FIND_DUPLICATE_FILES" = "true" ]] && echo "  2) Review duplicate files with menu option 4."
+    else
+      echo -e "${GREEN}[RECOMMENDED NEXT STEPS]${NC}"
+      echo "  1) Find duplicate folders (highest value, lowest risk):"
+      echo "       bin/find-duplicate-folders.sh --input \"$csv\""
+      echo "  2) Find and review duplicate files:"
+      echo "       bin/find-duplicates.sh --input \"$csv\""
+      echo "       bin/review-duplicates.sh --from-report \"$LOGS_DIR/duplicate-hashes-latest.txt\""
+    fi
     echo "  3) Remove zero-length files (review first, no changes):"
     echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --dry-run"
     echo "       bin/delete-zero-length.sh --report \"$zero_txt\" --force"

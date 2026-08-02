@@ -19,6 +19,7 @@ PLAN_DEFAULT="$LOGS_DIR/review-dedupe-plan-$(date +%F)-$RUN_ID.txt"
 
 REPORT="$REPORT_DEFAULT"
 PLAN_OUT="$PLAN_DEFAULT"
+INDEX_OVERRIDE=""
 PROGRESS_EVERY=1
 SHOW_PROGRESS=1
 ORDER="size"  # size|sizesmall|name|newest|oldest|shortpath|longpath
@@ -56,6 +57,7 @@ fi
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [--from-report PATH] [--plan-out PATH] [--plan PATH]
+                        [--review-index PATH]
                         [--every N] [--no-progress]
                         [--order size|sizesmall|name|newest|oldest|shortpath|longpath]
 Notes:
@@ -159,6 +161,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --from-report) REPORT="${2?}"; shift 2 ;;
     --plan-out|--plan) PLAN_OUT="${2?}"; shift 2 ;;
+    --review-index) INDEX_OVERRIDE="${2?}"; shift 2 ;;
     --every) PROGRESS_EVERY="${2?}"; shift 2 ;;
     --no-progress) SHOW_PROGRESS=0; shift ;;
     --order) ORDER="${2?}"; shift 2 ;;
@@ -268,6 +271,61 @@ order_group(){
 }
 ltrim(){ printf "%s" "$1" | sed 's/^[[:space:]]*//'; }
 
+# v1.3.30: locate and validate the run-specific review index produced by
+# find-duplicates.sh. The complete timestamp/PID suffix keeps the index tied to
+# exactly one verified report. Older reports without an index remain supported
+# through the existing live-index fallback.
+resolve_report_target() {
+  rp="$1"
+  if [ -L "$rp" ]; then
+    target="$(readlink "$rp" 2>/dev/null || true)"
+    case "$target" in
+      /*) printf "%s" "$target" ;;
+      *)  printf "%s/%s" "$(dirname "$rp")" "$target" ;;
+    esac
+  else
+    printf "%s" "$rp"
+  fi
+}
+
+find_review_index() {
+  if [ -n "$INDEX_OVERRIDE" ]; then
+    printf "%s" "$INDEX_OVERRIDE"
+    return 0
+  fi
+
+  resolved="$(resolve_report_target "$REPORT")"
+  base="$(basename "$resolved")"
+  case "$base" in
+    duplicate-hashes-*.txt)
+      suffix="${base#duplicate-hashes-}"
+      suffix="${suffix%.txt}"
+      printf "%s/duplicate-review-index-%s.tsv" "$LOGS_DIR" "$suffix"
+      ;;
+    *)
+      printf "%s/duplicate-review-index-latest.tsv" "$LOGS_DIR"
+      ;;
+  esac
+}
+
+review_index_valid() {
+  idx="$1"
+  [ -r "$idx" ] || return 1
+  grep -qxF '# HASHER_DUPLICATE_REVIEW_INDEX v1' "$idx" 2>/dev/null || return 1
+
+  idx_csv="$(sed -n 's/^# source-csv: //p' "$idx" 2>/dev/null | head -n1)"
+  report_csv="$(sed -n 's/^# source-csv: //p' "$REPORT" 2>/dev/null | head -n1)"
+  [ -n "$idx_csv" ] && [ "$idx_csv" = "$report_csv" ] || return 1
+
+  resolved="$(resolve_report_target "$REPORT")"
+  report_base="$(basename "$resolved")"
+  idx_report="$(sed -n 's/^# source-report: //p' "$idx" 2>/dev/null | head -n1)"
+  if [ "$report_base" != "duplicate-hashes-latest.txt" ]; then
+    [ "$(basename "$idx_report")" = "$report_base" ] || return 1
+  fi
+  return 0
+}
+
 info "Preparing interactive review…"
 info "Using report: $REPORT"
 info "Plan file: $PLAN_OUT"
@@ -299,70 +357,79 @@ esac
 # Prepare cleaned exceptions list
 EXC_CLEAN="$(clean_exceptions_file)"
 
-# PASS 1: index potential savings
+# PASS 1: prefer the finder-prepared savings index. It is already sorted by
+# potential reclaim and uses sizes from the exact manifest that produced the
+# verified report. If the index is absent or fails provenance checks, retain
+# the original safe live-indexing path for older reports.
 INDEX_FILE="$(mktemp "$VAR_DIR/revindex.XXXXXX")"
-trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "$TMP_GROUP" "$ORDERED" 2>/dev/null || true; rm -rf "$CAPDIR" 2>/dev/null || true; rm -f "$EXC_CLEAN" 2>/dev/null || true' EXIT INT TERM
-
-gno=0; in_group=0; N=0; first_path=""; CUR_HASH=""
-
-# v1.3.14: grab_N removed — N is now counted from member lines in the index
-# pass (the old header re-parse was environment-sensitive and could silently
-# default to 2).
-grab_hash(){ echo "$1" | awk '{print $2}'; }
-
-index_started="$(date +%s)"
-info "Indexing duplicate groups (potential savings)…"
-
-finish_group_index(){
-  if [ "$in_group" -eq 1 ] && [ -n "${first_path:-}" ] && ! hash_is_exception "$CUR_HASH" "$EXC_CLEAN"; then
-    sz="$(file_size "$first_path" 2>/dev/null || echo -1)"
-    # v1.3.14: N was counted from member lines; a group can't be smaller than 2
-    [ "${N:-0}" -ge 2 ] || N=2
-    # If size lookup failed, treat as 0 for potential calculation
-    case "$sz" in ''|-1|*[!0-9]*) sz_calc=0 ;; *) sz_calc="$sz" ;; esac
-    pot=$(( ( ${N:-2} - 1 ) * ${sz_calc:-0} ))
-    # fields: group_no, potential_bytes, N, first_path, hash, base_size
-    # v1.3.14: %s for the numeric fields — they're already plain decimal shell
-    # strings, and %llu is a C length modifier that not every bash printf
-    # accepts (environment-sensitive on the NAS).
-    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" "$sz" >>"$INDEX_FILE"
-  fi
-}
-
-# shellcheck disable=SC2162
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in
-    HASH\ *)
-      finish_group_index
-      # v1.3.14: N is COUNTED from the member path lines below rather than
-      # parsed out of the header. The old grab_N parse (a gawk-only 3-arg
-      # match() with a sed fallback) could fail environment-dependently and
-      # silently default every group to N=2 — misreporting potential savings
-      # and therefore the size-ordering of the whole review. Counting the
-      # same lines the review displays makes N correct by construction.
-      gno=$((gno+1)); in_group=1; first_path=""; CUR_HASH=""; N=0
-      CUR_HASH="$(grab_hash "$line")"
-      _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"
-      ;;
-    *)
-      if [ "$in_group" -eq 1 ]; then
-        t="$(ltrim "$line")"
-        case "$t" in
-          /*)
-            N=$((N+1))
-            [ -z "${first_path:-}" ] && first_path="$t"
-            ;;
-        esac
-      fi
-      ;;
-  esac
-done <"$REPORT"
-finish_group_index
-_progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"; printf "\n" >&2
-
-# FIX: removed cat antipattern; sort reads INDEX_FILE directly
 TOP_FILE="$(mktemp "$VAR_DIR/revtop.XXXXXX")"
-sort -nr -k2,2 "$INDEX_FILE" | head -n "$MAX_GROUPS" >"$TOP_FILE" || true
+TMP_GROUP=""; ORDERED=""; CAPDIR=""
+trap 'rm -f "$INDEX_FILE" "$TOP_FILE" "${TMP_GROUP:-}" "${ORDERED:-}" 2>/dev/null || true; [ -n "${CAPDIR:-}" ] && rm -rf "$CAPDIR" 2>/dev/null || true; rm -f "$EXC_CLEAN" 2>/dev/null || true' EXIT INT TERM
+
+CACHED_INDEX="$(find_review_index)"
+INDEX_FROM_CACHE=0
+if review_index_valid "$CACHED_INDEX"; then
+  # Apply the current exceptions list without changing the savings-descending
+  # order stored in the prepared index.
+  if [ -s "$EXC_CLEAN" ]; then
+    awk -F'\t' '
+      NR==FNR { if ($1 != "") exc[$1]=1; next }
+      /^#/ { next }
+      NF >= 6 && !($5 in exc) { print }
+    ' "$EXC_CLEAN" "$CACHED_INDEX" > "$INDEX_FILE"
+  else
+    awk -F'\t' '!/^#/ && NF >= 6 { print }' "$CACHED_INDEX" > "$INDEX_FILE"
+  fi
+  INDEX_FROM_CACHE=1
+  cached_groups="$(awk 'END{print NR+0}' "$INDEX_FILE")"
+  info "Using prepared review index: $CACHED_INDEX"
+  info "Prepared index contains $cached_groups actionable groups after exceptions."
+else
+  [ -n "$CACHED_INDEX" ] && warn "Prepared review index is missing or does not match this report; rebuilding now."
+
+  gno=0; in_group=0; N=0; first_path=""; CUR_HASH=""
+  grab_hash(){ echo "$1" | awk '{print $2}'; }
+
+  index_started="$(date +%s)"
+  info "Indexing duplicate groups (potential savings)…"
+
+  finish_group_index(){
+    if [ "$in_group" -eq 1 ] && [ -n "${first_path:-}" ] && ! hash_is_exception "$CUR_HASH" "$EXC_CLEAN"; then
+      sz="$(file_size "$first_path" 2>/dev/null || echo -1)"
+      [ "${N:-0}" -ge 2 ] || N=2
+      case "$sz" in ''|-1|*[!0-9]*) sz_calc=0 ;; *) sz_calc="$sz" ;; esac
+      pot=$(( ( ${N:-2} - 1 ) * ${sz_calc:-0} ))
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$gno" "$pot" "${N:-2}" "$first_path" "$CUR_HASH" "$sz" >>"$INDEX_FILE"
+    fi
+  }
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      HASH\ *)
+        finish_group_index
+        gno=$((gno+1)); in_group=1; first_path=""; CUR_HASH=""; N=0
+        CUR_HASH="$(grab_hash "$line")"
+        _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"
+        ;;
+      *)
+        if [ "$in_group" -eq 1 ]; then
+          t="$(ltrim "$line")"
+          case "$t" in
+            /*) N=$((N+1)); [ -z "${first_path:-}" ] && first_path="$t" ;;
+          esac
+        fi
+        ;;
+    esac
+  done <"$REPORT"
+  finish_group_index
+  _progress_bar "INDEX" "$gno" "$TOTAL_GROUPS" "$index_started"; printf "\n" >&2
+fi
+
+if [ "$INDEX_FROM_CACHE" -eq 1 ]; then
+  head -n "$MAX_GROUPS" "$INDEX_FILE" >"$TOP_FILE" || true
+else
+  LC_ALL=C sort -nr -k2,2 "$INDEX_FILE" | head -n "$MAX_GROUPS" >"$TOP_FILE" || true
+fi
 
 # FIX: use awk instead of wc -l for reliable line counting
 SELECTED_TOTAL="$(awk 'END{print NR}' "$TOP_FILE")"
