@@ -1,11 +1,19 @@
 # Runtime output
 logs/
 hashes/*.csv
+hashes/partial-*.csv
 zero-length/
 quarantine*/
-logs/du-*/
 
-# Local, machine-specific config (optional: see below)
+# Internal working state — keep the directory skeleton, not the contents
+var/*
+!var/*/
+!var/**/.gitkeep
+
+# Test sandboxes (harness uses mktemp, but --keep can leave these)
+tests/.sandbox*
+
+# Local, machine-specific config
 local/
 
 # OS / editor junk
