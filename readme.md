@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.0**
+Started Dec 2022. Current version: **v1.4.1**
 
 ### First-run launch screen
 
@@ -543,6 +543,51 @@ paths are sane. Exit status is `0` on pass, `1` if any errors are found. It exis
 to catch — at launch rather than in production — the class of problem where a
 correct change lands in a file the running code doesn't load, a script arrives
 without its executable bit, or the conf version drifts out of sync.
+
+---
+
+## Fault-injection test suite
+
+The self-test answers "is this installation intact". The suite under `tests/`
+answers a different question: "does this tool still *behave* correctly when the
+input is hostile".
+
+```bash
+tests/run-tests.sh                # everything (7 cases, ~10s)
+tests/run-tests.sh 20 40          # only cases whose name matches
+tests/run-tests.sh --list         # list cases without running them
+tests/run-tests.sh --verbose      # per-case diagnostic notes
+tests/run-tests.sh --keep         # retain sandboxes for inspection
+```
+
+Also offered from launcher option `x`, after the integrity self-test.
+
+Every case reproduces a defect found in real review. The situations covered are
+the ones that have historically broken things — none of which a run over a flat
+directory of ordinary files would exercise:
+
+| Case | Covers |
+|---|---|
+| `01-core-hashing` | Clean run: counts, row count, sorted manifest |
+| `10-input-validation` | Overlapping scan roots, explicitly listed symlinks |
+| `20-snapshot-integrity` | Files rewritten mid-hash, including same-size content with mtime restored |
+| `30-manifest-validation` | Truncated rows, wrong algorithm, `--allow-malformed-rows` |
+| `40-dedup-safety` | Hard links, folders holding symlinks, report provenance |
+| `50-exit-status` | Exit codes 0/1/4, empty input, destructive-tool failures |
+| `60-process-safety` | Lock ownership, orphaned workers, non-functional `pgrep` |
+
+**Safety.** Each case runs in its own sandbox under a temporary directory —
+nothing outside it is written, and the install tree is never modified. Fault
+injection is done entirely with `PATH` shims, never by touching system tools.
+Stray processes are matched by sandbox path, so real hasher runs elsewhere on
+the machine are never at risk.
+
+**Adding a case.** Drop a file in `tests/cases/` defining `case_description`
+and a `run_case` function. `tests/lib/harness.sh` provides sandbox management,
+fixture builders (hard links, symlinks, twin folders, malformed manifests),
+fault-injection shims, and assertions. Assertions should describe behaviour
+rather than implementation, so that a rewrite preserving the guarantee still
+passes.
 
 ---
 

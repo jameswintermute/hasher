@@ -2938,6 +2938,153 @@ summary (missing / stale / fresh), the `pending_blank` config-writing fix, and
 the `set_analysis_mode` read-back verification.
 
 
+---
+## 2026‑08 — v1.4.1
+**Fault-injection test suite — and the two silent defects it found immediately**
+
+The 1.3.x series closed seven rounds of external review. A consistent pattern
+ran through them: almost every defect was in *adversarial or merely unusual
+input*, not in the code path being actively worked on. Hashing a flat
+directory of ordinary files exercises none of the situations that actually
+broke — overlapping scan roots, hard links, a symlink inside an otherwise
+identical folder, a file rewritten mid-hash, a truncated manifest, a lock
+left behind by a killed parent.
+
+Verification up to this point was hand-assembled shell in a scratch
+directory, rebuilt from memory each time. That is fine for confirming a
+specific fix and useless for noticing that an *earlier* fix has stopped
+working. This release replaces it with a standing suite.
+
+### The suite
+
+```
+tests/
+  run-tests.sh                      runner
+  lib/harness.sh                    sandboxes, shims, fixtures, assertions
+  cases/01-core-hashing.sh          happy path, sorted-manifest guard
+  cases/10-input-validation.sh      overlapping roots, explicit symlinks
+  cases/20-snapshot-integrity.sh    mutate-during-hash, mutate+restore-mtime
+  cases/30-manifest-validation.sh   malformed rows, wrong algo, --allow flag
+  cases/40-dedup-safety.sh          hard links, folder symlinks, provenance
+  cases/50-exit-status.sh           rc 0/1/4, empty input, destructive tools
+  cases/60-process-safety.sh        lock ownership, orphans, broken pgrep
+```
+
+7 cases, 76 assertions, about 10 seconds.
+
+Design decisions worth recording:
+
+- **Every case gets a private sandbox** under `mktemp -d`. A case that leaves
+  a lock or a stray process behind cannot affect the next one, and nothing
+  outside the temp tree is ever written.
+- **Fault injection is entirely PATH shims.** No system tool is modified. An
+  earlier manual test overwrote `/usr/bin/sha256sum` with a stub and required
+  a coreutils reinstall to recover; that cannot happen here.
+- **Strays are killed by matching the sandbox path**, so a developer's real
+  hasher processes are never at risk.
+- **`IS_SESSION_LEADER=1` on every invocation** suppresses the setsid re-exec.
+  Without it the child outlives `timeout` and strays accumulate — a problem
+  that bit repeatedly during manual testing.
+- **Assertions describe behaviour, not implementation.** A rewrite that
+  preserves the guarantee still passes.
+- Each case carries a comment explaining which real defect it reproduces.
+
+Available from launcher option `x`: the integrity self-test runs first, then
+the behavioural suite is offered separately. They answer different questions —
+"is this installation intact" versus "does this tool still behave correctly".
+
+### Defect found #1 — log output contaminating the discovery list
+
+`build_file_list()` ended its pathfile loop with
+`done < "$PATHFILE" >> "$FILES_LIST".tmp`, redirecting the loop's stdout into
+the NUL-delimited discovery list. But `_log()` writes to **stdout**. Fourteen
+warning sites sat inside that loop — "Symlink refused", "Path does not exist",
+"find failed on…", every canonicalisation warning — and each one injected its
+text, ANSI escapes included, straight into the list.
+
+Because `warn` emits `\n` rather than `\0`, the warning and the *next
+discovered path* shared a single NUL record. The delimiter guard then saw a
+linefeed in that record and discarded the whole thing, **silently dropping a
+real file from the manifest**.
+
+Caught by 10-input-validation, which lists a symlink alongside a real
+directory and expects three rows. It got two, accompanied by a
+"Skipping 1 file(s) whose paths contain TAB/LF/CR" message pointing at
+entirely the wrong cause.
+
+Fixed structurally rather than by patching fourteen call sites: paths are now
+written to a dedicated file descriptor (`>&9`), so only deliberate writes
+reach the list and diagnostics can never contaminate it. A fixed descriptor
+number is used rather than `{var}>` for bash 3.2 (stock macOS) compatibility.
+
+### Defect found #2 — global IFS disabling the /proc fast path
+
+`hasher.sh` sets `IFS=$'\n\t'` globally. `/proc/PID/stat` is space-separated.
+`_enum_group_pids()` parsed it with `read -r _state _ppid _pgrp _`, so with
+that IFS the entire remainder landed in `_state` and `_pgrp` was left empty —
+the pgid comparison could never match.
+
+The `/proc` enumeration path therefore returned **nothing, always**, on Linux
+and Synology DSM. Every orphan check reported "PGID clean". Every shutdown
+survivor count was zero. The critical lock protection added in v1.3.24 had
+been inert on the primary target platform ever since the /proc fast path was
+introduced in v1.3.32.
+
+It failed *open*, which is precisely why seven review rounds never surfaced
+it: normal runs look perfectly healthy. Caught by 60-process-safety, which
+plants a synthetic stale lock whose recorded process group still contains a
+live process and asserts the run is refused.
+
+Fixed by scoping `IFS=' '` to the two `read` statements.
+
+### Launcher: live runs take precedence in the summary
+
+Reported from a live NAS: with a hash 41% complete and roughly five and a half
+hours remaining, the menu displayed "Latest successful hash is waiting for
+duplicate analysis. Next: rerun duplicate analysis — option r". The advice was
+actively wrong — the analysis it suggested running would have collided with
+the run already underway.
+
+New `print_hashing_progress()` runs before the analysis summary and takes
+precedence when a run is active. It reads the newest `[PROGRESS]` line from
+the background log (bounded `tail`, so log size costs nothing) and handles
+both phases:
+
+```
+Hashing in progress.
+   Progress:           41% (108267/263289 files)
+   Elapsed:            3h 49m
+   Estimated remaining: 5h 27m
+
+Next: follow the log — option l, or check status — option s
+Duplicate analysis will be prepared automatically when hashing completes.
+```
+
+During discovery, where no percentage is possible because the total is what
+the walk is still determining:
+
+```
+Hashing in progress.
+   Stage:              building the file inventory
+   Files discovered:   48231 so far
+   Elapsed:            00:02:15
+   No estimate yet — the total is still being counted.
+```
+
+### Reflection
+
+Both defects failed open and were invisible in normal operation. The second is
+the more instructive: a critical fix, built and verified at the time and
+re-verified in several later rounds, had been quietly doing nothing on the
+deployment platform. The verification used synthetic lock directories in a
+container where the code path happened to work, not the real one.
+
+That is the gap a standing suite closes. It is not that these tests are
+cleverer than the manual checks were — several are near-identical to commands
+run by hand during earlier reviews. It is that they run again on every change,
+so a guarantee verified once cannot silently stop holding.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
