@@ -3145,6 +3145,55 @@ not a config file) took two attempts — worth noting since any future case
 touching the first-run flow needs it.
 
 ---
+## 2026‑08 — v1.4.3
+**Documentation accuracy — the directory tree matched an install from twelve releases ago**
+
+The Directory Structure section in `readme.md` had drifted badly. Since it is
+the first thing a visitor to the repository sees after the introduction, an
+inaccurate tree is worse than no tree: it teaches the wrong mental model
+before anyone opens a file.
+
+What was wrong:
+
+- **`tests/` was entirely absent** — the whole fault-injection suite added in
+  v1.4.1, eleven files, undocumented.
+- **`lib/awk-detect.sh` and `lib/log.sh` were missing.** Only `host-detect.sh`
+  was listed, alongside an `← v1.1.9` annotation.
+- **`quarantine/` was shown at the repository root.** The install-relative
+  default has been `<install-dir>/quarantine-<date>` since v1.3.2, and the
+  tracked path is `var/quarantine/`. The diagram described neither.
+- **Version annotations were stale** — `← v1.1.13` on `review-folder-plan.sh`,
+  `← v1.1.9` on `host-detect.sh`. Both were pointing at releases long past by
+  the time anyone read them, and neither said anything a reader needed.
+- **`partial-hasher-*.csv` was undocumented**, despite v1.3.26 making the
+  distinction between complete and partial manifests load-bearing.
+- **`local/.setup-complete` was undocumented**, which matters because it is
+  the sentinel that decides whether the guided setup runs.
+
+### Changes
+
+The tree now lists every tracked file with a one-line note on what each tool
+does, so the section works as an orientation map rather than a bare listing.
+Runtime directories are described by what they hold and marked as untracked.
+Two short notes follow the diagram: where quarantine actually goes and how to
+pin it with `QUARANTINE_DIR`, and which paths are excluded from git along with
+why the `var/**/.gitkeep` files are tracked.
+
+Per-file version annotations were dropped rather than corrected. They were the
+part that went stale fastest, and `version-history.md` already answers "when
+did this arrive" properly.
+
+### Verification
+
+The section was checked in both directions rather than by eye: every filename
+mentioned in the diagram resolves to a real file, and every tracked file
+outside the runtime directories appears in the diagram. Both checks are clean.
+That bidirectional check is what should be repeated whenever a file is added
+or removed — it is what the previous drift would have caught immediately.
+
+No code changed. Suite unchanged at 9 cases, 104 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

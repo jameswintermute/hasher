@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.2**
+Started Dec 2022. Current version: **v1.4.3**
 
 ### First-run launch screen
 
@@ -444,47 +444,85 @@ var/jobs.conf (set by the 'p' menu) > HASH_JOBS env > default (1)`.
 
 ```
 hasher/
-├── bin/
-│   ├── apply-folder-plan.sh
-│   ├── auto-dedup.sh
-│   ├── check-deps.sh
-│   ├── clean-logs.sh
-│   ├── csv-quick-stats.sh
-│   ├── delete-duplicates.sh
-│   ├── delete-junk.sh
-│   ├── delete-zero-length.sh
-│   ├── find-duplicate-folders.sh
-│   ├── find-duplicates.sh
-│   ├── hash-check.sh
-│   ├── hasher.sh
-│   ├── launch-review.sh
-│   ├── review-duplicates.sh
-│   ├── review-folder-plan.sh    ← v1.1.13
-│   └── run-find-duplicates.sh
+├── bin/                              — the tools
+│   ├── apply-folder-plan.sh             apply a reviewed FOLDER plan
+│   ├── auto-dedup.sh                    no-prompt file dedup
+│   ├── check-deps.sh                    dependency check (--fix offers shims)
+│   ├── clean-logs.sh                    rotate and prune logs/
+│   ├── csv-quick-stats.sh               manifest summary
+│   ├── delete-duplicates.sh             apply a FILE plan (quarantine-first)
+│   ├── delete-junk.sh                   remove local/junk-extensions.txt matches
+│   ├── delete-zero-length.sh            remove or quarantine 0-byte files
+│   ├── find-duplicate-folders.sh        folder-level discovery
+│   ├── find-duplicates.sh               file-level discovery
+│   ├── hash-check.sh                    verify a file against the manifest
+│   ├── hasher.sh                        the hashing engine
+│   ├── launch-review.sh                 review entry point
+│   ├── review-duplicates.sh             interactive FILE review
+│   ├── review-folder-plan.sh            interactive FOLDER review
+│   ├── run-find-duplicates.sh           discovery wrapper
+│   └── self-test.sh                     installation preflight
 │
-├── lib/
-│   └── host-detect.sh           ← v1.1.9
+├── lib/                              — shared modules
+│   ├── awk-detect.sh                    BusyBox NUL-handling probe
+│   ├── host-detect.sh                   platform detection, path helpers
+│   └── log.sh                           shared logging
+│
+├── tests/                            — fault-injection suite
+│   ├── run-tests.sh                     runner
+│   ├── lib/
+│   │   └── harness.sh                   sandboxes, shims, fixtures, assertions
+│   └── cases/
+│       ├── 01-core-hashing.sh
+│       ├── 10-input-validation.sh
+│       ├── 20-snapshot-integrity.sh
+│       ├── 30-manifest-validation.sh
+│       ├── 40-dedup-safety.sh
+│       ├── 50-exit-status.sh
+│       ├── 60-process-safety.sh
+│       ├── 70-launcher-status.sh
+│       └── 80-first-run-gating.sh
 │
 ├── default/
-│   └── hasher.conf
+│   └── hasher.conf                      shipped defaults — do not edit
 │
-├── local/                       — your config (gitignored)
-│   ├── exceptions-hashes.txt
-│   ├── excludes.txt
-│   ├── hasher.conf
-│   ├── junk-extensions.txt
-│   └── paths.txt
+├── local/                            — your config (not tracked)
+│   ├── paths.txt                        what to scan, one path per line
+│   ├── excludes.txt                     glob patterns to skip
+│   ├── junk-extensions.txt              extensions for option 7
+│   ├── exceptions-hashes.txt            hashes never to quarantine
+│   ├── hasher.conf                      your overrides (optional)
+│   └── .setup-complete                  guided-setup sentinel
 │
-├── logs/                        — plan files and reports (gitignored)
-├── hashes/                      — hash CSVs (gitignored)
-├── var/                         — working files, jobs.conf (gitignored)
-├── quarantine/                  — files moved by delete-duplicates.sh
+├── hashes/                           — manifests (not tracked)
+│   ├── hasher-<stamp>.csv               complete manifests
+│   └── partial-hasher-<stamp>.csv       incomplete runs, kept for diagnosis
 │
-├── launcher.sh
-├── LICENSE
+├── logs/                             — reports and plans (not tracked)
+│
+├── var/                              — internal working state (not tracked)
+│   ├── low-value/
+│   ├── quarantine/
+│   └── zero-length/
+│
+├── quarantine-<date>/                — quarantined files (created on demand)
+│
+├── launcher.sh                       — the menu; start here
 ├── readme.md
-└── version-history.md
+├── version-history.md
+├── LICENSE
+└── .gitignore
 ```
+
+**Quarantine location.** Since v1.3.2 the default is install-relative:
+`<install-dir>/quarantine-<date>`, created the first time something is
+quarantined. It therefore follows the tool if you move the install. Set
+`QUARANTINE_DIR` in `local/hasher.conf` to pin it somewhere fixed.
+
+**What is not tracked.** `hashes/`, `logs/`, `var/` contents, `quarantine-*/`
+and `local/` are all runtime or machine-specific and are excluded by
+`.gitignore`. The three `.gitkeep` files under `var/` are tracked so the
+directory skeleton survives a fresh clone.
 
 ---
 
