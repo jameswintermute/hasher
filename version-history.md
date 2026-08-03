@@ -3085,6 +3085,66 @@ run by hand during earlier reviews. It is that they run again on every change,
 so a guarantee verified once cannot silently stop holding.
 
 ---
+## 2026‑08 — v1.4.2
+**First-run gating — an unconfigured install can no longer start an empty run**
+
+Reported from a fresh extraction on the NAS. Three defects compounded into a
+state a user could not get out of.
+
+On a genuinely fresh clone `local/paths.txt` is an empty template. Declining
+the guided setup leaves it that way — and the first-run screen still
+announced "Your configuration is complete" and offered
+`1) Initiate first Hasher run (recommended)`.
+
+Accepting produced:
+
+```
+[INFO] Roots listed: 0 (existing: 0, missing: 0)
+[NEXT] Hasher launched (PID 868).
+```
+
+No warning at any point. The run discovered nothing and wrote a header-only
+CSV.
+
+The third defect is what made it unrecoverable. `has_successful_hash_manifest`
+tested only that some `hasher-*.csv` existed, so that empty file counted as a
+manifest: the welcome screen disappeared **permanently** and the user landed
+in the full workflow menu, being advised to run duplicate analysis over zero
+rows, with no route back.
+
+### Fixes
+
+- **`has_successful_hash_manifest` requires a data row.** A header-only CSV
+  no longer releases the first-run screen. Implemented as `head -n 2 | wc -l`
+  so manifest size costs nothing.
+- **The welcome screen reflects real configuration.** With no scan paths it
+  now reads "One more step before the first run", explains that there is
+  nothing to hash, and offers only Settings and Help — the hash option is
+  withheld because it cannot succeed. When paths exist it confirms the count:
+  `Scan paths configured: 7`.
+- **`preflight_hashing` returns non-zero on zero roots**, and
+  `run_hasher_nohup` aborts before truncating the background log or
+  launching. The previous run's log therefore survives a mistaken start.
+- **The `1` key is refused when unconfigured**, since the option being
+  unlisted does not stop anyone typing it.
+
+Direct CLI use is unchanged: `hasher.sh --pathfile <empty>` still exits 0 with
+a header-only CSV, which is correct for scripted callers and is asserted by
+50-exit-status. The gating belongs in the launcher, where the user is being
+offered a choice.
+
+### Test coverage
+
+New case `80-first-run-gating`, 13 assertions covering all five states:
+unconfigured screen content, forced `1` refusal with no manifest created,
+header-only CSV rejection, single-row CSV acceptance, and the configured
+screen. Suite now 9 cases, 104 assertions.
+
+Finding the sentinel for the guided-setup wizard (`local/.setup-complete`,
+not a config file) took two attempts — worth noting since any future case
+touching the first-run flow needs it.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

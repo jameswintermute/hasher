@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.1 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.2 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -724,6 +724,10 @@ sample_files_quick() {
   printf "%s" "$total"
 }
 
+# preflight_hashing — report what will be scanned.
+# v1.4.2: returns non-zero when there is nothing to scan, so callers can
+# stop before launching. Previously it reported "Roots listed: 0" and the
+# run started anyway, producing a header-only CSV with no warning.
 preflight_hashing() {
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
@@ -742,6 +746,17 @@ preflight_hashing() {
     warn "No paths file found (local/paths.txt or ./paths.txt)."
   fi
   if [ -n "$efile" ]; then info "Excludes file: $efile"; fi
+
+  # v1.4.2: hard stop when nothing is configured. A run with zero roots
+  # cannot discover anything; letting it proceed wastes the user's time and
+  # leaves a header-only manifest behind that later confuses the workflow.
+  if [ "$(count_active_scan_paths)" -lt 1 ]; then
+    err "No scan paths configured — nothing to hash."
+    info "Add at least one directory to ${pfile:-$LOCAL_DIR/paths.txt}, one per line."
+    info "The launcher can do this for you: Settings → Review scan paths."
+    return 1
+  fi
+  return 0
 }
 
 find_hasher_script() {
@@ -762,7 +777,12 @@ run_hasher_nohup() {
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
 
-  preflight_hashing
+  # v1.4.2: preflight now returns non-zero when nothing is configured.
+  # Abort before truncating the background log or launching anything, so the
+  # previous run's log stays readable and no empty manifest is created.
+  if ! preflight_hashing; then
+    return 1
+  fi
   : >"$BACKGROUND_LOG" 2>/dev/null || true
 
   pfile="$(determine_paths_file)"
@@ -2012,15 +2032,69 @@ hasher_processes_running() {
 }
 
 has_successful_hash_manifest() {
-  [ -n "$(latest_hashes_csv)" ]
+  # v1.4.2: a header-only CSV is NOT a usable manifest.
+  #
+  # Previously this checked only that some hasher-*.csv existed. A run with
+  # no scan paths configured produces exactly that — a file containing the
+  # header and nothing else — and the first-run screen would then disappear
+  # for good, dropping the user into the full workflow menu with a manifest
+  # holding zero rows and no way back. Requiring a data row keeps the
+  # welcome screen in place until there is genuinely something to work with.
+  local _csv
+  _csv="$(latest_hashes_csv)"
+  [ -n "$_csv" ] || return 1
+  [ -r "$_csv" ] || return 1
+  # Cheap: stop reading as soon as a second line is seen.
+  [ "$(head -n 2 "$_csv" 2>/dev/null | wc -l | tr -d ' ')" -ge 2 ]
+}
+
+# count_active_scan_paths — non-blank, non-comment entries in the paths file.
+# v1.4.2: used to decide whether the install is actually configured, rather
+# than assuming it is because the launcher reached the main menu.
+count_active_scan_paths() {
+  local _pf
+  _pf="$(determine_paths_file)"
+  if [ -z "$_pf" ] || [ ! -r "$_pf" ]; then printf '0'; return; fi
+  grep -cvE '^[[:space:]]*(#|$)' "$_pf" 2>/dev/null | tr -d ' ' || printf '0'
 }
 
 print_first_hash_menu() {
+  # v1.4.2: the screen must reflect what is actually configured.
+  #
+  # It previously announced "Your configuration is complete" unconditionally
+  # and offered to start hashing. A user who declined the guided setup has
+  # an empty paths.txt, so that claim was false and the offered action could
+  # not work — it launched a run that discovered nothing and wrote a
+  # header-only CSV. Checking the paths file lets the screen ask for what is
+  # missing instead of inviting an action that cannot succeed.
+  local _roots
+  _roots="$(count_active_scan_paths)"
+
   echo
+  if [ "${_roots:-0}" -lt 1 ]; then
+    printf '%sWelcome. One more step before the first run.%s\n' "$BOLD" "$RST"
+    echo
+    echo "No scan paths are configured yet, so there is nothing to hash."
+    echo "Add at least one directory and the first run becomes available."
+    echo
+    printf '%sNeeded: choose what to scan%s\n' "$BOLD" "$RST"
+    echo "   Settings & preferences → Review scan paths"
+    echo
+    echo "   2) Settings & preferences  ← start here"
+    echo "   3) Help & information"
+    echo
+    echo "   q) Quit"
+    echo
+    printf "Select an option: "
+    return 0
+  fi
+
   printf '%sWelcome. Hasher is ready for its first run.%s\n' "$BOLD" "$RST"
   echo
-  echo "Your configuration is complete. The first hash safely inventories your"
-  echo "files and prepares the duplicate analysis used by the review workflow."
+  printf '   Scan paths configured: %s\n' "$_roots"
+  echo
+  echo "The first hash safely inventories your files and prepares the"
+  echo "duplicate analysis used by the review workflow."
   echo "No files are changed during hashing."
   echo
 
@@ -2128,7 +2202,14 @@ while :; do
     read -r choice || { echo; exit 0; }
     case "${choice:-}" in
       1)
-        if is_hasher_running || hasher_processes_running; then
+        # v1.4.2: `1` is not offered when no scan paths exist, but a user
+        # may still type it. Redirect to settings rather than launching a
+        # run that can only produce an empty manifest.
+        if [ "$(count_active_scan_paths)" -lt 1 ]; then
+          warn "No scan paths configured — there is nothing to hash yet."
+          info "Add a directory under Settings & preferences (option 2)."
+          printf "Press Enter to continue... "; read -r _ || true
+        elif is_hasher_running || hasher_processes_running; then
           info "The first hash run is already active."
           printf "Press Enter to continue... "; read -r _ || true
         else

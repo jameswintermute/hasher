@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.1**
+Started Dec 2022. Current version: **v1.4.2**
 
 ### First-run launch screen
 
