@@ -779,6 +779,23 @@ build_file_list() {
     if [[ ! -r "$PATHFILE" ]]; then
       error "Cannot read --pathfile '$PATHFILE'"; exit 1
     fi
+    # v1.4.1: the discovery list is written through a DEDICATED file
+    # descriptor rather than by redirecting the loop's stdout.
+    #
+    # Previously the loop ended `done < "$PATHFILE" >> "$FILES_LIST".tmp`,
+    # so *everything* the loop printed landed in the NUL-delimited list —
+    # including warn/info output, which writes to stdout. A single
+    # "Symlink refused" or "Path does not exist" warning injected its text
+    # (ANSI codes and all) into the list, and because warn emits \n rather
+    # than \0 the warning and the NEXT discovered path shared one NUL
+    # record. The delimiter guard then dropped that whole record, silently
+    # losing a real file from the manifest.
+    #
+    # Routing paths to FD 9 makes the data path explicit: only deliberate
+    # `>&9` writes reach the list, and diagnostics can never contaminate it.
+    # A fixed descriptor number is used rather than `{var}>` for bash 3.2
+    # (stock macOS) compatibility.
+    exec 9>> "$FILES_LIST".tmp || { error "Cannot open discovery list for writing"; exit 1; }
     while IFS= read -r raw || [[ -n "$raw" ]]; do
       # v1.3.20: strip trailing CR before anything else. A paths.txt saved
       # from a Windows editor, or copy-pasted from a web page, can carry
@@ -843,9 +860,9 @@ build_file_list() {
         # find. Branch explicitly instead — a tiny amount of duplication
         # is safer than a subtle cross-version quirk.
         if [[ ${#prune_args[@]} -gt 0 ]]; then
-          find "$path_real" "${prune_args[@]}" -type f -print0 2>"$find_err" || find_status=$?
+          find "$path_real" "${prune_args[@]}" -type f -print0 >&9 2>"$find_err" || find_status=$?
         else
-          find "$path_real" -type f -print0 2>"$find_err" || find_status=$?
+          find "$path_real" -type f -print0 >&9 2>"$find_err" || find_status=$?
         fi
         if [[ "$find_status" -eq 0 ]]; then
           pathfile_valid=$((pathfile_valid + 1))
@@ -871,7 +888,7 @@ build_file_list() {
         local path_real
         path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
         if [[ -n "$path_real" && -f "$path_real" ]]; then
-          printf '%s\0' "$path_real"
+          printf '%s\0' "$path_real" >&9
           pathfile_valid=$((pathfile_valid + 1))
         else
           warn "Could not canonicalise file path: $path"
@@ -879,7 +896,8 @@ build_file_list() {
       else
         warn "Path does not exist: $path"
       fi
-    done < "$PATHFILE" >> "$FILES_LIST".tmp
+    done < "$PATHFILE"
+    exec 9>&-
     had_input=true
   fi
 
@@ -918,6 +936,8 @@ build_file_list() {
       # Emit each incoming path through the same expansion policy as --pathfile
       local stdin_seen=0 stdin_valid=0
       if [[ "$_delim" = '\0' ]]; then
+        # v1.4.1: see the FD 9 note in the --pathfile branch above.
+        exec 9>> "$FILES_LIST".tmp || { error "Cannot open discovery list for writing"; exit 1; }
         while IFS= read -r -d '' path || [[ -n "$path" ]]; do
           [[ -z "$path" ]] && continue
           stdin_seen=$((stdin_seen + 1))
@@ -932,9 +952,9 @@ build_file_list() {
             fi
             local _fs=0
             if [[ ${#prune_args[@]} -gt 0 ]]; then
-              find "$path_real" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" "${prune_args[@]}" -type f -print0 >&9 2>/dev/null || _fs=$?
             else
-              find "$path_real" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" -type f -print0 >&9 2>/dev/null || _fs=$?
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
@@ -942,7 +962,7 @@ build_file_list() {
             local path_real
             path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
             if [[ -n "$path_real" && -f "$path_real" ]]; then
-              printf '%s\0' "$path_real"
+              printf '%s\0' "$path_real" >&9
               stdin_valid=$((stdin_valid + 1))
             else
               warn "Could not canonicalise piped file: $path"
@@ -950,8 +970,11 @@ build_file_list() {
           else
             warn "Piped path does not exist: $path"
           fi
-        done < "$tmp_in" >> "$FILES_LIST".tmp
+        done < "$tmp_in"
+        exec 9>&-
       else
+        # v1.4.1: see the FD 9 note in the --pathfile branch above.
+        exec 9>> "$FILES_LIST".tmp || { error "Cannot open discovery list for writing"; exit 1; }
         while IFS= read -r path || [[ -n "$path" ]]; do
           # v1.3.20: strip trailing CR (see pathfile-loop comment above)
           path="${path%$'\r'}"
@@ -968,9 +991,9 @@ build_file_list() {
             fi
             local _fs=0
             if [[ ${#prune_args[@]} -gt 0 ]]; then
-              find "$path_real" "${prune_args[@]}" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" "${prune_args[@]}" -type f -print0 >&9 2>/dev/null || _fs=$?
             else
-              find "$path_real" -type f -print0 2>/dev/null || _fs=$?
+              find "$path_real" -type f -print0 >&9 2>/dev/null || _fs=$?
             fi
             [[ "$_fs" -eq 0 ]] && stdin_valid=$((stdin_valid + 1)) \
               || warn "find failed on piped path '$path' (exit $_fs) — skipping"
@@ -978,7 +1001,7 @@ build_file_list() {
             local path_real
             path_real="$(canonical_existing_path "$path" 2>/dev/null || true)"
             if [[ -n "$path_real" && -f "$path_real" ]]; then
-              printf '%s\0' "$path_real"
+              printf '%s\0' "$path_real" >&9
               stdin_valid=$((stdin_valid + 1))
             else
               warn "Could not canonicalise piped file: $path"
@@ -986,7 +1009,8 @@ build_file_list() {
           else
             warn "Piped path does not exist: $path"
           fi
-        done < "$tmp_in" >> "$FILES_LIST".tmp
+        done < "$tmp_in"
+        exec 9>&-
       fi
       rm -f -- "$tmp_in" 2>/dev/null || true
       if [[ "$stdin_seen" -gt 0 && "$stdin_valid" -eq 0 ]]; then
@@ -1465,7 +1489,18 @@ _enum_group_pids() {
       [[ "$_p" = "$$" || "$_p" = "$_self_pid" || ( -n "$_extra_exclude" && "$_p" = "$_extra_exclude" ) ]] && continue
       IFS= read -r _rest < "$_stat" 2>/dev/null || continue
       _rest="${_rest##*) }"
-      read -r _state _ppid _pgrp _ <<< "$_rest"
+      # v1.4.1: /proc/PID/stat is SPACE-separated, but this script sets a
+      # global IFS=$'\n\t' (no space) at the top. Without restoring space
+      # here, `read` puts the entire remainder into _state and leaves
+      # _pgrp empty — so the pgid comparison below never matches and this
+      # whole /proc fast path silently returns nothing.
+      #
+      # The consequence was severe and invisible: every orphan check
+      # reported "PGID clean", so stale locks were adopted while workers
+      # were still running, and shutdown survivor counts were always zero.
+      # It failed OPEN, which is why normal runs never surfaced it.
+      # Setting IFS on the `read` itself keeps the change local.
+      IFS=' ' read -r _state _ppid _pgrp _ <<< "$_rest"
       [[ "$_pgrp" = "$_pgid" ]] || continue
       [[ "$_state" = "Z" ]] && continue
       printf '%s\n' "$_p"
@@ -1507,7 +1542,18 @@ _enum_children() {
       [[ "$_p" = "$_self_pid" ]] && continue
       IFS= read -r _rest < "$_stat" 2>/dev/null || continue
       _rest="${_rest##*) }"
-      read -r _state _ppid _pgrp _ <<< "$_rest"
+      # v1.4.1: /proc/PID/stat is SPACE-separated, but this script sets a
+      # global IFS=$'\n\t' (no space) at the top. Without restoring space
+      # here, `read` puts the entire remainder into _state and leaves
+      # _pgrp empty — so the pgid comparison below never matches and this
+      # whole /proc fast path silently returns nothing.
+      #
+      # The consequence was severe and invisible: every orphan check
+      # reported "PGID clean", so stale locks were adopted while workers
+      # were still running, and shutdown survivor counts were always zero.
+      # It failed OPEN, which is why normal runs never surfaced it.
+      # Setting IFS on the `read` itself keeps the change local.
+      IFS=' ' read -r _state _ppid _pgrp _ <<< "$_rest"
       [[ "$_ppid" = "$_parent" ]] || continue
       [[ "$_state" = "Z" ]] && continue
       printf '%s\n' "$_p"
@@ -2304,7 +2350,7 @@ sort_output_csv() {
 _run_post_hash_discovery() {
   local _csv="$1"
   local _disc_start _disc_end _disc_elapsed
-  local _folder_groups=0 _file_groups=0
+  local _folder_groups=0 _folders_to_quarantine=0 _file_groups=0
   local _folder_status=disabled _file_status=disabled
   local _folder_before="" _folder_after="" _file_report="" _file_source=""
   _disc_start=$(date +%s)
@@ -2334,7 +2380,8 @@ _run_post_hash_discovery() {
       _folder_status=ready
       _folder_after=$(ls -1t "$LOGS_DIR"/duplicate-folders-groups-[0-9]*.tsv 2>/dev/null | head -n1 || true)
       if [[ -n "$_folder_after" && "$_folder_after" != "$_folder_before" ]]; then
-        _folder_groups=$(wc -l < "$_folder_after" 2>/dev/null | tr -d ' ' || echo 0)
+        _folders_to_quarantine=$(wc -l < "$_folder_after" 2>/dev/null | tr -d ' ' || echo 0)
+        _folder_groups=$(awk -F '\t' '{seen[$2]=1} END{for(k in seen)n++; print n+0}' "$_folder_after" 2>/dev/null || echo 0)
       fi
       bglog INFO "Post-hash discovery: folder scan completed successfully."
     else
@@ -2415,6 +2462,7 @@ _run_post_hash_discovery() {
     printf 'files_hashed=%s\n' "$_files_hashed"
     printf 'folder_status=%s\n' "$_folder_status"
     printf 'folder_groups=%s\n' "${_folder_groups:-0}"
+    printf 'folders_to_quarantine=%s\n' "${_folders_to_quarantine:-0}"
     printf 'file_status=%s\n' "$_file_status"
     printf 'file_groups=%s\n' "${_file_groups:-0}"
   } > "$_summary_file"
