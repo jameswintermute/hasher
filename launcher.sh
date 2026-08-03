@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.0 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.1 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -361,7 +361,77 @@ refresh_analysis_summary() {
   cp -f -- "$_out" "$_tmp" && mv -f -- "$_tmp" "$LOGS_DIR/post-hash-analysis-latest.meta"
 }
 
+# ── Live run status (v1.4.1) ────────────────────────────────────────────────
+# When a hash is in flight, the analysis summary is describing the PREVIOUS
+# run — so leading with "waiting for duplicate analysis / rerun analysis" is
+# actively misleading: the thing the user is waiting for is already underway,
+# and the action being recommended would collide with it.
+#
+# This reads the newest [PROGRESS] line from the background log and reports
+# where the current run has got to. It recognises both phases:
+#   walk    "Walking paths: N file(s) discovered so far | elapsed=..."
+#   hashing "Hashing: [41%] 108267/263289 | elapsed=... eta=..."
+#
+# Returns 0 when a run is in progress (caller should skip the stale summary),
+# 1 when nothing is running.
+print_hashing_progress() {
+  is_hasher_running || hasher_processes_running || return 1
+
+  local _line="" _pct="" _counts="" _eta="" _elapsed="" _walk=""
+  if [ -r "$BACKGROUND_LOG" ]; then
+    # tail is bounded so a multi-gigabyte log costs nothing to inspect.
+    _line="$(tail -n 400 "$BACKGROUND_LOG" 2>/dev/null \
+      | sed 's/\x1b\[[0-9;]*m//g' \
+      | grep -F '[PROGRESS]' | tail -n1 || true)"
+  fi
+
+  echo
+  printf '%sHashing in progress.%s\n' "$BOLD" "$RST"
+
+  case "$_line" in
+    *"Walking paths:"*)
+      # Discovery phase: no percentage is possible yet, since the total is
+      # exactly what the walk is still determining.
+      _walk="$(printf '%s' "$_line" | sed -n 's/.*Walking paths: \([0-9]*\) file.*/\1/p')"
+      _elapsed="$(printf '%s' "$_line" | sed -n 's/.*elapsed=\([0-9:]*\).*/\1/p')"
+      printf '   Stage:              building the file inventory\n'
+      [ -n "$_walk" ]    && printf '   Files discovered:   %s so far\n' "$_walk"
+      [ -n "$_elapsed" ] && printf '   Elapsed:            %s\n' "$_elapsed"
+      printf '   No estimate yet — the total is still being counted.\n'
+      ;;
+    *"Hashing:"*)
+      _pct="$(printf '%s' "$_line"    | sed -n 's/.*Hashing: \[\([0-9]*\)%\].*/\1/p')"
+      _counts="$(printf '%s' "$_line" | sed -n 's/.*Hashing: \[[0-9]*%\] \([0-9]*\/[0-9]*\).*/\1/p')"
+      _elapsed="$(printf '%s' "$_line" | sed -n 's/.*elapsed=[0-9:]* (\([^)]*\)).*/\1/p')"
+      _eta="$(printf '%s' "$_line"     | sed -n 's/.*eta=[0-9:]* (\([^)]*\)).*/\1/p')"
+      [ -n "$_pct" ] && [ -n "$_counts" ] \
+        && printf '   Progress:           %s%% (%s files)\n' "$_pct" "$_counts"
+      [ -n "$_elapsed" ] && printf '   Elapsed:            %s\n' "$_elapsed"
+      if [ -n "$_eta" ]; then
+        printf '   %sEstimated remaining: %s%s\n' "$BOLD" "$_eta" "$RST"
+      fi
+      ;;
+    *)
+      # Running, but no progress line yet. The first heartbeat is one
+      # interval away (15s by default), so this window is brief.
+      printf '   Starting up — the first progress report is due shortly.\n'
+      ;;
+  esac
+
+  echo
+  printf '%sNext: follow the log — option l, or check status — option s%s\n' "$BOLD" "$RST"
+  printf 'Duplicate analysis will be prepared automatically when hashing completes.\n'
+  return 0
+}
+
 print_analysis_summary() {
+  # v1.4.1: a live run takes precedence. Showing the previous run's counts
+  # while a new one is underway invites the user to act on data that is
+  # about to be replaced.
+  if print_hashing_progress; then
+    return 0
+  fi
+
   _meta="$LOGS_DIR/post-hash-analysis-latest.meta"
   _latest_csv="$(latest_hashes_csv)"
   [ -n "$_latest_csv" ] || return 0
@@ -1542,6 +1612,31 @@ action_self_test(){
   else
     err "$BIN_DIR/self-test.sh not found."
   fi
+
+  # v1.4.1: the self-test checks that the installation is intact — files
+  # present, tools available, config readable. The fault-injection suite
+  # checks that the tool still *behaves* correctly under adversarial input.
+  # They answer different questions, so offer the second one separately
+  # rather than folding it into the first.
+  if [ -r "$ROOT_DIR/tests/run-tests.sh" ]; then
+    echo
+    info "A behavioural test suite is also available. It exercises the"
+    info "situations that have historically caused defects — overlapping"
+    info "scan roots, hard links, files modified mid-hash, damaged"
+    info "manifests, stale locks — using disposable sandboxes."
+    info "Nothing outside a temporary directory is touched."
+    echo
+    printf "Run the fault-injection suite now? (takes ~30s) [y/N]: "
+    read -r _ans || _ans=""
+    case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes)
+        echo
+        bash "$ROOT_DIR/tests/run-tests.sh" || true
+        ;;
+      *) info "Skipped. Run it any time with: tests/run-tests.sh" ;;
+    esac
+  fi
+
   printf "Press Enter to continue... "; read -r _ || true;
 }
 
@@ -1932,6 +2027,28 @@ print_first_hash_menu() {
   if is_hasher_running || hasher_processes_running; then
     printf '%sFirst hash currently running.%s\n' "$BOLD" "$RST"
     echo "   Hasher is building the initial file inventory in the background."
+    # v1.4.1: on a first run there is nothing else to look at, so the
+    # progress detail matters more here than anywhere. print_hashing_progress
+    # prints its own heading and next-step line, so only its body is wanted;
+    # the surrounding text above and the option list below provide the
+    # framing.
+    _fr_line=""
+    if [ -r "$BACKGROUND_LOG" ]; then
+      _fr_line="$(tail -n 400 "$BACKGROUND_LOG" 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g' | grep -F '[PROGRESS]' | tail -n1 || true)"
+    fi
+    case "$_fr_line" in
+      *"Walking paths:"*)
+        _fr_n="$(printf '%s' "$_fr_line" | sed -n 's/.*Walking paths: \([0-9]*\) file.*/\1/p')"
+        [ -n "$_fr_n" ] && echo "   Files discovered so far: $_fr_n (still counting)"
+        ;;
+      *"Hashing:"*)
+        _fr_pct="$(printf '%s' "$_fr_line" | sed -n 's/.*Hashing: \[\([0-9]*\)%\].*/\1/p')"
+        _fr_eta="$(printf '%s' "$_fr_line" | sed -n 's/.*eta=[0-9:]* (\([^)]*\)).*/\1/p')"
+        [ -n "$_fr_pct" ] && echo "   Progress: ${_fr_pct}%"
+        [ -n "$_fr_eta" ] && printf '   %sEstimated remaining: %s%s\n' "$BOLD" "$_fr_eta" "$RST"
+        ;;
+    esac
     echo
     echo "   s) Check hashing status"
     echo "   l) Follow background log"
@@ -2029,8 +2146,14 @@ while :; do
     continue
   fi
 
+  # v1.4.1: a run in progress is reported in BOTH modes — it is a fact about
+  # the machine, not a feature of the automatic workflow. print_analysis_summary
+  # already defers to it, so calling the progress panel directly here avoids
+  # printing it twice in automatic mode.
   if [ "$(analysis_mode)" = "automatic" ]; then
     print_analysis_summary
+  else
+    print_hashing_progress || true
   fi
   print_menu
   read -r choice || { echo; exit 0; }
