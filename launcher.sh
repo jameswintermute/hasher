@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.3.32 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.0 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -313,11 +313,69 @@ action_stop_hashing() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+refresh_analysis_summary() {
+  local _csv _folder_meta _folder_source _folder_groups=0 _folder_candidates=0
+  local _file_report _file_source _file_groups=0 _files _out _tmp
+  _csv="$(latest_hashes_csv)"
+  [ -n "$_csv" ] && [ -r "$_csv" ] || return 1
+
+  _folder_status=pending
+  _folder_meta=""
+  for _m in "$LOGS_DIR"/duplicate-folders-analysis-*.meta; do
+    [ -r "$_m" ] || continue
+    grep -qxF '# HASHER_FOLDER_ANALYSIS v1' "$_m" 2>/dev/null || continue
+    _folder_source="$(sed -n 's/^source_csv=//p' "$_m" | head -n1)"
+    if [ "$_folder_source" = "$_csv" ]; then _folder_meta="$_m"; break; fi
+  done
+  if [ -n "$_folder_meta" ]; then
+    _folder_status=ready
+    _folder_groups="$(sed -n 's/^folder_groups=//p' "$_folder_meta" | head -n1)"
+    _folder_candidates="$(sed -n 's/^folders_to_quarantine=//p' "$_folder_meta" | head -n1)"
+  fi
+
+  _file_status=pending
+  _file_report="$LOGS_DIR/duplicate-hashes-latest.txt"
+  if [ -r "$_file_report" ] && grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$_file_report" 2>/dev/null; then
+    _file_source="$(sed -n 's/^# source-csv: //p' "$_file_report" | head -n1)"
+    if [ "$_file_source" = "$_csv" ]; then
+      _file_status=ready
+      _file_groups="$(grep -c '^HASH ' "$_file_report" 2>/dev/null || true)"
+    fi
+  fi
+
+  _files=$(( $(wc -l < "$_csv" 2>/dev/null | tr -d ' ' || echo 1) - 1 ))
+  [ "$_files" -ge 0 ] 2>/dev/null || _files=0
+  _out="$LOGS_DIR/post-hash-analysis-$(basename "$_csv" .csv).meta"
+  _tmp="$LOGS_DIR/post-hash-analysis-latest.meta.tmp.$$"
+  {
+    printf '# HASHER_POST_HASH_ANALYSIS v1\n'
+    printf 'source_csv=%s\n' "$_csv"
+    printf 'completed=%s\n' "$(date '+%F %H:%M')"
+    printf 'files_hashed=%s\n' "$_files"
+    printf 'folder_status=%s\n' "$_folder_status"
+    printf 'folder_groups=%s\n' "${_folder_groups:-0}"
+    printf 'folders_to_quarantine=%s\n' "${_folder_candidates:-0}"
+    printf 'file_status=%s\n' "$_file_status"
+    printf 'file_groups=%s\n' "${_file_groups:-0}"
+  } > "$_out" || return 1
+  cp -f -- "$_out" "$_tmp" && mv -f -- "$_tmp" "$LOGS_DIR/post-hash-analysis-latest.meta"
+}
+
 print_analysis_summary() {
   _meta="$LOGS_DIR/post-hash-analysis-latest.meta"
-  [ -r "$_meta" ] || return 0
+  _latest_csv="$(latest_hashes_csv)"
+  [ -n "$_latest_csv" ] || return 0
 
-  _source_csv=""; _completed=""; _files=""; _folder_status=""; _folder_groups=""; _file_status=""; _file_groups=""
+  # A metadata file is trusted only when it carries the expected provenance
+  # marker. Corrupt, partial or unrelated files are ignored safely.
+  if [ ! -r "$_meta" ] || ! grep -qxF '# HASHER_POST_HASH_ANALYSIS v1' "$_meta" 2>/dev/null; then
+    echo
+    printf '%sLatest successful hash is waiting for duplicate analysis.%s\n' "$BOLD" "$RST"
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+    return 0
+  fi
+
+  _source_csv=""; _completed=""; _files=""; _folder_status=""; _folder_groups=""; _folder_candidates=""; _file_status=""; _file_groups=""
   while IFS='=' read -r _k _v; do
     case "$_k" in
       source_csv) _source_csv="$_v" ;;
@@ -325,19 +383,32 @@ print_analysis_summary() {
       files_hashed) _files="$_v" ;;
       folder_status) _folder_status="$_v" ;;
       folder_groups) _folder_groups="$_v" ;;
+      folders_to_quarantine) _folder_candidates="$_v" ;;
       file_status) _file_status="$_v" ;;
       file_groups) _file_groups="$_v" ;;
     esac
   done < "$_meta"
 
-  _latest_csv="$(latest_hashes_csv)"
-  [ -n "$_latest_csv" ] && [ "$_source_csv" = "$_latest_csv" ] || return 0
+  if [ "$_source_csv" != "$_latest_csv" ]; then
+    echo
+    printf '%sLast successful hash — %s%s\n' "$BOLD" "$(date -r "$_latest_csv" '+%F %H:%M' 2>/dev/null || printf 'unknown')" "$RST"
+    printf '   Duplicate analysis is out of date.\n'
+    echo
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+    return 0
+  fi
 
   echo
-  printf '%sLast successful hash — %s%s\n' "$BOLD" "${_completed:-unknown}" "$RST"
+  printf '%sLast successful analysis — %s%s\n' "$BOLD" "${_completed:-unknown}" "$RST"
   printf '   Files hashed:       %s\n' "${_files:-unknown}"
   case "$_folder_status" in
-    ready)    printf '   Duplicate folders:  %s groups ready\n' "${_folder_groups:-0}" ;;
+    ready)
+      if [ -n "$_folder_candidates" ]; then
+        printf '   Duplicate folders:  %s groups — %s folders ready\n' "${_folder_groups:-0}" "$_folder_candidates"
+      else
+        printf '   Duplicate folders:  %s groups ready\n' "${_folder_groups:-0}"
+      fi
+      ;;
     disabled) printf '   Duplicate folders:  analysis disabled\n' ;;
     failed)   printf '   Duplicate folders:  analysis failed\n' ;;
     *)        printf '   Duplicate folders:  analysis pending\n' ;;
@@ -350,14 +421,23 @@ print_analysis_summary() {
   esac
   echo
 
-  if [ "$_folder_status" = "ready" ] && [ "${_folder_groups:-0}" -gt 0 ] 2>/dev/null; then
+  # Prefer a reviewed plan that explicitly belongs to this analysis.
+  _current_plan=""
+  for _p in "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt "$LOGS_DIR"/review-dedupe-plan-*.txt; do
+    [ -r "$_p" ] || continue
+    _pcsv="$(sed -n 's/^# Source CSV: //p; s/^# source-csv: //p' "$_p" 2>/dev/null | head -n1)"
+    if [ "$_pcsv" = "$_source_csv" ]; then _current_plan="$_p"; break; fi
+  done
+  if [ -n "$_current_plan" ]; then
+    printf '%sNext: apply reviewed plan — option 4%s\n' "$BOLD" "$RST"
+  elif [ "$_folder_status" = "ready" ] && [ "${_folder_groups:-0}" -gt 0 ] 2>/dev/null; then
     printf '%sNext: review duplicate folders — option 2%s\n' "$BOLD" "$RST"
   elif [ "$_file_status" = "ready" ] && [ "${_file_groups:-0}" -gt 0 ] 2>/dev/null; then
     printf '%sNext: review duplicate files — option 3%s\n' "$BOLD" "$RST"
   elif [ "$_folder_status" = "failed" ] || [ "$_file_status" = "failed" ]; then
     printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
   else
-    printf '%sNext: no duplicate groups are waiting for review%s\n' "$BOLD" "$RST"
+    printf '%sNo duplicate items are waiting for review.%s\n' "$BOLD" "$RST"
   fi
 }
 
@@ -392,35 +472,45 @@ analysis_mode() {
 }
 
 set_analysis_mode() {
-  local _mode="$1" _cfg="$LOCAL_DIR/hasher.conf" _tmp
+  local _mode="$1" _cfg="$LOCAL_DIR/hasher.conf" _tmp _saved
   case "$_mode" in automatic|manual) ;; *) return 2 ;; esac
   mkdir -p "$LOCAL_DIR" 2>/dev/null || return 1
   _tmp="$_cfg.tmp.$$"
   if [ -r "$_cfg" ]; then
     awk -v mode="$_mode" '
-      BEGIN { section=""; written=0; have_post=0 }
+      function ispost(s){ return s=="post_hash" || s=="post-hash" }
+      BEGIN { section=""; written=0; have_post=0; pending_blank=0 }
+      /^[[:space:]]*$/ {
+        if (ispost(section) && !written) { pending_blank=1; next }
+        print; next
+      }
       /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-        if (section=="post_hash" && !written) { print "analysis_mode = " mode; written=1 }
+        if (ispost(section) && !written) { print "analysis_mode = " mode; written=1 }
+        if (pending_blank) { print ""; pending_blank=0 }
         raw=$0; sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec); section=tolower(sec)
-        if (section=="post_hash" || section=="post-hash") have_post=1
+        if (ispost(section)) have_post=1
         print raw; next
       }
-      (section=="post_hash" || section=="post-hash") && /^[[:space:]]*(analysis_mode|analysis-mode)[[:space:]]*=/ {
+      ispost(section) && /^[[:space:]]*(analysis_mode|analysis-mode)[[:space:]]*=/ {
         if (!written) { print "analysis_mode = " mode; written=1 }
         next
       }
-      { print }
+      {
+        if (pending_blank) { print ""; pending_blank=0 }
+        print
+      }
       END {
+        if (ispost(section) && !written) { print "analysis_mode = " mode; written=1 }
         if (!have_post) { print ""; print "[post_hash]"; print "analysis_mode = " mode }
-        else if (!written) print "analysis_mode = " mode
+        if (pending_blank) print ""
       }
     ' "$_cfg" > "$_tmp" || { rm -f "$_tmp"; return 1; }
   else
-    {
-      printf '# Local Hasher configuration\n\n[post_hash]\nanalysis_mode = %s\n' "$_mode"
-    } > "$_tmp" || return 1
+    printf '# Local Hasher configuration\n\n[post_hash]\nanalysis_mode = %s\n' "$_mode" > "$_tmp" || return 1
   fi
-  mv -f "$_tmp" "$_cfg"
+  mv -f "$_tmp" "$_cfg" || return 1
+  _saved="$(analysis_mode)"
+  [ "$_saved" = "$_mode" ] || return 1
 }
 
 choose_analysis_mode() {
@@ -444,8 +534,10 @@ choose_analysis_mode() {
   if set_analysis_mode "$_mode"; then
     info "Analysis mode saved: $_mode"
   else
-    warn "Could not save analysis mode; the default automatic mode will be used."
+    warn "Could not save analysis mode; setup has not been marked complete."
+    return 1
   fi
+  return 0
 }
 
 print_menu_automatic() {
@@ -1014,7 +1106,12 @@ first_run_setup() {
   # Step 5 — automatic or manual duplicate-analysis workflow
   echo
   echo "${BOLD}Step 5 of 5 — Duplicate-analysis workflow${RST}"
-  choose_analysis_mode
+  if ! choose_analysis_mode; then
+    echo
+    warn "The workflow choice could not be saved. Setup will run again next launch."
+    printf "Press Enter to return... "; read -r _ || true
+    return 1
+  fi
   echo
   echo "${BOLD}Setup complete.${RST} You're ready to hash (menu option 1)."
   mark_setup_complete
@@ -1082,6 +1179,7 @@ action_find_duplicate_folders(){
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
+  refresh_analysis_summary || warn "Could not refresh the launcher analysis summary."
 
   groups=""
   if [ -n "$plan" ]; then
@@ -1226,6 +1324,7 @@ action_find_duplicate_files(){
     fi
   fi
   if [ "$_file_find_rc" -eq 0 ]; then
+    refresh_analysis_summary || warn "Could not refresh the launcher analysis summary."
     info "Duplicate-file scan completed."
   else
     err "Duplicate-file scan failed (exit $_file_find_rc). Review the error above; no successful result is implied."
@@ -1312,9 +1411,13 @@ action_apply_plan(){
   [ -n "$folder_plan" ] && has_folder=1
 
   if [ "$has_file" -eq 0 ] && [ "$has_folder" -eq 0 ]; then
-    info "No plan found. Generate one first:"
-    info "  - File dedup: option 2 (find duplicate files), then option 4 (review) or 5 (auto-dedup)"
-    info "  - Folder dedup: option 3 (find duplicate folders), then option 'r' (review)"
+    info "No reviewed plan found."
+    if [ "$(analysis_mode)" = "automatic" ]; then
+      info "  Review folders with option 2 or files with option 3."
+      info "  If analysis is missing or stale, use option 'r' to rerun it."
+    else
+      info "  Find folders with option 2, or files with option 3, then review the results."
+    fi
     printf "Press Enter to continue... "; read -r _ || true
     return
   fi
@@ -1797,10 +1900,135 @@ if is_first_run; then
   first_run_setup
 fi
 
+# ── First-run launch screen (v1.4.0) ─────────────────────────────────────────
+# Before any successful manifest exists, review and cleanup actions cannot do
+# anything useful — every one of them needs a hash manifest as input. Showing
+# the full 12-option menu at that point invites the user to pick something that
+# will only tell them "no manifest found". This focused screen offers the one
+# action that makes sense, plus settings and help.
+
+# Boolean wrapper around list_hasher_pids (v1.3.15), used by the first-run
+# screen to decide between "ready to begin" and "currently running".
+# v1.4.0: this was called by the first-run menu before it existed as a
+# function — defining it here keeps the pidfile check and the orphan scan
+# consistent with ensure_no_running_hasher().
+hasher_processes_running() {
+  [ -n "$(list_hasher_pids)" ]
+}
+
+has_successful_hash_manifest() {
+  [ -n "$(latest_hashes_csv)" ]
+}
+
+print_first_hash_menu() {
+  echo
+  printf '%sWelcome. Hasher is ready for its first run.%s\n' "$BOLD" "$RST"
+  echo
+  echo "Your configuration is complete. The first hash safely inventories your"
+  echo "files and prepares the duplicate analysis used by the review workflow."
+  echo "No files are changed during hashing."
+  echo
+
+  if is_hasher_running || hasher_processes_running; then
+    printf '%sFirst hash currently running.%s\n' "$BOLD" "$RST"
+    echo "   Hasher is building the initial file inventory in the background."
+    echo
+    echo "   s) Check hashing status"
+    echo "   l) Follow background log"
+    echo "   k) Stop hashing"
+  else
+    printf '%sReady to begin%s\n' "$BOLD" "$RST"
+    echo "   Start the first hash run to build the inventory."
+    echo
+    echo "   1) Initiate first Hasher run (recommended)"
+  fi
+
+  echo
+  echo "Options"
+  echo "   2) Settings & preferences"
+  echo "   3) Help & information"
+  echo
+  echo "   q) Quit"
+  echo
+  printf "Select an option: "
+}
+
+action_first_hash_settings() {
+  local _choice
+  while :; do
+    clear 2>/dev/null || true
+    header
+    echo "${BOLD}First-run settings & preferences${RST}"
+    echo
+    echo "   1) Review scan paths"
+    echo "   2) Performance settings"
+    echo "   3) Duplicate-analysis mode"
+    echo "   4) System diagnostics"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _choice || return 0
+    case "${_choice:-}" in
+      1) firstrun_paths; printf "Press Enter to continue... "; read -r _ || true ;;
+      2) action_performance_settings ;;
+      3) choose_analysis_mode; printf "Press Enter to continue... "; read -r _ || true ;;
+      4) action_system_check ;;
+      b|B) return 0 ;;
+      *) echo "Unknown option: $_choice"; sleep 1 ;;
+    esac
+  done
+}
+
+action_first_hash_help() {
+  clear 2>/dev/null || true
+  header
+  echo "${BOLD}About the first hash run${RST}"
+  echo
+  echo "Hasher reads each configured file and records its size, path and secure"
+  echo "SHA-256 fingerprint in a manifest under the hashes directory."
+  echo
+  echo "The hash run does not modify, move or delete your files. In automatic"
+  echo "analysis mode, duplicate-folder and duplicate-file results are prepared"
+  echo "after the manifest completes so they are ready for review when you return."
+  echo
+  echo "The run continues in the background. Use hashing status or follow the"
+  echo "background log to check progress."
+  echo
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while :; do
   clear 2>/dev/null || true
   header
+
+  # v1.4.0: no manifest yet → focused launch screen. Every review and cleanup
+  # action needs a manifest as input, so offering them here would only produce
+  # "no manifest found" messages. `continue` skips the rest of the loop body.
+  if ! has_successful_hash_manifest; then
+    print_first_hash_menu
+    read -r choice || { echo; exit 0; }
+    case "${choice:-}" in
+      1)
+        if is_hasher_running || hasher_processes_running; then
+          info "The first hash run is already active."
+          printf "Press Enter to continue... "; read -r _ || true
+        else
+          action_start_hashing
+        fi
+        ;;
+      2) action_first_hash_settings ;;
+      3) action_first_hash_help ;;
+      s|S) action_check_status ;;
+      l|L) action_view_logs_follow ;;
+      k|K) action_stop_hashing ;;
+      q|Q) echo "Bye."; exit 0 ;;
+      *) echo "Unknown option: $choice"; sleep 1 ;;
+    esac
+    continue
+  fi
+
   if [ "$(analysis_mode)" = "automatic" ]; then
     print_analysis_summary
   fi

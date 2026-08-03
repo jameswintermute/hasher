@@ -102,12 +102,26 @@ dependencies, helps you choose a parallel-hashing level for your hardware, promp
 for a directory to scan, and shows you where quarantine will live. Everything it
 configures is also reachable from the menu afterwards.
 
+Until the first hash manifest exists, the launcher shows a focused welcome screen
+rather than the full menu — every review and cleanup action needs a manifest as its
+input, so the only useful action at that point is starting the first run. The screen
+offers that one action plus settings and help, and switches to status/log/stop
+controls while the first run is in progress.
+
 ---
 
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.3.32**
+Started Dec 2022. Current version: **v1.4.0**
+
+### First-run launch screen
+
+Before any manifest exists, the launcher presents a short welcome screen with a
+single recommended action — start the first hash — plus **Settings & preferences**
+(scan paths, performance, analysis mode, diagnostics) and **Help & information**
+explaining what the hash run does and does not do. Once the first manifest is
+written, the full workflow menu takes over automatically.
 
 ### Guided main menu
 
@@ -145,6 +159,35 @@ defaults (excludes, quarantine paths) are auto-applied via `lib/host-detect.sh`.
 
 ## Launcher Menu
 
+Before the first manifest exists, the launcher shows a focused welcome screen:
+
+```
+Welcome. Hasher is ready for its first run.
+
+Ready to begin
+   Start the first hash run to build the inventory.
+
+   1) Initiate first Hasher run (recommended)
+
+Options
+   2) Settings & preferences
+   3) Help & information
+
+   q) Quit
+```
+
+While the first run is in progress, options `1`–`3` are replaced by `s` (status),
+`l` (follow log) and `k` (stop hashing).
+
+Once a manifest exists, the full workflow menu appears. Its layout depends on the
+analysis mode.
+
+### Automatic mode (default)
+
+Duplicate analysis has already run, so the menu leads with review and quarantine.
+A compact summary above the menu shows what is waiting and recommends the next
+action.
+
 ```
 Stage 1 — Hash
    1) Start hashing (NAS-safe defaults)
@@ -153,24 +196,21 @@ Stage 1 — Hash
    p) Performance settings (parallel hashing)
    k) Stop hashing (terminate running hash jobs)
 
-Stage 2 — Identify  (run folders first — see note)
-   2) Find duplicate folders   ← recommended first
-   3) Find duplicate files
+Stage 2 — Review & quarantine
+   2) Review duplicate folders
+   3) Review duplicate files
+   4) Apply reviewed plan
+   5) Auto-dedup files (keep shortest path — no prompts)
    f) Find file by hash (lookup)
-      Note: dedup FOLDERS before FILES. Removing duplicate files first
-      changes folders' contents, so identical folders may no longer match
-      and you lose the bigger, one-decision folder cleanup.
 
-Stage 3 — Review & clean
-   4) Review duplicate FILES (interactive)
-   r) Review duplicate FOLDERS plan (interactive)
-   5) Auto-dedup (keep shortest path — no prompts)
-   6) Apply dedup plan (FILE or FOLDER)
-   7) Delete zero-length files
-   8) Delete junk (uses local/junk-extensions.txt)
-   9) Clean cache files & @eaDir (safe)
+Stage 3 — Clean
+   6) Review zero-length files
+   7) Delete junk (uses local/junk-extensions.txt)
+   8) Clean cache files & @eaDir (safe)
 
 Other
+   r) Rerun duplicate analysis
+   m) Change analysis mode (automatic/manual)
    d) System diagnostics (deps & readiness)
    x) Self-test (integrity preflight)
    l) Follow logs (tail -f background.log)
@@ -181,10 +221,55 @@ Other
    q) Quit
 ```
 
-Number keys 1–9 drive the main workflow. Letters cover meta and infrequent
-operations: `a`/`s`/`p` for hashing variants, status, and performance; `f` for
-hash lookup; `r` for folder plan review; and `d/l/t/v/c` for diagnostics and
-housekeeping.
+### Manual mode
+
+Duplicate discovery stays an explicit step, so the menu keeps the traditional
+identify-then-review ordering.
+
+```
+Stage 1 — Hash
+   1) Start hashing (NAS-safe defaults)
+   a) Advanced / custom hashing
+   s) Hashing status
+   p) Performance settings (parallel hashing)
+   k) Stop hashing (terminate running hash jobs)
+
+Stage 2 — Identify
+   2) Find duplicate folders
+   3) Find duplicate files
+   f) Find file by hash (lookup)
+
+Stage 3 — Review & clean
+   4) Review duplicate files (interactive)
+   r) Review duplicate folders plan (interactive)
+   5) Auto-dedup files (keep shortest path — no prompts)
+   6) Apply dedup plan (FILE or FOLDER)
+   7) Delete zero-length files
+   8) Delete junk (uses local/junk-extensions.txt)
+   9) Clean cache files & @eaDir (safe)
+
+Other
+   m) Change analysis mode (automatic/manual)
+   d) System diagnostics (deps & readiness)
+   x) Self-test (integrity preflight)
+   l) Follow logs (tail -f background.log)
+   t) Stats & scheduling hints
+   v) Clean internal working files (var/)
+   c) Clean logs (rotate & prune)
+
+   q) Quit
+```
+
+> **Folders before files.** In manual mode, run duplicate *folders* (option 2)
+> before duplicate *files* (option 3). Removing duplicate files first changes
+> folder contents, so identical folders may no longer match and you lose the
+> bigger, one-decision folder cleanup. Automatic mode runs them in this order
+> for you.
+
+Number keys drive the main workflow; letters cover meta and infrequent
+operations. Note that option numbering differs between the two modes — the
+summary line above the menu always names the correct option for the recommended
+next action.
 
 ---
 
@@ -219,45 +304,67 @@ the order rows are written to the CSV.
 
 ## Recommended Workflow
 
-### For large volumes — use auto-dedup (option 5)
+### For large volumes — use auto-dedup
 
 When you have hundreds or thousands of duplicate groups and don't need
-per-group review, option 5 handles file dedup in one step. **Do folders first**
-(see the note below on ordering):
+per-group review, auto-dedup handles file dedup in one step. **Do folders first**
+(see the note below on ordering).
+
+**Automatic mode** — analysis has already run, so you go straight to review:
+
+1. Run **option 1** — hash all files; folder and file analysis run automatically
+2. Run **option 2** — review the duplicate folders plan
+3. Run **option 4** — apply the reviewed folder plan
+4. Run **option 5** — auto-dedup the remaining files
+
+**Manual mode** — discovery is an explicit step:
 
 1. Run **option 1** — hash all files
-2. Run **option 3** — find duplicate folders, then **option r** to review and
+2. Run **option 2** — find duplicate folders, then **option r** to review and
    **option 6 → d** to apply the folder plan
-3. Run **option 2** — find duplicate files (now far fewer)
-4. Run **option 5** — auto-dedup the remaining files (uses only the verified, hard-link-filtered option 2 report; generates a plan and offers to apply it)
+3. Run **option 3** — find duplicate files (now far fewer)
+4. Run **option 5** — auto-dedup the remaining files
 
 Auto-dedup keeps the copy with the **shortest file path** in each duplicate group
-and quarantines the others. Configurable to longest-path, newest, or oldest.
+and quarantines the others. Configurable to longest-path, newest, or oldest. It
+consumes only the verified, hard-link-filtered duplicate report — a raw hash-scan
+summary is refused.
 
 > **Why folders first?** File dedup collapses duplicate files *inside* folders,
 > which changes those folders' contents. Two folders that are currently identical
 > may no longer match afterwards — so you lose the bigger, one-decision folder
-> cleanup. The menu lists folders first and will warn you if you start file dedup
-> (option 2 or 5) before running folder detection. The warning is a single
-> keypress and never blocks you; it just protects the recommended order.
+> cleanup. Automatic mode runs folder analysis before file analysis for you. In
+> manual mode the menu lists folders first and warns if you start file dedup
+> before running folder detection; the warning is a single keypress and never
+> blocks you.
 
 ### For careful review — folder-first, then files
 
 Folder dedup removes far more redundancy per decision than file-by-file review.
 Run it first:
 
-1. Run **option 1** — hash all files
-2. Run **option 3** — find duplicate folders
-3. Run **option r** — interactively review the folder plan; accept, skip, or swap
+**Automatic mode:**
+
+1. Run **option 1** — hash all files; analysis runs automatically afterwards
+2. Run **option 2** — interactively review the folder plan; accept, skip, or swap
    keepers per group; the reviewer writes a reviewed plan
+3. Run **option 4** — apply the reviewed FOLDER plan
+4. Run **option 3** — interactively review the file groups
+5. Run **option 4** — apply the FILE plan
+
+**Manual mode:**
+
+1. Run **option 1** — hash all files
+2. Run **option 2** — find duplicate folders
+3. Run **option r** — interactively review the folder plan
 4. Run **option 6** → `d` — apply the reviewed FOLDER plan
-5. Run **option 2** — find duplicate files (now far fewer)
+5. Run **option 3** — find duplicate files (now far fewer)
 6. Run **option 4** — interactively review the file groups
 7. Run **option 6** → `f` — apply the FILE plan
 
-When you run option 3, you'll be offered the reviewer immediately. Decline if
-you want to inspect the plan in a different terminal first; option `r` is always
-available to come back to.
+In manual mode, when you run folder discovery you'll be offered the reviewer
+immediately. Decline if you want to inspect the plan in a different terminal
+first; option `r` is always available to come back to.
 
 > **How folder matching works (and what it does not do).** Folder dedup matches
 > directories whose *direct* file contents are identical — the files sitting

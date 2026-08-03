@@ -1,29 +1,3 @@
-# v1.3.32 — 2026-08-02
-
-**Automatic/manual analysis workflow selection**
-
-- Added a final first-run setup choice for automatic or manual duplicate analysis.
-- Uses positive, safety-explicit guidance: automatic analysis saves user time while
-  never reviewing, quarantining, or deleting files automatically.
-- Added `[post_hash] analysis_mode = automatic|manual`; automatic is the shipped default.
-- Automatic mode shows the compact statistics-led review menu introduced in v1.3.31.
-- Manual mode preserves the traditional discovery-first menu and option numbering.
-- Added launcher option `m` so the workflow can be changed later; the choice is persisted
-  in `local/hasher.conf`.
-- `hasher.sh` now skips post-hash discovery when manual mode is selected.
-
-## 2026‑08 — v1.3.31
-
-### Statistics-led launcher workflow
-
-- Added a compact summary beneath the existing ASCII header for the latest successful hash and its matched post-hash analysis.
-- Shows files hashed, duplicate-folder groups ready, duplicate-file groups ready, and one recommended next action.
-- Promoted review and quarantine actions into the primary workflow: folder review, file review, plan application and auto-dedup.
-- Moved manual duplicate discovery into a dedicated **Rerun duplicate analysis** submenu.
-- Removed the duplicated folders-first explanation from the main screen; the dynamic recommendation provides the single primary prompt.
-- Post-hash discovery now publishes a run-specific metadata summary used by the launcher, and log cleanup recognises these metadata files.
-- Updated option references printed after post-hash analysis to match the new menu.
-
 # Version History
 Contact: **jameswintermute@protonmail.ch**
 ---
@@ -2868,6 +2842,102 @@ honoured during upgrades.
   this version history.
 
 ---
+## 2026‑08 — v1.3.31
+**Statistics-led launcher workflow**
+
+- Added a compact, run-matched post-hash analysis summary beneath the existing
+  ASCII header.
+- Automatic workflow users are guided directly to folder review, file review
+  and plan application.
+- Moved manual duplicate discovery into a dedicated rerun-analysis submenu.
+- Added immutable post-hash summary metadata for launcher display.
+
+---
+## 2026‑08 — v1.3.32
+**Automatic/manual analysis workflow selection**
+
+- Added a final first-run choice between automatic and manual duplicate
+  analysis, with automatic as the recommended time-saving default.
+- Automatic mode shows the compact review-first menu; manual mode preserves the
+  traditional discovery-first menu and numbering.
+- Added launcher option `m` to change the workflow later.
+- `hasher.sh` skips post-hash discovery when manual mode is selected.
+
+---
+## 2026‑08 — v1.3.33
+**Analysis-state accuracy and workflow guidance fixes**
+
+- Fixed `analysis_mode` persistence for both `[post_hash]` and `[post-hash]`
+  sections, preserved configuration formatting, and verified the saved value.
+- First-run setup is marked complete only after the workflow choice is written
+  and read back successfully.
+- The launcher now validates the post-hash metadata provenance marker and shows
+  a directed stale/missing-analysis message instead of silently hiding stats.
+- Corrected folder statistics to distinguish duplicate groups from folders
+  proposed for quarantine.
+- Manual duplicate-analysis reruns refresh the same launcher summary used by
+  automatic discovery.
+- Added source CSV/report provenance to newly reviewed file plans and source CSV
+  provenance to newly reviewed folder plans.
+- The automatic menu detects a current reviewed plan and recommends applying it;
+  no-plan guidance is now aware of automatic versus manual menu numbering.
+- Restored this document's title and chronological structure.
+
+
+---
+## 2026‑08 — v1.4.0
+**Milestone release — first-run launch screen and workflow maturity**
+
+Version 1.4.0 marks the point where the workflow, not just the engine, is
+considered production-ready. The 1.3.x series closed seven rounds of external
+peer review covering process safety, snapshot integrity, path handling, and
+plan provenance. This release completes the user-facing half of that work.
+
+### First-run launch screen
+
+Until a hash manifest exists, every review and cleanup action in the main menu
+needs a manifest as its input — selecting any of them produces nothing but a
+"no manifest found" message. The launcher now detects this state and presents a
+focused welcome screen instead:
+
+- One recommended action: **Initiate first Hasher run**.
+- **Settings & preferences** submenu covering scan paths, performance, analysis
+  mode, and system diagnostics — everything a first-time user might want to
+  adjust before committing to a long run.
+- **Help & information** explaining what the hash run reads, what it records,
+  and — stated explicitly — that it does not modify, move, or delete files.
+- While a first run is in progress the screen switches to status, follow-log,
+  and stop controls, so the user always has something useful to do.
+
+The full workflow menu takes over automatically once the first manifest is
+written. No configuration, no mode to set.
+
+New helper `hasher_processes_running()` — a boolean wrapper around
+`list_hasher_pids()` — backs the running/not-running branch. It was referenced
+by the first-run screen before being defined; defining it here keeps the
+pidfile check and the orphan scan consistent with `ensure_no_running_hasher()`.
+
+### Documentation
+
+- `readme.md` menu section rewritten. It previously showed a pre-v1.3.31
+  layout that no longer matched either mode. Both current menus are now
+  documented separately, with the first-run screen shown first.
+- Recommended-workflow sections corrected. The step-by-step sequences used
+  option numbers from an older layout (2 = files, 3 = folders) that were wrong
+  in both automatic and manual mode. Each workflow now gives the correct
+  sequence for both modes, with a note that numbering differs between them and
+  that the summary line above the menu always names the right option.
+- Version references updated across `launcher.sh`, `default/hasher.conf`, and
+  `readme.md`.
+
+### Carried forward from v1.3.33
+
+All v1.3.33 launcher fixes are preserved in this release and were re-verified
+after the merge: metadata provenance validation, the three-state analysis
+summary (missing / stale / fresh), the `pending_blank` config-writing fix, and
+the `set_analysis_mode` read-back verification.
+
+
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
