@@ -178,6 +178,27 @@ run_tool() {
   return 0
 }
 
+# run_tool_with_input <input> <script> <args...> — as run_tool, but feeds
+# <input> to the tool's stdin instead of /dev/null.
+#
+# Added for import-check.sh's `setup` subcommand, which prompts for a
+# folder path with `read -r`. run_tool's unconditional `</dev/null` makes
+# every such prompt read EOF immediately, so the tool silently falls back
+# to its own default path instead of the one a test wants to exercise —
+# not a bug in the tool, but a gap in the harness that produced a batch of
+# confusing downstream failures (wrong import_dir, "no files scanned",
+# etc.) that looked like classifier defects until traced back here.
+run_tool_with_input() {
+  local _input="$1" _script="$2"; shift 2
+  RUN_OUT="$SANDBOX/.run-out.$$"
+  RUN_RC=0
+  ( cd "$SANDBOX" && \
+    printf '%s\n' "$_input" | \
+    timeout "${TEST_TIMEOUT:-60}" bash "bin/$_script" "$@" \
+  ) > "$RUN_OUT" 2>&1 || RUN_RC=$?
+  return 0
+}
+
 # out_plain — the last run's output with ANSI colour stripped.
 out_plain() {
   sed 's/\x1b\[[0-9;]*m//g' "$RUN_OUT" 2>/dev/null
