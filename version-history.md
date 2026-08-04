@@ -3360,6 +3360,246 @@ for safety — move counts and exit codes — is already covered by
 50-exit-status.
 
 ---
+## 2026‑08 — v1.4.6
+**Import Check — bring SD cards, old backups, and cloud exports onto the NAS without duplicating anything**
+
+New capability, built from a design discussion rather than a bug report.
+The premise: a user's NAS is their primary store; everything else — SD
+cards, old backup disks, DVD rips, cloud exports — is a source they want
+folded in without re-storing what's already there.
+
+### Design
+
+Agreed before writing any code, and unchanged through implementation:
+
+1. **Quarantine, never permanent delete.** Same model as every other
+   destructive path in this tool.
+2. **Only cross-boundary matches are automated.** An import file that
+   duplicates something already on the NAS is resolved automatically. Two
+   files that duplicate *each other* inside the import folder, or a file
+   with no match anywhere, are left alone — "which of my own two copies do
+   I keep" has no safe default, and folding it into "does the NAS already
+   have this" would blur a rule that needs to stay simple. Both categories
+   are moved together into `import/unique-files/` for hand-sorting.
+3. **Scan scope is the import folder only**, compared against the most
+   recent complete NAS manifest — not a fresh full-NAS hash. This is what
+   makes repeated use ("drop a card in, check it") fast instead of costing
+   a multi-hour rescan every time. The staleness this introduces (a NAS
+   file changed or vanished since that manifest was taken) is absorbed by
+   `delete-duplicates.sh`'s existing keeper re-verification — a stale match
+   is skipped (exit 4) rather than acted on wrongly. No new safety
+   mechanism was needed because the fixed point already required since
+   v1.4.4 covers it.
+4. **The rule is structural, not conventional.** The NAS side of a match
+   can never appear on the delete side of a plan — not "by default", not
+   "unless configured otherwise". The classifier builds NAS-side and
+   import-side path lists as separate arrays that are never merged into one
+   "pick one" pool, and re-checks the invariant explicitly before writing
+   each KEEP line. `discard` re-checks it again — a full independent
+   pass over the finished plan — before invoking anything destructive. If
+   either check ever finds a violation, it refuses outright and explains
+   that this indicates a defect in the tool, not the user's data.
+
+### Implementation
+
+New `bin/import-check.sh`, five subcommands (`setup`, `scan`, `summary`,
+`discard`, `sort`). Deliberately thin where it can be: `discard` builds a
+plan in the exact `KEEP|path|hash` / `DEL|path|hash` format
+`delete-duplicates.sh` already consumes, then hands off to it unmodified —
+same keeper re-verification, same quarantine handling, same exit codes.
+Nothing about "this is an import-check plan" needs to be known below that
+handoff.
+
+`import_dir` is configured via `[import_check]` in `local/hasher.conf`,
+written by `setup` alongside appending the folder to `local/paths.txt` so
+normal full hashes include it. Every prefix comparison against the import
+folder goes through a dedicated `import_dir_boundary()` helper that adds
+exactly one trailing slash — a bare-prefix comparison would let
+`/volume1/import-archive` false-match against `/volume1/import`, the same
+class of bug fixed for scan-root overlap detection in hasher.sh.
+
+Wired into the launcher as `i) Import Check` in both automatic and manual
+menus, and registered in `self-test.sh`'s `MENU_TARGETS`.
+
+### Two bugs found while integrating, both from the same root cause
+
+**`set -e` killing the launcher submenu.** `local _dir; _dir="$(awk ...
+"$LOCAL_DIR/hasher.conf")"` — when `hasher.conf` doesn't exist yet (a
+plausible first visit to this menu), `awk` exits non-zero and, unlike
+`local _dir=$(...)` in a single statement, the two-statement form does NOT
+swallow that under `set -e`. Fixed with `|| true` after the substitution.
+
+**The same pattern, one layer deeper, inside `import-check.sh` itself.**
+`grep -c` always prints a count — including "0" on no match — but still
+exits 1 in that case. Two count assignments in the script hit this:
+first written as `grep -c ... || echo 0`, which does not crash but instead
+double-fires, since the exit-1 triggers the fallback ON TOP OF grep's own
+"0" output, producing the two-line string `"0
+0"` and breaking the `-eq`
+test that follows. Corrected to `"$(grep -c ...)" || true` — tolerate the
+exit without adding output. Both defects were introduced and caught within
+this release; neither shipped.
+
+### Verified
+
+End-to-end by hand before the test suite existed for this feature: NAS
+file preserved byte-for-byte after discard, import duplicate quarantined,
+unique file untouched by discard and correctly moved by sort, adversarial
+sibling-folder-name-collision case (`/tmp/import` vs `/tmp/import-archive`)
+correctly not confused.
+
+New case `90-import-check.sh`, 26 assertions: cross-boundary discard,
+remainder sort with top-level-cleared reporting, boundary safety against a
+name-colliding sibling, import-internal duplicates left alone, no-NAS-
+manifest and empty-import refusals with correct exit codes, and a
+manifest-poisoning case where a NAS CSV containing a stray row from inside
+the import folder must not be usable as a keeper.
+
+One gap found in the test harness itself while writing these: `run_tool`
+unconditionally redirects stdin from `/dev/null`, which starved
+`import-check.sh setup`'s interactive prompt and made every case that used
+it configure the wrong folder — looking, at first, like classifier defects
+rather than a missing test capability. New `run_tool_with_input` added
+alongside it for tools that prompt.
+
+Suite now 11 cases, 147 assertions.
+
+---
+## 2026‑08 — v1.4.7
+**Import Check peer review — overlap isolation, trust-boundary hygiene, manifest pinning, and two bugs the review's own fixes surfaced**
+
+External peer review of v1.4.6 found the classifier's structural
+guarantee ("a NAS path is never a delete candidate") was true but scoped
+one level too narrow: it protected against a bad SELECTION from within
+the import folder, but nothing stopped the import folder itself from
+being misconfigured to overlap real NAS storage. If it did, the
+protection's own assumption — "everything under the import boundary is
+disposable" — became false, and `discard` could relocate real primary
+NAS content out of its real location whenever a backup copy of the same
+file happened to exist elsewhere on the NAS, an entirely ordinary thing
+for a NAS user to have. Two lower-severity findings accompanied it.
+
+### #1 (critical) — Import-folder overlap now refused, not merely discouraged
+
+New `validate_import_isolation()`, called from `require_import_dir()` so
+every operational subcommand gets it for free: canonicalises the import
+folder and every line in `local/paths.txt` (resolving symlinks and `..`
+via `lib/host-detect.sh`'s existing `canonical_existing_path()`, so the
+check cannot be routed around) and refuses — exit 2, nothing touched —
+if any of `import_dir == root`, `import_dir` inside `root`, or `root`
+inside `import_dir` holds.
+
+Checked at `setup` (before anything is saved) and again at the start of
+`scan`/`discard`/`sort`, not only at setup time — `paths.txt` and
+`hasher.conf` are both plain text files a user can hand-edit afterwards,
+and the check needs to hold regardless of how the overlap came about.
+
+Live-verified: all three overlap shapes refused; a symlink resolving into
+a trusted root refused; a genuinely non-overlapping sibling folder
+correctly accepted; re-validation catches an overlap introduced by
+hand-editing `paths.txt` after a clean `setup`.
+
+### #2 (high) — Import folder no longer added to `local/paths.txt`
+
+`setup` previously appended the import folder to the trusted NAS
+inventory. Removed entirely: `local/paths.txt` is the trusted NAS root
+list, the import folder is deliberately untrusted staging material, and
+`scan` already builds its own single-folder pathfile — nothing in this
+script ever needed the addition to function.
+
+A **separate, more serious bug** was found while removing it: the old
+code ran `: > "$_pf"` — an unconditional truncate — before checking
+whether the folder was already listed, silently discarding the user's
+real NAS roots on every `setup` run, including re-running setup just to
+change the import folder later. Not touching the file at all removes
+this failure mode too. Confirmed by hand: two trusted roots, present
+before `setup`, both present and the import folder absent, after.
+
+For existing v1.4.6 installs, `setup` now detects the import folder
+already present in `local/paths.txt` and offers (default yes) to remove
+it.
+
+### #3 (medium) — Each import scan pinned to the exact NAS manifest it used
+
+`scan` now writes `hashes/import-scan-<run>.meta` (marker
+`HASHER_IMPORT_SCAN_V1`) recording the NAS manifest it compared against.
+`summary`, `discard`, and `sort` all read that pinned manifest via new
+`scan_pinned_nas_csv()` instead of independently re-resolving "the latest
+one" — so a full NAS hash completing between viewing the summary and
+running `discard` can no longer silently change what discard acts on.
+`warn_if_nas_manifest_newer()` still tells the user when a newer
+inventory exists; it warns, it does not substitute.
+
+Found and fixed during this: the first draft of the sidecar reader used
+`awk -F'=' '$1=""; ...; print'`, which rebuilds `$0` with OFS (a space)
+once `$1` is cleared — producing a leading-space-corrupted path that made
+the sidecar unreadable and, worse, made the "newer manifest" comparison
+always report a difference even when the two manifests were identical.
+Corrected to a single `sub()` against the whole line.
+
+### Other fixes from the same review
+
+- **`unique-files/` excluded from later scans** (`hasher.sh --exclude
+  '*/unique-files/*'`) — without this, files already sorted were
+  repeatedly rehashed and reconsidered by every subsequent scan.
+- **Wording**: "discard" reads as permanent; the action is quarantine.
+  Launcher menu, summary, and the confirmation prompt itself now say so
+  explicitly ("moved to quarantine (not deleted)"). The `discard`
+  subcommand name is unchanged for backward compatibility.
+- **Lock file** (`var/import-check.lock`, mkdir-based, same mechanism
+  hasher.sh's own lock uses): held for `scan`/`discard`/`sort`, which
+  read or write shared state; not for `summary` (read-only) or `setup`
+  (interactive, has its own prompts). Verified: a stale lock refuses a
+  second operation with a clear message; a normal run releases it
+  automatically, including via the EXIT trap on early-exit paths like
+  rc=4 for an empty import folder.
+- **`|` in a filename** would corrupt the inherited `KEEP|path|hash` /
+  `DEL|path|hash` plan format, which has no escaping. Fixing the format
+  itself is a larger, cross-cutting change (`find-duplicates.sh` and
+  `apply-folder-plan.sh` use the same format) and stayed out of scope;
+  what belongs in this script is refusing to ever emit a corrupting
+  line. `classify_and_plan()` now takes an optional skipped-paths report
+  argument — any match where either side contains `|` is diverted there
+  as a whole group rather than partially written, with a warning naming
+  the file so it can be renamed. Import Check was judged the most likely
+  place in the tool to encounter this, since it processes material from
+  uncontrolled external media rather than the NAS's own layout.
+
+### Reviewer suggestions not taken up this release
+
+- **Verify scan identity before sort** (detect files changed/added/
+  removed since the scan). Assessed as lower priority: `sort` makes no
+  keep/delete judgement — it relocates whatever is in the remainder list,
+  already tolerates files missing since scan, and a changed file simply
+  moves under a new name rather than being lost. Not the same class of
+  risk as a stale `discard` match.
+- **Separate remainder counts** (unique files vs. import-internal
+  duplicates) in `summary`. Genuinely useful, deferred for scope — the
+  isolation and pinning fixes were the priority for this release.
+- **Escaping the plan format properly**, rather than defensively refusing
+  `|`-containing matches. Correct long-term fix, but cross-cutting across
+  three tools and larger than this release.
+
+### Test coverage
+
+New `tests/cases/91-import-check-isolation.sh`, 29 assertions: all three
+overlap shapes plus the symlink-evasion case and the non-overlapping-
+sibling negative case, re-validation after a hand-edited `paths.txt`,
+confirmation that `setup` never writes to `paths.txt` and never
+truncates it (the regression guard for the bug found while fixing #2),
+manifest pinning including the exact "scan against A, new hash creates
+B, discard still uses A" sequence from the review, `unique-files/`
+exclusion, quarantine wording, lock contention and auto-release
+(including on an early-exit path), and the pipe-character defence.
+
+`tests/cases/90-import-check.sh` (the original classifier suite, NAS
+precedence and boundary safety within a single tree) required no changes
+and all 26 assertions continue to pass unmodified — confirming this
+release is additive to the safety model, not a rework of it.
+
+Suite now 12 cases, 176 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

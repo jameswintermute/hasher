@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.5**
+Started Dec 2022. Current version: **v1.4.7**
 
 ### First-run launch screen
 
@@ -380,6 +380,89 @@ first; option `r` is always available to come back to.
 
 ---
 
+## Import Check
+
+For bringing files from an SD card, old backup disk, DVD rip, or cloud
+export onto the NAS without duplicating anything already there.
+
+The rule is simple and absolute: **the NAS copy always wins.** If a file in
+the import folder matches a file already on the NAS — confirmed by
+SHA-256, re-verified again immediately before anything is moved — the
+import copy is quarantined and the NAS file is never touched.
+
+This is enforced two ways, deliberately independent of each other:
+
+1. **Isolation.** The import folder must not overlap any trusted NAS scan
+   root (`local/paths.txt`) — not equal to one, not inside one, not
+   containing one, checked after resolving symlinks and `..` so the check
+   cannot be routed around. `setup` refuses to configure an overlapping
+   folder, and every operational subcommand re-checks it on every run,
+   because `paths.txt` and `hasher.conf` are both plain text files a user
+   can hand-edit afterwards. Without this, a NAS path could end up
+   *inside* what the tool considers "import content" and be treated as
+   disposable — which is a materially different, and worse, failure than
+   anything the classifier itself controls.
+2. **Classification.** Given an isolated import folder, a NAS path can
+   never appear on the delete side of the generated plan — enforced
+   structurally in the classifier (NAS-side and import-side paths are
+   built as separate lists that are never merged into one pool to choose
+   a keeper from), not just by convention.
+
+```bash
+bin/import-check.sh setup     # first time: choose/create the import folder
+bin/import-check.sh scan      # hash the import folder (fast — not a full NAS rescan)
+bin/import-check.sh summary   # see what matches, what doesn't
+bin/import-check.sh discard   # quarantine the NAS duplicates, with confirmation
+bin/import-check.sh sort      # move whatever's left into import/unique-files/
+```
+
+Also reachable from the launcher's main menu (`i`).
+
+**Trust boundary.** The import folder is never added to `local/paths.txt`.
+It is untrusted staging material, hashed separately by `scan`; keeping it
+out of the trusted inventory means full NAS hashes don't spend time on
+temporary import content and ordinary duplicate discovery never processes
+it as if it were NAS data.
+
+**What "scan" compares against.** Only the import folder is (re)hashed each
+time — comparison uses the NAS manifest that existed at scan time, not
+whatever the newest one happens to be later. `scan` records which manifest
+it used in a sidecar (`hashes/import-scan-<run>.meta`); `summary`,
+`discard`, and `sort` all read that same pinned manifest, so a full NAS
+hash completing in the background between viewing the summary and running
+`discard` cannot silently change what gets acted on. If a newer NAS
+manifest exists, you're told — a warning, not a substitution — and can
+re-run `scan` to compare against it. If a NAS file has changed or been
+removed since the pinned manifest was taken regardless, `discard`'s reuse
+of `delete-duplicates.sh` re-verifies each match immediately before acting
+and skips anything that no longer checks out (exit code 4, not an error).
+
+**What's automated and what isn't.** Only *cross-boundary* matches — an
+import file that duplicates something already on the NAS — are resolved
+automatically. Two files that duplicate *each other* inside the import
+folder, or a file with no match anywhere, are left alone: `discard` never
+touches them, and `sort` moves all of them together into
+`import/unique-files/` for you to look through by hand. Deciding which of
+your own two copies to keep is a different decision with no safe default,
+so it isn't folded into "does the NAS already have this." `scan` excludes
+`unique-files/` itself from later runs, so files you've already sorted
+aren't repeatedly reconsidered.
+
+**Concurrency.** `scan`, `discard`, and `sort` take a lock
+(`var/import-check.lock`) so two of them can't run against the same import
+folder at once — `summary` is read-only and `setup` has its own
+confirmation prompts, so neither needs it.
+
+**A filename containing `|`** would corrupt the `KEEP|path|hash` plan
+format the same way it inherited from every other duplicate-handling tool
+in this project. Import Check processes material from uncontrolled
+external media, so this is more likely to come up here than elsewhere;
+any match involving such a filename is excluded from the plan rather than
+risking a corrupted line, with a warning naming the file so you can rename
+it and re-run.
+
+---
+
 ## Plan Files
 
 All dedup operations produce a plain-text plan file in `logs/` before anything
@@ -456,6 +539,7 @@ hasher/
 │   ├── find-duplicate-folders.sh        folder-level discovery
 │   ├── find-duplicates.sh               file-level discovery
 │   ├── hash-check.sh                    verify a file against the manifest
+│   ├── import-check.sh                  NAS-precedence check for staged imports
 │   ├── hasher.sh                        the hashing engine
 │   ├── launch-review.sh                 review entry point
 │   ├── review-duplicates.sh             interactive FILE review
@@ -482,7 +566,9 @@ hasher/
 │       ├── 60-process-safety.sh
 │       ├── 70-launcher-status.sh
 │       ├── 80-first-run-gating.sh
-│       └── 85-manifest-selection.sh
+│       ├── 85-manifest-selection.sh
+│       ├── 90-import-check.sh
+│       └── 91-import-check-isolation.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -592,7 +678,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (10 cases, ~25s)
+tests/run-tests.sh                # everything (12 cases, ~50s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -617,6 +703,8 @@ directory of ordinary files would exercise:
 | `70-launcher-status` | Live progress takes precedence over a stale summary |
 | `80-first-run-gating` | Unconfigured installs cannot start an empty run |
 | `85-manifest-selection` | Newest usable manifest, storage availability, preflight parity |
+| `90-import-check` | NAS-precedence duplicate classification, boundary safety, remainder handling |
+| `91-import-check-isolation` | Overlap refusal, paths.txt isolation, manifest pinning, lock, pipe-char safety |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.5 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.7 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -632,6 +632,7 @@ print_menu_automatic() {
   echo "   8) Clean cache files & @eaDir (safe)"
   echo
   echo "${BOLD}Other${RST}"
+  echo "   i) Import Check (new files vs your NAS)"
   echo "   r) Rerun duplicate analysis"
   echo "   m) Change analysis mode (automatic/manual)"
   echo "   d) System diagnostics (deps & readiness)"
@@ -670,6 +671,7 @@ print_menu_manual() {
   echo "   9) Clean cache files & @eaDir (safe)"
   echo
   echo "${BOLD}Other${RST}"
+  echo "   i) Import Check (new files vs your NAS)"
   echo "   m) Change analysis mode (automatic/manual)"
   echo "   d) System diagnostics (deps & readiness)"
   echo "   x) Self-test (integrity preflight)"
@@ -1859,6 +1861,66 @@ action_find_by_hash() {
   printf "Press Enter to continue... "; read -r _ || true
 }
 
+# v1.4.6: Import Check — bring files from an SD card, old backup disk, DVD,
+# or cloud export into a staging folder and find out which are already on
+# the NAS, without ever risking the NAS copy. Thin menu wrapper around
+# bin/import-check.sh; all the classification and safety logic lives there.
+action_import_check() {
+  local _ic="$BIN_DIR/import-check.sh"
+  if [ ! -r "$_ic" ]; then
+    err "bin/import-check.sh not found."
+    printf "Press Enter to continue... "; read -r _ || true
+    return 1
+  fi
+
+  local _choice
+  while :; do
+    clear 2>/dev/null || true
+    header
+
+    local _dir
+    _dir="$(awk '
+      /^[[:space:]]*\[/ { insec = (tolower($0) ~ /\[import_check\]/); next }
+      insec && /^[[:space:]]*import_dir[[:space:]]*=/ {
+        sub(/^[[:space:]]*import_dir[[:space:]]*=[[:space:]]*/, ""); print; exit
+      }
+    ' "$LOCAL_DIR/hasher.conf" 2>/dev/null || true)"
+
+    echo "${BOLD}Import Check — bring new files onto the NAS without duplicating anything${RST}"
+    echo "This mode is for SD cards, old backup disks, DVDs, or cloud exports —"
+    echo "anything you're folding into the NAS. Files already on the NAS are"
+    echo "never touched; only copies sitting in the import folder are ever"
+    echo "proposed for removal, and always to quarantine, never deleted outright."
+    echo
+    if [ -n "$_dir" ]; then
+      echo "   Import folder: $_dir"
+    else
+      echo "   Import folder: not yet configured"
+    fi
+    echo
+    echo "   1) Set up import folder             (first time, or to change it)"
+    echo "   2) Scan (hash the import folder)"
+    echo "   3) Show import summary"
+    echo "   4) Quarantine NAS duplicates         (verified copies only, with confirmation)"
+    echo "   5) Move remainder into unique-files/ (for hand-sorting)"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _choice || return 0
+
+    case "${_choice:-}" in
+      1) run_script "$_ic" setup;    printf "Press Enter to continue... "; read -r _ || true ;;
+      2) run_script "$_ic" scan;     printf "Press Enter to continue... "; read -r _ || true ;;
+      3) run_script "$_ic" summary;  printf "Press Enter to continue... "; read -r _ || true ;;
+      4) run_script "$_ic" discard;  printf "Press Enter to continue... "; read -r _ || true ;;
+      5) run_script "$_ic" sort;     printf "Press Enter to continue... "; read -r _ || true ;;
+      b|B) return 0 ;;
+      *) echo "Unknown option: $_choice"; sleep 1 ;;
+    esac
+  done
+}
+
 action_stats_and_cron() {
   info "Hasher usage stats (approximate):"
 
@@ -2370,6 +2432,7 @@ while :; do
       printf "Press Enter to continue... "; read -r _ || true
       ;;
     d|D)     action_system_check ;;
+    i|I)     action_import_check ;;
     x|X)     action_self_test ;;
     l|L)     action_view_logs_follow ;;
     t|T)     action_stats_and_cron ;;
