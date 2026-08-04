@@ -3293,6 +3293,73 @@ convention and nothing previously asserted it.
 Suite now 10 cases, 121 assertions.
 
 ---
+## 2026‑08 — v1.4.5
+**Progress reporting during quarantine — and a shared renderer to stop reinventing it**
+
+Reported from a live run: applying a file plan moved 1584 files and took one
+to two minutes, printing nothing between "Plan summary:" and "Move complete:".
+With no output there is no way to tell slow-but-working from hung, and the
+natural response to an apparently-frozen *destructive* operation is to
+interrupt it — the worst possible moment to do so.
+
+`apply-folder-plan.sh` had the same gap, and worse odds: each folder move is
+a recursive relocation, so even a small plan can run for minutes.
+
+### A shared renderer rather than a fourth implementation
+
+Three progress styles already existed — `[PROGRESS]` in hasher.sh, `[WORK]`
+in find-duplicate-folders.sh, `[INDEX]` and `[PROGRESS]` in
+review-duplicates.sh, the last two being byte-identical functions defined
+twice in the same file. Adding a fifth would have compounded the problem the
+inconsistent-colouring note raised several releases ago.
+
+`lib/log.sh` now provides `log_progress_bar`, `log_progress_done` and
+`log_htime`, promoted from the review-duplicates implementation. Three
+constraints are baked in, each learned from an existing defect:
+
+- **Writes to stderr.** Callers pipe stdout into files and other processes.
+  v1.4.1 shipped a defect where log output on stdout corrupted a
+  NUL-delimited path list; progress output is far chattier and would be
+  worse.
+- **TTY only.** Redirected output would otherwise accumulate one line per
+  update — verified suppressed when piped.
+- **Rate limited**, default one redraw per second, with the first and final
+  updates always drawn so the bar appears immediately and lands on 100%.
+
+Existing renderers were left in place. Migrating them is a separate change
+with its own regression risk, and this release is about the missing case.
+
+### Wiring
+
+`delete-duplicates.sh` reuses `$existing` — the count of DEL entries still on
+disk, already computed for the plan summary — so no extra pass over the plan
+is needed. The counter advances before the per-entry safety checks, so
+skipped entries still move the bar: it reports entries examined, not files
+moved, and therefore always reaches 100%.
+
+`apply-folder-plan.sh` reuses its existing `idx` counter and `$COUNT` total.
+
+One interaction needed handling: warnings inside these loops also write to
+stderr and would land on top of the in-place bar. Both scripts funnel every
+message through a single emitter, so clearing the bar there covers every
+call site rather than each `warn` individually.
+
+Both scripts carry no-op fallbacks for `log_progress_bar` and
+`log_progress_done`, so a partially-updated install with an older
+`lib/log.sh` still runs.
+
+### Verified
+
+Suppression when piped (0 bar lines in redirected output), correct rendering
+at 1%/20%/50%/76%/100%, and end-to-end move correctness unchanged — 60 files,
+59 quarantined, 1 keeper retained, rc=0.
+
+Suite unchanged at 10 cases, 121 assertions. No test was added: asserting a
+TTY-only in-place redraw needs a pty harness, and the behaviour that matters
+for safety — move counts and exit codes — is already covered by
+50-exit-status.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
