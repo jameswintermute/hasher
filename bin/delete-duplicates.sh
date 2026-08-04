@@ -33,8 +33,25 @@ APPLY_TAG="$(date +'%F-%H%M%S')-$$"
 APPLY_LOG="$LOGS_DIR/delete-duplicates-apply-$APPLY_TAG.log"
 : > "$APPLY_LOG" 2>/dev/null || APPLY_LOG="${TMPDIR:-/tmp}/delete-duplicates-apply-$APPLY_TAG.log"
 : > "$APPLY_LOG" 2>/dev/null || true
+# v1.4.5: source the shared logging module for its progress helpers only.
+# It is loaded BEFORE the local info/warn/error definitions below, so those
+# continue to win — this script deliberately tees every message into the
+# apply log, which the shared versions do not do. Only log_progress_bar,
+# log_progress_done and log_htime are actually taken from it.
+if [ -r "$ROOT_DIR/lib/log.sh" ]; then
+  # shellcheck source=../lib/log.sh
+  . "$ROOT_DIR/lib/log.sh" 2>/dev/null || true
+fi
+# Fallbacks so the script runs standalone if lib/log.sh is missing.
+command -v log_progress_bar  >/dev/null 2>&1 || log_progress_bar()  { :; }
+command -v log_progress_done >/dev/null 2>&1 || log_progress_done() { :; }
+
 _emit() {
   _level="$1"; shift
+  # v1.4.5: the progress bar redraws in place on stderr, so any message
+  # emitted mid-loop would land on top of it and leave a garbled line.
+  # Clearing first is a no-op when no bar is active.
+  log_progress_done
   printf '[%s] %s\n' "$_level" "$*" >&2
   [ -n "${APPLY_LOG:-}" ] && printf '[%s] %s\n' "$_level" "$*" >> "$APPLY_LOG" 2>/dev/null || true
 }
@@ -363,6 +380,21 @@ moves_ok=0
 moves_fail=0
 moves_skipped_changed=0
 
+# v1.4.5: progress reporting for the quarantine loop.
+#
+# Moving 1584 files across a NAS volume takes a minute or two and previously
+# printed nothing between "Plan summary:" and "Move complete:". With no
+# output the operator cannot distinguish slow-but-working from hung, and the
+# natural response to a apparently-frozen destructive operation is to
+# interrupt it — which is the worst possible moment to do so.
+#
+# `$existing` is the count of DEL entries that still exist on disk, already
+# computed for the summary above, so this needs no extra pass over the plan.
+_move_seen=0
+_move_total="${existing:-0}"
+_move_started="$(date +%s)"
+[ "$_move_total" -gt 0 ] && info "Moving $_move_total file(s) to quarantine..."
+
 # shellcheck disable=SC2162
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
@@ -370,6 +402,11 @@ while IFS= read -r line || [ -n "$line" ]; do
       _split_del_line "$line"
       [ -z "$DEL_PATH" ] && continue
       [ -e "$DEL_PATH" ] || continue
+
+      # Counted before the safety checks below, so skipped entries still
+      # advance the bar — the total is "entries examined", not "moved".
+      _move_seen=$(( _move_seen + 1 ))
+      log_progress_bar "MOVE" "$_move_seen" "$_move_total" "$_move_started"
 
       if [ -L "$DEL_PATH" ]; then
         warn "Planned path is now a symlink — SKIPPING for safety: $DEL_PATH"
@@ -488,6 +525,9 @@ while IFS= read -r line || [ -n "$line" ]; do
       ;;
   esac
 done <"$PLAN_FILE"
+
+# Clear the in-place bar so the summary below starts on a clean line.
+log_progress_done
 
 if [ "$moves_skipped_changed" -gt 0 ]; then
   warn "$moves_skipped_changed file(s) skipped because the DEL or its keeper could not be safely re-verified."

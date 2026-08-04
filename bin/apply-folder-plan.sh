@@ -19,11 +19,17 @@ DELETE_METADATA=false
 # Fallback to minimal local defs if the shared file is missing.
 if [ -r "$ROOT_DIR/lib/log.sh" ]; then
   . "$ROOT_DIR/lib/log.sh"
+  # v1.4.5: tolerate an older lib/log.sh that predates the progress helpers,
+  # so a partially-updated install still runs.
+  command -v log_progress_bar  >/dev/null 2>&1 || log_progress_bar()  { :; }
+  command -v log_progress_done >/dev/null 2>&1 || log_progress_done() { :; }
 else
   info(){ printf '[INFO] %s\n' "$*"; }
   work(){ printf '[WORK] %s\n' "$*"; }
   ok(){   printf '[OK] %s\n'   "$*"; }
   warn(){ printf '[WARN] %s\n' "$*"; }
+  log_progress_bar()  { :; }
+  log_progress_done() { :; }
   err(){  printf '[ERR] %s\n'  "$*" >&2; }
 fi
 
@@ -329,12 +335,21 @@ _audit() {
   printf '# dest-root: %s\n' "$DEST_ROOT"
 } >> "$ACTIONS_LOG" 2>/dev/null || true
 
+# v1.4.5: progress reporting for the folder move loop, matching
+# delete-duplicates.sh. Folder moves are individually slower than file moves
+# (each is a recursive relocation), so even a modest plan can run for
+# minutes with no output — which reads as a hang during a destructive
+# operation. $COUNT is the directory total already reported above.
+_fold_started="$(date +%s)"
+[ "${COUNT:-0}" -gt 0 ] && info "Moving ${COUNT} director(ies) to quarantine..."
+
 idx=0; moved=0; fail=0; removed=0; skipped_verify=0
 while IFS= read -r src; do
   [ -z "$src" ] && continue
   # belt-and-braces: skip any comment line even though PLAN_CLEAN is filtered
   case "$src" in \#*) continue ;; esac
   idx=$((idx+1))
+  log_progress_bar "MOVE" "$idx" "${COUNT:-1}" "$_fold_started"
 
   src_plan="$src"
   if [ -L "$src_plan" ]; then
@@ -519,6 +534,8 @@ while IFS= read -r src; do
     _audit "QUARANTINE_FAILED" "$src_plan" "$dest" "$sz_kb"
   fi
 done < "$PLAN_CLEAN"
+
+log_progress_done
 
 info "Done. Moved: $moved  | Deleted metadata: $removed  | Skipped (changed): $skipped_verify  | Failed: $fail  | Log: $LOG_FILE"
 if [ "$skipped_verify" -gt 0 ]; then
