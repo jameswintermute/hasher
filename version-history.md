@@ -3194,6 +3194,105 @@ or removed — it is what the previous drift would have caught immediately.
 No code changed. Suite unchanged at 9 cases, 104 assertions.
 
 ---
+## 2026‑08 — v1.4.4
+**Peer review of v1.4.2 — three partial fixes completed**
+
+All three findings reproduced before any code changed. Each was a
+precondition tightened at one call site and not the others — the same shape
+that has produced most of the defects in this project.
+
+### #1 — A newer empty manifest could mask a valid one
+
+v1.4.2 made `has_successful_hash_manifest` require a data row, but left
+`latest_hashes_csv` returning the newest *filename*. Validation therefore
+landed on whichever file happened to be newest, so:
+
+```
+hasher-2026-01-01-000000-1.csv   valid, 3 rows
+hasher-2026-06-01-000000-2.csv   header only
+```
+
+made the launcher conclude no manifest existed and fall back to the
+first-run screen — cutting the user off from the workflow menu with a good
+manifest sitting right there. Validating the wrong file is worse than not
+validating at all, and this was a direct consequence of applying the v1.4.2
+fix to the checker rather than the selector.
+
+`latest_hashes_csv` now walks candidates newest-first and returns the first
+with a data row. `has_successful_hash_manifest` collapses to a presence test,
+because keeping a second copy of the data-row check is exactly how the two
+drifted apart.
+
+Implementation notes. Ordering comes from the filename rather than mtime:
+manifests are always `hasher-YYYY-MM-DD-HHMMSS-PID.csv`, so lexical order is
+chronological. That avoids `ls -1t` (unparseable when a path contains spaces)
+and avoids `find -printf` and `sed -z`, which are GNU-only and absent on
+macOS and BusyBox — the reviewer's suggested implementation used both, and a
+first draft here did too before the portability problem was caught. A plain
+glob into an array is bash 3.2 safe and cannot word-split.
+
+The reviewer's draft also carried a `${_csv}.partial` sidecar check. That
+convention does not exist: since v1.3.26 an incomplete run is *renamed* to
+`partial-hasher-*.csv`, which the glob already excludes. The check was
+dropped and the assumption is now asserted by a test instead.
+
+### #2 — Configured is not the same as available
+
+`count_active_scan_paths` counts non-comment lines, so an unmounted external
+disk yields "Scan paths configured: 3" and an offer to begin. `preflight_hashing`
+reported `existing: 0` and launched anyway.
+
+The reviewer's impact line said Hasher "can still launch a doomed first run".
+Worth being precise: `hasher.sh` rejects this cleanly with exit 3 and
+"All 3 path(s) are missing or unreadable", and leaves no manifest behind —
+verified. So this was never a correctness problem. It is a UX one: the user
+is told "ready", commits, waits, and only then learns the disk is not
+mounted.
+
+`preflight_hashing` now fails when no configured root exists. New
+`count_available_scan_paths` lets the first-run screen say so before anything
+is launched:
+
+```
+Welcome. Your storage is not currently available.
+
+   Scan paths configured: 3
+   Available now:         0
+```
+
+Partial availability is reported but not blocked — hashing what is reachable
+is a legitimate choice, so the gate is "none available", not "any missing".
+
+### #3 — Interactive hashing bypassed the preflight
+
+v1.4.2 added the guard to `run_hasher_nohup` because that was the route the
+report came from. `run_hasher_interactive` builds its arguments from the same
+configured paths file and had no guard, so advanced hashing could still start
+with nothing configured or nothing mounted.
+
+This is the failure mode named in an earlier session — fixing what is pointed
+at rather than the class — and it recurred within two releases of naming it.
+Both launch paths now call `preflight_hashing`, and a test asserts parity
+structurally so a third launch path cannot quietly skip it.
+
+### Tests
+
+New case `85-manifest-selection`, 17 assertions:
+
+- newer header-only manifest does not mask a valid older one
+- a newer `partial-hasher-*` manifest is invisible to the selector
+- all-empty manifests still yield the first-run screen
+- configured-but-unreachable roots withhold the hash offer
+- typing `1` anyway is refused and creates no manifest
+- partial availability still permits a run
+- both launch paths call `preflight_hashing`
+
+The second of those exists because fix #1 depends on the partial-naming
+convention and nothing previously asserted it.
+
+Suite now 10 cases, 121 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

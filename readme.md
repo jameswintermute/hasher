@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.3**
+Started Dec 2022. Current version: **v1.4.4**
 
 ### First-run launch screen
 
@@ -481,7 +481,8 @@ hasher/
 │       ├── 50-exit-status.sh
 │       ├── 60-process-safety.sh
 │       ├── 70-launcher-status.sh
-│       └── 80-first-run-gating.sh
+│       ├── 80-first-run-gating.sh
+│       └── 85-manifest-selection.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -591,7 +592,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (7 cases, ~10s)
+tests/run-tests.sh                # everything (10 cases, ~25s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -613,6 +614,9 @@ directory of ordinary files would exercise:
 | `40-dedup-safety` | Hard links, folders holding symlinks, report provenance |
 | `50-exit-status` | Exit codes 0/1/4, empty input, destructive-tool failures |
 | `60-process-safety` | Lock ownership, orphaned workers, non-functional `pgrep` |
+| `70-launcher-status` | Live progress takes precedence over a stale summary |
+| `80-first-run-gating` | Unconfigured installs cannot start an empty run |
+| `85-manifest-selection` | Newest usable manifest, storage availability, preflight parity |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

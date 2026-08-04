@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.3 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.4 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -691,10 +691,52 @@ print_menu() {
   fi
 }
 
+# manifest_has_data_rows — true when a CSV holds at least one row after the
+# header. `head -n 2` stops immediately, so manifest size is irrelevant.
+manifest_has_data_rows() {
+  [ -r "${1:-}" ] || return 1
+  [ "$(head -n 2 "$1" 2>/dev/null | wc -l | tr -d ' ')" -ge 2 ]
+}
+
+# latest_hashes_csv — newest manifest that is actually USABLE.
+#
+# v1.4.4 (peer review #1): this previously returned the newest filename and
+# left validation to the caller. Validating only the newest file meant a
+# newer header-only CSV could mask a perfectly good older manifest — the
+# launcher then concluded no manifest existed and fell back to the first-run
+# screen, cutting the user off from the workflow menu entirely. That is worse
+# than not validating at all, and it was a direct consequence of the v1.4.2
+# fix being applied to the checker rather than the selector.
+#
+# Now: walk candidates newest-first and return the first with a data row.
+#
+# Ordering comes from the filename, not mtime. Manifests are always named
+# hasher-YYYY-MM-DD-HHMMSS-PID.csv, so lexical order IS chronological order.
+# This avoids `ls -1t` (whose output cannot be parsed safely when a path
+# contains spaces) and avoids `find -printf` / `sed -z`, which are GNU-only
+# and absent on macOS and BusyBox. A plain glob into an array is portable to
+# bash 3.2 and cannot word-split.
+#
+# Partial manifests need no special handling: since v1.3.26 an incomplete run
+# is renamed to `partial-hasher-*.csv`, which the glob below does not match.
 latest_hashes_csv() {
-  # shellcheck disable=SC2012
-  f="$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)"
-  [ -n "${f:-}" ] && printf "%s" "$f" || printf ""
+  _lhc_files=()
+  for _lhc_f in "$HASHES_DIR"/hasher-*.csv; do
+    # An unmatched glob expands to the literal pattern; -e filters it out.
+    [ -e "$_lhc_f" ] || continue
+    _lhc_files[${#_lhc_files[@]}]="$_lhc_f"
+  done
+
+  # Glob expansion is lexically ascending, so iterate from the end.
+  _lhc_i=$(( ${#_lhc_files[@]} - 1 ))
+  while [ "$_lhc_i" -ge 0 ]; do
+    if manifest_has_data_rows "${_lhc_files[$_lhc_i]}"; then
+      printf '%s' "${_lhc_files[$_lhc_i]}"
+      return 0
+    fi
+    _lhc_i=$(( _lhc_i - 1 ))
+  done
+  printf ''
 }
 
 determine_paths_file() {
@@ -756,7 +798,36 @@ preflight_hashing() {
     info "The launcher can do this for you: Settings → Review scan paths."
     return 1
   fi
+
+  # v1.4.4 (peer review #2): configured is not the same as available.
+  # Every root can be listed correctly and still be absent — an unmounted
+  # external disk is the common case. hasher.sh does reject this cleanly
+  # (exit 3, "All N path(s) are missing or unreadable") and leaves no
+  # manifest behind, so nothing is corrupted; but the user has by then
+  # committed to an action and waited for it. Checking here lets the answer
+  # arrive before the launch rather than after it.
+  if [ "${exist:-0}" -lt 1 ]; then
+    err "None of the configured scan paths currently exists or is readable."
+    info "Configured: ${roots:-0}   Available now: ${exist:-0}"
+    info "This usually means the volume or external disk is not mounted."
+    info "Check the mount, then try again — no configuration change is needed."
+    return 1
+  fi
   return 0
+}
+
+# count_available_scan_paths — configured roots that exist RIGHT NOW.
+# v1.4.4: paired with count_active_scan_paths so the first-run screen can
+# distinguish "configured" from "reachable" without launching anything.
+count_available_scan_paths() {
+  local _pf _line _n=0
+  _pf="$(determine_paths_file)"
+  if [ -z "$_pf" ] || [ ! -r "$_pf" ]; then printf '0'; return; fi
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in \#*|"") continue ;; esac
+    [ -d "$_line" ] && _n=$(( _n + 1 ))
+  done < "$_pf"
+  printf '%s' "$_n"
 }
 
 find_hasher_script() {
@@ -891,6 +962,18 @@ run_hasher_interactive() {
 
   script="$(find_hasher_script || true)"
   if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
+
+  # v1.4.4 (peer review #3): the same preflight as run_hasher_nohup.
+  #
+  # v1.4.2 added the guard to the background path only, because that was the
+  # route the report came from. Advanced/custom hashing builds its arguments
+  # from the same configured paths file, so it could still start a run with
+  # nothing configured or nothing mounted. Guarding one caller of a shared
+  # precondition and not the others is the recurring shape of these defects;
+  # any future launch path needs this call too.
+  if ! preflight_hashing; then
+    return 1
+  fi
 
   pfile="$(determine_paths_file)"
   efile="$(determine_excludes_file)"
@@ -2032,20 +2115,14 @@ hasher_processes_running() {
 }
 
 has_successful_hash_manifest() {
-  # v1.4.2: a header-only CSV is NOT a usable manifest.
+  # v1.4.2: a header-only CSV is NOT a usable manifest — a run with no scan
+  # paths configured produces exactly that, and treating it as real made the
+  # first-run screen disappear permanently.
   #
-  # Previously this checked only that some hasher-*.csv existed. A run with
-  # no scan paths configured produces exactly that — a file containing the
-  # header and nothing else — and the first-run screen would then disappear
-  # for good, dropping the user into the full workflow menu with a manifest
-  # holding zero rows and no way back. Requiring a data row keeps the
-  # welcome screen in place until there is genuinely something to work with.
-  local _csv
-  _csv="$(latest_hashes_csv)"
-  [ -n "$_csv" ] || return 1
-  [ -r "$_csv" ] || return 1
-  # Cheap: stop reading as soon as a second line is seen.
-  [ "$(head -n 2 "$_csv" 2>/dev/null | wc -l | tr -d ' ')" -ge 2 ]
+  # v1.4.4: the data-row test moved into latest_hashes_csv, which now returns
+  # only usable manifests. Keeping a second copy here invited them to drift
+  # apart, which is precisely how peer-review #1 arose.
+  [ -n "$(latest_hashes_csv)" ]
 }
 
 # count_active_scan_paths — non-blank, non-comment entries in the paths file.
@@ -2089,9 +2166,40 @@ print_first_hash_menu() {
     return 0
   fi
 
+  # v1.4.4 (peer review #2): configured paths may all be unavailable — an
+  # unmounted external disk is the usual reason. Announcing "ready" and
+  # offering to start would send the user into a run that cannot proceed.
+  local _avail
+  _avail="$(count_available_scan_paths)"
+
+  if [ "${_avail:-0}" -lt 1 ]; then
+    printf '%sWelcome. Your storage is not currently available.%s\n' "$BOLD" "$RST"
+    echo
+    printf '   Scan paths configured: %s\n' "$_roots"
+    printf '   Available now:         %s\n' "$_avail"
+    echo
+    echo "The paths are configured correctly, but none of them can be reached"
+    echo "at the moment. This usually means a volume or external disk is not"
+    echo "mounted. No configuration change is needed — mount it and return."
+    echo
+    echo "   2) Settings & preferences  (review the configured paths)"
+    echo "   3) Help & information"
+    echo
+    echo "   q) Quit"
+    echo
+    printf "Select an option: "
+    return 0
+  fi
+
   printf '%sWelcome. Hasher is ready for its first run.%s\n' "$BOLD" "$RST"
   echo
   printf '   Scan paths configured: %s\n' "$_roots"
+  if [ "$_avail" -lt "$_roots" ]; then
+    # Partial availability is worth flagging but not blocking: hashing what
+    # is reachable is a legitimate choice, and hasher.sh warns per path.
+    printf '   Available now:         %s  %s(%s not reachable)%s\n' \
+      "$_avail" "$YEL" "$(( _roots - _avail ))" "$RST"
+  fi
   echo
   echo "The first hash safely inventories your files and prepares the"
   echo "duplicate analysis used by the review workflow."
@@ -2208,6 +2316,12 @@ while :; do
         if [ "$(count_active_scan_paths)" -lt 1 ]; then
           warn "No scan paths configured — there is nothing to hash yet."
           info "Add a directory under Settings & preferences (option 2)."
+          printf "Press Enter to continue... "; read -r _ || true
+        elif [ "$(count_available_scan_paths)" -lt 1 ]; then
+          # v1.4.4: the option is not listed in this state, but nothing stops
+          # the user typing it.
+          warn "None of the configured scan paths is reachable right now."
+          info "Mount the volume or external disk, then try again."
           printf "Press Enter to continue... "; read -r _ || true
         elif is_hasher_running || hasher_processes_running; then
           info "The first hash run is already active."
