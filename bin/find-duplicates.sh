@@ -26,6 +26,7 @@ Usage: find-duplicates.sh [--input CSV] [--mode standard|bulk]
                           [--min-group-size N] [--keep-strategy shortest-path|oldest|newest|first]
                           [--allow-malformed-rows]
                           [--build-review-index|--no-review-index]
+                          [--report-out PATH] [--no-publish-latest]
 Outputs:
   - Canonical: logs/duplicate-hashes-YYYY-MM-DD-HHMMSS-PID.txt   (per-run)
   - Latest:    logs/duplicate-hashes-latest.txt                  (symlink to newest)
@@ -35,6 +36,24 @@ Outputs:
                   (sorted by potential reclaim; built by default)
 Bulk mode also writes:
   - Plan:      logs/review-dedupe-plan-YYYY-MM-DD-HHMMSS-PID.txt
+
+--report-out PATH     Write the canonical report to PATH instead of the
+                       default logs/duplicate-hashes-<run>.txt name. Use
+                       this when the input CSV is not a NAS scan (e.g. a
+                       single-folder scan for an isolated workflow) so the
+                       output lands in its own namespace rather than the
+                       one normal NAS duplicate-discovery runs use.
+--no-publish-latest    Do not update duplicate-hashes-latest.txt or
+                       duplicate-review-index-latest.tsv. The per-run,
+                       timestamped files are still written normally; only
+                       the global "latest" pointers other tools default to
+                       reading are left untouched. v1.4.10: added after a
+                       peer review found that Import Check's internal
+                       deduplication (which scans the import folder, not
+                       the NAS) was silently overwriting these pointers,
+                       so a later NAS-side review-duplicates.sh/auto-
+                       dedup.sh run with no explicit --from-report would
+                       pick up import-only data instead of NAS data.
 EOF
 }
 
@@ -45,6 +64,8 @@ MIN_GROUP=2
 KEEP_STRATEGY="shortest-path"
 ALLOW_MALFORMED=0
 BUILD_REVIEW_INDEX=1
+REPORT_OUT=""
+PUBLISH_LATEST=1
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -57,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --allow-malformed-rows) ALLOW_MALFORMED=1; shift ;;
     --build-review-index) BUILD_REVIEW_INDEX=1; shift ;;
     --no-review-index) BUILD_REVIEW_INDEX=0; shift ;;
+    --report-out) REPORT_OUT="${2:-}"; shift 2 ;;
+    --no-publish-latest) PUBLISH_LATEST=0; shift ;;
     *) err "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
@@ -76,6 +99,10 @@ timestamp="$(date +'%Y-%m-%d-%H%M%S')-$$"
 # per-run history accumulates. Mirrors the pattern hasher.sh post_run_reports
 # has used since v1.3.19.
 OUT_CANON="$LOGS_DIR/duplicate-hashes-$timestamp.txt"
+# v1.4.10: --report-out lets a caller redirect the canonical report to a
+# path outside the normal logs/ naming, so its content is never confusable
+# with (and never collides in a directory listing with) a NAS-scan report.
+[ -n "$REPORT_OUT" ] && OUT_CANON="$REPORT_OUT"
 OUT_GROUPS="$LOGS_DIR/duplicate-groups-$timestamp.txt"
 OUT_CSV="$LOGS_DIR/duplicates-$timestamp.csv"
 OUT_PLAN="$LOGS_DIR/review-dedupe-plan-$timestamp.txt"  # only when bulk
@@ -428,11 +455,15 @@ if [[ ! -s "$HASHES_TMP" ]]; then
   info "Group summary:           $OUT_GROUPS"
   : > "$OUT_CSV"
   printf '# hardlink-filter: not-required\n' >> "$OUT_CANON"
-  publish_latest_report || warn "Could not update latest report pointer: $OUT_LATEST"
+  if [[ "$PUBLISH_LATEST" -eq 1 ]]; then
+    publish_latest_report || warn "Could not update latest report pointer: $OUT_LATEST"
+  fi
   if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
     write_review_index_header
-    publish_latest_index || warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
-    info "Review index (empty):    $OUT_INDEX"
+    if [[ "$PUBLISH_LATEST" -eq 1 ]]; then
+      publish_latest_index || warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
+      info "Review index (empty):    $OUT_INDEX"
+    fi
   fi
   exit 0
 fi
@@ -655,15 +686,22 @@ fi
 
 # Standard and bulk modes both publish the immutable run-specific canonical
 # report only after all rendering/planning work has completed.
-if publish_latest_report; then
-  info "Canonical report ready: $OUT_LATEST"
-else
-  warn "Could not update latest report pointer: $OUT_LATEST"
-fi
-if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
-  if publish_latest_index; then
-    info "Prepared review index ready: $OUT_INDEX_LATEST"
+# v1.4.10: --no-publish-latest skips both pointer updates entirely, for
+# callers whose input isn't the NAS's own manifest (see usage() above).
+if [[ "$PUBLISH_LATEST" -eq 1 ]]; then
+  if publish_latest_report; then
+    info "Canonical report ready: $OUT_LATEST"
   else
-    warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
+    warn "Could not update latest report pointer: $OUT_LATEST"
   fi
+  if [[ "$BUILD_REVIEW_INDEX" -eq 1 ]]; then
+    if publish_latest_index; then
+      info "Prepared review index ready: $OUT_INDEX_LATEST"
+    else
+      warn "Could not update latest review-index pointer: $OUT_INDEX_LATEST"
+    fi
+  fi
+else
+  info "Canonical report: $OUT_CANON"
+  info "(--no-publish-latest: the global *-latest pointers were left untouched)"
 fi

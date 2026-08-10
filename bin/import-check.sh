@@ -312,13 +312,63 @@ cmd_setup() {
     info "$_dir already exists — using it."
   fi
 
+  # v1.4.10 (peer review finding #2): detect and offer to fix a LEGACY
+  # configuration (this exact folder still listed in paths.txt from a
+  # pre-v1.4.7 install) BEFORE running the general overlap check below.
+  #
+  # The original ordering ran the overlap check first, which refused
+  # unconditionally the moment it found this exact entry in paths.txt --
+  # so the migration offer a few lines further down could NEVER be
+  # reached by the very users it existed to help: a v1.4.6 install that
+  # had added import_dir to paths.txt (the old, pre-v1.4.7 behaviour) hit
+  # "This folder overlaps a trusted NAS scan root and cannot be used" and
+  # setup simply refused, with no path forward.
+  #
+  # Regression caught by the test suite immediately after this was first
+  # written: a bare "is $_dir an exact line in paths.txt" test cannot
+  # distinguish a genuine legacy-migration case from a user setting up
+  # Import Check for the FIRST time who happens to type in a path that is
+  # ALSO a real, currently-used NAS scan root -- both look identical from
+  # that one signal alone, and the latter is exactly the unsafe
+  # configuration the overlap check exists to catch. The correct
+  # distinguishing signal is whether IMPORT_DIR was ALREADY configured to
+  # this exact folder before this setup run started ($IMPORT_DIR here
+  # still holds the pre-existing value; it is not reassigned until
+  # write_import_dir further down) -- that is only true if a previous
+  # setup already recorded this folder as Import Check's own, which is
+  # precisely the legacy-migration case and nothing else.
+  local _pf="$LOCAL_DIR/paths.txt"
+  if [ -n "${IMPORT_DIR:-}" ] && [ "$IMPORT_DIR" = "$_dir" ] \
+     && [ -r "$_pf" ] && grep -qxF "$_dir" "$_pf" 2>/dev/null; then
+    warn "This exact folder is listed in local/paths.txt as a trusted NAS"
+    warn "scan root -- likely added by an earlier version of Import Check,"
+    warn "which is no longer how this works. It needs to be removed from"
+    warn "there before it can be used as the import staging folder."
+    printf 'Remove this entry from local/paths.txt now? [Y/n]: '
+    local _reply
+    read -r _reply || _reply=""
+    case "$(printf '%s' "${_reply:-y}" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        warn "Left in place. The overlap check below will refuse to proceed"
+        warn "while it remains listed there."
+        ;;
+      *)
+        local _tmp="${_pf}.import-tmp.$$"
+        grep -vxF "$_dir" "$_pf" > "$_tmp" 2>/dev/null || : > "$_tmp"
+        mv -f -- "$_tmp" "$_pf"
+        ok "Removed from $_pf"
+        ;;
+    esac
+  fi
+
   # v1.4.7 (peer review #1): validate BEFORE saving anything. Reuses the
   # same check every operational subcommand runs via require_import_dir(),
   # so setup and normal use can never disagree about what counts as an
   # overlap. Directly against local/paths.txt rather than through
   # IMPORT_DIR/require_import_dir(), since $_dir has not been written to
-  # config yet at this point.
-  local _pf="$LOCAL_DIR/paths.txt"
+  # config yet at this point. Re-reads $_pf fresh here (rather than reusing
+  # anything read above) in case the legacy-removal step above just
+  # changed it -- this must see the CURRENT file, not a stale copy.
   if [ -r "$_pf" ]; then
     local _dir_canon _line _root_canon
     _dir_canon="$(_canon_or_raw "$_dir")"
@@ -344,37 +394,6 @@ cmd_setup() {
   write_import_dir "$_dir"
   IMPORT_DIR="$_dir"
   ok "Recorded import_dir in $CONF"
-
-  # v1.4.7 (peer review #2): local/paths.txt is the trusted NAS inventory.
-  # The import folder is deliberately untrusted staging material and must
-  # NOT be added to it — doing so blurred the trust boundary, made full
-  # NAS hashes spend time on temporary import content, and fed import
-  # material into ordinary duplicate discovery. cmd_scan below already
-  # builds its own single-folder pathfile; nothing in this script has ever
-  # needed IMPORT_DIR to be in paths.txt to function.
-  #
-  # This also removes a real pre-existing bug: the old code truncated
-  # paths.txt (`: > "$_pf"`) before checking whether the folder was
-  # already listed, which discarded the user's actual NAS roots on every
-  # setup run. Not touching the file at all removes that failure mode too.
-  if [ -r "$_pf" ] && grep -qxF "$_dir" "$_pf" 2>/dev/null; then
-    warn "Import Check's folder is currently listed in $_pf."
-    warn "For a clean trust boundary it should not be part of the normal"
-    warn "NAS inventory — that also means it will stop being hashed by"
-    warn "full runs (bin/import-check.sh scan hashes it separately)."
-    printf 'Remove this entry from local/paths.txt now? [Y/n]: '
-    local _reply
-    read -r _reply || _reply=""
-    case "$(printf '%s' "${_reply:-y}" | tr '[:upper:]' '[:lower:]')" in
-      n|no) info "Left in place. You can remove it yourself later if you change your mind." ;;
-      *)
-        local _tmp="${_pf}.import-tmp.$$"
-        grep -vxF "$_dir" "$_pf" > "$_tmp" 2>/dev/null || : > "$_tmp"
-        mv -f -- "$_tmp" "$_pf"
-        ok "Removed from $_pf"
-        ;;
-    esac
-  fi
 
   echo
   ok "Import Check is set up: $_dir"
@@ -458,10 +477,96 @@ cmd_scan() {
   info "Next: bin/import-check.sh summary"
 }
 
+# load_verified_import_scan — v1.4.10 (peer review finding #3).
+#
+# Sets globals _import_csv and _nas_csv as ONE atomic unit, read from the
+# import-scan-latest.meta sidecar. The previous approach independently
+# resolved import-scan-latest.csv (one symlink) and scan_pinned_nas_csv()
+# (a second, separate symlink) — cmd_scan publishes those two symlinks as
+# two non-atomic operations, so a process killed between them could leave
+# the CSV symlink pointing at a NEWER scan than the meta symlink
+# describes, silently reintroducing the exact provenance mismatch the
+# meta sidecar exists to prevent.
+#
+# Fix: the meta file is now authoritative, and the CSV path used is the
+# one ITS OWN import_csv= field names — a specific, already-fully-written,
+# timestamped file (never the -latest.csv symlink). That file was written
+# in full by cmd_scan before either "latest" symlink was touched, so this
+# is internally consistent by construction: whichever scan the meta
+# symlink currently names, its own record of "the CSV that went with it"
+# is always correct, even if it isn't the very latest scan by wall-clock
+# time. The publish order of the two -latest symlinks in cmd_scan
+# therefore no longer affects correctness for any v1.4.7+ scan — only the
+# meta symlink is read by any internal consumer now.
+#
+# Also validates meta.import_dir against the CURRENTLY CONFIGURED
+# IMPORT_DIR, catching the case where the user switched import folders
+# (re-ran setup pointing elsewhere) but a stale scan's meta is still
+# sitting there unrefreshed.
+#
+# Returns 0 and sets _import_csv/_nas_csv on success; returns 1 with an
+# error already printed on failure. Falls back to the pre-v1.4.7 two-file
+# lookup only when no meta sidecar exists at all -- upgrade continuity,
+# not normal use, since every v1.4.7+ scan writes one.
+load_verified_import_scan() {
+  _import_csv=""
+  _nas_csv=""
+  local _meta="$HASHES_DIR/import-scan-latest.meta"
+
+  if [ ! -r "$_meta" ] || ! grep -qxF 'marker=HASHER_IMPORT_SCAN_V1' "$_meta" 2>/dev/null; then
+    _import_csv="$HASHES_DIR/import-scan-latest.csv"
+    if [ ! -r "$_import_csv" ]; then
+      err "No import scan found. Run: bin/import-check.sh scan"
+      _import_csv=""
+      return 1
+    fi
+    _nas_csv="$(latest_nas_manifest)"
+    if [ -z "$_nas_csv" ]; then
+      err "No NAS manifest found."
+      return 1
+    fi
+    return 0
+  fi
+
+  local _meta_import_csv _meta_nas_csv _meta_import_dir
+  _meta_import_csv="$(awk '/^import_csv=/{ sub(/^import_csv=/, ""); print; exit }' "$_meta")"
+  _meta_nas_csv="$(awk '/^nas_csv=/{ sub(/^nas_csv=/, ""); print; exit }' "$_meta")"
+  _meta_import_dir="$(awk '/^import_dir=/{ sub(/^import_dir=/, ""); print; exit }' "$_meta")"
+
+  if [ -z "$_meta_import_csv" ] || [ ! -r "$_meta_import_csv" ]; then
+    err "The recorded import scan is missing or unreadable."
+    err "Run: bin/import-check.sh scan"
+    return 1
+  fi
+  if [ -z "$_meta_nas_csv" ] || [ ! -r "$_meta_nas_csv" ]; then
+    err "The NAS manifest this scan was pinned to is missing or unreadable."
+    err "Run a full hash, then: bin/import-check.sh scan"
+    return 1
+  fi
+  if [ "$_meta_import_dir" != "$IMPORT_DIR" ]; then
+    err "The last scan was against a different import folder:"
+    err "  scanned:   $_meta_import_dir"
+    err "  currently: $IMPORT_DIR"
+    err "Run: bin/import-check.sh scan"
+    return 1
+  fi
+
+  _import_csv="$_meta_import_csv"
+  _nas_csv="$_meta_nas_csv"
+  return 0
+}
+
 # scan_pinned_nas_csv — the exact NAS manifest the current import scan was
 # compared against, from the sidecar written by cmd_scan(). Falls back to
 # latest_nas_manifest() only for a scan that predates v1.4.7 (no sidecar
 # yet exists) — a fresh scan always gets a fresh sidecar.
+#
+# v1.4.10: kept only because cmd_scan's own completion message uses it to
+# report the pinned manifest name it just wrote (which is always the
+# freshest by definition, so the crash-window concern that motivated
+# load_verified_import_scan() doesn't apply to that one call site).
+# summary/discard/sort no longer call this directly -- see
+# load_verified_import_scan() above.
 scan_pinned_nas_csv() {
   local _meta="$HASHES_DIR/import-scan-latest.meta"
   if [ -r "$_meta" ] && grep -qxF 'marker=HASHER_IMPORT_SCAN_V1' "$_meta" 2>/dev/null; then
@@ -491,6 +596,23 @@ warn_if_nas_manifest_newer() {
     warn "($(basename "$_pinned")). Run 'scan' again to compare against the"
     warn "newer inventory, or continue — nothing changes automatically."
   fi
+}
+
+# import_scan_is_stale — v1.4.10 (peer review finding #4).
+#
+# True if a discard or dedup-internal action has happened since
+# $_import_csv was scanned -- i.e. rows in it may no longer reflect what
+# is actually on disk (files it lists may have already been quarantined).
+# Originally only cmd_dedup_internal checked this (v1.4.9); discard and
+# summary did not, which was inconsistent -- delete-duplicates.sh's
+# keeper-verification makes a stale discard SAFE (it skips vanished
+# files rather than acting on them), but the user experience was
+# confusing: apparent duplicate counts that turn into a wall of skips.
+# Extracted here so summary/discard/dedup-internal apply the identical
+# test rather than three near-copies of the same -nt comparison.
+import_scan_is_stale() {
+  local _marker="$VAR_DIR/import-check-last-destructive.marker"
+  [ -r "$_marker" ] && [ "$_marker" -nt "$_import_csv" ]
 }
 
 # classify_and_plan <nas_csv> <import_csv> <out_plan> <out_remainder_list>
@@ -704,21 +826,44 @@ classify_and_plan() {
 cmd_summary() {
   require_import_dir
   local _nas_csv _import_csv
-  _import_csv="$HASHES_DIR/import-scan-latest.csv"
-  [ -r "$_import_csv" ] || { err "No import scan found. Run: bin/import-check.sh scan"; exit 3; }
-  # v1.4.7 (peer review #3): use the manifest THIS scan was pinned to, not
-  # whatever the newest NAS manifest happens to be right now — see the
-  # comment on scan_pinned_nas_csv() for why that distinction matters.
-  _nas_csv="$(scan_pinned_nas_csv)"
-  [ -n "$_nas_csv" ] || { err "No NAS manifest found. Run a full hash first."; exit 3; }
+  # v1.4.10 (peer review #3): both resolved atomically from the meta
+  # sidecar — see load_verified_import_scan() for why this replaced
+  # independently resolving import-scan-latest.csv and
+  # scan_pinned_nas_csv().
+  load_verified_import_scan || exit 3
   warn_if_nas_manifest_newer "$_nas_csv"
+  # v1.4.10 (peer review #4): summary is read-only, so a stale scan is a
+  # caveat, not a reason to refuse showing information -- unlike discard,
+  # nothing here acts on the data. See import_scan_is_stale() for what
+  # "stale" means.
+  if import_scan_is_stale; then
+    warn "The import folder has changed since this scan (a discard or"
+    warn "dedup action ran since). These counts may not reflect the"
+    warn "current contents. Run '"'"'scan'"'"' again for a current picture."
+  fi
 
   local _plan="$VAR_DIR/import-summary-plan.$$"
   local _remainder="$VAR_DIR/import-summary-remainder.$$"
   local _skipped="$VAR_DIR/import-summary-skipped.$$"
   classify_and_plan "$_nas_csv" "$_import_csv" "$_plan" "$_remainder" "$_skipped"
+  # v1.4.10 (peer review #5): capture the skipped count BEFORE deleting
+  # the file, so it can be folded into "Files scanned" below. Previously
+  # this count was warned about but never added to the total, so "Files
+  # scanned in import" silently undercounted by however many files hit
+  # the pipe-character guard -- the numbers didn't add up to what was
+  # actually in the folder, with no explanation why.
+  local _skipped_count=0
   if [ -s "$_skipped" ]; then
-    warn "$(wc -l < "$_skipped" | tr -d ' ') path(s) are part of a match involving a '|'"
+    # v1.4.10: count only DEL-CANDIDATE/REMAINDER-CANDIDATE lines — those
+    # are the actual import-folder files affected. A cross-boundary match
+    # also logs one KEEP-CANDIDATE line, which is the NAS-side path, not
+    # an import file; counting it too overstated "files scanned in
+    # import" by one for every cross-boundary pipe-match (caught by
+    # comparing this summary's total against the real file count in a
+    # manual test — 4 reported vs 3 actual files on disk).
+    _skipped_count="$(grep -cE '^(DEL|REMAINDER)-CANDIDATE' "$_skipped" 2>/dev/null)" || true
+    [ -z "$_skipped_count" ] && _skipped_count=0
+    warn "$_skipped_count path(s) are part of a match involving a '|'"
     warn "character and are excluded from this summary — the plan format"
     warn "cannot represent them safely. Details: $_skipped"
   fi
@@ -742,10 +887,16 @@ cmd_summary() {
   printf -- '─────────────────────────────────────────────────────────\n'
   printf 'Import folder:              %s\n' "$IMPORT_DIR"
   printf 'Compared against:           %s\n' "$(basename "$_nas_csv")"
-  printf 'Files scanned in import:    %s\n' "$(( _del_count + _remainder_count ))"
+  # v1.4.10 (peer review #5): the total now includes _skipped_count, so
+  # this line adds up to everything classify_and_plan actually looked at
+  # -- not just the two buckets that happen to be actionable.
+  printf 'Files scanned in import:    %s\n' "$(( _del_count + _remainder_count + _skipped_count ))"
   echo
   printf '  Already on your NAS:      %-6s -> safe to quarantine\n' "$_del_count"
   printf "  Remaining (hand-sort):    %-6s -> unique + import's own duplicates\n" "$_remainder_count"
+  if [ "$_skipped_count" -gt 0 ]; then
+    printf '  Excluded (unsafe name):   %-6s -> contains '"'"'|'"'"', see warning above\n' "$_skipped_count"
+  fi
   echo
 
   if [ "$_del_count" -gt 0 ]; then
@@ -769,12 +920,20 @@ cmd_discard() {
   for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
 
   local _nas_csv _import_csv
-  _import_csv="$HASHES_DIR/import-scan-latest.csv"
-  [ -r "$_import_csv" ] || { err "No import scan found. Run: bin/import-check.sh scan"; exit 3; }
-  # v1.4.7 (peer review #3): use the manifest THIS scan was pinned to.
-  _nas_csv="$(scan_pinned_nas_csv)"
-  [ -n "$_nas_csv" ] || { err "No NAS manifest found."; exit 3; }
+  load_verified_import_scan || exit 3
   warn_if_nas_manifest_newer "$_nas_csv"
+  # v1.4.10 (peer review #4): discard is destructive, so -- unlike
+  # summary -- a stale scan is a hard refusal here, matching what
+  # dedup-internal already enforced (v1.4.9). Safe either way because
+  # delete-duplicates.sh's keeper-verification would just skip vanished
+  # files, but refusing up front avoids "lots of skips" confusion.
+  if import_scan_is_stale; then
+    err "The import folder has changed since this scan (a discard or"
+    err "dedup action ran since this scan was taken). Re-scan first so"
+    err "this works from current data:"
+    err "  bin/import-check.sh scan"
+    exit 2
+  fi
 
   local _tag _plan
   _tag="$(date +'%Y-%m-%d-%H%M%S')-$$"
@@ -888,19 +1047,25 @@ cmd_dedup_internal() {
   local _force=false
   for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
 
-  local _import_csv="$HASHES_DIR/import-scan-latest.csv"
-  [ -r "$_import_csv" ] || { err "No import scan found. Run: bin/import-check.sh scan"; exit 3; }
+  # v1.4.10: uses the same atomic loader as summary/discard/sort (peer
+  # review #3), rather than resolving import-scan-latest.csv on its own —
+  # this also gets it the import_dir-mismatch protection for free (if the
+  # import folder was switched since the last scan, that is now caught
+  # here too, not just in the other three commands). _nas_csv is set but
+  # unused: dedup-internal never compares against the NAS.
+  local _nas_csv _import_csv
+  load_verified_import_scan || exit 3
 
-  # v1.4.9: require a scan that postdates the most recent discard/dedup
-  # action against this import folder, rather than silently working from
-  # whatever import-scan-latest.csv happens to contain. A stale scan here
-  # would build duplicate groups referencing files discard already
-  # quarantined; delete-duplicates.sh's keeper-verification (v1.4.4) would
-  # catch that safely (skip, not act), but the result would be confusing
-  # -- "0 groups usable" -- rather than the tool asking for what it needs
-  # up front.
-  local _marker="$VAR_DIR/import-check-last-destructive.marker"
-  if [ -r "$_marker" ] && [ "$_marker" -nt "$_import_csv" ]; then
+  # v1.4.9, extracted to a shared helper in v1.4.10 (peer review #4) so
+  # summary/discard/dedup-internal all apply the identical staleness test
+  # rather than three near-copies of the same -nt comparison. Destructive
+  # here, so this refuses (matches discard) rather than warns (matches
+  # summary): a stale scan would build duplicate groups referencing files
+  # discard already quarantined. delete-duplicates.sh's keeper-
+  # verification (v1.4.4) would catch that safely (skip, not act), but
+  # the result would be confusing -- "0 groups usable" -- rather than the
+  # tool asking for what it needs up front.
+  if import_scan_is_stale; then
     err "Your last import scan predates a discard or dedup action against"
     err "this folder. Re-scan first so this works from current data:"
     err "  bin/import-check.sh scan"
@@ -911,8 +1076,22 @@ cmd_dedup_internal() {
   [ -r "$_fd" ] || { err "find-duplicates.sh not found."; exit 3; }
 
   info "Checking for duplicates within the import folder itself..."
-  local _fd_log="$VAR_DIR/import-internal-fd.$$.log"
+  local _tag _dupes_report _fd_log
+  _tag="$(date +'%Y-%m-%d-%H%M%S')-$$"
+  # v1.4.10 (peer review finding #1): find-duplicates.sh normally publishes
+  # logs/duplicate-hashes-latest.txt -- the SAME pointer review-duplicates.sh,
+  # auto-dedup.sh, and launch-review.sh all default to reading for the
+  # NORMAL NAS duplicate workflow. Running this against the import-only
+  # manifest and letting it publish unconditionally would silently replace
+  # that pointer with import-only data, so a later NAS-side run with no
+  # explicit --from-report would pick up the wrong report. --report-out
+  # gives this run its own namespace; --no-publish-latest keeps the NAS
+  # pointers untouched entirely. Import Check's own review index is not
+  # needed here, so --no-review-index skips building one.
+  _dupes_report="$LOGS_DIR/import-internal-duplicates-$_tag.txt"
+  _fd_log="$VAR_DIR/import-internal-fd.$$.log"
   if ! bash "$_fd" --input "$_import_csv" --mode bulk --keep-strategy shortest-path \
+        --report-out "$_dupes_report" --no-publish-latest --no-review-index \
         > "$_fd_log" 2>&1; then
     err "Could not check for internal duplicates -- see output below."
     cat "$_fd_log" >&2
@@ -921,9 +1100,6 @@ cmd_dedup_internal() {
   fi
   rm -f -- "$_fd_log" 2>/dev/null || true
 
-  # find-duplicates.sh always writes/updates the *-latest.txt pointer;
-  # that IS the report to hand to auto-dedup.sh next.
-  local _dupes_report="$LOGS_DIR/duplicate-hashes-latest.txt"
   if ! grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$_dupes_report" 2>/dev/null; then
     info "No duplicates found within the import folder."
     exit 4
@@ -937,7 +1113,7 @@ cmd_dedup_internal() {
   # the plan, not for acting on it. Applying is a separate, explicit call
   # to delete-duplicates.sh below, exactly mirroring how cmd_discard
   # already reuses delete-duplicates.sh unmodified.
-  local _plan_out="$LOGS_DIR/import-internal-dedup-plan-$(date +'%Y-%m-%d-%H%M%S')-$$.txt"
+  local _plan_out="$LOGS_DIR/import-internal-dedup-plan-$_tag.txt"
   if ! bash "$_ad" --from-report "$_dupes_report" --plan-out "$_plan_out" \
         --keep shortest-path --force > "$VAR_DIR/import-internal-ad.$$.log" 2>&1; then
     err "Could not build a dedup plan -- see output below."
@@ -978,7 +1154,7 @@ cmd_dedup_internal() {
 
   # Mark this destructive action so the next dedup-internal or discard run
   # knows the import-scan CSV it's about to reuse may now be stale.
-  : > "$_marker"
+  : > "$VAR_DIR/import-check-last-destructive.marker"
 
   exit "$_rc"
 }
@@ -990,11 +1166,7 @@ cmd_sort() {
   for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
 
   local _nas_csv _import_csv
-  _import_csv="$HASHES_DIR/import-scan-latest.csv"
-  [ -r "$_import_csv" ] || { err "No import scan found. Run: bin/import-check.sh scan"; exit 3; }
-  # v1.4.7 (peer review #3): use the manifest THIS scan was pinned to.
-  _nas_csv="$(scan_pinned_nas_csv)"
-  [ -n "$_nas_csv" ] || { err "No NAS manifest found."; exit 3; }
+  load_verified_import_scan || exit 3
   warn_if_nas_manifest_newer "$_nas_csv"
 
   local _plan="$VAR_DIR/import-sort-plan.$$"
