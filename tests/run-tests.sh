@@ -104,7 +104,25 @@ for _f in "$TESTS_DIR"/cases/*.sh; do
   if [ -n "$(printf '%s' "$FILTERS" | tr -d ' ')" ]; then
     _match=0
     for _flt in $FILTERS; do
-      case "$(basename "$_f")" in *"$_flt"*) _match=1 ;; esac
+      # v1.4.15: a purely numeric filter ("10") must match the case's
+      # leading test-ID number specifically, not appear anywhere in the
+      # filename. The Usage comment above has always documented this as
+      # "run cases whose NUMBER matches" — a plain substring match never
+      # actually implemented that. Reported live: `run-tests.sh ... 10 ...`
+      # also pulled in 93-import-check-v1410-fixes.sh, because "10" is a
+      # substring of "v1410" (from "v1.4.10", dots stripped) inside that
+      # file's descriptive name — nothing to do with test case 10.
+      # Non-numeric filters (e.g. "import-check") keep the broader
+      # substring match, since selecting by topic across the 90s series is
+      # a real, intentional use of this flag.
+      case "$_flt" in
+        ''|*[!0-9]*)
+          case "$(basename "$_f")" in *"$_flt"*) _match=1 ;; esac
+          ;;
+        *)
+          case "$(basename "$_f")" in "$_flt"-*) _match=1 ;; esac
+          ;;
+      esac
     done
     [ "$_match" = "1" ] || continue
   fi
