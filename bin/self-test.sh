@@ -96,6 +96,7 @@ find-duplicate-folders.sh
 find-duplicates.sh
 hash-check.sh
 hasher.sh
+import-check.sh
 launch-review.sh
 review-duplicates.sh
 review-folder-plan.sh
@@ -151,6 +152,32 @@ $(find "$ROOT_DIR" -name "$base" -type f 2>/dev/null)
 EOF
 done
 [ "$dup_found" -eq 0 ] && pass "no duplicate copies of sourced helpers"
+
+# v1.4.15 (peer review of v1.4.14): the check above only ever covered
+# $SOURCED_HELPERS (lib/host-detect.sh, lib/log.sh) — it never looked at
+# $MENU_TARGETS, the executable bin/ scripts. A stray duplicate of one of
+# those (e.g. a top-level /import-check.sh left behind by a packaging
+# step, shadowing the canonical bin/import-check.sh) went completely
+# undetected: it isn't a "sourced helper" by this check's own name, so it
+# was never in scope. Same search-and-compare logic, reused for the
+# executable scripts too. A SEPARATE flag from dup_found above, so a
+# failure in one check can never mask (or be masked by) a genuine pass in
+# the other.
+dup_found_bin=0
+for base in $MENU_TARGETS; do
+  rel="bin/$base"
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    relhit="${hit#$ROOT_DIR/}"
+    if [ "$relhit" != "$rel" ]; then
+      fail "duplicate script: $relhit shadows the canonical $rel (delete the stray copy)"
+      dup_found_bin=1
+    fi
+  done <<EOF
+$(find "$ROOT_DIR" -name "$base" -type f 2>/dev/null)
+EOF
+done
+[ "$dup_found_bin" -eq 0 ] && pass "no duplicate copies of canonical bin/ scripts"
 
 # v1.3.13 (recheck item 6 / A1): hasher.conf belongs ONLY in default/ (shipped)
 # and local/ (user override). A stray copy anywhere else — e.g. lib/hasher.conf
