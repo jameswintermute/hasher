@@ -716,10 +716,19 @@ build_file_list() {
           # Post-filter path already produced; still worth reporting.
           hb_seen=$(tr -cd '\0' < "$FILES_LIST" 2>/dev/null | wc -c 2>/dev/null | tr -d ' ' || echo 0)
         fi
-        printf '[%s] [RUN %s] [PROGRESS] Walking paths: %s file(s) discovered so far | elapsed=%02d:%02d:%02d\n' \
+        local _wline
+        _wline=$(printf '[%s] [RUN %s] [PROGRESS] Walking paths: %s file(s) discovered so far | elapsed=%02d:%02d:%02d' \
           "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "${hb_seen:-0}" \
-          $((hb_elapsed/3600)) $((hb_elapsed%3600/60)) $((hb_elapsed%60)) \
-          >> "$BACKGROUND_LOG" 2>/dev/null || true
+          $((hb_elapsed/3600)) $((hb_elapsed%3600/60)) $((hb_elapsed%60)))
+        printf '%s\n' "$_wline" >> "$BACKGROUND_LOG" 2>/dev/null || true
+        # v1.4.12: see the matching comment in start_hash_progress() —
+        # same fixed-path-only write, same invisibility for any
+        # synchronous/foreground caller. Applied here too since a slow
+        # WALK (deep nesting, network storage) can hit the identical
+        # "looks hung" symptom before hashing even begins.
+        if [[ -t 1 ]]; then
+          printf '%b%s%b\n' "$GREEN" "$_wline" "$NC" 2>/dev/null || true
+        fi
       done
     ) &
     walk_hb_pid=$!
@@ -1224,12 +1233,36 @@ start_hash_progress() {
       else
         pct=0; eta=0
       fi
-      printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)\n' \
+      local _line
+      _line=$(printf '[%s] [RUN %s] [PROGRESS] Hashing: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)' \
         "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$done" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
         "$(human_dur "$elapsed")" \
         $((eta/3600)) $((eta%3600/60)) $((eta%60)) \
-        "$(human_dur "$eta")" >> "$BACKGROUND_LOG"
+        "$(human_dur "$eta")")
+      printf '%s\n' "$_line" >> "$BACKGROUND_LOG"
+      # v1.4.12: this ticker has ALWAYS written to background.log, on a
+      # fixed path, regardless of how hasher.sh was invoked. That is fine
+      # for the launcher's nohup-backgrounded "Start hashing" path, whose
+      # own stdout is redirected elsewhere and which expects the operator
+      # to `tail -f` this file (launcher option 'l'). It silently broke
+      # for any SYNCHRONOUS/foreground invocation with no such redirect —
+      # most visibly import-check.sh's `scan`, which runs hasher.sh
+      # directly in the caller's terminal with no separate follow-log
+      # step. On a large corpus that run can take many minutes with a
+      # completely blank screen and no way to tell it apart from a hang,
+      # which is exactly what happened: reported live via a screenshot of
+      # dozens of unanswered Ctrl-C presses, confirmed still alive and
+      # progressing correctly by tailing background.log from a second
+      # session.
+      #
+      # Fix: also echo the identical line to stdout when it IS a TTY.
+      # Gated on `-t 1` so a genuinely backgrounded/redirected/piped run
+      # (stdout not a terminal) gets no extra output and no duplication —
+      # this only adds visibility where a human is actually watching.
+      if [[ -t 1 ]]; then
+        printf '%b%s%b\n' "$GREEN" "$_line" "$NC"
+      fi
     done
   ) &
   hash_progress_pid=$!
@@ -1275,12 +1308,19 @@ start_zero_progress() {
       else
         pct=0; eta=0
       fi
-      printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)\n' \
+      local _zline
+      _zline=$(printf '[%s] [RUN %s] [PROGRESS] Zero-scan: [%s%%] %s/%s | elapsed=%02d:%02d:%02d (%s) eta=%02d:%02d:%02d (%s)' \
         "$(date +'%Y-%m-%d %H:%M:%S')" "$RUN_ID" "$pct" "$count" "$total" \
         $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)) \
         "$(human_dur "$elapsed")" \
         $((eta/3600)) $((eta%3600/60)) $((eta%60)) \
-        "$(human_dur "$eta")" >> "$BACKGROUND_LOG"
+        "$(human_dur "$eta")")
+      printf '%s\n' "$_zline" >> "$BACKGROUND_LOG"
+      # v1.4.12: see the matching comment in start_hash_progress() — same
+      # fixed-path-only write, same invisibility for a synchronous caller.
+      if [[ -t 1 ]]; then
+        printf '%b%s%b\n' "$GREEN" "$_zline" "$NC"
+      fi
     done
   ) &
   zero_progress_pid=$!
