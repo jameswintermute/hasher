@@ -309,7 +309,29 @@ TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
 # detected/declared column numbers against the CORRECTLY split fields. TSV
 # inputs (DELIM='\t') are split on tab with no quote handling, which is
 # correct for TSV.
-awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -v DELIM="$DELIM" '
+# v1.4.9: progress reporting for this pass. On a large manifest (order
+# 100k+ rows) this quote-aware parse genuinely takes several seconds with
+# zero prior feedback — the same "is it hung" complaint fixed for
+# import-check.sh's classify_and_plan() in v1.4.8, using the identical
+# approach for the identical reason: this is a single awk process with no
+# per-row return to bash to call a bash progress-bar function from.
+#
+# Deliberately no elapsed time or ETA — needs systime(), not reliably
+# available across every awk variant this tool supports (BusyBox awk on
+# Synology DSM; see lib/awk-detect.sh). A moving percentage and row count
+# is enough to show the process is alive without depending on awk timing
+# behaviour. TTY detection and the row-count precheck happen here in bash,
+# where they're cheap and portable.
+_fd_show_progress=0
+[ -t 2 ] && _fd_show_progress=1
+_fd_total_lines=0
+if [ "$_fd_show_progress" -eq 1 ]; then
+  _fd_total_lines="$(wc -l < "$INPUT" 2>/dev/null | tr -d ' ')"
+  [ -z "$_fd_total_lines" ] && _fd_total_lines=0
+fi
+
+awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HEADER" -v DELIM="$DELIM" \
+    -v show_progress="$_fd_show_progress" -v total_lines="$_fd_total_lines" '
   # Quote-aware splitter: fills global array F[1..nf] from line s using sep.
   # Honours RFC4180 double-quoting only when sep is comma; for any other sep
   # (e.g. tab) it splits plainly. Returns nf.
@@ -336,10 +358,30 @@ awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HE
     F[++nf] = cur;
     return nf;
   }
-  BEGIN{ OFS="\t" }   # FIX (v1.3.1): intermediate is TAB-separated so paths
-                      # containing commas survive downstream awk -F parsing.
+  # draw_progress — redraw the in-place bar. Rate-limited by row count
+  # rather than wall-clock time (see the comment above the awk call for
+  # why): step is sized so roughly 200 redraws happen over the whole run
+  # regardless of input size.
+  function draw_progress(cur,    pct, filled, bar, i) {
+    if (!show_progress || total_lines <= 0) return
+    if (cur < total_lines && (cur % step) != 0) return
+    pct = int(100 * cur / total_lines)
+    if (pct > 100) pct = 100
+    filled = int(40 * pct / 100)
+    bar = ""
+    for (i = 0; i < 40; i++) bar = bar (i < filled ? "#" : "-")
+    printf "\r[WORK] %3d%% [%s]  %d/%d  scanning manifest for duplicate hashes    ", \
+      pct, bar, cur, total_lines > "/dev/stderr"
+  }
+  BEGIN {
+    OFS="\t"   # FIX (v1.3.1): intermediate is TAB-separated so paths
+               # containing commas survive downstream awk -F parsing.
+    step = 1
+    if (total_lines > 200) step = int(total_lines / 200)
+  }
   NR==1 && skip==1 { next }
   {
+    draw_progress(NR)
     nf = csv_split($0, DELIM);
     h = (ch <= nf ? F[ch] : "");
     p = (cp <= nf ? F[cp] : "");
@@ -352,6 +394,12 @@ awk -v ch="$COL_HASH" -v cp="$COL_PATH" -v cs="${COL_SIZE:-0}" -v skip="$SKIP_HE
     gsub(/\t/," ",p);
     k = h SUBSEP p;
     if (h!="" && p!="" && !seen[k]++) print h, p, s;
+  }
+  END {
+    if (show_progress && total_lines > 0) {
+      draw_progress(total_lines)
+      printf "\r%80s\r", "" > "/dev/stderr"
+    }
   }
 ' "$INPUT" > "$TMP"
 
