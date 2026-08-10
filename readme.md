@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.14**
+Started Dec 2022. Current version: **v1.4.15**
 
 ### First-run launch screen
 
@@ -750,7 +750,7 @@ input is hostile".
 
 ```bash
 tests/run-tests.sh                # everything (18 cases, ~85s)
-tests/run-tests.sh 20 40          # only cases whose name matches
+tests/run-tests.sh 20 40          # only cases whose leading number matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
 tests/run-tests.sh --keep         # retain sandboxes for inspection

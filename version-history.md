@@ -4255,6 +4255,88 @@ under test is actually exercised.
 Full suite: 18 cases, 260 assertions.
 
 ---
+## 2026‑08 — v1.4.15
+**Tooling hardening: exact test-case selection, self-test catches stray canonical scripts**
+
+Two small, independently verified fixes from a peer review of v1.4.14,
+picked because both were fully diagnosed and low-risk. The review's
+main recommendation — rewriting `delete-duplicates.sh`'s O(n²)-shaped
+validation loops — is intentionally NOT in this release; see the note
+at the end.
+
+### Live evidence the O(n²) concern is real, not theoretical
+
+Confirmed from the same NAS session, on the same 72,685-entry plan: the
+`SCAN` phase (v1.4.13) completed in under two minutes; the `BUILD` phase
+(v1.4.14) reported **1% after 14 seconds with a 17-minute-18-second ETA**
+against 145,261 total lines. That single data point is a much stronger
+case for prioritising the rewrite than the earlier "this could be slow"
+framing — it now has a real number attached. Recorded here for whoever
+picks up that work next.
+
+### Test-case selection matched substrings, not the documented "number"
+
+`tests/run-tests.sh`'s own Usage comment has always said `20 40` runs
+"cases whose number matches." The implementation was a plain substring
+match against the whole filename, which never actually did that.
+
+Reported live and precisely reproduced: requesting cases `01 10 20 30
+40 50 60 70 80 85` also ran `93-import-check-v1410-fixes.sh` — filter
+`10` matched the substring `10` inside `v1410` (from "v1.4.10", dots
+stripped), which has nothing to do with test case 10.
+
+Fixed: a purely numeric filter now matches only the case's leading
+test-ID prefix (`"$_flt"-*`), not an arbitrary substring anywhere in the
+filename. A non-numeric filter (`import-check`) keeps the broader
+substring match, since selecting a whole topic across the 90s series is
+a real, intentional use of the same flag — verified both still work as
+expected: the exact ten-filter request now returns exactly ten cases,
+and `import-check` still returns all seven of 90–96.
+
+### self-test's duplicate-script check only ever covered two files
+
+The existing "Stale/duplicate helpers" check in `self-test.sh` searches
+the whole tree for a second copy of any name in `$SOURCED_HELPERS` —
+but that list has always contained exactly two entries,
+`lib/host-detect.sh` and `lib/log.sh`. It never looked at
+`$MENU_TARGETS`, the fifteen executable `bin/` scripts. A stray
+duplicate of one of those — a top-level `/import-check.sh` shadowing
+the canonical `bin/import-check.sh`, the exact shape of a packaging
+regression from earlier in this project's history — was invisible to
+this check: it isn't a "sourced helper" by the check's own name, so it
+was never in scope regardless of how thorough the search inside that
+scope was.
+
+Extended with a second pass reusing the identical search-and-compare
+logic against `$MENU_TARGETS`, with its own independent pass/fail flag
+so a failure in one check can never mask a genuine pass in the other.
+Verified against the exact reported scenario: copied
+`bin/import-check.sh` to the repo root and confirmed self-test now
+fails with `duplicate script: import-check.sh shadows the canonical
+bin/import-check.sh (delete the stray copy)`; confirmed a clean tree
+still passes both checks independently.
+
+### On the rewrite itself
+
+Not attempted in this release. Rewriting `SCAN`/`BUILD`/`VERIFY` as a
+single AWK pass over the plan — replacing the per-line and per-group
+forked lookups with in-memory associative arrays, while preserving
+every existing rejection condition (duplicate KEEP per hash, mixed
+hashed/legacy plans, orphaned legacy KEEP, missing keepers) exactly —
+is real surgery on the same safety-critical validation logic that has
+already needed two correction passes in three releases (v1.4.13 found
+two slow loops, v1.4.14 found a third that had been missed). It
+deserves a dedicated release with its own performance-oriented
+regression coverage against a synthetic large plan, not a third
+attempt folded into a turn that also touched two unrelated tools.
+
+Suite unchanged at 18 cases, 260 assertions — neither fix touched
+product behaviour tested by the existing suite, and no new automated
+test was written for either (both were verified by direct, reproduced
+demonstration instead: the exact filter list and the exact
+stray-file scenario).
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
