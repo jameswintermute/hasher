@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.9**
+Started Dec 2022. Current version: **v1.4.10**
 
 ### First-run launch screen
 
@@ -423,19 +423,36 @@ Also reachable from the launcher's main menu (`i`).
 It is untrusted staging material, hashed separately by `scan`; keeping it
 out of the trusted inventory means full NAS hashes don't spend time on
 temporary import content and ordinary duplicate discovery never processes
-it as if it were NAS data.
+it as if it were NAS data. Attempting to configure an import folder that
+equals, contains, or sits inside a trusted NAS root is refused outright —
+checked after resolving symlinks and `..`, and re-checked on every
+operational subcommand, not only at setup time, since `paths.txt` and
+`hasher.conf` are both plain text files a user can hand-edit afterwards.
+
+**`dedup-internal` never touches the NAS's own duplicate-discovery
+output.** It reuses `find-duplicates.sh` internally (the same tool the
+main menu's duplicate discovery uses), but with `--report-out` and
+`--no-publish-latest` so its report lands in its own
+`logs/import-internal-duplicates-*` namespace rather than overwriting
+`logs/duplicate-hashes-latest.txt` — the pointer `review-duplicates.sh`,
+`auto-dedup.sh`, and `launch-review.sh` all default to reading for the
+normal NAS workflow.
 
 **What "scan" compares against.** Only the import folder is (re)hashed each
 time — comparison uses the NAS manifest that existed at scan time, not
 whatever the newest one happens to be later. `scan` records which manifest
-it used in a sidecar (`hashes/import-scan-<run>.meta`); `summary`,
-`discard`, and `sort` all read that same pinned manifest, so a full NAS
-hash completing in the background between viewing the summary and running
-`discard` cannot silently change what gets acted on. If a newer NAS
-manifest exists, you're told — a warning, not a substitution — and can
-re-run `scan` to compare against it. If a NAS file has changed or been
-removed since the pinned manifest was taken regardless, `discard`'s reuse
-of `delete-duplicates.sh` re-verifies each match immediately before acting
+it used in a sidecar (`hashes/import-scan-<run>.meta`), and that sidecar is
+authoritative: `summary`, `discard`, `dedup-internal`, and `sort` all
+derive both the import CSV and the pinned NAS manifest from the meta
+file's own fields, rather than independently resolving two separately
+published `-latest` pointers, so the two can never describe different
+scans. The meta's recorded import folder is also cross-checked against
+whichever one is currently configured, catching the case where you've
+switched import folders since the last scan. If a newer NAS manifest
+exists, you're told — a warning, not a substitution — and can re-run
+`scan` to compare against it. If a NAS file has changed or been removed
+since the pinned manifest was taken regardless, `discard`'s reuse of
+`delete-duplicates.sh` re-verifies each match immediately before acting
 and skips anything that no longer checks out (exit code 4, not an error).
 
 **What's automated and what isn't.** *Cross-boundary* matches — an import
@@ -449,12 +466,19 @@ I keep" has no safe default the way "does the NAS already have this"
 does, so it gets its own plan-review-then-confirm step rather than being
 folded silently into the automatic one. Whatever is left after both —
 genuinely unique, no NAS match, no internal duplicate — is what `sort`
-moves into `import/unique-files/` for you to look through by hand.
-`dedup-internal` refuses to run against a scan that predates a discard or
-previous dedup-internal action, so it always works from current data
-rather than files that have already been quarantined. `scan` excludes
-`unique-files/` itself from later runs, so files you've already sorted
-aren't repeatedly reconsidered.
+moves into `import/unique-files/` for you to look through by hand. `scan`
+excludes `unique-files/` itself from later runs, so files you've already
+sorted aren't repeatedly reconsidered.
+
+**Working from current data.** `discard` and `dedup-internal` both refuse
+to run against a scan that predates a prior discard or dedup-internal
+action against the same folder — a stale scan's rows may no longer
+reflect what's actually on disk. `summary` is read-only, so it warns
+instead of refusing, and still shows the numbers with the caveat that
+they may be out of date. `sort` is deliberately exempt: it makes no
+keep-or-delete judgement and already tolerates files that have moved or
+vanished since the scan, so requiring a fresh scan before every `sort`
+would cost real friction for no added safety.
 
 **Progress on large imports.** `summary`, `discard`, and `sort` all classify
 the import against the NAS manifest before doing anything else, and on a
@@ -583,7 +607,8 @@ hasher/
 │       ├── 85-manifest-selection.sh
 │       ├── 90-import-check.sh
 │       ├── 91-import-check-isolation.sh
-│       └── 92-import-check-dedup-internal.sh
+│       ├── 92-import-check-dedup-internal.sh
+│       └── 93-import-check-v1410-fixes.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -693,7 +718,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (13 cases, ~55s)
+tests/run-tests.sh                # everything (14 cases, ~65s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -721,6 +746,7 @@ directory of ordinary files would exercise:
 | `90-import-check` | NAS-precedence duplicate classification, boundary safety, remainder handling |
 | `91-import-check-isolation` | Overlap refusal, paths.txt isolation, manifest pinning, lock, pipe-char safety |
 | `92-import-check-dedup-internal` | Import's own duplicates, keep-shortest-path, staleness refusal, NAS isolation |
+| `93-import-check-v1410-fixes` | NAS-pointer isolation, migration reachability, atomic scan pinning, consistent staleness, accurate counts |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

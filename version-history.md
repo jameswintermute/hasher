@@ -3767,6 +3767,158 @@ full assertion counts pass unmodified.
 Suite now 13 cases, 195 assertions.
 
 ---
+## 2026‑08 — v1.4.10
+**Import Check peer review of v1.4.9 — five findings, all confirmed against source before fixing, one fix causing (and catching) its own regression**
+
+An external review of v1.4.9 raised five findings. Every one was checked
+against the actual code before being trusted — not just plausibility —
+and all five were confirmed real. Two of the fixes below also found
+additional bugs of their own while being verified, in the same pattern
+this project has repeated across several releases: a fix is only as good
+as the test that exercises it, and several of these would have shipped
+broken without one.
+
+### #1 (headline) — dedup-internal was overwriting the NAS's own duplicate report
+
+`cmd_dedup_internal()` called `find-duplicates.sh` against the
+import-only manifest, which — confirmed by reading the source —
+unconditionally publishes `logs/duplicate-hashes-latest.txt` and
+`logs/duplicate-review-index-latest.tsv`. Those are the exact pointers
+`review-duplicates.sh`, `auto-dedup.sh`, and `launch-review.sh` all
+default to reading for the *normal* NAS duplicate workflow. Running
+`dedup-internal` after a normal NAS duplicate-discovery pass silently
+replaced that pointer with import-only data.
+
+`find-duplicates.sh` gained two new flags: `--report-out PATH` (write the
+canonical report somewhere other than the default `logs/duplicate-hashes-
+<run>.txt` name) and `--no-publish-latest` (skip updating both `-latest`
+pointers entirely; the existing `--no-review-index` was reused rather
+than adding a third). `cmd_dedup_internal` now uses all three, landing
+its report in its own `logs/import-internal-duplicates-*` namespace.
+
+Verified end-to-end, not just by inspection: ran a normal NAS duplicate
+discovery, recorded what `duplicate-hashes-latest.txt` pointed at, ran
+`dedup-internal`, confirmed the pointer was byte-for-byte unchanged
+afterward and the import-internal report existed separately.
+
+### #2 — the v1.4.6 migration path was unreachable, and the fix for that broke something else
+
+`cmd_setup`'s overlap check ran before the migration offer a few lines
+below it, so a v1.4.6-era config (import folder still listed in
+`paths.txt`, the old pre-v1.4.7 behaviour) hit "This folder overlaps a
+trusted NAS scan root and cannot be used" and setup simply refused — the
+migration code written specifically to help that population could never
+run. Confirmed by reading the actual line order, and confirmed **there
+was no test covering this combination at all**: the migration feature had
+been described as complete in the v1.4.7 history entry without ever being
+exercised end-to-end.
+
+First fix: detect an exact `paths.txt` line match before the general
+overlap check, offer to remove it, then re-run the overlap check against
+the updated file. This broke `91-import-check-isolation.sh`'s `ov-equal`
+case immediately — a bare "is this folder an exact `paths.txt` line" test
+cannot distinguish a genuine legacy migration from a user configuring
+Import Check for the first time against a folder that is *also* a real,
+currently-used NAS root, which is exactly the unsafe configuration the
+overlap check exists to catch. Both look identical from that one signal.
+
+Corrected: the legacy-migration path now also requires that `IMPORT_DIR`
+was *already* configured to this exact folder before the current `setup`
+run started — only true if a previous run genuinely recorded this folder
+as Import Check's own. A first-time setup, where `IMPORT_DIR` is unset,
+cannot satisfy that condition regardless of what's in `paths.txt`, so it
+falls straight through to the ordinary refusal. Both the legacy case and
+the regression case are now covered by name in the new test suite.
+
+### #3 — the CSV and meta sidecar could describe different scans
+
+`cmd_scan` publishes `import-scan-latest.csv` and `import-scan-
+latest.meta` as two separate, non-atomic symlink operations, confirmed
+~19 lines apart. A process killed between them could leave the CSV
+pointing at a newer scan than the meta describes — reintroducing the
+exact provenance mismatch the meta sidecar (v1.4.7) exists to prevent.
+
+New `load_verified_import_scan()` makes the meta file authoritative:
+rather than independently resolving the `-latest.csv` symlink and calling
+`scan_pinned_nas_csv()` (a second, separate symlink read), both the
+import CSV and the pinned NAS manifest are now read from the meta's own
+`import_csv=`/`nas_csv=` fields in one pass. That file was already fully
+written before either `-latest` symlink was touched, so this is
+internally consistent by construction regardless of which scan the meta
+symlink currently names — the publish order of the two symlinks no longer
+affects correctness for any v1.4.7+ scan. Also validates `meta.import_dir`
+against the currently configured `IMPORT_DIR`, catching a folder switch
+that leaves a stale, unrefreshed meta — a real gap that didn't exist
+before this fix, not merely a narrowed race window.
+
+`cmd_summary`, `cmd_discard`, and `cmd_sort` were updated to call this
+instead of their previous two-step resolution. `cmd_dedup_internal` had
+been missed in an earlier pass and was still doing manual resolution;
+caught by grepping for leftover call sites rather than assuming the
+rewrite was complete, and fixed to match.
+
+### #4 — the destructive-action staleness marker was checked inconsistently
+
+v1.4.9 added a marker file so `dedup-internal` could detect a scan that
+predates a prior discard/dedup action. Confirmed the marker was written
+by both `discard` and `dedup-internal` but only ever *checked* by
+`dedup-internal` — a second `discard` run, or `summary`, against stale
+data proceeded without comment. Safe either way (`delete-duplicates.sh`'s
+keeper-verification just skips vanished files), but confusing: a wall of
+skips with no explanation.
+
+Extracted the check to a shared `import_scan_is_stale()` so the three
+commands that care apply the identical test rather than near-copies of
+the same `-nt` comparison. Applied consistently but not uniformly, by
+design: `summary` (read-only) now warns and still shows the numbers;
+`discard` (destructive) now refuses, matching what `dedup-internal`
+already did; `sort` was deliberately left untouched, per the review's own
+reasoning — it makes no keep/delete judgement and already tolerates
+files that vanished since the scan, so forcing a rescan before every
+`sort` would add friction without adding safety.
+
+### #5 — the summary's file count silently undercounted, then briefly over-counted
+
+"Files scanned in import" was `_del_count + _remainder_count`, which
+never included files diverted to the pipe-character skip report — the
+total didn't add up to what was actually in the folder, with no
+explanation why. Fixed by folding the skipped count into the total and
+adding an explicit "Excluded (unsafe name)" line rather than silently
+absorbing it into either existing bucket.
+
+The first version of this fix introduced a related bug, caught during
+manual verification rather than by the test that was about to be written
+for it: the skipped-report file logs a NAS-side `KEEP-CANDIDATE` line
+alongside each import-side `DEL-CANDIDATE` line for every cross-boundary
+match, so a plain `wc -l` over the skip file counted the NAS path too —
+over-attributing matches to "files in import" by one per cross-boundary
+pipe-match. A three-file fixture with one cross-boundary pipe-match
+reported "Files scanned: 4" before this was caught. Fixed to count only
+`DEL-CANDIDATE`/`REMAINDER-CANDIDATE` lines, which correspond to actual
+import-folder files; the same fixture now correctly reports 3.
+
+### Also
+
+Menu wording: "Dedup import's own duplicates" → "Remove duplicate copies
+within import" — "dedup" is internal project vocabulary, and everything
+else in the Import Check menu speaks to a general user.
+
+### Test coverage
+
+New `tests/cases/93-import-check-v1410-fixes.sh`, 21 assertions: NAS
+pointer isolation verified by literal before/after comparison of
+`duplicate-hashes-latest.txt`'s target; the legacy-migration case and its
+own regression case named and tested separately so the second cannot
+silently reappear; a folder-switch scenario exercising the new
+`meta.import_dir` cross-check; the summary/discard staleness-consistency
+split: warn vs refuse for the exact same underlying condition; and the
+summary count-accuracy check against a fixture with a known, hand-counted
+answer. The existing `90`, `91`, and `92` suites required no changes and
+all their assertions continue to pass unmodified.
+
+Full suite: 14 cases, 216 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
