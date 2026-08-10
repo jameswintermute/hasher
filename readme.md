@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.10**
+Started Dec 2022. Current version: **v1.4.12**
 
 ### First-run launch screen
 
@@ -448,12 +448,16 @@ file's own fields, rather than independently resolving two separately
 published `-latest` pointers, so the two can never describe different
 scans. The meta's recorded import folder is also cross-checked against
 whichever one is currently configured, catching the case where you've
-switched import folders since the last scan. If a newer NAS manifest
-exists, you're told — a warning, not a substitution — and can re-run
-`scan` to compare against it. If a NAS file has changed or been removed
-since the pinned manifest was taken regardless, `discard`'s reuse of
-`delete-duplicates.sh` re-verifies each match immediately before acting
-and skips anything that no longer checks out (exit code 4, not an error).
+switched import folders since the last scan. A sidecar that exists but is
+truncated or otherwise invalid — a crash mid-write, or direct editing — is
+refused outright rather than silently falling back to an unpinned
+comparison; only a genuinely absent sidecar (a pre-v1.4.7 scan) falls back
+that way. If a newer NAS manifest exists, you're told — a warning, not a
+substitution — and can re-run `scan` to compare against it. If a NAS file
+has changed or been removed since the pinned manifest was taken
+regardless, `discard`'s reuse of `delete-duplicates.sh` re-verifies each
+match immediately before acting and skips anything that no longer checks
+out (exit code 4, not an error).
 
 **What's automated and what isn't.** *Cross-boundary* matches — an import
 file that duplicates something already on the NAS — are resolved by
@@ -484,7 +488,19 @@ would cost real friction for no added safety.
 the import against the NAS manifest before doing anything else, and on a
 large import (order 100k files) that comparison alone can take several
 seconds. When run interactively, an in-place progress bar shows it working;
-piped or redirected output stays clean with no bar at all.
+piped or redirected output stays clean with no bar at all. `scan` itself —
+the hashing pass over the import folder — now shows the same periodic
+`[PROGRESS]` line on screen that has always gone to
+`logs/background.log`, since `scan` runs synchronously in whatever
+terminal it was invoked from and has no separate follow-log step the way
+the launcher's backgrounded "Start hashing" does; on a large corpus,
+minutes of complete silence there were previously indistinguishable from
+a hang. `scan` also honours whatever parallel-hashing level is configured
+via the launcher's Performance settings menu (`var/jobs.conf`) — it
+previously always ran fully serial regardless of that setting, which
+measurably matters on a large small-file corpus (an SD card, a
+Photos-library-style export), where per-file fork overhead, not the
+hashing itself, dominates wall-clock in serial mode.
 
 **Concurrency.** `scan`, `discard`, and `sort` take a lock
 (`var/import-check.lock`) so two of them can't run against the same import
@@ -608,7 +624,9 @@ hasher/
 │       ├── 90-import-check.sh
 │       ├── 91-import-check-isolation.sh
 │       ├── 92-import-check-dedup-internal.sh
-│       └── 93-import-check-v1410-fixes.sh
+│       ├── 93-import-check-v1410-fixes.sh
+│       ├── 94-import-check-meta-corruption.sh
+│       └── 95-import-check-scan-visibility.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -718,7 +736,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (14 cases, ~65s)
+tests/run-tests.sh                # everything (16 cases, ~75s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -747,6 +765,8 @@ directory of ordinary files would exercise:
 | `91-import-check-isolation` | Overlap refusal, paths.txt isolation, manifest pinning, lock, pipe-char safety |
 | `92-import-check-dedup-internal` | Import's own duplicates, keep-shortest-path, staleness refusal, NAS isolation |
 | `93-import-check-v1410-fixes` | NAS-pointer isolation, migration reachability, atomic scan pinning, consistent staleness, accurate counts |
+| `94-import-check-meta-corruption` | Corrupt/truncated scan metadata is refused, not silently bypassed |
+| `95-import-check-scan-visibility` | Configured parallelism honoured; progress tickers stay silent when piped |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

@@ -3919,6 +3919,169 @@ all their assertions continue to pass unmodified.
 Full suite: 14 cases, 216 assertions.
 
 ---
+## 2026‑08 — v1.4.11
+**Import Check: corrupt scan metadata is refused, not silently bypassed**
+
+A follow-up review of v1.4.10 found one remaining gap in
+`load_verified_import_scan()`, confirmed against the actual source before
+fixing: its single condition —
+
+```bash
+if [ ! -r "$_meta" ] || ! grep -qxF 'marker=HASHER_IMPORT_SCAN_V1' "$_meta"; then
+```
+
+— treated two genuinely different situations identically. A meta sidecar
+that **does not exist** is legitimate upgrade continuity (a pre-v1.4.7
+scan, or none yet) and correctly falls back to the unpinned lookup. A
+meta sidecar that **exists but fails validation** — truncated, corrupted,
+or hand-edited — was falling through to that exact same fallback,
+completely bypassing the pinning guarantee the sidecar exists to provide.
+
+That second case is not a hypothetical. The meta file is written as
+several separate `printf` calls inside one redirect, not a single atomic
+write, so a crash mid-write can leave a partial file. A NAS user directly
+editing `hashes/import-scan-latest.meta` — plausible, given how much
+scrutiny this install has already had — is equally capable of producing
+a file that exists and is readable but is missing the marker line. Either
+way, the result was a full, silent reversion to the exact provenance
+problem v1.4.7 and v1.4.10 were built to eliminate — not a smaller
+version of it, the whole thing.
+
+### Fix
+
+Split into two conditions. Only a genuinely absent meta file (`[ ! -e
+"$_meta" ]`) takes the legacy path; a present-but-invalid one is refused
+outright with a clear message and asked for a fresh scan, rather than
+guessing. `-e` was used deliberately for the absence check rather than
+`-r`: a file that exists but is unreadable (a permissions problem, say)
+is not "no scan happened", it belongs in the corruption branch, not the
+legacy-continuity one.
+
+Verified against all three real states by hand before writing the test:
+a valid meta continues to classify correctly; a genuinely absent meta
+still falls back and classifies correctly (unchanged behaviour, upgrade
+continuity preserved); a corrupted meta now refuses cleanly (exit 3,
+matching the existing "missing prerequisite" convention) rather than
+silently substituting unpinned data.
+
+### Test coverage
+
+New `tests/cases/94-import-check-meta-corruption.sh`, 13 assertions:
+the absent-meta baseline (must still succeed, guarding against the fix
+becoming too strict), garbage content, a marker line specifically
+missing while other fields remain present, a zero-byte file, and a
+final confirmation that an untouched, valid meta is completely
+unaffected by any of this. `93-import-check-v1410-fixes.sh` required no
+changes and its 21 assertions continue to pass unmodified.
+
+Suite now 15 cases, 229 assertions.
+
+---
+## 2026‑08 — v1.4.12
+**Import Check scan: live progress on screen, and configured parallelism honoured**
+
+Reported live, mid-run, from a NAS session: `bin/import-check.sh scan`
+against a 72,686-file import folder produced its usual startup lines,
+then went completely silent for many minutes. The operator sent dozens of
+Ctrl-C keypresses with no visible effect and reasonably assumed it had
+hung. Confirmed from a second SSH session tailing
+`logs/background.log` in parallel: the run was alive and progressing
+correctly the entire time — `[PROGRESS] Hashing: [50%] 36455/72686 |
+elapsed=00:14:30 eta=00:14:24` — just invisible on the terminal actually
+being watched.
+
+Two separate, compounding defects, confirmed against source before either
+was touched.
+
+### Progress tickers only ever wrote to background.log
+
+`hasher.sh` has three progress tickers — the walk-phase heartbeat
+(v1.3.21), the hashing-phase ticker (v1.3.21), and the zero-length-scan
+ticker — and all three write exclusively to a fixed path,
+`logs/background.log`, regardless of how the process was invoked. That
+is correct for the launcher's nohup-backgrounded "Start hashing" path,
+whose own stdout is redirected elsewhere and which expects the operator
+to `tail -f` that file via menu option `l`. It silently breaks for any
+SYNCHRONOUS, foreground invocation with no separate follow-log step —
+which describes `bin/import-check.sh scan` exactly: it runs `hasher.sh`
+directly in the caller's own terminal, with nothing else watching
+`background.log` on its behalf.
+
+All three tickers now also echo the identical line to stdout, gated on
+`[[ -t 1 ]]` so the fix is purely additive: a genuinely backgrounded,
+piped, or redirected invocation (stdout not a terminal — the launcher's
+nohup path, or any script consuming `hasher.sh`'s output) gets no change
+at all, confirmed by the fault-injection suite's own harness, which never
+runs anything under a real TTY and therefore exercises the non-firing
+path on every single test that touches hashing. An interactive run —
+direct CLI use, or `import-check.sh scan` — now sees the same line on
+screen that has always gone to the log, coloured to match the rest of
+the script's `info()`-style output.
+
+Fixed in all three tickers for consistency, not only the one that
+happened to get reported: a slow WALK phase (deep nesting, network
+storage) or a slow zero-length scan can hit the identical "looks hung"
+symptom before hashing even begins.
+
+### Import Check always ran fully serial, independent of configured parallelism
+
+`cmd_scan` never passed `--jobs` to `hasher.sh`, so it always defaulted
+to `HASH_JOBS=1` — completely independent of whatever parallel-hashing
+level the operator had configured via the launcher's Performance
+settings menu (`var/jobs.conf`) for every OTHER hash run in the tool.
+`hasher.sh`'s own comments on `HASH_JOBS` note exactly why this matters:
+serial mode forks three processes per file, and on a large small-file
+corpus — an SD card, a Photos-library-style export, precisely what
+Import Check exists to handle — that fork overhead, not the hashing
+itself, dominates wall-clock.
+
+`cmd_scan` now reads `var/jobs.conf` with the identical logic
+`launcher.sh` already uses (`head -n1`, strip to digits, fall back to 1
+if empty, invalid, or less than 1) — the same file, not a separate
+Import-Check-specific setting, so a parallelism level chosen once
+applies everywhere `hasher.sh` runs, including here. `hasher.sh`'s own
+existing safety cap (`min(cores*2, 64)`, v1.3.23) still applies on top,
+unchanged — confirmed in testing that a low-core sandbox correctly
+clamped a requested 4 workers down to 2, exactly as it already does for
+the launcher's own path.
+
+### Verified
+
+The exact `printf`/echo mechanism confirmed correct in isolation before
+being trusted in the real code path: coloured line on stdout, identical
+plain line in the log, both present, neither corrupting the other. Full
+suite confirms no regression to the log-writing behaviour existing cases
+depend on — `60-process-safety` and `70-launcher-status` both read
+`background.log` content directly and continue to pass unmodified.
+`--jobs` pass-through verified end-to-end: no `jobs.conf` → unchanged
+serial behaviour, no misleading message; `jobs.conf=4` → import-check
+reports the configured count and hasher.sh itself confirms entering
+parallel mode; corrupt `jobs.conf` content → falls back to 1 cleanly,
+no crash. Classification correctness (a real cross-boundary match)
+confirmed unaffected by either fix.
+
+### Test coverage
+
+New `tests/cases/95-import-check-scan-visibility.sh`, 11 assertions:
+the three `jobs.conf` states above, classification correctness with
+parallelism configured, and a direct, unconditional assertion that no
+`[PROGRESS]` line ever appears in the harness's own redirected output —
+this one runs for real on every suite execution, since the test harness
+never provides a TTY, rather than needing to simulate the non-firing
+condition.
+
+### Also caught while finishing this release
+
+`import-check.sh` had dropped out of `self-test.sh`'s `MENU_TARGETS` list
+at some point since it was first registered there. A missing entry
+doesn't fail self-test loudly — it just means that one script silently
+stops being checked for presence and executable bit — so this went
+unnoticed until a direct grep during final packaging turned up nothing.
+Restored.
+
+Full suite: 16 cases, 240 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
