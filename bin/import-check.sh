@@ -45,6 +45,7 @@
 #   bin/import-check.sh scan                      hash the import folder
 #   bin/import-check.sh summary                   classify and report
 #   bin/import-check.sh discard [--force]         generate + apply the plan
+#   bin/import-check.sh dedup-internal [--force]  dedup import's own duplicates
 #   bin/import-check.sh sort [--force]            move remainder to unique-files/
 #
 # Exit codes: 0 success, 1 hard failure, 2 invalid input/config,
@@ -516,6 +517,35 @@ classify_and_plan() {
   : > "$_remainder"
   [ -n "$_skipped" ] && : > "$_skipped"
 
+  # v1.4.8: progress reporting for the classification pass. On a large
+  # import (order 100k files) this awk pass genuinely takes several
+  # seconds with zero prior feedback — indistinguishable from a hang,
+  # the same complaint fixed for the hash and quarantine loops in v1.4.5.
+  #
+  # Implemented natively inside the awk script rather than via
+  # lib/log.sh's log_progress_bar(), because classify_and_plan does its
+  # work in a single awk process — there is no per-row return to bash to
+  # call a bash function from. Deliberately does NOT show elapsed time or
+  # an ETA: that needs systime(), which is not reliably available across
+  # the awk variants this tool already has to support (see
+  # lib/awk-detect.sh — BusyBox awk on Synology DSM has bitten this
+  # project before). A moving percentage and row count is enough to show
+  # the process is alive without depending on awk timing behaviour.
+  #
+  # TTY detection and the "how many rows total" precount both happen here
+  # in bash, where they're cheap and portable, rather than inside awk.
+  local _show_progress=0
+  log_is_tty && _show_progress=1
+  local _total_lines=0
+  if [ "$_show_progress" -eq 1 ]; then
+    local _n1 _n2
+    _n1="$(wc -l < "$_nas_csv" 2>/dev/null | tr -d ' ')"
+    _n2="$(wc -l < "$_import_csv" 2>/dev/null | tr -d ' ')"
+    [ -z "$_n1" ] && _n1=0
+    [ -z "$_n2" ] && _n2=0
+    _total_lines=$(( _n1 + _n2 ))
+  fi
+
   # v1.4.7 (peer review, plan-format limitation): the KEEP|path|hash /
   # DEL|path|hash format inherited from delete-duplicates.sh uses `|` as
   # its field separator with no escaping. A legal filename containing `|`
@@ -532,13 +562,34 @@ classify_and_plan() {
   # diverted to the skipped-paths report (when the caller provides one)
   # instead of being written into the plan. The match is simply not acted
   # on; nothing unsafe is emitted.
-  awk -v boundary="$_boundary" -v plan="$_plan" -v remainder="$_remainder" -v skipped="$_skipped" '
+  awk -v boundary="$_boundary" -v plan="$_plan" -v remainder="$_remainder" -v skipped="$_skipped" \
+      -v show_progress="$_show_progress" -v total_lines="$_total_lines" '
     function unquote(s) {
       if (substr(s,1,1) == "\"") {
         s = substr(s, 2, length(s)-2)
         gsub(/""/, "\"", s)
       }
       return s
+    }
+    # draw_progress — redraw the in-place bar. Rate-limited by row count
+    # rather than wall-clock time (see the comment above the awk call for
+    # why): step is sized so roughly 200 redraws happen over the whole
+    # run regardless of input size, which is smooth without being
+    # wasteful on a very large manifest.
+    function draw_progress(cur,    pct, filled, bar, i) {
+      if (!show_progress || total_lines <= 0) return
+      if (cur < total_lines && (cur % step) != 0) return
+      pct = int(100 * cur / total_lines)
+      if (pct > 100) pct = 100
+      filled = int(40 * pct / 100)
+      bar = ""
+      for (i = 0; i < 40; i++) bar = bar (i < filled ? "#" : "-")
+      printf "\r[WORK] %3d%% [%s]  %d/%d  matching import files against the NAS manifest    ", \
+        pct, bar, cur, total_lines > "/dev/stderr"
+    }
+    BEGIN {
+      step = 1
+      if (total_lines > 200) step = int(total_lines / 200)
     }
     # Re-split a CSV line respecting quoted commas; sets P (path) and H (hash).
     function parse_row(line,    n, i, c, cur, inq, fields, nf) {
@@ -562,6 +613,9 @@ classify_and_plan() {
       H = fields[nf]   # hash is always the last column
     }
     FNR == 1 { next }  # skip header of each file
+    {
+      draw_progress(NR)
+    }
     FNR == NR {
       # First file: NAS manifest.
       parse_row($0)
@@ -579,6 +633,13 @@ classify_and_plan() {
       import_path[H] = import_path[H] SUBSEP P
     }
     END {
+      # Final draw at 100%, then clear the line so whatever the caller
+      # prints next (warn/info from cmd_summary etc.) starts on a fresh
+      # line rather than overwriting the tail of the bar.
+      if (show_progress && total_lines > 0) {
+        draw_progress(total_lines)
+        printf "\r%80s\r", "" > "/dev/stderr"
+      }
       for (h in import_path) {
         if (h in nas_path) {
           split(nas_path[h], keepers, SUBSEP)
@@ -786,7 +847,142 @@ cmd_discard() {
   # 4 safety skips). Nothing about "this is an import-check plan" needs to
   # be known below this line.
   bash "$_dd" "$_plan"
+  local _rc=$?
+
+  # v1.4.9: mark the import-scan CSV as potentially stale, so a later
+  # dedup-internal run knows to ask for a fresh scan rather than silently
+  # building groups from files this discard just quarantined.
+  : > "$VAR_DIR/import-check-last-destructive.marker"
+
+  exit "$_rc"
 }
+
+# cmd_dedup_internal — v1.4.9. Deduplicate the import folder's OWN
+# duplicates (two files in the import folder that match each other, not
+# the NAS). This was deliberately left unautomated in v1.4.6/v1.4.7:
+# "which of my own two copies do I keep" has no safe default the way
+# "does the NAS already have this" does, and folding it into `discard`
+# would have blurred a rule that needed to stay simple. It remains a
+# SEPARATE, explicit, opt-in action here — not part of `discard` — with
+# the same plan-review-then-confirm workflow as everywhere else in this
+# tool. What changes in v1.4.9 is only that the action now has a menu
+# entry, instead of requiring the user to run a second hasher instance
+# scoped to the import folder by hand.
+#
+# Run AFTER `discard`, not before: if a hash group has both a NAS match
+# and multiple import copies, `discard` already removes every import copy
+# in that group (NAS wins over all of them, not just one). Running this
+# first would waste effort deduplicating files `discard` is about to
+# remove anyway. Running `discard` first also means whatever `sort` moves
+# into unique-files/ afterward is genuinely unique — not "unique + our own
+# duplicates" as the pre-v1.4.9 documentation had to caveat.
+#
+# Safety is structural, the same way `discard` is: import-scan-latest.csv
+# NEVER contains a NAS path — it is a scan of IMPORT_DIR alone — so a plan
+# generated from it cannot reference anything outside the import folder,
+# regardless of what find-duplicates.sh's keep-strategy selects as each
+# group's keeper. No overlap check is doing that work here; the manifest
+# itself never had a NAS path to leak.
+cmd_dedup_internal() {
+  require_import_dir
+  local _force=false
+  for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
+
+  local _import_csv="$HASHES_DIR/import-scan-latest.csv"
+  [ -r "$_import_csv" ] || { err "No import scan found. Run: bin/import-check.sh scan"; exit 3; }
+
+  # v1.4.9: require a scan that postdates the most recent discard/dedup
+  # action against this import folder, rather than silently working from
+  # whatever import-scan-latest.csv happens to contain. A stale scan here
+  # would build duplicate groups referencing files discard already
+  # quarantined; delete-duplicates.sh's keeper-verification (v1.4.4) would
+  # catch that safely (skip, not act), but the result would be confusing
+  # -- "0 groups usable" -- rather than the tool asking for what it needs
+  # up front.
+  local _marker="$VAR_DIR/import-check-last-destructive.marker"
+  if [ -r "$_marker" ] && [ "$_marker" -nt "$_import_csv" ]; then
+    err "Your last import scan predates a discard or dedup action against"
+    err "this folder. Re-scan first so this works from current data:"
+    err "  bin/import-check.sh scan"
+    exit 2
+  fi
+
+  local _fd="$BIN_DIR/find-duplicates.sh"
+  [ -r "$_fd" ] || { err "find-duplicates.sh not found."; exit 3; }
+
+  info "Checking for duplicates within the import folder itself..."
+  local _fd_log="$VAR_DIR/import-internal-fd.$$.log"
+  if ! bash "$_fd" --input "$_import_csv" --mode bulk --keep-strategy shortest-path \
+        > "$_fd_log" 2>&1; then
+    err "Could not check for internal duplicates -- see output below."
+    cat "$_fd_log" >&2
+    rm -f -- "$_fd_log" 2>/dev/null || true
+    exit 1
+  fi
+  rm -f -- "$_fd_log" 2>/dev/null || true
+
+  # find-duplicates.sh always writes/updates the *-latest.txt pointer;
+  # that IS the report to hand to auto-dedup.sh next.
+  local _dupes_report="$LOGS_DIR/duplicate-hashes-latest.txt"
+  if ! grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$_dupes_report" 2>/dev/null; then
+    info "No duplicates found within the import folder."
+    exit 4
+  fi
+
+  local _ad="$BIN_DIR/auto-dedup.sh"
+  [ -r "$_ad" ] || { err "auto-dedup.sh not found."; exit 3; }
+
+  # v1.4.9: auto-dedup.sh only ever WRITES a plan -- it never applies one.
+  # Its own --force flag only skips ITS confirmation prompt for writing
+  # the plan, not for acting on it. Applying is a separate, explicit call
+  # to delete-duplicates.sh below, exactly mirroring how cmd_discard
+  # already reuses delete-duplicates.sh unmodified.
+  local _plan_out="$LOGS_DIR/import-internal-dedup-plan-$(date +'%Y-%m-%d-%H%M%S')-$$.txt"
+  if ! bash "$_ad" --from-report "$_dupes_report" --plan-out "$_plan_out" \
+        --keep shortest-path --force > "$VAR_DIR/import-internal-ad.$$.log" 2>&1; then
+    err "Could not build a dedup plan -- see output below."
+    cat "$VAR_DIR/import-internal-ad.$$.log" >&2
+    rm -f -- "$VAR_DIR/import-internal-ad.$$.log" 2>/dev/null || true
+    exit 1
+  fi
+  rm -f -- "$VAR_DIR/import-internal-ad.$$.log" 2>/dev/null || true
+
+  local _del_count
+  _del_count="$(grep -c '^DEL|' "$_plan_out" 2>/dev/null)" || true
+  [ -z "$_del_count" ] && _del_count=0
+  if [ "$_del_count" -eq 0 ]; then
+    info "Nothing to deduplicate -- every file in the import folder is unique."
+    exit 4
+  fi
+
+  info "Plan written: $_plan_out"
+  info "$_del_count file(s) inside the import folder duplicate ANOTHER file"
+  info "also inside the import folder (not the NAS). Keeping the shortest"
+  info "path in each group; the rest will be moved to quarantine."
+
+  if ! $_force; then
+    printf 'Proceed? [y/N]: '
+    local _reply
+    read -r _reply || _reply=""
+    case "$(printf '%s' "$_reply" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) ;;
+      *) echo "Cancelled. Plan retained: $_plan_out"; exit 0 ;;
+    esac
+  fi
+
+  local _dd="$BIN_DIR/delete-duplicates.sh"
+  [ -r "$_dd" ] || { err "delete-duplicates.sh not found."; exit 3; }
+
+  bash "$_dd" "$_plan_out"
+  local _rc=$?
+
+  # Mark this destructive action so the next dedup-internal or discard run
+  # knows the import-scan CSV it's about to reuse may now be stale.
+  : > "$_marker"
+
+  exit "$_rc"
+}
+
 
 cmd_sort() {
   require_import_dir
@@ -932,6 +1128,7 @@ case "$SUBCOMMAND" in
   scan)     _ic_acquire_lock; cmd_scan "$@";    _ic_release_lock ;;
   summary)  cmd_summary "$@" ;;
   discard)  _ic_acquire_lock; cmd_discard "$@"; _ic_release_lock ;;
+  dedup-internal) _ic_acquire_lock; cmd_dedup_internal "$@"; _ic_release_lock ;;
   sort)     _ic_acquire_lock; cmd_sort "$@";    _ic_release_lock ;;
   ""|help|-h|--help)
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -939,7 +1136,7 @@ case "$SUBCOMMAND" in
     ;;
   *)
     err "Unknown subcommand: $SUBCOMMAND"
-    info "Usage: bin/import-check.sh {setup|scan|summary|discard|sort}"
+    info "Usage: bin/import-check.sh {setup|scan|summary|discard|dedup-internal|sort}"
     exit 2
     ;;
 esac
