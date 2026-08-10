@@ -285,8 +285,32 @@ if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
   _pending_legacy_keep=""
   _pending_legacy_line=""
   _line_no=0
+  # v1.4.14: this loop was MISSED in the v1.4.13 investigation of the
+  # "no progress shown" report — reported again, live, from the exact
+  # same NAS session: the [SCAN] bar (the OTHER loop, fixed in v1.4.13)
+  # completed, then the screen went blank again at "Plan carries content
+  # hashes..." with nothing after it. This loop is what runs in that gap,
+  # and on inspection it is arguably the most expensive of the three: for
+  # nearly every DEL line it forks an awk process to linearly scan the
+  # (growing) DEL_GROUPS file for hash membership, and for every hashed
+  # KEEP line it does the same against the (growing) KEEPER_MAP file —
+  # another O(n²)-shaped pattern, this time per LINE rather than per
+  # GROUP, so on a large plan it is likely slower than the VERIFY loop
+  # below it. Same scope decision as v1.4.13: add visibility, leave the
+  # underlying algorithm for a dedicated rewrite of all three loops
+  # together (a single awk pass could very plausibly replace SCAN, this
+  # loop, and VERIFY combined) rather than touching more of this
+  # safety-critical validation logic in the same turn a reported symptom
+  # is being chased down.
+  #
+  # Total is plan LINE count, not TOTAL_DEL -- this loop walks every KEEP
+  # line as well as every DEL line, unlike the other two.
+  _build_total="$(wc -l < "$PLAN_FILE" 2>/dev/null | tr -d ' ')"
+  [ -z "$_build_total" ] && _build_total=0
+  _build_started="$(date +%s)"
   while IFS= read -r _line || [ -n "$_line" ]; do
     _line_no=$((_line_no + 1))
+    log_progress_bar "BUILD" "$_line_no" "$_build_total" "$_build_started"
     case "$_line" in
       KEEP\|*)
         _split_keep_line "$_line"
@@ -342,6 +366,7 @@ if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
         ;;
     esac
   done < "$PLAN_FILE"
+  log_progress_done
 
   if [ -n "$_pending_legacy_keep" ]; then
     error "Legacy KEEP entry at line $_pending_legacy_line has no following hashed DEL group."
