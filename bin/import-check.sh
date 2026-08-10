@@ -421,7 +421,27 @@ cmd_scan() {
   _out="$HASHES_DIR/import-scan-$_tag.csv"
   printf '%s\n' "$IMPORT_DIR" > "$_pf"
 
+  # v1.4.12: respect the user's configured parallel-hashing level rather
+  # than silently defaulting to serial (1 job). This reads the exact same
+  # var/jobs.conf the launcher's Performance settings menu ('p') writes —
+  # not a separate, Import-Check-specific setting — so a level chosen
+  # once applies everywhere hasher.sh is invoked, including here. Before
+  # this fix, a single-folder import scan against a large small-file
+  # corpus (an SD card, a Photos-library-style export) ran fully serial
+  # regardless of what the operator had configured for normal full hashes,
+  # which measurably matters: hasher.sh's own comment on HASH_JOBS notes
+  # serial mode's per-file fork overhead dominates wall-clock on exactly
+  # this kind of corpus. Same read logic as launcher.sh (head -n1, strip
+  # to digits, fall back to 1 if empty/invalid/<1) so the two never
+  # disagree about what "configured" means.
+  local _jobs_file="$VAR_DIR/jobs.conf" _jobs=1 _j
+  if [ -r "$_jobs_file" ]; then
+    _j="$(head -n1 "$_jobs_file" 2>/dev/null | tr -cd '0-9')"
+    if [ -n "$_j" ] && [ "$_j" -ge 1 ] 2>/dev/null; then _jobs="$_j"; fi
+  fi
+
   info "Hashing import folder only: $IMPORT_DIR"
+  [ "$_jobs" -gt 1 ] && info "Parallel hashing: $_jobs workers."
   # v1.4.7 (peer review, "other improvements"): exclude the tool's own
   # managed output folder. Without this, files sort() already moved into
   # unique-files/ get rehashed and reconsidered on every later scan —
@@ -433,7 +453,7 @@ cmd_scan() {
   # time. --no-sort: this manifest is consumed immediately below, not kept
   # for cross-run diffing, so the sort's guarantees buy nothing here.
   if ! bash "$_script" --pathfile "$_pf" --output "$_out" \
-        --exclude '*/unique-files/*' \
+        --exclude '*/unique-files/*' --jobs "$_jobs" \
         --no-discover --no-sort; then
     rm -f -- "$_pf" 2>/dev/null || true
     err "Import folder hashing failed — see output above."
@@ -504,6 +524,24 @@ cmd_scan() {
 # (re-ran setup pointing elsewhere) but a stale scan's meta is still
 # sitting there unrefreshed.
 #
+# v1.4.11 (peer review of v1.4.10): the original single condition here —
+# "meta unreadable OR marker missing" — treated two different situations
+# identically: a meta file that genuinely does not exist yet (a real
+# pre-v1.4.7 install, upgrade continuity) versus one that EXISTS but is
+# truncated, corrupted, or otherwise invalid (a crash mid-write — the meta
+# is written as several separate printf calls inside one redirect, not
+# one atomic write — or a user directly editing the file, plausible on a
+# NAS). The second case was silently falling through to the SAME legacy
+# fallback as the first: unpinned import-scan-latest.csv plus an
+# independently-resolved latest_nas_manifest(), completely bypassing the
+# pinning guarantee this function exists to provide. That is a full,
+# silent reversion to the exact provenance problem v1.4.7/v1.4.10 fixed,
+# not a smaller version of it — worth closing rather than leaving as a
+# known gap. Split into two conditions: "meta does not exist at all" is
+# genuine legacy compatibility (unchanged behaviour); "meta exists but
+# fails validation" is now treated as corruption and refused outright,
+# asking for a fresh scan rather than guessing.
+#
 # Returns 0 and sets _import_csv/_nas_csv on success; returns 1 with an
 # error already printed on failure. Falls back to the pre-v1.4.7 two-file
 # lookup only when no meta sidecar exists at all -- upgrade continuity,
@@ -513,7 +551,12 @@ load_verified_import_scan() {
   _nas_csv=""
   local _meta="$HASHES_DIR/import-scan-latest.meta"
 
-  if [ ! -r "$_meta" ] || ! grep -qxF 'marker=HASHER_IMPORT_SCAN_V1' "$_meta" 2>/dev/null; then
+  if [ ! -e "$_meta" ]; then
+    # Genuinely no sidecar has ever been written -- a pre-v1.4.7 scan, or
+    # no scan at all yet. -e rather than -r deliberately: an unreadable
+    # (but present) file is NOT "no scan happened", it's "something is
+    # here and cannot be trusted" -- that belongs in the corruption branch
+    # below, not this one.
     _import_csv="$HASHES_DIR/import-scan-latest.csv"
     if [ ! -r "$_import_csv" ]; then
       err "No import scan found. Run: bin/import-check.sh scan"
@@ -526,6 +569,14 @@ load_verified_import_scan() {
       return 1
     fi
     return 0
+  fi
+
+  if [ ! -r "$_meta" ] || ! grep -qxF 'marker=HASHER_IMPORT_SCAN_V1' "$_meta" 2>/dev/null; then
+    err "Import scan metadata is invalid, unreadable, or incomplete"
+    err "($_meta)."
+    err "Run a fresh import scan before continuing:"
+    err "  bin/import-check.sh scan"
+    return 1
   fi
 
   local _meta_import_csv _meta_nas_csv _meta_import_dir
