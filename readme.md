@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.13**
+Started Dec 2022. Current version: **v1.4.14**
 
 ### First-run launch screen
 
@@ -522,15 +522,16 @@ it and re-run.
 All dedup operations produce a plain-text plan file in `logs/` before anything
 is moved. Inspect, then apply.
 
-**Applying a large plan.** `delete-duplicates.sh` validates every plan in two
-passes before moving anything — first classifying each entry as hash-verified
-or not, then confirming every hash group has exactly one keeper — and shows
-progress (`[SCAN]`, then `[VERIFY]`) through both, followed by `[MOVE]` for
-the actual quarantine step. On a plan with tens of thousands of entries the
-verification passes themselves can take real time; this is deliberately
-conservative validation of a destructive operation, not something to route
-around. `[INFO]`/`[WARN]`/`[ERROR]` output from this script is coloured to
-match the rest of the tool.
+**Applying a large plan.** `delete-duplicates.sh` validates every plan in
+three passes before moving anything — classifying each entry as
+hash-verified or not, building the hash-to-keeper map, then confirming
+every hash group has exactly one keeper — and shows progress (`[SCAN]`,
+`[BUILD]`, `[VERIFY]`) through all three, followed by `[MOVE]` for the
+actual quarantine step. On a plan with tens of thousands of entries these
+verification passes can take real time — minutes, not seconds; this is
+deliberately conservative validation of a destructive operation, not
+something to route around. `[INFO]`/`[WARN]`/`[ERROR]` output from this
+script is coloured to match the rest of the tool.
 
 ```bash
 # See what would be deleted (file dedup):
@@ -637,7 +638,8 @@ hasher/
 │       ├── 93-import-check-v1410-fixes.sh
 │       ├── 94-import-check-meta-corruption.sh
 │       ├── 95-import-check-scan-visibility.sh
-│       └── 96-launcher-import-check-survival.sh
+│       ├── 96-launcher-import-check-survival.sh
+│       └── 97-delete-duplicates-build-phase.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -747,7 +749,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (17 cases, ~80s)
+tests/run-tests.sh                # everything (18 cases, ~85s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -779,6 +781,7 @@ directory of ordinary files would exercise:
 | `94-import-check-meta-corruption` | Corrupt/truncated scan metadata is refused, not silently bypassed |
 | `95-import-check-scan-visibility` | Configured parallelism honoured; progress tickers stay silent when piped |
 | `96-launcher-import-check-survival` | Launcher survives non-zero returns from Import Check subcommands |
+| `97-delete-duplicates-build-phase` | BUILD-phase progress added; keeper-map error detection unaffected |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

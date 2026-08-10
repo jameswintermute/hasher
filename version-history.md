@@ -4186,6 +4186,75 @@ driven through the real interactive launcher rather than
 Full suite: 17 cases, 247 assertions.
 
 ---
+## 2026‑08 — v1.4.14
+**delete-duplicates.sh: the third slow loop, missed in v1.4.13**
+
+Reported live, from the same NAS session and the same 72,685-entry plan
+that surfaced v1.4.13's two loops: the new `[SCAN]` bar completed
+correctly, then the screen went blank again — a blinking cursor, no
+output — right after "Plan carries content hashes... will be
+re-verified before quarantine."
+
+That gap is a third loop in `delete-duplicates.sh`'s validation logic
+that the v1.4.13 investigation missed entirely: the one building the
+hash-to-keeper map and the per-group DEL index. On inspection it is
+arguably the most expensive of the three, worse than either loop fixed
+in v1.4.13 — for nearly every DEL line it forks an `awk` process to
+linearly scan the growing `DEL_GROUPS` file for hash membership, and for
+every hashed KEEP line it does the same against the growing
+`KEEPER_MAP`. Another O(n²)-shaped pattern, this time per LINE rather
+than per GROUP, so on a large plan it very plausibly costs more than the
+VERIFY loop it sits next to.
+
+Worth being direct about the miss: v1.4.13 traced the gap between
+"Detailed apply log:" and "Plan structure valid:" and found two loops in
+that span, fixed both, and treated the investigation as complete. There
+was a third loop in the same span that wasn't found — the trace wasn't
+as thorough as it needed to be. This release is that correction, found
+by the same person who reported the original gap, watching the same
+real run a second time.
+
+### Fix
+
+Added `[BUILD]` progress reporting to the missed loop, using the plan's
+total LINE count (not `TOTAL_DEL`) as the denominator, since this loop
+walks every KEEP line as well as every DEL line — the only one of the
+four passes that does. `log_progress_done` clears the bar once the loop
+completes, matching the other three.
+
+This loop carries the most intricate error-detection logic in the
+script — duplicate KEEP entries for one hash group, legacy-format
+KEEP/DEL pairing, orphaned legacy KEEP entries with no following hashed
+DEL — so verification paid particular attention to confirming that logic
+is completely undisturbed, not just that the bar appears. Confirmed
+directly: a plan with two KEEP entries for the same hash is still
+refused with the identical error message and exit code as before; an
+orphaned legacy KEEP entry (constructed so it reaches this loop rather
+than exiting earlier on the "no DEL entries" fast path) is still
+refused; a straightforward 40-group plan still applies with the exact
+correct keeper/quarantine counts.
+
+Same scope decision as v1.4.13, now applying to all three validation
+loops together: add visibility, leave the underlying algorithm alone.
+A single-pass awk rewrite could very plausibly replace SCAN, BUILD, and
+VERIFY combined and turn minutes into a fraction of a second — flagged
+again, now more clearly warranted given a third O(n²)-shaped pattern was
+found in the same script, as a dedicated follow-up rather than further
+surgery on safety-critical validation logic in the same session a
+symptom is being chased down.
+
+### Test coverage
+
+New `tests/cases/97-delete-duplicates-build-phase.sh`, 13 assertions:
+end-to-end correctness on a 40-group plan, the duplicate-KEEP refusal,
+and the orphaned-legacy-KEEP refusal — the last one required
+deliberately constructing a plan that reaches the BUILD loop rather than
+exiting on the earlier "no DEL entries" check, so the specific code path
+under test is actually exercised.
+
+Full suite: 18 cases, 260 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
