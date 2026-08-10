@@ -4337,6 +4337,53 @@ demonstration instead: the exact filter list and the exact
 stray-file scenario).
 
 ---
+## 2026‑08 — v1.4.16
+**Sanity check of the v1.4.15 upload found a stray self-test.sh — and the tool's own new duplicate-check missed it**
+
+A routine structural sanity check on the merged v1.4.15 zip found
+`self-test.sh` present at the repository root, alongside the canonical
+`bin/self-test.sh` — the exact class of packaging defect the v1.4.15
+duplicate-script check was built to catch. Run against the live tree,
+it passed cleanly. It should not have.
+
+### Root cause
+
+`self-test.sh`'s own `$MENU_TARGETS` list — the list the v1.4.15 fix
+scans for stray duplicates — has never included `self-test.sh` itself.
+It is invoked from the launcher exactly like every other entry in that
+list (`run_script "$BIN_DIR/self-test.sh"`, launcher option `x`), so
+there was no principled reason for the omission; it was simply never
+added; possibly because it felt strange for the checker to check for
+copies of itself.
+
+The consequence: the one script explicitly responsible for catching
+this exact bug class was blind to a copy of itself. Confirmed directly
+— reproduced the found scenario in a clean sandbox (copied
+`bin/self-test.sh` to the repo root) and confirmed `self-test.sh`
+reported a clean pass despite the stray file sitting right next to it.
+
+### Fix
+
+Added `self-test.sh` to its own `$MENU_TARGETS` list. Safe for both of
+that list's consumers, not just the duplicate check: section 3
+("Menu targets exist and are runnable") now also verifies
+`bin/self-test.sh` itself is present and executable, which it never
+did before either.
+
+Verified against the exact reported scenario: with the fix in place, a
+root-level `self-test.sh` now correctly fails with `duplicate script:
+self-test.sh shadows the canonical bin/self-test.sh (delete the stray
+copy)`; a clean tree still passes.
+
+### Test coverage
+
+No new automated test added — this is the same category of fix as
+v1.4.15's other two changes (a meta/tooling correction, verified by
+direct reproduction of the exact reported scenario, not a data-safety
+behaviour the sandbox-based suite is built to exercise). Full suite
+unchanged at 18 cases, 260 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
