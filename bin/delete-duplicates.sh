@@ -52,7 +52,22 @@ _emit() {
   # emitted mid-loop would land on top of it and leave a garbled line.
   # Clearing first is a no-op when no bar is active.
   log_progress_done
-  printf '[%s] %s\n' "$_level" "$*" >&2
+  # v1.4.13: colour the tag to match every other tool in this project.
+  # This script has printed plain, uncoloured [INFO]/[WARN] text since it
+  # was written — reported live from a NAS session, where these lines sit
+  # directly after import-check.sh's own coloured [INFO] output and the
+  # mismatch is visually jarring mid-sequence. lib/log.sh is already
+  # sourced above (for the progress-bar helpers); LOG_C_INFO/LOG_C_WARN/
+  # LOG_C_RST are reused here rather than defining a second set of colour
+  # variables. The file-tee below stays plain text — colour codes have no
+  # place in a saved log meant to be read back later.
+  local _c=""
+  case "$_level" in
+    INFO)  _c="${LOG_C_INFO:-}" ;;
+    WARN)  _c="${LOG_C_WARN:-}" ;;
+    ERROR) _c="${LOG_C_ERR:-}"  ;;
+  esac
+  printf '%s[%s]%s %s\n' "$_c" "$_level" "${_c:+${LOG_C_RST:-}}" "$*" >&2
   [ -n "${APPLY_LOG:-}" ] && printf '[%s] %s\n' "$_level" "$*" >> "$APPLY_LOG" 2>/dev/null || true
 }
 info()  { _emit INFO  "$*"; }
@@ -172,8 +187,21 @@ fi
 _mixed_count=0
 _unhashed_count=0
 _hashed_count=0
+# v1.4.13: reported live from a NAS session — this loop classifies every
+# DEL entry (72,685 of them, in that run) with zero output in between,
+# and _split_del_line forks a regex check per line, so on a plan this
+# large the pass itself takes real, non-trivial wall-clock time. Adding
+# visibility here rather than optimising the loop itself: this validation
+# gates whether a plan is treated as hash-verified before mass-quarantine,
+# so it stays untouched pending a dedicated, carefully-tested rewrite —
+# see the note on the second loop below for the fuller performance
+# concern this run surfaced.
+_verify_started="$(date +%s)"
+_verify_seen=0
 while IFS= read -r _line; do
   [ -z "$_line" ] && continue
+  _verify_seen=$((_verify_seen + 1))
+  log_progress_bar "SCAN" "$_verify_seen" "$TOTAL_DEL" "$_verify_started"
   _split_del_line "$_line"
   if [ -n "$DEL_HASH" ]; then
     _hashed_count=$((_hashed_count + 1))
@@ -181,6 +209,7 @@ while IFS= read -r _line; do
     _unhashed_count=$((_unhashed_count + 1))
   fi
 done < <(grep '^DEL|' "$PLAN_FILE" 2>/dev/null || true)
+log_progress_done
 
 if [ "$_hashed_count" -gt 0 ] && [ "$_unhashed_count" -gt 0 ]; then
   _mixed_count=$_hashed_count
@@ -322,9 +351,25 @@ if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
 
   _group_count=0
   _missing_keeper_count=0
+  # v1.4.13: this is the more expensive of the two loops flagged in this
+  # release -- for EVERY hash group it forks a fresh awk process that
+  # linearly scans the whole KEEPER_MAP file, so cost grows with
+  # groups × keeper-map size rather than staying linear in plan size.
+  # On a plan with tens of thousands of groups this can take substantially
+  # longer than the classification loop above, again with zero prior
+  # visibility. Same scope decision as above: add visibility now, leave
+  # the O(n²)-shaped algorithm itself for a dedicated, carefully-tested
+  # rewrite (a single awk pass building an in-memory hash→keeper map would
+  # very likely turn this from minutes into a fraction of a second) rather
+  # than touching core plan-verification logic in the same pass as
+  # several other fixes.
+  _keeper_verify_total="$(wc -l < "$DEL_GROUPS" 2>/dev/null | tr -d ' ')"
+  [ -z "$_keeper_verify_total" ] && _keeper_verify_total=0
+  _keeper_verify_started="$(date +%s)"
   while IFS=$'\t' read -r _group_hash _first_del_line _first_del_path || [ -n "${_group_hash:-}" ]; do
     [ -n "${_group_hash:-}" ] || continue
     _group_count=$((_group_count + 1))
+    log_progress_bar "VERIFY" "$_group_count" "$_keeper_verify_total" "$_keeper_verify_started"
     _keeper_record="$(awk -F '\t' -v h="$_group_hash" '$1==h {print; exit}' "$KEEPER_MAP")"
     if [ -z "$_keeper_record" ]; then
       _missing_keeper_count=$((_missing_keeper_count + 1))
@@ -332,6 +377,7 @@ if [ "$PLAN_HAS_HASHES" -eq 1 ]; then
       error "  first DEL: line $_first_del_line: $_first_del_path"
     fi
   done < "$DEL_GROUPS"
+  log_progress_done
 
   if [ "$_missing_keeper_count" -gt 0 ]; then
     error "Plan validation failed: $_missing_keeper_count group(s) have no unique keeper."
