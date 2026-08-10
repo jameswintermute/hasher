@@ -101,6 +101,7 @@ launch-review.sh
 review-duplicates.sh
 review-folder-plan.sh
 run-find-duplicates.sh
+self-test.sh
 "
 
 # Helpers that are SOURCED (not executed). These must exist and be readable;
