@@ -1,0 +1,2473 @@
+#!/bin/bash
+# Hasher — NAS File Hasher & Duplicate Finder
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
+# This program comes with ABSOLUTELY NO WARRANTY.
+#
+# NOTE: This launcher requires bash (not plain sh) because:
+#   - action_clean_caches uses 'read -r -d ""' (bash/ksh extension)
+#   - The project's hasher.sh also requires bash
+# Minimum: bash 3.2+ (compatible with Synology DSM default bash)
+
+set -eu
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+cd "$ROOT_DIR"
+
+LOGS_DIR="$ROOT_DIR/logs"; mkdir -p "$LOGS_DIR"
+HASHES_DIR="$ROOT_DIR/hashes"; mkdir -p "$HASHES_DIR"
+BIN_DIR="$ROOT_DIR/bin"
+LOCAL_DIR="$ROOT_DIR/local"
+LIB_DIR="$ROOT_DIR/lib"
+BACKGROUND_LOG="$LOGS_DIR/background.log"
+VAR_DIR="$ROOT_DIR/var"; mkdir -p "$VAR_DIR"
+
+# Pidfile for reliable hasher-running detection
+HASHER_PIDFILE="$VAR_DIR/hasher.pid"
+
+# v1.2.0: parallel hashing worker count, persisted across launcher sessions
+# in var/jobs.conf. 1 = serial (default). The performance menu ('p') edits it.
+HASHER_JOBS_FILE="$VAR_DIR/jobs.conf"
+HASHER_JOBS=1
+if [ -r "$HASHER_JOBS_FILE" ]; then
+  _j="$(head -n1 "$HASHER_JOBS_FILE" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$_j" ] && [ "$_j" -ge 1 ] 2>/dev/null && HASHER_JOBS="$_j"
+fi
+export HASHER_JOBS
+
+# FIX (v1.1.9): source the host-detection helper so the launcher and
+# everything it spawns can apply host-appropriate defaults (excludes,
+# quarantine roots, scan fallbacks). The lib is POSIX-sh-safe so
+# sourcing under bash 3.2 is fine.
+if [ -r "$LIB_DIR/host-detect.sh" ]; then
+  . "$LIB_DIR/host-detect.sh"
+  detect_host
+fi
+
+# TTY-aware colour palette
+if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
+  RED="$(printf '\033[31m')"
+  GRN="$(printf '\033[32m')"
+  YEL="$(printf '\033[33m')"
+  BLU="$(printf '\033[34m')"
+  MAG="$(printf '\033[35m')"
+  BOLD="$(printf '\033[1m')"
+  RST="$(printf '\033[0m')"
+else
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; BOLD=""; RST=""
+fi
+
+info(){  printf "%s[INFO]%s %s\n"  "$GRN" "$RST" "$*"; }
+warn(){  printf "%s[WARN]%s %s\n"  "$YEL" "$RST" "$*"; }
+err(){   printf "%s[ERR ]%s %s\n"  "$RED" "$RST" "$*"; }
+next(){  printf "%s[NEXT]%s %s\n" "$BLU" "$RST" "$*"; }
+
+# v1.3.2: tolerate helper scripts that arrived without the executable bit.
+# Some users install via the GitHub web UI / zip upload, which does not
+# preserve the +x bit, and cannot easily chmod on the NAS. Previously the
+# launcher hard-failed ("not found or not executable") when a needed helper
+# lacked +x — breaking folder review and auto-dedup on such installs.
+# script_runnable: true if the script can be run either directly (+x) or via bash.
+script_runnable() {
+  [ -x "$1" ] || [ -r "$1" ]
+}
+# run_script: execute a helper, preferring direct execution; if it is readable
+# but not executable, fall back to running it through bash so a missing +x bit
+# is not fatal. (Best-effort chmod first, in case the filesystem allows it.)
+run_script() {
+  local s="$1"; shift
+  if [ ! -x "$s" ] && [ -r "$s" ]; then
+    chmod +x "$s" 2>/dev/null || true   # may fail on some mounts; harmless
+  fi
+  if [ -x "$s" ]; then
+    "$s" "$@"
+  elif [ -r "$s" ]; then
+    bash "$s" "$@"
+  else
+    return 127
+  fi
+}
+
+# v1.3.27: keep folder-plan decisions run-consistent. A plan and its raw
+# groups sidecar share the complete timestamp-and-PID suffix. Never combine
+# independently selected "latest" files from different scans.
+raw_folder_groups_for_plan() {
+  local _plan="$1" _base _suffix _groups
+  _base="$(basename -- "$_plan")"
+  _suffix="${_base#duplicate-folders-plan-}"
+  _suffix="${_suffix%.txt}"
+  _groups="$LOGS_DIR/duplicate-folders-groups-$_suffix.tsv"
+  [ -s "$_groups" ] && printf '%s' "$_groups"
+}
+
+
+header() {
+  printf "%s" "$MAG"
+  printf "%s\n" " _   _           _               "
+  printf "%s\n" "| | | | __ _ ___| |__   ___ _ __ "
+  printf "%s\n" "| |_| |/ _' / __| '_ \ / _ \ '__|"
+  printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
+  printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
+  printf "\n%s\n" "      NAS File Hasher & Dedupe"
+  printf "\n%s\n" "      v1.4.16 - August 2026. James Wintermute"
+  # FIX (v1.1.9): show the detected host class so the user sees at a
+  # glance which set of host-aware defaults will apply.
+  if command -v host_pretty_label >/dev/null 2>&1; then
+    printf "%s\n" "      Host: $(host_pretty_label)"
+  fi
+  # v1.3.7: surface the running Bash version (the platform most likely to be
+  # ancient is macOS, which ships 3.2). Shown for transparency; a hard warning
+  # for below-baseline is emitted at startup separately.
+  if command -v detect_bash_version >/dev/null 2>&1; then
+    detect_bash_version
+    printf "%s\n" "      Bash: ${HASHER_BASH_VERSION:-unknown}"
+  fi
+  printf "%s" "$RST"
+  printf "\n"
+}
+
+# ── Pidfile-based running detection ──────────────────────────────────────────
+# FIX: replaced unreliable ps|grep approach with a pidfile.
+# The pidfile is written when hasher is launched and cleared on completion.
+# This avoids false positives from paths containing "hasher" and ps truncation.
+
+write_pidfile() {
+  printf "%s\n" "$1" >"$HASHER_PIDFILE"
+}
+
+clear_pidfile() {
+  rm -f "$HASHER_PIDFILE" 2>/dev/null || true
+}
+
+is_hasher_running() {
+  [ -f "$HASHER_PIDFILE" ] || return 1
+  pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) clear_pidfile; return 1 ;;
+  esac
+  # Check the pid is actually alive
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  else
+    # Stale pidfile — process is gone
+    clear_pidfile
+    return 1
+  fi
+}
+
+# v1.3.15: ps-scan for ALL live hasher.sh processes (parents AND --jobs worker
+# subshells share the same cmdline). The pidfile tracks only the most recent
+# launch, so orphans from crashed/duplicate runs are invisible to it — as seen
+# in the field: three concurrent hasher.sh runs needing manual `ps | grep` +
+# `kill -9`. PRECISION MATTERS: we must match processes EXECUTING hasher.sh,
+# not any cmdline that merely mentions it (an editor, tail -f, or shell
+# one-liner touching the file must never be killed). A process is executing
+# it iff an interpreter token (bash/sh, any path prefix) is immediately
+# followed by a token ending in bin/hasher.sh — which is exactly how the
+# launcher (nohup bash …), the exec-bit shebang, and DSM's ps all render it.
+# Prints one PID per line.
+list_hasher_pids() {
+  { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v self="$$" '
+    BEGIN { tgt = "bin/" "hasher" ".sh" }
+    $1 == self { next }
+    {
+      for (i = 2; i < NF; i++) {
+        itp = $i; sub(/^.*\//, "", itp)          # basename of candidate token
+        if (itp == "bash" || itp == "sh") {
+          nxt = $(i + 1)
+          if (length(nxt) >= length(tgt) && substr(nxt, length(nxt) - length(tgt) + 1) == tgt) {
+            print $1; next
+          }
+        }
+      }
+    }
+  ' | grep -E '^[0-9]+$' || true
+}
+
+ensure_no_running_hasher() {
+  if is_hasher_running; then
+    pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    warn "Hasher appears to be already running (PID $pid)."
+    printf "Start another run anyway? [y/N]: "
+    read -r ans || ans=""
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) return 0 ;;
+      *) printf "Aborting new hasher run.\n"; return 1 ;;
+    esac
+  fi
+  # v1.3.15: belt-and-braces — the pidfile only knows about the most recent
+  # launch. Scan for orphaned hasher.sh processes (e.g. from a crashed
+  # session) so concurrent runs can't start silently.
+  _orphans="$(list_hasher_pids)"
+  if [ -n "$_orphans" ]; then
+    warn "Found running hasher.sh process(es) not tracked by the pidfile:"
+    for _p in $_orphans; do warn "   PID $_p"; done
+    warn "Recommended: choose 'k' (Stop hashing) from the menu first."
+    printf "Start another run anyway? [y/N]: "
+    read -r ans || ans=""
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) return 0 ;;
+      *) printf "Aborting new hasher run.\n"; return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+# v1.3.15: menu action — stop all running hashing cleanly. Sends TERM first
+# (hasher.sh now traps TERM: stops progress tickers, removes working files
+# and its pidfile), waits up to 8s, then KILLs any survivor. Covers parents,
+# --jobs worker subshells, and orphans alike via the ps scan; no more manual
+# `ps aux | grep hasher` + recursive kill -9.
+action_stop_hashing() {
+  pids="$(list_hasher_pids)"
+  # merge in the pidfile PID in case ps output is unavailable on this host
+  if [ -f "$HASHER_PIDFILE" ]; then
+    _pfpid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    case "$_pfpid" in
+      *[!0-9]*|'') : ;;
+      *) case " $pids " in *" $_pfpid "*) : ;; *) pids="$pids $_pfpid" ;; esac ;;
+    esac
+  fi
+  pids="$(printf '%s\n' $pids 2>/dev/null | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')"
+
+  if [ -z "${pids// /}" ]; then
+    info "No hashing processes are running."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  echo
+  warn "The following hashing process(es) will be stopped (with all their workers):"
+  # v1.3.16 (finding #4) / v1.3.17 (recheck #1c): resolve each parent to its
+  # PGID and confirm the parent OWNS that group (PGID == PID) before we
+  # group-signal it. Without that check, a hasher process that failed to
+  # become a session leader (e.g. no setsid on host) would share PGID with
+  # its caller — group-signalling would take out the caller too, potentially
+  # the launcher itself or the interactive shell.
+  #
+  # Parents in a group they own → collected in $pgids for group-kill.
+  # Parents NOT owning their group → collected in $safe_pids for tree-walk.
+  pgids=""
+  safe_pids=""
+  for p in $pids; do
+    _line="$( { ps ax 2>/dev/null || ps 2>/dev/null; } | awk -v p="$p" '$1==p {print; exit}' )"
+    printf '   %s\n' "${_line:-PID $p}"
+    _pg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ' || echo "$p")"
+    if [ "$_pg" = "$p" ]; then
+      case " $pgids " in *" $_pg "*) : ;; *) pgids="$pgids $_pg" ;; esac
+    else
+      safe_pids="$safe_pids $p"
+    fi
+  done
+  if [ -n "${safe_pids// /}" ]; then
+    warn "  (some processes are not session leaders — will use descendant-tree TERM for those)"
+  fi
+  printf "Stop hashing now? [y/N]: "
+  read -r ans || ans=""
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) : ;;
+    *) info "Left running."; printf "Press Enter to continue... "; read -r _ || true; return ;;
+  esac
+
+  # TERM the whole process group for each verified session leader.
+  for g in $pgids; do kill -TERM "-$g" 2>/dev/null || true; done
+  # For non-leaders: walk descendants and TERM each one, then the parent.
+  for p in $safe_pids; do
+    for d in $(pgrep -P "$p" 2>/dev/null); do kill -TERM "$d" 2>/dev/null || true; done
+    kill -TERM "$p" 2>/dev/null || true
+  done
+  info "Sent TERM to process group(s); waiting for clean shutdown…"
+  waited=0
+  while [ "$waited" -lt 8 ]; do
+    alive=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+    [ -z "${alive// /}" ] && break
+    sleep 1; waited=$((waited+1))
+  done
+  killed=0
+  if [ -n "${alive:-}" ] && [ -n "${alive// /}" ]; then
+    # Escalate: KILL group for verified leaders; walk descendants otherwise
+    for g in $pgids; do kill -KILL "-$g" 2>/dev/null && killed=$((killed+1)) || true; done
+    for p in $safe_pids; do
+      for d in $(pgrep -P "$p" 2>/dev/null); do kill -KILL "$d" 2>/dev/null || true; done
+      kill -KILL "$p" 2>/dev/null || true
+    done
+    warn "Escalated to KILL"
+  fi
+  # v1.3.16 (finding #4): verify no descendants remain before reporting success.
+  sleep 1
+  survivors=""
+  for g in $pgids; do
+    _s="$(pgrep -g "$g" 2>/dev/null | tr '\n' ' ' || true)"
+    [ -n "$_s" ] && survivors="$survivors $_s"
+  done
+  clear_pidfile
+  printf '%s [launcher] hashing stopped via menu (TERM%s)\n' "$(date '+%F %T')" \
+    "$( [ "$killed" -gt 0 ] && printf ', %d group(s) force-killed' "$killed" )" >>"$BACKGROUND_LOG" 2>/dev/null || true
+  if [ -n "${survivors// /}" ]; then
+    warn "Some descendants may still be alive: $survivors"
+    warn "You can investigate with:  ps -eo pid,pgid,cmd | grep -E 'hasher|xargs'"
+  else
+    ok "Hashing stopped (no descendants remain)."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+refresh_analysis_summary() {
+  local _csv _folder_meta _folder_source _folder_groups=0 _folder_candidates=0
+  local _file_report _file_source _file_groups=0 _files _out _tmp
+  _csv="$(latest_hashes_csv)"
+  [ -n "$_csv" ] && [ -r "$_csv" ] || return 1
+
+  _folder_status=pending
+  _folder_meta=""
+  for _m in "$LOGS_DIR"/duplicate-folders-analysis-*.meta; do
+    [ -r "$_m" ] || continue
+    grep -qxF '# HASHER_FOLDER_ANALYSIS v1' "$_m" 2>/dev/null || continue
+    _folder_source="$(sed -n 's/^source_csv=//p' "$_m" | head -n1)"
+    if [ "$_folder_source" = "$_csv" ]; then _folder_meta="$_m"; break; fi
+  done
+  if [ -n "$_folder_meta" ]; then
+    _folder_status=ready
+    _folder_groups="$(sed -n 's/^folder_groups=//p' "$_folder_meta" | head -n1)"
+    _folder_candidates="$(sed -n 's/^folders_to_quarantine=//p' "$_folder_meta" | head -n1)"
+  fi
+
+  _file_status=pending
+  _file_report="$LOGS_DIR/duplicate-hashes-latest.txt"
+  if [ -r "$_file_report" ] && grep -qxF '# HASHER_VERIFIED_DUPLICATE_REPORT v1' "$_file_report" 2>/dev/null; then
+    _file_source="$(sed -n 's/^# source-csv: //p' "$_file_report" | head -n1)"
+    if [ "$_file_source" = "$_csv" ]; then
+      _file_status=ready
+      _file_groups="$(grep -c '^HASH ' "$_file_report" 2>/dev/null || true)"
+    fi
+  fi
+
+  _files=$(( $(wc -l < "$_csv" 2>/dev/null | tr -d ' ' || echo 1) - 1 ))
+  [ "$_files" -ge 0 ] 2>/dev/null || _files=0
+  _out="$LOGS_DIR/post-hash-analysis-$(basename "$_csv" .csv).meta"
+  _tmp="$LOGS_DIR/post-hash-analysis-latest.meta.tmp.$$"
+  {
+    printf '# HASHER_POST_HASH_ANALYSIS v1\n'
+    printf 'source_csv=%s\n' "$_csv"
+    printf 'completed=%s\n' "$(date '+%F %H:%M')"
+    printf 'files_hashed=%s\n' "$_files"
+    printf 'folder_status=%s\n' "$_folder_status"
+    printf 'folder_groups=%s\n' "${_folder_groups:-0}"
+    printf 'folders_to_quarantine=%s\n' "${_folder_candidates:-0}"
+    printf 'file_status=%s\n' "$_file_status"
+    printf 'file_groups=%s\n' "${_file_groups:-0}"
+  } > "$_out" || return 1
+  cp -f -- "$_out" "$_tmp" && mv -f -- "$_tmp" "$LOGS_DIR/post-hash-analysis-latest.meta"
+}
+
+# ── Live run status (v1.4.1) ────────────────────────────────────────────────
+# When a hash is in flight, the analysis summary is describing the PREVIOUS
+# run — so leading with "waiting for duplicate analysis / rerun analysis" is
+# actively misleading: the thing the user is waiting for is already underway,
+# and the action being recommended would collide with it.
+#
+# This reads the newest [PROGRESS] line from the background log and reports
+# where the current run has got to. It recognises both phases:
+#   walk    "Walking paths: N file(s) discovered so far | elapsed=..."
+#   hashing "Hashing: [41%] 108267/263289 | elapsed=... eta=..."
+#
+# Returns 0 when a run is in progress (caller should skip the stale summary),
+# 1 when nothing is running.
+print_hashing_progress() {
+  is_hasher_running || hasher_processes_running || return 1
+
+  local _line="" _pct="" _counts="" _eta="" _elapsed="" _walk=""
+  if [ -r "$BACKGROUND_LOG" ]; then
+    # tail is bounded so a multi-gigabyte log costs nothing to inspect.
+    _line="$(tail -n 400 "$BACKGROUND_LOG" 2>/dev/null \
+      | sed 's/\x1b\[[0-9;]*m//g' \
+      | grep -F '[PROGRESS]' | tail -n1 || true)"
+  fi
+
+  echo
+  printf '%sHashing in progress.%s\n' "$BOLD" "$RST"
+
+  case "$_line" in
+    *"Walking paths:"*)
+      # Discovery phase: no percentage is possible yet, since the total is
+      # exactly what the walk is still determining.
+      _walk="$(printf '%s' "$_line" | sed -n 's/.*Walking paths: \([0-9]*\) file.*/\1/p')"
+      _elapsed="$(printf '%s' "$_line" | sed -n 's/.*elapsed=\([0-9:]*\).*/\1/p')"
+      printf '   Stage:              building the file inventory\n'
+      [ -n "$_walk" ]    && printf '   Files discovered:   %s so far\n' "$_walk"
+      [ -n "$_elapsed" ] && printf '   Elapsed:            %s\n' "$_elapsed"
+      printf '   No estimate yet — the total is still being counted.\n'
+      ;;
+    *"Hashing:"*)
+      _pct="$(printf '%s' "$_line"    | sed -n 's/.*Hashing: \[\([0-9]*\)%\].*/\1/p')"
+      _counts="$(printf '%s' "$_line" | sed -n 's/.*Hashing: \[[0-9]*%\] \([0-9]*\/[0-9]*\).*/\1/p')"
+      _elapsed="$(printf '%s' "$_line" | sed -n 's/.*elapsed=[0-9:]* (\([^)]*\)).*/\1/p')"
+      _eta="$(printf '%s' "$_line"     | sed -n 's/.*eta=[0-9:]* (\([^)]*\)).*/\1/p')"
+      [ -n "$_pct" ] && [ -n "$_counts" ] \
+        && printf '   Progress:           %s%% (%s files)\n' "$_pct" "$_counts"
+      [ -n "$_elapsed" ] && printf '   Elapsed:            %s\n' "$_elapsed"
+      if [ -n "$_eta" ]; then
+        printf '   %sEstimated remaining: %s%s\n' "$BOLD" "$_eta" "$RST"
+      fi
+      ;;
+    *)
+      # Running, but no progress line yet. The first heartbeat is one
+      # interval away (15s by default), so this window is brief.
+      printf '   Starting up — the first progress report is due shortly.\n'
+      ;;
+  esac
+
+  echo
+  printf '%sNext: follow the log — option l, or check status — option s%s\n' "$BOLD" "$RST"
+  printf 'Duplicate analysis will be prepared automatically when hashing completes.\n'
+  return 0
+}
+
+print_analysis_summary() {
+  # v1.4.1: a live run takes precedence. Showing the previous run's counts
+  # while a new one is underway invites the user to act on data that is
+  # about to be replaced.
+  if print_hashing_progress; then
+    return 0
+  fi
+
+  _meta="$LOGS_DIR/post-hash-analysis-latest.meta"
+  _latest_csv="$(latest_hashes_csv)"
+  [ -n "$_latest_csv" ] || return 0
+
+  # A metadata file is trusted only when it carries the expected provenance
+  # marker. Corrupt, partial or unrelated files are ignored safely.
+  if [ ! -r "$_meta" ] || ! grep -qxF '# HASHER_POST_HASH_ANALYSIS v1' "$_meta" 2>/dev/null; then
+    echo
+    printf '%sLatest successful hash is waiting for duplicate analysis.%s\n' "$BOLD" "$RST"
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+    return 0
+  fi
+
+  _source_csv=""; _completed=""; _files=""; _folder_status=""; _folder_groups=""; _folder_candidates=""; _file_status=""; _file_groups=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      source_csv) _source_csv="$_v" ;;
+      completed) _completed="$_v" ;;
+      files_hashed) _files="$_v" ;;
+      folder_status) _folder_status="$_v" ;;
+      folder_groups) _folder_groups="$_v" ;;
+      folders_to_quarantine) _folder_candidates="$_v" ;;
+      file_status) _file_status="$_v" ;;
+      file_groups) _file_groups="$_v" ;;
+    esac
+  done < "$_meta"
+
+  if [ "$_source_csv" != "$_latest_csv" ]; then
+    echo
+    printf '%sLast successful hash — %s%s\n' "$BOLD" "$(date -r "$_latest_csv" '+%F %H:%M' 2>/dev/null || printf 'unknown')" "$RST"
+    printf '   Duplicate analysis is out of date.\n'
+    echo
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+    return 0
+  fi
+
+  echo
+  printf '%sLast successful analysis — %s%s\n' "$BOLD" "${_completed:-unknown}" "$RST"
+  printf '   Files hashed:       %s\n' "${_files:-unknown}"
+  case "$_folder_status" in
+    ready)
+      if [ -n "$_folder_candidates" ]; then
+        printf '   Duplicate folders:  %s groups — %s folders ready\n' "${_folder_groups:-0}" "$_folder_candidates"
+      else
+        printf '   Duplicate folders:  %s groups ready\n' "${_folder_groups:-0}"
+      fi
+      ;;
+    disabled) printf '   Duplicate folders:  analysis disabled\n' ;;
+    failed)   printf '   Duplicate folders:  analysis failed\n' ;;
+    *)        printf '   Duplicate folders:  analysis pending\n' ;;
+  esac
+  case "$_file_status" in
+    ready)    printf '   Duplicate files:    %s groups ready\n' "${_file_groups:-0}" ;;
+    disabled) printf '   Duplicate files:    analysis disabled\n' ;;
+    failed)   printf '   Duplicate files:    analysis failed\n' ;;
+    *)        printf '   Duplicate files:    analysis pending\n' ;;
+  esac
+  echo
+
+  # Prefer a reviewed plan that explicitly belongs to this analysis.
+  _current_plan=""
+  for _p in "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt "$LOGS_DIR"/review-dedupe-plan-*.txt; do
+    [ -r "$_p" ] || continue
+    _pcsv="$(sed -n 's/^# Source CSV: //p; s/^# source-csv: //p' "$_p" 2>/dev/null | head -n1)"
+    if [ "$_pcsv" = "$_source_csv" ]; then _current_plan="$_p"; break; fi
+  done
+  if [ -n "$_current_plan" ]; then
+    printf '%sNext: apply reviewed plan — option 4%s\n' "$BOLD" "$RST"
+  elif [ "$_folder_status" = "ready" ] && [ "${_folder_groups:-0}" -gt 0 ] 2>/dev/null; then
+    printf '%sNext: review duplicate folders — option 2%s\n' "$BOLD" "$RST"
+  elif [ "$_file_status" = "ready" ] && [ "${_file_groups:-0}" -gt 0 ] 2>/dev/null; then
+    printf '%sNext: review duplicate files — option 3%s\n' "$BOLD" "$RST"
+  elif [ "$_folder_status" = "failed" ] || [ "$_file_status" = "failed" ]; then
+    printf '%sNext: rerun duplicate analysis — option r%s\n' "$BOLD" "$RST"
+  else
+    printf '%sNo duplicate items are waiting for review.%s\n' "$BOLD" "$RST"
+  fi
+}
+
+# v1.3.32: the configured workflow controls which main menu is shown.
+# Automatic mode presents prepared review work. Manual mode retains the
+# traditional discovery-first menu. local/hasher.conf overrides the default.
+analysis_mode() {
+  local _file _section="" _line _key _val _mode=""
+  for _file in "$LOCAL_DIR/hasher.conf" "$ROOT_DIR/default/hasher.conf"; do
+    [ -r "$_file" ] || continue
+    _section=""
+    while IFS= read -r _line || [ -n "$_line" ]; do
+      _line="$(printf '%s' "$_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      case "$_line" in ''|'#'*|';'*) continue ;; esac
+      case "$_line" in
+        \[*\]) _section="$(printf '%s' "${_line#[}" | sed 's/]$//' | tr '[:upper:]' '[:lower:]')"; continue ;;
+      esac
+      [ "$_section" = "post_hash" ] || [ "$_section" = "post-hash" ] || continue
+      case "$_line" in *=*) ;; *) continue ;; esac
+      _key="${_line%%=*}"; _val="${_line#*=}"
+      _key="$(printf '%s' "$_key" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+      _val="$(printf '%s' "$_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' | tr '[:upper:]' '[:lower:]')"
+      case "$_key" in
+        analysis_mode|analysis-mode)
+          case "$_val" in automatic|manual) _mode="$_val"; break ;; esac
+          ;;
+      esac
+    done < "$_file"
+    [ -n "$_mode" ] && { printf '%s' "$_mode"; return; }
+  done
+  printf 'automatic'
+}
+
+set_analysis_mode() {
+  local _mode="$1" _cfg="$LOCAL_DIR/hasher.conf" _tmp _saved
+  case "$_mode" in automatic|manual) ;; *) return 2 ;; esac
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || return 1
+  _tmp="$_cfg.tmp.$$"
+  if [ -r "$_cfg" ]; then
+    awk -v mode="$_mode" '
+      function ispost(s){ return s=="post_hash" || s=="post-hash" }
+      BEGIN { section=""; written=0; have_post=0; pending_blank=0 }
+      /^[[:space:]]*$/ {
+        if (ispost(section) && !written) { pending_blank=1; next }
+        print; next
+      }
+      /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+        if (ispost(section) && !written) { print "analysis_mode = " mode; written=1 }
+        if (pending_blank) { print ""; pending_blank=0 }
+        raw=$0; sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec); section=tolower(sec)
+        if (ispost(section)) have_post=1
+        print raw; next
+      }
+      ispost(section) && /^[[:space:]]*(analysis_mode|analysis-mode)[[:space:]]*=/ {
+        if (!written) { print "analysis_mode = " mode; written=1 }
+        next
+      }
+      {
+        if (pending_blank) { print ""; pending_blank=0 }
+        print
+      }
+      END {
+        if (ispost(section) && !written) { print "analysis_mode = " mode; written=1 }
+        if (!have_post) { print ""; print "[post_hash]"; print "analysis_mode = " mode }
+        if (pending_blank) print ""
+      }
+    ' "$_cfg" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  else
+    printf '# Local Hasher configuration\n\n[post_hash]\nanalysis_mode = %s\n' "$_mode" > "$_tmp" || return 1
+  fi
+  mv -f "$_tmp" "$_cfg" || return 1
+  _saved="$(analysis_mode)"
+  [ "$_saved" = "$_mode" ] || return 1
+}
+
+choose_analysis_mode() {
+  local _choice _mode
+  echo
+  echo "${BOLD}Automatic duplicate analysis${RST}"
+  echo
+  echo "Hasher can prepare duplicate-folder and duplicate-file results after each"
+  echo "successful hash run. This saves time by doing the analysis while the NAS is"
+  echo "already working, so review results are ready when you return."
+  echo
+  echo "No files are removed automatically — review and quarantine remain separate."
+  echo
+  echo "  1) Automatic — recommended; prepare results after every successful hash"
+  echo "  2) Manual    — run duplicate discovery yourself from the main menu"
+  echo
+  printf "Choose analysis mode [1]: "
+  read -r _choice || _choice="1"
+  [ -z "$_choice" ] && _choice="1"
+  case "$_choice" in 2|m|M|manual) _mode="manual" ;; *) _mode="automatic" ;; esac
+  if set_analysis_mode "$_mode"; then
+    info "Analysis mode saved: $_mode"
+  else
+    warn "Could not save analysis mode; setup has not been marked complete."
+    return 1
+  fi
+  return 0
+}
+
+print_menu_automatic() {
+  echo
+  echo "${BOLD}Stage 1 — Hash${RST}"
+  echo "   1) Start hashing (NAS-safe defaults)"
+  echo "   a) Advanced / custom hashing"
+  echo "   s) Hashing status"
+  echo "   p) Performance settings (parallel hashing)"
+  echo "   k) Stop hashing (terminate running hash jobs)"
+  echo
+  echo "${BOLD}Stage 2 — Review & quarantine${RST}"
+  echo "   2) Review duplicate folders"
+  echo "   3) Review duplicate files"
+  echo "   4) Apply reviewed plan"
+  echo "   5) Auto-dedup files (keep shortest path — no prompts)"
+  echo "   f) Find file by hash (lookup)"
+  echo
+  echo "${BOLD}Stage 3 — Clean${RST}"
+  echo "   6) Review zero-length files"
+  echo "   7) Delete junk (uses local/junk-extensions.txt)"
+  echo "   8) Clean cache files & @eaDir (safe)"
+  echo
+  echo "${BOLD}Other${RST}"
+  echo "   i) Import Check (new files vs your NAS)"
+  echo "   r) Rerun duplicate analysis"
+  echo "   m) Change analysis mode (automatic/manual)"
+  echo "   d) System diagnostics (deps & readiness)"
+  echo "   x) Self-test (integrity preflight)"
+  echo "   l) Follow logs (tail -f background.log)"
+  echo "   t) Stats & scheduling hints"
+  echo "   v) Clean internal working files (var/)"
+  echo "   c) Clean logs (rotate & prune)"
+  echo
+  echo "   q) Quit"
+  echo
+  printf "Select an option: "
+}
+
+print_menu_manual() {
+  echo
+  echo "${BOLD}Stage 1 — Hash${RST}"
+  echo "   1) Start hashing (NAS-safe defaults)"
+  echo "   a) Advanced / custom hashing"
+  echo "   s) Hashing status"
+  echo "   p) Performance settings (parallel hashing)"
+  echo "   k) Stop hashing (terminate running hash jobs)"
+  echo
+  echo "${BOLD}Stage 2 — Identify${RST}"
+  echo "   2) Find duplicate folders"
+  echo "   3) Find duplicate files"
+  echo "   f) Find file by hash (lookup)"
+  echo
+  echo "${BOLD}Stage 3 — Review & clean${RST}"
+  echo "   4) Review duplicate files (interactive)"
+  echo "   r) Review duplicate folders plan (interactive)"
+  echo "   5) Auto-dedup files (keep shortest path — no prompts)"
+  echo "   6) Apply dedup plan (FILE or FOLDER)"
+  echo "   7) Delete zero-length files"
+  echo "   8) Delete junk (uses local/junk-extensions.txt)"
+  echo "   9) Clean cache files & @eaDir (safe)"
+  echo
+  echo "${BOLD}Other${RST}"
+  echo "   i) Import Check (new files vs your NAS)"
+  echo "   m) Change analysis mode (automatic/manual)"
+  echo "   d) System diagnostics (deps & readiness)"
+  echo "   x) Self-test (integrity preflight)"
+  echo "   l) Follow logs (tail -f background.log)"
+  echo "   t) Stats & scheduling hints"
+  echo "   v) Clean internal working files (var/)"
+  echo "   c) Clean logs (rotate & prune)"
+  echo
+  echo "   q) Quit"
+  echo
+  printf "Select an option: "
+}
+
+print_menu() {
+  if [ "$(analysis_mode)" = "manual" ]; then
+    print_menu_manual
+  else
+    print_menu_automatic
+  fi
+}
+
+# manifest_has_data_rows — true when a CSV holds at least one row after the
+# header. `head -n 2` stops immediately, so manifest size is irrelevant.
+manifest_has_data_rows() {
+  [ -r "${1:-}" ] || return 1
+  [ "$(head -n 2 "$1" 2>/dev/null | wc -l | tr -d ' ')" -ge 2 ]
+}
+
+# latest_hashes_csv — newest manifest that is actually USABLE.
+#
+# v1.4.4 (peer review #1): this previously returned the newest filename and
+# left validation to the caller. Validating only the newest file meant a
+# newer header-only CSV could mask a perfectly good older manifest — the
+# launcher then concluded no manifest existed and fell back to the first-run
+# screen, cutting the user off from the workflow menu entirely. That is worse
+# than not validating at all, and it was a direct consequence of the v1.4.2
+# fix being applied to the checker rather than the selector.
+#
+# Now: walk candidates newest-first and return the first with a data row.
+#
+# Ordering comes from the filename, not mtime. Manifests are always named
+# hasher-YYYY-MM-DD-HHMMSS-PID.csv, so lexical order IS chronological order.
+# This avoids `ls -1t` (whose output cannot be parsed safely when a path
+# contains spaces) and avoids `find -printf` / `sed -z`, which are GNU-only
+# and absent on macOS and BusyBox. A plain glob into an array is portable to
+# bash 3.2 and cannot word-split.
+#
+# Partial manifests need no special handling: since v1.3.26 an incomplete run
+# is renamed to `partial-hasher-*.csv`, which the glob below does not match.
+latest_hashes_csv() {
+  _lhc_files=()
+  for _lhc_f in "$HASHES_DIR"/hasher-*.csv; do
+    # An unmatched glob expands to the literal pattern; -e filters it out.
+    [ -e "$_lhc_f" ] || continue
+    _lhc_files[${#_lhc_files[@]}]="$_lhc_f"
+  done
+
+  # Glob expansion is lexically ascending, so iterate from the end.
+  _lhc_i=$(( ${#_lhc_files[@]} - 1 ))
+  while [ "$_lhc_i" -ge 0 ]; do
+    if manifest_has_data_rows "${_lhc_files[$_lhc_i]}"; then
+      printf '%s' "${_lhc_files[$_lhc_i]}"
+      return 0
+    fi
+    _lhc_i=$(( _lhc_i - 1 ))
+  done
+  printf ''
+}
+
+determine_paths_file() {
+  if [ -s "$LOCAL_DIR/paths.txt" ]; then printf "%s" "$LOCAL_DIR/paths.txt"; return; fi
+  if [ -s "$ROOT_DIR/paths.txt" ]; then printf "%s" "$ROOT_DIR/paths.txt"; return; fi
+  printf ""
+}
+
+determine_excludes_file() {
+  if [ -s "$LOCAL_DIR/excludes.txt" ]; then printf "%s" "$LOCAL_DIR/excludes.txt"; return; fi
+  printf ""
+}
+
+sample_files_quick() {
+  pfile="$1"
+  [ -s "$pfile" ] || { printf "0"; return; }
+  total=0
+  # shellcheck disable=SC2162
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in \#*|"") continue ;; esac
+    [ -d "$line" ] || continue
+    # FIX: added head -n 10001 safety limit to prevent hanging on huge volumes.
+    # The count is capped at 10000+ as a signal rather than an exact number.
+    c="$(find "$line" -maxdepth 2 -type f 2>/dev/null | head -n 10001 | wc -l | tr -d ' ')" || c=0
+    total=$(( total + c ))
+  done < "$pfile"
+  printf "%s" "$total"
+}
+
+# preflight_hashing — report what will be scanned.
+# v1.4.2: returns non-zero when there is nothing to scan, so callers can
+# stop before launching. Previously it reported "Roots listed: 0" and the
+# run started anyway, producing a header-only CSV with no warning.
+preflight_hashing() {
+  pfile="$(determine_paths_file)"
+  efile="$(determine_excludes_file)"
+  if [ -n "$pfile" ]; then
+    roots=0; exist=0; missing=0
+    # shellcheck disable=SC2162
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in \#*|"") continue ;; esac
+      roots=$((roots+1))
+      if [ -d "$line" ]; then exist=$((exist+1)); else missing=$((missing+1)); fi
+    done < "$pfile"
+    info "Paths file: $pfile"
+    info "Roots listed: $roots (existing: $exist, missing: $missing)"
+    info "Quick sample (depth≤2): at least $(sample_files_quick "$pfile") files to scan (lower-bound)."
+  else
+    warn "No paths file found (local/paths.txt or ./paths.txt)."
+  fi
+  if [ -n "$efile" ]; then info "Excludes file: $efile"; fi
+
+  # v1.4.2: hard stop when nothing is configured. A run with zero roots
+  # cannot discover anything; letting it proceed wastes the user's time and
+  # leaves a header-only manifest behind that later confuses the workflow.
+  if [ "$(count_active_scan_paths)" -lt 1 ]; then
+    err "No scan paths configured — nothing to hash."
+    info "Add at least one directory to ${pfile:-$LOCAL_DIR/paths.txt}, one per line."
+    info "The launcher can do this for you: Settings → Review scan paths."
+    return 1
+  fi
+
+  # v1.4.4 (peer review #2): configured is not the same as available.
+  # Every root can be listed correctly and still be absent — an unmounted
+  # external disk is the common case. hasher.sh does reject this cleanly
+  # (exit 3, "All N path(s) are missing or unreadable") and leaves no
+  # manifest behind, so nothing is corrupted; but the user has by then
+  # committed to an action and waited for it. Checking here lets the answer
+  # arrive before the launch rather than after it.
+  if [ "${exist:-0}" -lt 1 ]; then
+    err "None of the configured scan paths currently exists or is readable."
+    info "Configured: ${roots:-0}   Available now: ${exist:-0}"
+    info "This usually means the volume or external disk is not mounted."
+    info "Check the mount, then try again — no configuration change is needed."
+    return 1
+  fi
+  return 0
+}
+
+# count_available_scan_paths — configured roots that exist RIGHT NOW.
+# v1.4.4: paired with count_active_scan_paths so the first-run screen can
+# distinguish "configured" from "reachable" without launching anything.
+count_available_scan_paths() {
+  local _pf _line _n=0
+  _pf="$(determine_paths_file)"
+  if [ -z "$_pf" ] || [ ! -r "$_pf" ]; then printf '0'; return; fi
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in \#*|"") continue ;; esac
+    [ -d "$_line" ] && _n=$(( _n + 1 ))
+  done < "$_pf"
+  printf '%s' "$_n"
+}
+
+find_hasher_script() {
+  for c in "$ROOT_DIR/hasher.sh" "$BIN_DIR/hasher.sh" "$ROOT_DIR/scripts/hasher.sh" "$ROOT_DIR/tools/hasher.sh"; do
+    [ -f "$c" ] && { printf "%s" "$c"; return 0; }
+  done
+  # shellcheck disable=SC2010
+  f="$(ls -1 "$BIN_DIR"/hasher*.sh 2>/dev/null | head -n1 || true)"
+  [ -n "${f:-}" ] && { printf "%s" "$f"; return 0; }
+  return 1
+}
+
+run_hasher_nohup() {
+  if ! ensure_no_running_hasher; then
+    return 0
+  fi
+
+  script="$(find_hasher_script || true)"
+  if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
+
+  # v1.4.2: preflight now returns non-zero when nothing is configured.
+  # Abort before truncating the background log or launching anything, so the
+  # previous run's log stays readable and no empty manifest is created.
+  if ! preflight_hashing; then
+    return 1
+  fi
+  : >"$BACKGROUND_LOG" 2>/dev/null || true
+
+  pfile="$(determine_paths_file)"
+  efile="$(determine_excludes_file)"
+
+  set -- "$script"
+  if [ -n "$pfile" ]; then
+    set -- "$@" --pathfile "$pfile"
+  fi
+  if [ -n "$efile" ]; then
+    # shellcheck disable=SC2162
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in \#*|"") continue ;; esac
+      # v1.3.18 (peer-review finding #2): pass patterns through unchanged;
+      # hasher.sh implements case-insensitive glob semantics itself.
+      pat="$(printf "%s" "$line" | sed 's/^[[:space:]]\{1,\}//; s/[[:space:]]\{1,\}$//')"
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done < "$efile"
+  fi
+
+  # FIX (v1.1.9): host-aware default excludes instead of a fixed
+  # Synology-only set. host_default_excludes() returns one pattern per
+  # line, including OS-specific noise dirs (Spotlight/.fseventsd on mac,
+  # @eaDir/@tmp on Synology, etc.). Falls back to the legacy hardcoded
+  # set if the host-detect lib isn't sourced for any reason.
+  if command -v host_default_excludes >/dev/null 2>&1; then
+    while IFS= read -r pat; do
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done <<EOF
+$(host_default_excludes)
+EOF
+  else
+    set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  fi
+
+  info "Starting hasher: $script (nohup to $BACKGROUND_LOG)"
+  # v1.2.0: pass parallel-jobs setting if configured
+  if [ -n "${HASHER_JOBS:-}" ] && [ "${HASHER_JOBS:-1}" -gt 1 ] 2>/dev/null; then
+    set -- "$@" --jobs "$HASHER_JOBS"
+    info "Parallel hashing: $HASHER_JOBS workers."
+  fi
+  if [ -x "$script" ]; then
+    nohup "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
+  else
+    # v1.3.13 (recheck item 7): fallback interpreter is BASH, not sh — the
+    # target (bin/hasher.sh) is a Bash script; sh (dash/BusyBox ash) would
+    # break on its bashisms.
+    nohup bash "$@" </dev/null >>"$BACKGROUND_LOG" 2>&1 &
+  fi
+  bgpid=$!
+
+  # v1.3.3: write the pidfile immediately so the duplicate-run guard is active
+  # in the brief window before hasher.sh claims it. hasher.sh then overwrites
+  # this with its own PID at the start of main() and removes it via its EXIT
+  # trap when the run finishes.
+  #
+  # The previous "( wait "$bgpid" 2>/dev/null; clear_pidfile ) &" line was
+  # removed: a subshell cannot wait on a sibling process, so wait returned
+  # immediately and cleared the pidfile within milliseconds of launch — while
+  # the hash run continued for hours. That made is_hasher_running() always
+  # report "not running" and the guard never fired. Pidfile lifecycle now
+  # lives entirely in hasher.sh, where it can be tied to the real process via
+  # $$ and a trap.
+  write_pidfile "$bgpid"
+
+  sleep 1
+  # FIX (v1.1.10): the previous check was 'tail -n 5 | grep Run-ID:'.
+  # On a fast/zero-file run (e.g. external disk not mounted, missing path)
+  # hasher.sh completes in well under a second; by the time we tail, the
+  # log has scrolled past Run-ID into the recommended-next-steps block,
+  # the grep fails, and the launcher warns "Hasher may not be running"
+  # for a process that already finished cleanly. We now look at the whole
+  # background log (limited to the last 200 lines), and treat either
+  # 'Run-ID:' (still running) OR 'Run complete' / 'Hashed' (already done)
+  # as success. We also detect the new "all paths missing" exit and
+  # surface it as a hard error rather than a confusing warning.
+  if tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+       | grep -qE 'Run-ID:|Run complete|Hashed [0-9]+/[0-9]+ files'; then
+    if tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+         | grep -qE 'are missing or unreadable|No input paths provided'; then
+      err "Hasher exited with a path error. Recent log:"
+      tail -n 30 "$BACKGROUND_LOG" 2>/dev/null || true
+      err "Edit local/paths.txt and confirm those paths exist before retrying."
+      clear_pidfile
+    elif tail -n 200 "$BACKGROUND_LOG" 2>/dev/null \
+           | grep -qE 'Hashed 0/0 files'; then
+      warn "Hasher completed but processed 0 files. Recent log:"
+      tail -n 20 "$BACKGROUND_LOG" 2>/dev/null || true
+      warn "Common causes: paths.txt empty, all paths excluded, or disk not mounted."
+      clear_pidfile
+    else
+      next "Hasher launched (PID $bgpid)."
+    fi
+  else
+    warn "Hasher may not be running. Recent log:"
+    tail -n 60 "$BACKGROUND_LOG" 2>/dev/null || true
+    clear_pidfile
+  fi
+  info "While it runs, use option 'l' to watch logs. Path: $BACKGROUND_LOG"
+}
+
+run_hasher_interactive() {
+  if ! ensure_no_running_hasher; then
+    return 0
+  fi
+
+  script="$(find_hasher_script || true)"
+  if [ -z "${script:-}" ]; then err "hasher.sh not found."; return 1; fi
+
+  # v1.4.4 (peer review #3): the same preflight as run_hasher_nohup.
+  #
+  # v1.4.2 added the guard to the background path only, because that was the
+  # route the report came from. Advanced/custom hashing builds its arguments
+  # from the same configured paths file, so it could still start a run with
+  # nothing configured or nothing mounted. Guarding one caller of a shared
+  # precondition and not the others is the recurring shape of these defects;
+  # any future launch path needs this call too.
+  if ! preflight_hashing; then
+    return 1
+  fi
+
+  pfile="$(determine_paths_file)"
+  efile="$(determine_excludes_file)"
+
+  set -- "$script"
+  if [ -n "$pfile" ]; then set -- "$@" --pathfile "$pfile"; fi
+  if [ -n "$efile" ]; then
+    # shellcheck disable=SC2162
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in \#*|"") continue ;; esac
+      # v1.3.18 (peer-review finding #2): pass patterns through unchanged;
+      # hasher.sh implements case-insensitive glob semantics itself.
+      pat="$(printf "%s" "$line" | sed 's/^[[:space:]]\{1,\}//; s/[[:space:]]\{1,\}$//')"
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done < "$efile"
+  fi
+
+  # FIX (v1.1.9): host-aware default excludes (see run_hasher_nohup).
+  if command -v host_default_excludes >/dev/null 2>&1; then
+    while IFS= read -r pat; do
+      [ -n "$pat" ] && set -- "$@" --exclude "$pat"
+    done <<EOF
+$(host_default_excludes)
+EOF
+  else
+    set -- "$@" --exclude "#recycle" --exclude "@Recycle" --exclude "@RecycleBin"
+  fi
+
+  info "Running hasher interactively: $script"
+  # v1.2.0: pass parallel-jobs setting if configured
+  if [ -n "${HASHER_JOBS:-}" ] && [ "${HASHER_JOBS:-1}" -gt 1 ] 2>/dev/null; then
+    set -- "$@" --jobs "$HASHER_JOBS"
+    info "Parallel hashing: $HASHER_JOBS workers."
+  fi
+  # v1.3.13 (recheck item 7): bash fallback, not sh (targets are Bash scripts)
+  if [ -x "$script" ]; then "$@"; else bash "$@"; fi
+}
+
+action_check_status(){
+  info "Background log: $BACKGROUND_LOG"
+  if is_hasher_running; then
+    pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    info "Hasher is currently running (PID $pid)."
+  else
+    info "Hasher is not currently running."
+  fi
+  [ -f "$BACKGROUND_LOG" ] && tail -n 200 "$BACKGROUND_LOG" || info "No background.log yet."
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+action_start_hashing(){
+  run_hasher_nohup
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+action_custom_hashing(){
+  run_hasher_interactive
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+# v1.2.0: performance settings — parallel hashing worker count
+action_performance_settings(){
+  # Detect a sensible recommended value: cores capped at 4
+  cores=1
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || echo 1)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  fi
+  case "$cores" in ''|*[!0-9]*) cores=1 ;; esac
+  recommended="$cores"
+  [ "$recommended" -gt 4 ] && recommended=4
+
+  echo
+  echo "${BOLD}Performance — parallel hashing${RST}"
+  echo
+  echo "Hashing can run multiple workers in parallel. More workers speed up"
+  echo "large runs on multi-core systems and SSD / SHR arrays. On a single"
+  echo "spinning HDD, too many workers cause seek thrashing — keep it low (1-2)."
+  echo
+  echo "  Detected CPU cores : $cores"
+  echo "  Recommended (safe) : $recommended"
+  echo "  Current setting    : $HASHER_JOBS worker(s)$([ "$HASHER_JOBS" -eq 1 ] && echo '  (serial)')"
+  echo
+  echo "  1) Serial (1 worker)        — safest, original behaviour"
+  echo "  2) Recommended ($recommended workers) — balanced default for most NAS units"
+  echo "  3) Aggressive ($cores workers)        — full cores; SSD/SHD arrays only"
+  echo "  4) Custom value"
+  echo "  q) Back (no change)"
+  echo
+  printf "Choice: "
+  read -r pc || pc="q"
+  case "$pc" in
+    1) HASHER_JOBS=1 ;;
+    2) HASHER_JOBS="$recommended" ;;
+    3) HASHER_JOBS="$cores" ;;
+    4)
+      printf "Enter worker count (1-%s): " "$cores"
+      read -r cv || cv=""
+      cv="$(printf '%s' "$cv" | tr -cd '0-9')"
+      if [ -n "$cv" ] && [ "$cv" -ge 1 ] 2>/dev/null; then
+        HASHER_JOBS="$cv"
+        if [ "$cv" -gt "$cores" ]; then
+          warn "Set to $cv, above the $cores detected cores — workers will contend for CPU."
+        fi
+      else
+        warn "Invalid value; keeping $HASHER_JOBS."
+      fi
+      ;;
+    *) info "No change."; printf "Press Enter to continue... "; read -r _ || true; return ;;
+  esac
+
+  # Persist
+  printf '%s\n' "$HASHER_JOBS" > "$HASHER_JOBS_FILE" 2>/dev/null || true
+  export HASHER_JOBS
+  info "Parallel hashing set to $HASHER_JOBS worker(s). Saved."
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# ── First-run guided setup (v1.3.0) ──────────────────────────────────────────
+# Detection: presence of the sentinel file local/.setup-complete. Absent means
+# this is the first launch on this install. The sentinel is written when setup
+# finishes OR is skipped, so the prompt never appears again (first launch only,
+# never on upgrade). Reaching every step manually via the menu is always
+# possible; this flow just guides a new user through the sensible starting
+# points so they aren't dropped cold into the full menu.
+
+SETUP_SENTINEL="$LOCAL_DIR/.setup-complete"
+
+is_first_run() {
+  [ ! -f "$SETUP_SENTINEL" ]
+}
+
+mark_setup_complete() {
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || true
+  {
+    printf '# Hasher setup completed/skipped on %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '# Delete this file to see the first-run guided setup again.\n'
+  } > "$SETUP_SENTINEL" 2>/dev/null || true
+}
+
+# Step: pick a parallel-jobs value (shared logic with action_performance_settings,
+# but inline here so the first-run flow reads as one continuous guided sequence).
+firstrun_performance() {
+  cores=1
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || echo 1)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  fi
+  case "$cores" in ''|*[!0-9]*) cores=1 ;; esac
+  recommended="$cores"; [ "$recommended" -gt 4 ] && recommended=4
+
+  echo
+  echo "${BOLD}Step 2 of 5 — Performance (parallel hashing)${RST}"
+  echo
+  echo "Hashing can use multiple workers in parallel. More workers are faster"
+  echo "on multi-core systems with SSD or SHR/RAID storage. On a single spinning"
+  echo "HDD, keep this low (1-2) — too many workers cause seek thrashing."
+  echo
+  echo "  Detected CPU cores : $cores"
+  echo
+  echo "  1) Serial (1 worker)         — safest"
+  echo "  2) Recommended ($recommended worker(s))  — good default for most NAS units"
+  echo "  3) Aggressive ($cores worker(s))   — SSD/SHR arrays only"
+  echo "  s) Skip (leave at current: $HASHER_JOBS)"
+  echo
+  printf "Choice [2]: "
+  read -r pc || pc="2"
+  [ -z "$pc" ] && pc="2"
+  case "$pc" in
+    1) HASHER_JOBS=1 ;;
+    2) HASHER_JOBS="$recommended" ;;
+    3) HASHER_JOBS="$cores" ;;
+    s|S) info "Skipped — performance left at $HASHER_JOBS."; return ;;
+    *) info "Unrecognised; using recommended ($recommended)."; HASHER_JOBS="$recommended" ;;
+  esac
+  printf '%s\n' "$HASHER_JOBS" > "$HASHER_JOBS_FILE" 2>/dev/null || true
+  export HASHER_JOBS
+  info "Parallel hashing set to $HASHER_JOBS worker(s)."
+}
+
+# Step: ensure paths.txt has at least one real scan root.
+firstrun_paths() {
+  echo
+  echo "${BOLD}Step 3 of 5 — Scan paths${RST}"
+  echo
+  pfile="$(determine_paths_file)"
+  # "configured" = a paths file exists with at least one non-comment, non-blank line
+  configured=0
+  if [ -n "$pfile" ]; then
+    if grep -vE '^[[:space:]]*(#|$)' "$pfile" >/dev/null 2>&1; then configured=1; fi
+  fi
+
+  if [ "$configured" -eq 1 ]; then
+    info "Scan paths already configured in: $pfile"
+    grep -vE '^[[:space:]]*(#|$)' "$pfile" | sed 's/^/    /'
+    info "Edit that file any time to change what gets scanned."
+    return
+  fi
+
+  echo "Hasher needs at least one directory to scan. None is configured yet."
+  echo "You can add one now, or skip and edit local/paths.txt yourself later."
+  echo
+  printf "Enter a directory to scan (absolute path), or leave blank to skip: "
+  read -r p || p=""
+  p="$(printf '%s' "$p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ -z "$p" ]; then
+    warn "Skipped. Add paths to local/paths.txt before hashing (menu option 1 will warn if empty)."
+    return
+  fi
+  if [ ! -d "$p" ]; then
+    warn "That path does not exist or is not a directory: $p"
+    warn "Not added. You can add it later in local/paths.txt once it's available."
+    return
+  fi
+  mkdir -p "$LOCAL_DIR" 2>/dev/null || true
+  # Preserve any template header if the file exists; just append the real path.
+  printf '%s\n' "$p" >> "$LOCAL_DIR/paths.txt"
+  info "Added to local/paths.txt: $p"
+  info "Add more any time by editing that file (one path per line)."
+}
+
+# Step: confirm where quarantine will live (read-only; reassurance, not a change).
+firstrun_quarantine() {
+  echo
+  echo "${BOLD}Step 4 of 5 — Quarantine location${RST}"
+  echo
+  qroot=""
+  if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$ROOT_DIR/lib/host-detect.sh"
+    qroot="$(default_quarantine_root 2>/dev/null || true)"
+  fi
+  [ -z "$qroot" ] && qroot="$ROOT_DIR/quarantine-$(date +%F)"
+  echo "When you remove DUPLICATES, Hasher MOVES them to quarantine — it never"
+  echo "deletes duplicates outright, and quarantine is recoverable. (The separate"
+  echo "housekeeping helpers — zero-length, junk, and cache cleaning — delete by"
+  echo "default; zero-length removal supports --quarantine if you prefer.) On this"
+  echo "install, quarantine will be created beside the tool, at:"
+  echo
+  echo "    ${BOLD}$qroot${RST}"
+  echo
+  echo "To use a different location, set QUARANTINE_DIR in local/hasher.conf."
+  info "Nothing to do here — just so you know where to look."
+}
+
+first_run_setup() {
+  clear 2>/dev/null || true
+  header
+  echo "${BOLD}Welcome to Hasher — first-run setup${RST}"
+  echo
+  echo "This looks like the first launch on this install. I can walk you through"
+  echo "a few quick checks to get you ready: dependencies, performance, scan paths,"
+  echo "and where quarantine lives. It takes under a minute and everything is"
+  echo "skippable. You can also reach all of it later from the menu."
+  echo
+  printf "Run guided setup now? [Y/n]: "
+  read -r ans || ans="y"
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    n|no)
+      info "Skipping guided setup. You can run individual checks from the menu"
+      info "(d = diagnostics, p = performance). This prompt won't appear again."
+      mark_setup_complete
+      printf "Press Enter to continue to the menu... "; read -r _ || true
+      return
+      ;;
+  esac
+
+  # Step 1 — dependencies (reuse check-deps.sh)
+  echo
+  echo "${BOLD}Step 1 of 5 — Dependencies & readiness${RST}"
+  echo
+  if [ -x "$BIN_DIR/check-deps.sh" ]; then
+    "$BIN_DIR/check-deps.sh" || true
+    echo
+    # offer --fix if it looks like a hash tool may be missing
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+      warn "No sha256 tool detected."
+      printf "Attempt to create OpenSSL-based shims now? [y/N]: "
+      read -r fixit || fixit="n"
+      case "$(printf '%s' "$fixit" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) "$BIN_DIR/check-deps.sh" --fix || true ;;
+      esac
+    fi
+  else
+    warn "check-deps.sh not found — skipping dependency check."
+  fi
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 2 — performance
+  firstrun_performance
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 3 — paths
+  firstrun_paths
+  printf "Press Enter for the next step... "; read -r _ || true
+
+  # Step 4 — quarantine
+  firstrun_quarantine
+  printf "Press Enter for the final setup choice... "; read -r _ || true
+
+  # Step 5 — automatic or manual duplicate-analysis workflow
+  echo
+  echo "${BOLD}Step 5 of 5 — Duplicate-analysis workflow${RST}"
+  if ! choose_analysis_mode; then
+    echo
+    warn "The workflow choice could not be saved. Setup will run again next launch."
+    printf "Press Enter to return... "; read -r _ || true
+    return 1
+  fi
+  echo
+  echo "${BOLD}Setup complete.${RST} You're ready to hash (menu option 1)."
+  mark_setup_complete
+  printf "Press Enter to continue to the menu... "; read -r _ || true
+}
+
+action_view_logs_follow(){
+  if [ ! -f "$BACKGROUND_LOG" ]; then
+    info "No background.log yet."
+    printf "Press Enter to continue... "; read -r _ || true;
+    return
+  fi
+  info "Following $BACKGROUND_LOG"
+  printf "%s(Ctrl+C to stop)%s\n" "$YEL" "$RST"
+  tail -f "$BACKGROUND_LOG"
+}
+
+action_find_duplicate_folders(){
+  input="$(latest_hashes_csv)"
+  [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
+  info "Using hashes file: $input"
+
+  if [ ! -x "$BIN_DIR/find-duplicate-folders.sh" ]; then
+    err "$BIN_DIR/find-duplicate-folders.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # FIX: inform the user of the defaults being applied, especially --keep shortest-path
+  # which silently decides which copy is the "primary". Users should know this.
+  echo
+  info "Running with defaults: --mode plan --scope leaf-folders --min-group-size 2 --keep shortest-path"
+  info "Note: matches directories whose DIRECT file contents are identical (leaf level),"
+  info "not whole directory trees. See the README 'Duplicate folders' section."
+  warn "Note: '--keep shortest-path' will nominate the copy with the shortest path as the keeper."
+  warn "Edit local/hasher.conf to change this default, or run find-duplicate-folders.sh directly for custom flags."
+  echo
+
+  # Snapshot the existing raw artefact names. The finder uses unique
+  # timestamp+PID names, so the set difference after this invocation identifies
+  # the CURRENT run's output without ever resurrecting an older plan when the
+  # new scan finds no duplicates.
+  _plans_before="$(mktemp "${TMPDIR:-/tmp}/hasher-folder-plans-before.XXXXXX")"
+  _plans_after="$(mktemp "${TMPDIR:-/tmp}/hasher-folder-plans-after.XXXXXX")"
+  find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_before"
+
+  _folder_find_rc=0
+  if run_script "$BIN_DIR/find-duplicate-folders.sh" \
+    --input "$input"        \
+    --mode plan             \
+    --scope leaf-folders    \
+    --min-group-size 2      \
+    --keep shortest-path; then
+    :
+  else
+    _folder_find_rc=$?
+  fi
+
+  find "$LOGS_DIR" -maxdepth 1 -type f -name 'duplicate-folders-plan-[0-9]*.txt' -print 2>/dev/null | LC_ALL=C sort > "$_plans_after"
+  plan="$(comm -13 "$_plans_before" "$_plans_after" 2>/dev/null | tail -n1 || true)"
+  rm -f -- "$_plans_before" "$_plans_after" 2>/dev/null || true
+
+  if [ "$_folder_find_rc" -ne 0 ]; then
+    err "Duplicate-folder scan failed (exit $_folder_find_rc). No result has been presented as a successful no-duplicates scan."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  refresh_analysis_summary || warn "Could not refresh the launcher analysis summary."
+
+  groups=""
+  if [ -n "$plan" ]; then
+    groups="$(raw_folder_groups_for_plan "$plan" || true)"
+  fi
+  # FIX (v1.3.5 — peer-review item 4): test -s (non-empty FILE), not -n
+  # (non-empty string/path). An empty plan file would otherwise be offered for
+  # review. find-duplicate-folders.sh no longer writes empty plans, but this
+  # guards against a stale empty plan from an earlier version too.
+  if [ -s "$plan" ]; then
+    info "Plan saved to: $plan"
+    [ -s "$groups" ] && info "Group context: $groups"
+    echo
+    # NEW (v1.1.13): offer to launch the interactive reviewer immediately
+    if [ -s "$groups" ] && script_runnable "$BIN_DIR/review-folder-plan.sh"; then
+      printf "Review this plan interactively now? [Y/n]: "
+      read -r ans || ans="y"
+      case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+        ""|y|yes)
+          if run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan"; then
+            info "Folder-plan review completed."
+          else
+            _review_rc=$?
+            err "Folder-plan review failed or was interrupted (exit $_review_rc)."
+          fi
+          ;;
+        *)
+          info "OK — review later with option 2, or apply a reviewed plan with option 4."
+          ;;
+      esac
+    else
+      info "Review later with option 2, or apply a reviewed plan with option 4."
+    fi
+  else
+    info "No duplicate folders found — nothing to review or apply."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_rerun_analysis_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    header
+    echo
+    echo "${BOLD}Rerun duplicate analysis${RST}"
+    echo
+    echo "   1) Rerun duplicate-folder analysis"
+    echo "   2) Rerun duplicate-file analysis (includes review index)"
+    echo "   3) Rerun all analysis for latest successful hash"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _analysis_choice || return 0
+    case "${_analysis_choice:-}" in
+      1) action_find_duplicate_folders ;;
+      2) action_find_duplicate_files ;;
+      3) action_find_duplicate_folders; action_find_duplicate_files ;;
+      b|B|'') return 0 ;;
+      *) warn "Unknown option: $_analysis_choice"; sleep 1 ;;
+    esac
+  done
+}
+
+# NEW (v1.1.13): interactive reviewer for the folder-dedup plan
+action_review_folder_plan(){
+  # Review the newest RAW plan and derive its exact groups sidecar. Reviewed
+  # plans have already passed through this step and must not be independently
+  # paired with a newer/older groups TSV.
+  plan="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
+  if [ ! -s "$plan" ]; then
+    err "No unreviewed duplicate-folder plan found. Use option 'r' to rerun duplicate-folder analysis first."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  groups="$(raw_folder_groups_for_plan "$plan" || true)"
+  if [ ! -s "$groups" ]; then
+    err "The matching groups sidecar is missing for: $plan"
+    err "Refusing to combine this plan with context from another scan."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  if ! script_runnable "$BIN_DIR/review-folder-plan.sh"; then
+    err "$BIN_DIR/review-folder-plan.sh not found or not readable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  info "Reviewing raw folder plan: $plan"
+  info "Using matching context:   $groups"
+  if run_script "$BIN_DIR/review-folder-plan.sh" --groups "$groups" --plan "$plan"; then
+    info "Folder-plan review completed."
+  else
+    _review_rc=$?
+    err "Folder-plan review failed or was interrupted (exit $_review_rc)."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# v1.3.9: folders-first guard (medium). File dedup collapses duplicate files
+# WITHIN folders, changing those folders' direct-file signatures — so two
+# folders that are currently identical may no longer match afterwards, and the
+# high-leverage one-decision folder cleanup is lost. Returns 0 to proceed, 1 to
+# abort. Never blocks outright (one keypress); does not fire once a folder plan
+# or groups file exists (from this or a previous session).
+folders_first_guard() {
+  _what="${1:-this step}"
+  if ls "$LOGS_DIR"/duplicate-folders-plan-*.txt >/dev/null 2>&1 \
+     || ls "$LOGS_DIR"/duplicate-folders-groups-*.tsv >/dev/null 2>&1; then
+    return 0
+  fi
+  echo
+  warn "No duplicate-folder analysis is available for the latest hash."
+  warn "Recommended order is FOLDERS first, then FILES. Removing duplicate"
+  warn "files now changes folders' contents, so identical folders may no longer"
+  warn "match — and you lose the bigger, one-decision folder cleanup. This"
+  warn "cannot be undone by re-running afterwards."
+  echo
+  info "Tip: choose 'n', use option 'r' to rerun folder analysis, then review with option 2."
+  printf "Continue with %s anyway? [y/N]: " "$_what"
+  read -r _ans || _ans=""
+  case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) return 0 ;;
+    *) info "Good call — rerun folder analysis from option 'r' first."; return 1 ;;
+  esac
+}
+
+action_find_duplicate_files(){
+  folders_first_guard "FILE dedup" || { printf "Press Enter to continue... "; read -r _ || true; return; }
+
+  _file_find_rc=0
+  if script_runnable "$BIN_DIR/run-find-duplicates.sh"; then
+    if run_script "$BIN_DIR/run-find-duplicates.sh"; then :; else _file_find_rc=$?; fi
+  else
+    input="$(latest_hashes_csv)"
+    [ -z "$input" ] && { err "No hashes CSV found."; printf "Press Enter to continue... "; read -r _ || true; return; }
+    info "Using hashes file: $input"
+    if script_runnable "$BIN_DIR/find-duplicates.sh"; then
+      if run_script "$BIN_DIR/find-duplicates.sh" --input "$input"; then :; else _file_find_rc=$?; fi
+    else
+      err "$BIN_DIR/find-duplicates.sh not found or not readable."
+      _file_find_rc=127
+    fi
+  fi
+  if [ "$_file_find_rc" -eq 0 ]; then
+    refresh_analysis_summary || warn "Could not refresh the launcher analysis summary."
+    info "Duplicate-file scan completed."
+  else
+    err "Duplicate-file scan failed (exit $_file_find_rc). Review the error above; no successful result is implied."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_review_duplicates(){
+  _review_rc=0
+  if script_runnable "$BIN_DIR/launch-review.sh"; then
+    if run_script "$BIN_DIR/launch-review.sh"; then :; else _review_rc=$?; fi
+  elif script_runnable "$BIN_DIR/review-duplicates.sh"; then
+    if run_script "$BIN_DIR/review-duplicates.sh"; then :; else _review_rc=$?; fi
+  else
+    err "$BIN_DIR/review-duplicates.sh not found or readable."
+    _review_rc=127
+  fi
+  [ "$_review_rc" -eq 0 ] || err "Duplicate-file review failed or was interrupted (exit $_review_rc)."
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_delete_zero_length(){
+  if [ -x "$BIN_DIR/delete-zero-length.sh" ]; then
+    "$BIN_DIR/delete-zero-length.sh" || true
+  else
+    err "$BIN_DIR/delete-zero-length.sh not found or not executable."
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# FIX: action_apply_plan previously silently preferred file plans and never
+# mentioned folder plans if a file plan existed. Now both are surfaced and
+# the user chooses which to apply.
+action_apply_plan(){
+  # Collect latest plan of each type: review-duplicates, auto-dedup, folder
+  review_plan="$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)"
+  auto_plan="$(ls -1t "$LOGS_DIR"/auto-dedup-plan-*.txt 2>/dev/null | head -n1 || true)"
+
+  # NEW (v1.1.13): for folder plans, prefer reviewed plans over raw ones.
+  # The reviewer writes duplicate-folders-plan-reviewed-DATETIME.txt; the
+  # finder writes duplicate-folders-plan-DATE.txt. Both match the same
+  # broad glob, so we split them and pick the reviewed one when present,
+  # warning the user if they're about to apply a raw plan that has no
+  # reviewed sibling.
+  folder_plan_reviewed="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt 2>/dev/null | head -n1 || true)"
+  folder_plan_raw="$(ls -1t "$LOGS_DIR"/duplicate-folders-plan-[0-9]*.txt 2>/dev/null | head -n1 || true)"
+
+  folder_plan=""; _folder_src=""
+  if [ -n "$folder_plan_reviewed" ] && [ -n "$folder_plan_raw" ]; then
+    # A reviewed plan is not automatically newer than the latest raw scan.
+    # Prefer it only when it is at least as new; otherwise surface the newer
+    # raw plan and warn that it has not yet been reviewed.
+    if [ "$folder_plan_raw" -nt "$folder_plan_reviewed" ]; then
+      folder_plan="$folder_plan_raw"
+      _folder_src="raw (unreviewed)"
+    else
+      folder_plan="$folder_plan_reviewed"
+      _folder_src="reviewed"
+    fi
+  elif [ -n "$folder_plan_reviewed" ]; then
+    folder_plan="$folder_plan_reviewed"
+    _folder_src="reviewed"
+  elif [ -n "$folder_plan_raw" ]; then
+    folder_plan="$folder_plan_raw"
+    _folder_src="raw (unreviewed)"
+  fi
+
+  # Use the newest file plan between review and auto-dedup
+  file_plan=""; _plan_src=""
+  if [ -n "$review_plan" ] && [ -n "$auto_plan" ]; then
+    if [ "$review_plan" -nt "$auto_plan" ]; then
+      file_plan="$review_plan"; _plan_src="interactive review"
+    else
+      file_plan="$auto_plan"; _plan_src="auto-dedup"
+    fi
+  elif [ -n "$review_plan" ]; then
+    file_plan="$review_plan"; _plan_src="interactive review"
+  elif [ -n "$auto_plan" ]; then
+    file_plan="$auto_plan"; _plan_src="auto-dedup"
+  fi
+
+  has_file=0; has_folder=0
+  [ -n "$file_plan" ]   && has_file=1
+  [ -n "$folder_plan" ] && has_folder=1
+
+  if [ "$has_file" -eq 0 ] && [ "$has_folder" -eq 0 ]; then
+    info "No reviewed plan found."
+    if [ "$(analysis_mode)" = "automatic" ]; then
+      info "  Review folders with option 2 or files with option 3."
+      info "  If analysis is missing or stale, use option 'r' to rerun it."
+    else
+      info "  Find folders with option 2, or files with option 3, then review the results."
+    fi
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  echo
+  if [ "$has_file" -eq 1 ]; then
+    info "Latest FILE dedupe plan ($_plan_src):"
+    info "  $file_plan"
+  else
+    info "No file dedupe plan found."
+  fi
+  if [ "$has_folder" -eq 1 ]; then
+    info "Latest FOLDER dedupe plan ($_folder_src):"
+    info "  $folder_plan"
+    # NEW (v1.1.13): warn if folder plan is unreviewed
+    if [ "$_folder_src" = "raw (unreviewed)" ]; then
+      warn "This folder plan has NOT been interactively reviewed."
+      warn "Consider running menu option 'r' first to review each group before applying."
+    fi
+  else
+    info "No folder dedupe plan found."
+  fi
+
+  echo
+  echo "Which plan do you want to apply?"
+  [ "$has_file"   -eq 1 ] && echo "  f) Apply FILE plan   ($_plan_src)"
+  [ "$has_folder" -eq 1 ] && echo "  d) Apply FOLDER plan ($_folder_src)"
+  echo "  q) Cancel"
+  printf "Choice: "
+  read -r ans || ans="q"
+
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    f)
+      if [ "$has_file" -eq 0 ]; then
+        warn "No file plan available."; printf "Press Enter to continue... "; read -r _ || true; return
+      fi
+      info "Applying FILE plan: $file_plan"
+      if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+        if "$BIN_DIR/delete-duplicates.sh" "$file_plan"; then
+          info "File plan applied successfully."
+        else
+          _apply_rc=$?
+          case "$_apply_rc" in
+            4) warn "File plan completed with safety skips; it was not fully applied." ;;
+            *) err "File-plan apply failed (exit $_apply_rc)." ;;
+          esac
+        fi
+      else
+        err "$BIN_DIR/delete-duplicates.sh not found or not executable."
+      fi
+      ;;
+    d)
+      if [ "$has_folder" -eq 0 ]; then
+        warn "No folder plan available."; printf "Press Enter to continue... "; read -r _ || true; return
+      fi
+      # NEW (v1.1.13): extra confirmation when applying an unreviewed plan
+      if [ "$_folder_src" = "raw (unreviewed)" ]; then
+        warn "About to apply an UNREVIEWED folder plan."
+        printf "Proceed without review? [y/N]: "
+        read -r confirm || confirm="n"
+        case "$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]')" in
+          y|yes) : ;;
+          *) info "Cancelled. Run menu option 'r' to review first."
+             printf "Press Enter to continue... "; read -r _ || true; return ;;
+        esac
+      fi
+      info "Applying FOLDER plan: $folder_plan"
+      if [ -x "$BIN_DIR/apply-folder-plan.sh" ]; then
+        if "$BIN_DIR/apply-folder-plan.sh" --plan "$folder_plan" --force; then
+          info "Folder plan applied successfully."
+        else
+          _apply_rc=$?
+          case "$_apply_rc" in
+            4) warn "Folder plan completed with safety skips; it was not fully applied." ;;
+            *) err "Folder-plan apply failed (exit $_apply_rc)." ;;
+          esac
+        fi
+      else
+        err "$BIN_DIR/apply-folder-plan.sh not found or not executable."
+      fi
+      ;;
+    *)
+      info "Cancelled."
+      ;;
+  esac
+
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_system_check(){
+  info "System check:"
+  command -v awk  >/dev/null && echo "  - awk:  OK" || echo "  - awk:  MISSING"
+  command -v sort >/dev/null && echo "  - sort: OK" || echo "  - sort: MISSING"
+  command -v cksum>/dev/null && echo "  - cksum:OK" || echo "  - cksum:MISSING"
+  command -v stat >/dev/null && echo "  - stat: OK" || echo "  - stat: MISSING"
+  command -v df   >/dev/null && echo "  - df:   OK" || echo "  - df:   MISSING"
+  echo "  - Logs dir:    $LOGS_DIR"
+  echo "  - Hashes dir:  $HASHES_DIR"
+  echo "  - Bin dir:     $BIN_DIR"
+  echo "  - Latest CSV:  $(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || echo none)"
+  pfile="$(determine_paths_file)"
+  if [ -n "$pfile" ]; then
+    echo "  - Paths file: $pfile"
+    sed -n '1,10p' "$pfile" | sed 's/^/      /'
+    echo "    Lower-bound (depth≤2): $(sample_files_quick "$pfile") files"
+  else
+    echo "  - Paths file: (none found)"
+  fi
+  efile="$(determine_excludes_file)"
+  if [ -n "$efile" ]; then
+    echo "  - Excludes: $efile"
+    sed -n '1,10p' "$efile" | sed 's/^/      /'
+  fi
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+action_self_test(){
+  # v1.3.4: run the integrity preflight on demand. Uses run_script so a missing
+  # +x bit on self-test.sh itself is not fatal.
+  if script_runnable "$BIN_DIR/self-test.sh"; then
+    run_script "$BIN_DIR/self-test.sh" || true
+  else
+    err "$BIN_DIR/self-test.sh not found."
+  fi
+
+  # v1.4.1: the self-test checks that the installation is intact — files
+  # present, tools available, config readable. The fault-injection suite
+  # checks that the tool still *behaves* correctly under adversarial input.
+  # They answer different questions, so offer the second one separately
+  # rather than folding it into the first.
+  if [ -r "$ROOT_DIR/tests/run-tests.sh" ]; then
+    echo
+    info "A behavioural test suite is also available. It exercises the"
+    info "situations that have historically caused defects — overlapping"
+    info "scan roots, hard links, files modified mid-hash, damaged"
+    info "manifests, stale locks — using disposable sandboxes."
+    info "Nothing outside a temporary directory is touched."
+    echo
+    printf "Run the fault-injection suite now? (takes ~30s) [y/N]: "
+    read -r _ans || _ans=""
+    case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes)
+        echo
+        bash "$ROOT_DIR/tests/run-tests.sh" || true
+        ;;
+      *) info "Skipped. Run it any time with: tests/run-tests.sh" ;;
+    esac
+  fi
+
+  printf "Press Enter to continue... "; read -r _ || true;
+}
+
+
+action_clean_caches() {
+  paths_file="$LOCAL_DIR/paths.txt"
+  # FIX (v1.1.9): host-aware default scan root instead of hardcoded /volume1
+  if command -v host_default_scan_root >/dev/null 2>&1; then
+    default_root="$(host_default_scan_root)"
+  else
+    default_root="/volume1"
+  fi
+  listfile="$VAR_DIR/eadir-list-$(date +%s).txt"
+  : > "$listfile"
+
+  if [ -f "$paths_file" ]; then
+    info "Using roots from $paths_file"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in \#*|"") continue ;; esac
+      [ -d "$line" ] || { warn "Missing root: $line"; continue; }
+      find "$line" -type d -name '@eaDir' -prune -print0 >> "$listfile"
+    done < "$paths_file"
+  else
+    printf "Root to clean (default: %s): " "$default_root"; read -r _r || _r=""
+    root="${_r:-$default_root}"
+    [ -d "$root" ] || { warn "Missing root: $root"; printf "Press Enter to continue... "; read -r _ || true; return; }
+    find "$root" -type d -name '@eaDir' -prune -print0 >> "$listfile"
+  fi
+
+  total=0
+  if [ -s "$listfile" ]; then
+    total=$(tr -cd '\0' < "$listfile" | wc -c | tr -d ' ')
+  fi
+  info "Found @eaDir directories: $total"
+  if [ "$total" -eq 0 ]; then
+    printf "Nothing to clean. Press Enter to continue... "; read -r _ || true; return
+  fi
+
+  printf '[INFO] Examples:\n'
+  tr '\0' '\n' < "$listfile" | head -n 10
+
+  printf "Delete ALL @eaDir directories found? [y/N]: "
+  read -r ans || ans=""
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) ;;
+    *) info "Aborted."; printf "Press Enter to continue... "; read -r _ || true; return ;;
+  esac
+
+  done_count=0
+  last=$(date +%s)
+  while IFS= read -r -d '' d; do
+    rm -rf -- "$d" 2>/dev/null || true
+    done_count=$((done_count+1))
+    now=$(date +%s)
+    if [ $((now-last)) -ge 15 ] 2>/dev/null; then
+      printf '[PROGRESS] Deleted %d/%d @eaDir folders\n' "$done_count" "$total"
+      last="$now"
+    fi
+  done < "$listfile"
+
+  rm -f "$listfile" 2>/dev/null || true
+  printf '[OK] Deleted %d @eaDir folders.\n' "$done_count"
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_delete_junk(){
+  if [ ! -x "$BIN_DIR/delete-junk.sh" ]; then
+    err "$BIN_DIR/delete-junk.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  echo
+  echo ">>> Delete junk files"
+  echo "    - Using rules from: local/junk-extensions.txt"
+  echo "    - Matches both extensions (e.g. AAE, LRV, THM)"
+  echo "      and common junk basenames (Thumbs.db, .DS_Store, Desktop.ini)"
+  echo
+  echo "The script will:"
+  echo "  - Scan your configured paths (local/paths.txt)"
+  echo "  - Show a preview of junk files and total size"
+  echo "  - Ask for confirmation before deleting anything"
+  echo
+
+  "$BIN_DIR/delete-junk.sh"
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# FIX: SHA256 validation previously only checked the first character with a
+# case pattern, allowing strings like "abc123xyz" to pass. Now validates
+# that the entire string is 64 hex characters using grep -E.
+action_find_by_hash() {
+  printf "Enter SHA256 hash to look up: "
+  read -r HASHVAL || HASHVAL=""
+  if [ -z "$HASHVAL" ]; then
+    warn "No hash entered."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  clean_hash="$(printf "%s" "$HASHVAL" | tr -d '[:space:]')"
+
+  # Full-string validation: must be exactly 64 hex characters
+  if ! printf "%s" "$clean_hash" | grep -qE '^[0-9a-fA-F]{64}$'; then
+    warn "Input does not look like a valid SHA256 hash (expected 64 hex characters)."
+    warn "Got: $clean_hash"
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  if [ -x "$BIN_DIR/hash-check.sh" ] || [ -f "$BIN_DIR/hash-check.sh" ]; then
+    info "Looking up hash: $clean_hash"
+    "$BIN_DIR/hash-check.sh" "$clean_hash" || true
+  else
+    err "hash-check.sh not found in $BIN_DIR"
+  fi
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# v1.4.6: Import Check — bring files from an SD card, old backup disk, DVD,
+# or cloud export into a staging folder and find out which are already on
+# the NAS, without ever risking the NAS copy. Thin menu wrapper around
+# bin/import-check.sh; all the classification and safety logic lives there.
+action_import_check() {
+  local _ic="$BIN_DIR/import-check.sh"
+  if [ ! -r "$_ic" ]; then
+    err "bin/import-check.sh not found."
+    printf "Press Enter to continue... "; read -r _ || true
+    return 1
+  fi
+
+  local _choice
+  while :; do
+    clear 2>/dev/null || true
+    header
+
+    local _dir
+    _dir="$(awk '
+      /^[[:space:]]*\[/ { insec = (tolower($0) ~ /\[import_check\]/); next }
+      insec && /^[[:space:]]*import_dir[[:space:]]*=/ {
+        sub(/^[[:space:]]*import_dir[[:space:]]*=[[:space:]]*/, ""); print; exit
+      }
+    ' "$LOCAL_DIR/hasher.conf" 2>/dev/null || true)"
+
+    echo "${BOLD}Import Check — bring new files onto the NAS without duplicating anything${RST}"
+    echo "This mode is for SD cards, old backup disks, DVDs, or cloud exports —"
+    echo "anything you're folding into the NAS. Files already on the NAS are"
+    echo "never touched; only copies sitting in the import folder are ever"
+    echo "proposed for removal, and always to quarantine, never deleted outright."
+    echo
+    if [ -n "$_dir" ]; then
+      echo "   Import folder: $_dir"
+    else
+      echo "   Import folder: not yet configured"
+    fi
+    echo
+    echo "   1) Set up import folder             (first time, or to change it)"
+    echo "   2) Scan (hash the import folder)"
+    echo "   3) Show import summary"
+    echo "   4) Quarantine NAS duplicates         (verified copies only, with confirmation)"
+    echo "   5) Remove duplicate copies within import (keep shortest path, with confirmation)"
+    echo "   6) Move remainder into unique-files/ (for hand-sorting)"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _choice || return 0
+
+    case "${_choice:-}" in
+      1) run_script "$_ic" setup          || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      2) run_script "$_ic" scan           || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      3) run_script "$_ic" summary        || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      4) run_script "$_ic" discard        || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      5) run_script "$_ic" dedup-internal || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      6) run_script "$_ic" sort           || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      b|B) return 0 ;;
+      *) echo "Unknown option: $_choice"; sleep 1 ;;
+    esac
+  done
+}
+
+action_stats_and_cron() {
+  info "Hasher usage stats (approximate):"
+
+  csv_count=$(ls -1 "$HASHES_DIR"/hasher-*.csv 2>/dev/null | wc -l | tr -d ' ')
+  echo "  - Hash runs (CSV files): $csv_count"
+
+  latest_csv=$(ls -1t "$HASHES_DIR"/hasher-*.csv 2>/dev/null | head -n1 || true)
+  if [ -n "$latest_csv" ]; then
+    echo "  - Latest hashes CSV: $latest_csv"
+  else
+    echo "  - Latest hashes CSV: (none yet)"
+  fi
+
+  plan_count=$(ls -1 "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | wc -l | tr -d ' ')
+  echo "  - File dedupe plans created: $plan_count"
+
+  latest_plan=$(ls -1t "$LOGS_DIR"/review-dedupe-plan-*.txt 2>/dev/null | head -n1 || true)
+  if [ -n "$latest_plan" ] && [ -f "$latest_plan" ]; then
+    echo "  - Latest file dedupe plan: $latest_plan"
+  fi
+
+  echo
+  echo "Example cron entries (templates only; adjust paths & options):"
+  echo
+  echo "  # Run hasher nightly at 02:00"
+  echo "  0 2 * * * cd <hasher_root_dir> && bin/hasher.sh --pathfile local/paths.txt >> logs/cron-hash.log 2>&1"
+  echo
+  echo "  # Run junk cleaner weekly on Sundays at 03:00"
+  echo "  0 3 * * 0 cd <hasher_root_dir> && bin/delete-junk.sh >> logs/cron-junk.log 2>&1"
+  echo
+  echo "Note: bin/hasher.sh loads default/hasher.conf and local/hasher.conf on start,"
+  echo "so cron and menu runs use the same exclusion set. If you rely on additional"
+  echo "excludes, put them in local/hasher.conf (see EXTRA_EXCLUDES) or pass"
+  echo "them explicitly with --exclude."
+  echo
+  echo "Edit crontab with: crontab -e"
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_clean_logs() {
+  if [ ! -x "$BIN_DIR/clean-logs.sh" ]; then
+    err "$BIN_DIR/clean-logs.sh not found or not executable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  echo
+  info "Running log housekeeping (bin/clean-logs.sh)…"
+  info "This will rotate large logs and prune old hash CSVs, run logs, and dedupe plans."
+  echo
+  "$BIN_DIR/clean-logs.sh" || true
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_clean_internal() {
+  if [ ! -d "$VAR_DIR" ]; then
+    info "VAR dir not found: $VAR_DIR"
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # v1.3.17 (peer-review finding #4): CRITICAL — never clean var/ while a
+  # hash run is active. Removing hasher.pid, hasher.lock, the current run's
+  # NUL file list, or the zero-length progress files during a live run
+  # unblocks concurrent runs and can corrupt in-flight reporting. Check the
+  # same two signals used elsewhere: (1) a live pidfile, (2) any tracked
+  # hasher.sh process visible to the launcher.
+  if is_hasher_running 2>/dev/null; then
+    _pid="$(cat "$HASHER_PIDFILE" 2>/dev/null || true)"
+    err "Refusing to clean $VAR_DIR while hashing is active (PID ${_pid:-?})."
+    err "Stop hashing first (menu option 'k'), then try again."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  _orphans="$(list_hasher_pids 2>/dev/null || true)"
+  if [ -n "${_orphans// /}" ]; then
+    warn "Found live hasher.sh process(es) not tracked by the pidfile:"
+    for _p in $_orphans; do warn "   PID $_p"; done
+    err  "Refusing to clean $VAR_DIR while any hasher.sh is alive."
+    err  "Use menu option 'k' (Stop hashing) first."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # Single find pass into a temp file
+  tmplist="$VAR_DIR/.clean-list-$$.txt"
+  find "$VAR_DIR" -mindepth 1 -maxdepth 10 -print 2>/dev/null >"$tmplist" || true
+  count="$(wc -l <"$tmplist" | tr -d ' ')"
+
+  info "Internal working dir: $VAR_DIR"
+  echo "  - Items that would be removed (files + dirs): $count"
+
+  if [ "${count:-0}" -eq 0 ] 2>/dev/null; then
+    rm -f "$tmplist"
+    info "Nothing to clean."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  printf "Delete ALL contents of %s (keeping the directory itself)? [y/N]: " "$VAR_DIR"
+  read -r ans || ans=""
+  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      # Delete deepest entries first to handle non-empty dirs correctly
+      sort -r "$tmplist" | while IFS= read -r item; do
+        rm -rf -- "$item" 2>/dev/null || true
+      done
+      rm -f "$tmplist"
+      info "Internal working files cleaned."
+      ;;
+    *)
+      rm -f "$tmplist"
+      info "Aborted."
+      ;;
+  esac
+
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+action_auto_dedup() {
+  if ! script_runnable "$BIN_DIR/auto-dedup.sh"; then
+    err "$BIN_DIR/auto-dedup.sh not found or not readable."
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+  folders_first_guard "AUTO file dedup" || { printf "Press Enter to continue... "; read -r _ || true; return; }
+
+  echo
+  echo ">>> Auto-dedup — keep shortest path"
+  echo
+  echo "This will automatically generate a dedup plan for ALL duplicate groups"
+  echo "without interactive review. The strategy is: for each group, the copy"
+  echo "with the SHORTEST file path is kept; all others are marked for deletion."
+  echo
+  echo "No files are moved yet — a plan file is written to logs/."
+  echo "Review it with:  cat <plan-file> | grep '^DEL' | head -50"
+  echo "Apply it with:   option 6 (Delete duplicates / apply plan)"
+  echo
+
+  # Optional: allow choosing a different strategy
+  echo "Keep strategy:"
+  echo "  1) shortest-path  (default — recommended for dedupe after backup copies)"
+  echo "  2) longest-path"
+  echo "  3) newest"
+  echo "  4) oldest"
+  printf "Strategy [1]: "
+  read -r strat_choice || strat_choice="1"
+  case "${strat_choice:-1}" in
+    2) KEEP="longest-path" ;;
+    3) KEEP="newest" ;;
+    4) KEEP="oldest" ;;
+    *) KEEP="shortest-path" ;;
+  esac
+
+  echo
+  info "Running auto-dedup with strategy: $KEEP"
+  echo
+
+  # v1.3.28: give this invocation an exact output path and honour its return
+  # status. A failed run must never fall through to an older historical plan.
+  _auto_run_id="$(date +%Y%m%d-%H%M%S)-$$"
+  plan_file="$LOGS_DIR/auto-dedup-plan-$(date +%F)-$_auto_run_id.txt"
+  rm -f -- "$plan_file" 2>/dev/null || true
+  if run_script "$BIN_DIR/auto-dedup.sh" --keep "$KEEP" --plan-out "$plan_file"; then
+    _auto_rc=0
+  else
+    _auto_rc=$?
+  fi
+  if [ "$_auto_rc" -ne 0 ]; then
+    err "Auto-dedup failed (exit $_auto_rc). No plan will be offered for application."
+    rm -f -- "$plan_file" 2>/dev/null || true
+    printf "Press Enter to continue... "; read -r _ || true
+    return
+  fi
+
+  # Offer to apply only the exact plan created by this invocation.
+  echo
+  if [ -n "$plan_file" ] && [ -s "$plan_file" ]; then
+    del_count="$(grep -c '^DEL|' "$plan_file" 2>/dev/null || echo 0)"
+    echo "Plan contains $del_count file(s) marked for quarantine."
+    printf "Apply this plan now? [y/N] "
+    read -r _apply || _apply="n"
+    case "$(printf '%s' "$_apply" | tr '[:upper:]' '[:lower:]')" in
+      y|yes)
+        info "Applying plan: $plan_file"
+        if [ -x "$BIN_DIR/delete-duplicates.sh" ]; then
+          if "$BIN_DIR/delete-duplicates.sh" "$plan_file"; then
+            info "File plan applied successfully."
+          else
+            _apply_rc=$?
+            case "$_apply_rc" in
+              4) warn "File plan completed with safety skips. Re-hash and rebuild the plan before retrying." ;;
+              *) err "File-plan apply failed (exit $_apply_rc)." ;;
+            esac
+          fi
+        else
+          err "$BIN_DIR/delete-duplicates.sh not found or not executable."
+        fi
+        ;;
+      *)
+        info "Plan not applied. Use option 6 to apply when ready."
+        ;;
+    esac
+  fi
+
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# ── Bash baseline check (v1.3.7) ─────────────────────────────────────────────
+# Warn once at startup if running below the Bash 3.2 baseline. The tool targets
+# 3.2+ (macOS /bin/bash is 3.2); below that, behaviour is unsupported.
+if command -v bash_at_least >/dev/null 2>&1; then
+  if ! bash_at_least 3 2; then
+    detect_bash_version
+    warn "Running under Bash ${HASHER_BASH_VERSION:-unknown}, which is below the 3.2 baseline."
+    warn "Some features may misbehave. Bash 3.2 or newer is recommended."
+    printf "Press Enter to continue... "; read -r _ || true
+  fi
+fi
+
+# ── Startup integrity preflight (v1.3.4) ─────────────────────────────────────
+# Run self-test quietly at launch. On a healthy install this is silent; if it
+# finds ERRORS (missing helper, duplicate helper, version drift, missing menu
+# target) it prints a short banner so the problem is seen immediately rather
+# than discovered later in production. Warnings (e.g. missing +x, handled by the
+# bash fallback) are not surfaced here to avoid nagging.
+if [ -r "$BIN_DIR/self-test.sh" ]; then
+  if ! _st_out="$(run_script "$BIN_DIR/self-test.sh" --quiet 2>&1)"; then
+    printf '%s\n' "$_st_out" | grep -E '\[FAIL\]' 2>/dev/null
+    warn "Self-test reported problems above. Run option 'x' for the full report."
+    printf "Press Enter to continue... "; read -r _ || true
+  fi
+fi
+
+# ── First-run guided setup ────────────────────────────────────────────────────
+# Runs once on the first launch of a new install (sentinel: local/.setup-complete).
+if is_first_run; then
+  first_run_setup
+fi
+
+# ── First-run launch screen (v1.4.0) ─────────────────────────────────────────
+# Before any successful manifest exists, review and cleanup actions cannot do
+# anything useful — every one of them needs a hash manifest as input. Showing
+# the full 12-option menu at that point invites the user to pick something that
+# will only tell them "no manifest found". This focused screen offers the one
+# action that makes sense, plus settings and help.
+
+# Boolean wrapper around list_hasher_pids (v1.3.15), used by the first-run
+# screen to decide between "ready to begin" and "currently running".
+# v1.4.0: this was called by the first-run menu before it existed as a
+# function — defining it here keeps the pidfile check and the orphan scan
+# consistent with ensure_no_running_hasher().
+hasher_processes_running() {
+  [ -n "$(list_hasher_pids)" ]
+}
+
+has_successful_hash_manifest() {
+  # v1.4.2: a header-only CSV is NOT a usable manifest — a run with no scan
+  # paths configured produces exactly that, and treating it as real made the
+  # first-run screen disappear permanently.
+  #
+  # v1.4.4: the data-row test moved into latest_hashes_csv, which now returns
+  # only usable manifests. Keeping a second copy here invited them to drift
+  # apart, which is precisely how peer-review #1 arose.
+  [ -n "$(latest_hashes_csv)" ]
+}
+
+# count_active_scan_paths — non-blank, non-comment entries in the paths file.
+# v1.4.2: used to decide whether the install is actually configured, rather
+# than assuming it is because the launcher reached the main menu.
+count_active_scan_paths() {
+  local _pf
+  _pf="$(determine_paths_file)"
+  if [ -z "$_pf" ] || [ ! -r "$_pf" ]; then printf '0'; return; fi
+  grep -cvE '^[[:space:]]*(#|$)' "$_pf" 2>/dev/null | tr -d ' ' || printf '0'
+}
+
+print_first_hash_menu() {
+  # v1.4.2: the screen must reflect what is actually configured.
+  #
+  # It previously announced "Your configuration is complete" unconditionally
+  # and offered to start hashing. A user who declined the guided setup has
+  # an empty paths.txt, so that claim was false and the offered action could
+  # not work — it launched a run that discovered nothing and wrote a
+  # header-only CSV. Checking the paths file lets the screen ask for what is
+  # missing instead of inviting an action that cannot succeed.
+  local _roots
+  _roots="$(count_active_scan_paths)"
+
+  echo
+  if [ "${_roots:-0}" -lt 1 ]; then
+    printf '%sWelcome. One more step before the first run.%s\n' "$BOLD" "$RST"
+    echo
+    echo "No scan paths are configured yet, so there is nothing to hash."
+    echo "Add at least one directory and the first run becomes available."
+    echo
+    printf '%sNeeded: choose what to scan%s\n' "$BOLD" "$RST"
+    echo "   Settings & preferences → Review scan paths"
+    echo
+    echo "   2) Settings & preferences  ← start here"
+    echo "   3) Help & information"
+    echo
+    echo "   q) Quit"
+    echo
+    printf "Select an option: "
+    return 0
+  fi
+
+  # v1.4.4 (peer review #2): configured paths may all be unavailable — an
+  # unmounted external disk is the usual reason. Announcing "ready" and
+  # offering to start would send the user into a run that cannot proceed.
+  local _avail
+  _avail="$(count_available_scan_paths)"
+
+  if [ "${_avail:-0}" -lt 1 ]; then
+    printf '%sWelcome. Your storage is not currently available.%s\n' "$BOLD" "$RST"
+    echo
+    printf '   Scan paths configured: %s\n' "$_roots"
+    printf '   Available now:         %s\n' "$_avail"
+    echo
+    echo "The paths are configured correctly, but none of them can be reached"
+    echo "at the moment. This usually means a volume or external disk is not"
+    echo "mounted. No configuration change is needed — mount it and return."
+    echo
+    echo "   2) Settings & preferences  (review the configured paths)"
+    echo "   3) Help & information"
+    echo
+    echo "   q) Quit"
+    echo
+    printf "Select an option: "
+    return 0
+  fi
+
+  printf '%sWelcome. Hasher is ready for its first run.%s\n' "$BOLD" "$RST"
+  echo
+  printf '   Scan paths configured: %s\n' "$_roots"
+  if [ "$_avail" -lt "$_roots" ]; then
+    # Partial availability is worth flagging but not blocking: hashing what
+    # is reachable is a legitimate choice, and hasher.sh warns per path.
+    printf '   Available now:         %s  %s(%s not reachable)%s\n' \
+      "$_avail" "$YEL" "$(( _roots - _avail ))" "$RST"
+  fi
+  echo
+  echo "The first hash safely inventories your files and prepares the"
+  echo "duplicate analysis used by the review workflow."
+  echo "No files are changed during hashing."
+  echo
+
+  if is_hasher_running || hasher_processes_running; then
+    printf '%sFirst hash currently running.%s\n' "$BOLD" "$RST"
+    echo "   Hasher is building the initial file inventory in the background."
+    # v1.4.1: on a first run there is nothing else to look at, so the
+    # progress detail matters more here than anywhere. print_hashing_progress
+    # prints its own heading and next-step line, so only its body is wanted;
+    # the surrounding text above and the option list below provide the
+    # framing.
+    _fr_line=""
+    if [ -r "$BACKGROUND_LOG" ]; then
+      _fr_line="$(tail -n 400 "$BACKGROUND_LOG" 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g' | grep -F '[PROGRESS]' | tail -n1 || true)"
+    fi
+    case "$_fr_line" in
+      *"Walking paths:"*)
+        _fr_n="$(printf '%s' "$_fr_line" | sed -n 's/.*Walking paths: \([0-9]*\) file.*/\1/p')"
+        [ -n "$_fr_n" ] && echo "   Files discovered so far: $_fr_n (still counting)"
+        ;;
+      *"Hashing:"*)
+        _fr_pct="$(printf '%s' "$_fr_line" | sed -n 's/.*Hashing: \[\([0-9]*\)%\].*/\1/p')"
+        _fr_eta="$(printf '%s' "$_fr_line" | sed -n 's/.*eta=[0-9:]* (\([^)]*\)).*/\1/p')"
+        [ -n "$_fr_pct" ] && echo "   Progress: ${_fr_pct}%"
+        [ -n "$_fr_eta" ] && printf '   %sEstimated remaining: %s%s\n' "$BOLD" "$_fr_eta" "$RST"
+        ;;
+    esac
+    echo
+    echo "   s) Check hashing status"
+    echo "   l) Follow background log"
+    echo "   k) Stop hashing"
+  else
+    printf '%sReady to begin%s\n' "$BOLD" "$RST"
+    echo "   Start the first hash run to build the inventory."
+    echo
+    echo "   1) Initiate first Hasher run (recommended)"
+  fi
+
+  echo
+  echo "Options"
+  echo "   2) Settings & preferences"
+  echo "   3) Help & information"
+  echo
+  echo "   q) Quit"
+  echo
+  printf "Select an option: "
+}
+
+action_first_hash_settings() {
+  local _choice
+  while :; do
+    clear 2>/dev/null || true
+    header
+    echo "${BOLD}First-run settings & preferences${RST}"
+    echo
+    echo "   1) Review scan paths"
+    echo "   2) Performance settings"
+    echo "   3) Duplicate-analysis mode"
+    echo "   4) System diagnostics"
+    echo
+    echo "   b) Back"
+    echo
+    printf "Select an option: "
+    read -r _choice || return 0
+    case "${_choice:-}" in
+      1) firstrun_paths; printf "Press Enter to continue... "; read -r _ || true ;;
+      2) action_performance_settings ;;
+      3) choose_analysis_mode; printf "Press Enter to continue... "; read -r _ || true ;;
+      4) action_system_check ;;
+      b|B) return 0 ;;
+      *) echo "Unknown option: $_choice"; sleep 1 ;;
+    esac
+  done
+}
+
+action_first_hash_help() {
+  clear 2>/dev/null || true
+  header
+  echo "${BOLD}About the first hash run${RST}"
+  echo
+  echo "Hasher reads each configured file and records its size, path and secure"
+  echo "SHA-256 fingerprint in a manifest under the hashes directory."
+  echo
+  echo "The hash run does not modify, move or delete your files. In automatic"
+  echo "analysis mode, duplicate-folder and duplicate-file results are prepared"
+  echo "after the manifest completes so they are ready for review when you return."
+  echo
+  echo "The run continues in the background. Use hashing status or follow the"
+  echo "background log to check progress."
+  echo
+  printf "Press Enter to continue... "; read -r _ || true
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+while :; do
+  clear 2>/dev/null || true
+  header
+
+  # v1.4.0: no manifest yet → focused launch screen. Every review and cleanup
+  # action needs a manifest as input, so offering them here would only produce
+  # "no manifest found" messages. `continue` skips the rest of the loop body.
+  if ! has_successful_hash_manifest; then
+    print_first_hash_menu
+    read -r choice || { echo; exit 0; }
+    case "${choice:-}" in
+      1)
+        # v1.4.2: `1` is not offered when no scan paths exist, but a user
+        # may still type it. Redirect to settings rather than launching a
+        # run that can only produce an empty manifest.
+        if [ "$(count_active_scan_paths)" -lt 1 ]; then
+          warn "No scan paths configured — there is nothing to hash yet."
+          info "Add a directory under Settings & preferences (option 2)."
+          printf "Press Enter to continue... "; read -r _ || true
+        elif [ "$(count_available_scan_paths)" -lt 1 ]; then
+          # v1.4.4: the option is not listed in this state, but nothing stops
+          # the user typing it.
+          warn "None of the configured scan paths is reachable right now."
+          info "Mount the volume or external disk, then try again."
+          printf "Press Enter to continue... "; read -r _ || true
+        elif is_hasher_running || hasher_processes_running; then
+          info "The first hash run is already active."
+          printf "Press Enter to continue... "; read -r _ || true
+        else
+          action_start_hashing
+        fi
+        ;;
+      2) action_first_hash_settings ;;
+      3) action_first_hash_help ;;
+      s|S) action_check_status ;;
+      l|L) action_view_logs_follow ;;
+      k|K) action_stop_hashing ;;
+      q|Q) echo "Bye."; exit 0 ;;
+      *) echo "Unknown option: $choice"; sleep 1 ;;
+    esac
+    continue
+  fi
+
+  # v1.4.1: a run in progress is reported in BOTH modes — it is a fact about
+  # the machine, not a feature of the automatic workflow. print_analysis_summary
+  # already defers to it, so calling the progress panel directly here avoids
+  # printing it twice in automatic mode.
+  if [ "$(analysis_mode)" = "automatic" ]; then
+    print_analysis_summary
+  else
+    print_hashing_progress || true
+  fi
+  print_menu
+  read -r choice || { echo; exit 0; }
+
+  _menu_mode="$(analysis_mode)"
+  case "${choice:-}" in
+    1)       action_start_hashing ;;
+    a|A)     action_custom_hashing ;;
+    s|S)     action_check_status ;;
+    p|P)     action_performance_settings ;;
+    k|K)     action_stop_hashing ;;
+    f|F)     action_find_by_hash ;;
+    m|M)
+      clear 2>/dev/null || true
+      header
+      printf 'Current analysis mode: %s%s%s
+' "$BOLD" "$_menu_mode" "$RST"
+      choose_analysis_mode
+      printf "Press Enter to continue... "; read -r _ || true
+      ;;
+    d|D)     action_system_check ;;
+    i|I)     action_import_check ;;
+    x|X)     action_self_test ;;
+    l|L)     action_view_logs_follow ;;
+    t|T)     action_stats_and_cron ;;
+    v|V)     action_clean_internal ;;
+    c|C)     action_clean_logs ;;
+    q|Q)     echo "Bye."; exit 0 ;;
+    *)
+      if [ "$_menu_mode" = "manual" ]; then
+        case "${choice:-}" in
+          2) action_find_duplicate_folders ;;
+          3) action_find_duplicate_files ;;
+          4) action_review_duplicates ;;
+          r|R) action_review_folder_plan ;;
+          5) action_auto_dedup ;;
+          6) action_apply_plan ;;
+          7) action_delete_zero_length ;;
+          8) action_delete_junk ;;
+          9) action_clean_caches ;;
+          *) echo "Unknown option: $choice"; sleep 1 ;;
+        esac
+      else
+        case "${choice:-}" in
+          2) action_review_folder_plan ;;
+          3) action_review_duplicates ;;
+          4) action_apply_plan ;;
+          5) action_auto_dedup ;;
+          6) action_delete_zero_length ;;
+          7) action_delete_junk ;;
+          8) action_clean_caches ;;
+          r|R) action_rerun_analysis_menu ;;
+          *) echo "Unknown option: $choice"; sleep 1 ;;
+        esac
+      fi
+      ;;
+  esac
+done
