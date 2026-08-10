@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.7**
+Started Dec 2022. Current version: **v1.4.9**
 
 ### First-run launch screen
 
@@ -413,6 +413,7 @@ bin/import-check.sh setup     # first time: choose/create the import folder
 bin/import-check.sh scan      # hash the import folder (fast — not a full NAS rescan)
 bin/import-check.sh summary   # see what matches, what doesn't
 bin/import-check.sh discard   # quarantine the NAS duplicates, with confirmation
+bin/import-check.sh dedup-internal # quarantine the import's OWN duplicates, keep shortest path
 bin/import-check.sh sort      # move whatever's left into import/unique-files/
 ```
 
@@ -437,16 +438,29 @@ removed since the pinned manifest was taken regardless, `discard`'s reuse
 of `delete-duplicates.sh` re-verifies each match immediately before acting
 and skips anything that no longer checks out (exit code 4, not an error).
 
-**What's automated and what isn't.** Only *cross-boundary* matches — an
-import file that duplicates something already on the NAS — are resolved
-automatically. Two files that duplicate *each other* inside the import
-folder, or a file with no match anywhere, are left alone: `discard` never
-touches them, and `sort` moves all of them together into
-`import/unique-files/` for you to look through by hand. Deciding which of
-your own two copies to keep is a different decision with no safe default,
-so it isn't folded into "does the NAS already have this." `scan` excludes
+**What's automated and what isn't.** *Cross-boundary* matches — an import
+file that duplicates something already on the NAS — are resolved by
+`discard`. Files that duplicate *each other* inside the import folder are
+a separate, explicit action: `dedup-internal`, run after `discard` (so it
+only ever considers groups with no NAS match — `discard` has already
+cleared out the rest), keeping the shortest path in each group. It was
+deliberately kept out of `discard` itself: "which of my own two copies do
+I keep" has no safe default the way "does the NAS already have this"
+does, so it gets its own plan-review-then-confirm step rather than being
+folded silently into the automatic one. Whatever is left after both —
+genuinely unique, no NAS match, no internal duplicate — is what `sort`
+moves into `import/unique-files/` for you to look through by hand.
+`dedup-internal` refuses to run against a scan that predates a discard or
+previous dedup-internal action, so it always works from current data
+rather than files that have already been quarantined. `scan` excludes
 `unique-files/` itself from later runs, so files you've already sorted
 aren't repeatedly reconsidered.
+
+**Progress on large imports.** `summary`, `discard`, and `sort` all classify
+the import against the NAS manifest before doing anything else, and on a
+large import (order 100k files) that comparison alone can take several
+seconds. When run interactively, an in-place progress bar shows it working;
+piped or redirected output stays clean with no bar at all.
 
 **Concurrency.** `scan`, `discard`, and `sort` take a lock
 (`var/import-check.lock`) so two of them can't run against the same import
@@ -568,7 +582,8 @@ hasher/
 │       ├── 80-first-run-gating.sh
 │       ├── 85-manifest-selection.sh
 │       ├── 90-import-check.sh
-│       └── 91-import-check-isolation.sh
+│       ├── 91-import-check-isolation.sh
+│       └── 92-import-check-dedup-internal.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -678,7 +693,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (12 cases, ~50s)
+tests/run-tests.sh                # everything (13 cases, ~55s)
 tests/run-tests.sh 20 40          # only cases whose name matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -705,6 +720,7 @@ directory of ordinary files would exercise:
 | `85-manifest-selection` | Newest usable manifest, storage availability, preflight parity |
 | `90-import-check` | NAS-precedence duplicate classification, boundary safety, remainder handling |
 | `91-import-check-isolation` | Overlap refusal, paths.txt isolation, manifest pinning, lock, pipe-char safety |
+| `92-import-check-dedup-internal` | Import's own duplicates, keep-shortest-path, staleness refusal, NAS isolation |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

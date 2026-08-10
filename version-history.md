@@ -3600,6 +3600,173 @@ release is additive to the safety model, not a rework of it.
 Suite now 12 cases, 176 assertions.
 
 ---
+## 2026‑08 — v1.4.8
+**Import Check: progress reporting for classify_and_plan()**
+
+Reported from a live run against a 108,367-file import (an Apple Photos
+library bundle already backed up elsewhere on the NAS): `bin/import-check.sh
+summary` gave no feedback at all while it worked, on a comparison large
+enough to take real, noticeable time. Same "is it hung or just slow"
+complaint already fixed for the hash loop (v1.3.21), the quarantine loops
+(v1.4.5), and the discard/sort loops within Import Check itself (v1.4.6) —
+this was the one remaining gap, in the classification pass shared by
+`summary`, `discard`, and `sort`.
+
+### Why this needed a different approach from the existing progress bar
+
+`lib/log.sh`'s `log_progress_bar()` (built in v1.4.5) is called from bash,
+once per loop iteration, and is the right tool everywhere else in this
+project. `classify_and_plan()` doesn't fit that shape: the whole
+NAS-vs-import comparison runs inside a single `awk` invocation with no
+per-row return to bash to call a bash function from.
+
+The bar is therefore implemented natively inside the awk script — same
+visual style (40-char `#`/`-` bar, percentage, `current/total`, in-place
+`\r` redraw), but drawn by an awk function rather than a bash one.
+Deliberately **does not show elapsed time or an ETA**: those need
+`systime()`, which is not reliably available across every awk variant this
+tool already has to support — `lib/awk-detect.sh` exists specifically
+because BusyBox awk on Synology DSM has caused problems before, and this
+avoids reopening that class of issue for a cosmetic feature. A moving
+percentage and row count is enough to show the process is alive without
+depending on awk timing behaviour.
+
+TTY detection and the row-count precheck (`wc -l` on both input CSVs) both
+happen in bash before the awk call, where they're cheap and portable, and
+are passed in as `-v` arguments. Redraw is rate-limited by row count
+(roughly 200 redraws over the whole run regardless of input size) rather
+than wall-clock time, for the same portability reason.
+
+### Verified
+
+Piped/redirected output: confirmed zero `[WORK]` lines emitted — the
+existing behaviour for every other progress bar in this project.
+TTY-forced test run: confirmed correct 0→100% progression, correct
+in-place `\r` redraw, and a clean trailing clear so the summary/warning
+text that follows starts on a fresh line. Classification output itself
+(match counts, plan contents) confirmed byte-identical with the
+instrumentation in place versus without — this is purely a progress
+overlay, no behavioural change.
+
+No code touched outside `classify_and_plan()`'s own awk block. Suite
+unchanged at 12 cases, 176 assertions — every existing case runs
+non-interactively, so all of them exercised the (correctly silent)
+non-TTY path throughout, and none needed updating.
+
+---
+## 2026‑08 — v1.4.9
+**Import Check: dedup-internal, and progress reporting for find-duplicates.sh's scanning pass**
+
+### Progress reporting extended to find-duplicates.sh
+
+Checking whether the v1.4.8 progress work covered every phase a user could
+hit surfaced a gap: `find-duplicates.sh`'s main CSV-scanning pass — the
+one that quote-aware parses every row of a manifest and dedups by
+(hash, path) — had no progress feedback at all. On a large manifest this
+is exactly the same "is it hung" risk fixed for import-check.sh's
+classification pass in v1.4.8, and it matters directly here because
+`dedup-internal` (below) calls this exact pass.
+
+Same technique as v1.4.8, applied to a different tool: the bar is drawn
+natively inside the awk script (no per-row return to bash to call a bash
+progress function from), TTY-gated and row-count precheck done in bash,
+no elapsed time or ETA (needs `systime()`, not reliably available across
+every awk variant this tool supports — BusyBox awk on Synology DSM has
+caused problems here before). Verified: zero `[WORK]` lines when piped,
+correct 0→100% progression and clean in-place redraw when TTY-forced,
+classification output (group count) unchanged with the instrumentation
+in place versus without.
+
+### dedup-internal: the import folder's own duplicates
+
+Reported from a live run: the user was maintaining a *second, separate
+hasher installation* rooted at the import folder, purely to run
+`auto-dedup.sh` against import-internal duplicates in isolation from the
+NAS. That workaround had the right instinct — genuine isolation between
+NAS and import — but required maintaining a whole parallel install just
+to get it.
+
+`import-scan-latest.csv` already has that isolation property for free: it
+is a scan of the import folder alone and has never once contained a NAS
+path. Feeding it into `find-duplicates.sh` therefore produces a plan that
+is structurally incapable of referencing anything outside the import
+folder — not because of a boundary check, but because a NAS path was
+never in the pool of candidates to begin with.
+
+New `bin/import-check.sh dedup-internal`, thin by design — the same
+composition pattern `discard` already uses, no new dedup logic written:
+
+```
+find-duplicates.sh --input import-scan-latest.csv --mode bulk --keep-strategy shortest-path
+       (writes a HASHER_VERIFIED_DUPLICATE_REPORT-tagged report)
+auto-dedup.sh --from-report <report> --plan-out <plan> --keep shortest-path --force
+       (writes a plan; does NOT apply it — confirmed against the actual
+        source rather than assumed, after an early draft got this wrong)
+delete-duplicates.sh <plan>
+       (applies it — same keeper re-verification, same quarantine-not-
+        delete, same exit codes as everywhere else this tool is reused)
+```
+
+Deliberately kept OUT of `discard` rather than folded into it: "which of
+my own two copies do I keep" has no safe default the way "does the NAS
+already have this" does, so it gets its own explicit, opt-in,
+plan-review-then-confirm action instead of running silently inside an
+automatic one.
+
+**Ordering matters.** `dedup-internal` is meant to run AFTER `discard`,
+not before: if a hash group has both a NAS match and multiple import
+copies, `discard` already removes every import copy in that group (NAS
+wins over all of them, not just one). Running internal-dedup first would
+waste effort deduplicating files `discard` is about to remove anyway.
+This ordering also closes a documentation gap the peer review flagged as
+a nice-to-have in v1.4.7: `sort`'s remainder used to be described as
+"unique + import's own duplicates" because both were genuinely mixed
+together. After `discard` then `dedup-internal`, whatever `sort` moves
+into `unique-files/` really is unique.
+
+**Staleness guard.** `import-scan-latest.csv` still lists paths `discard`
+may have just quarantined. A new marker file
+(`var/import-check-last-destructive.marker`), touched by both `discard`
+and `dedup-internal`, lets `dedup-internal` detect when its scan predates
+the last destructive action and refuse (exit 2) rather than silently
+building duplicate groups against files that no longer exist —
+`delete-duplicates.sh`'s keeper-verification would have caught that
+safely regardless, but as a confusing "0 groups usable" rather than the
+tool asking up front for what it needs.
+
+**A bug reintroduced, then fixed, in the same session it was written.**
+The exact `grep -c ... || echo 0` double-fire defect fixed twice already
+in this file (v1.4.7) — `grep -c` prints "0" on no match AND exits 1, so
+the `|| echo 0` fallback fires too, producing the two-line string "0\n0"
+that breaks a subsequent `-eq` test — was written a third time into the
+brand-new `cmd_dedup_internal()`. Caught by the new test suite itself:
+the "no internal duplicates" case failed with `integer expression
+expected` on first run. Fixed to the same corrected pattern
+(`"$(grep -c ...)" || true` followed by an explicit empty-string check)
+already used at the other two sites in this file — worth noting as a
+reminder that a documented fix in one place doesn't prevent the same
+mistake in new code the same day.
+
+### Launcher
+
+New option 5 in the Import Check submenu ("Dedup import's own
+duplicates"); the old option 5 ("Move remainder into unique-files/")
+shifts to option 6.
+
+### Test coverage
+
+New `tests/cases/92-import-check-dedup-internal.sh`, 19 assertions:
+keep-shortest-path selection verified against real files, staleness
+refusal immediately after `discard` and success after a fresh re-scan,
+clean rc=4 when nothing to deduplicate, clean rc=3 with no scan at all,
+and a structural-isolation check that inspects the generated plan file
+directly to confirm it contains no NAS-side path. `90-import-check.sh`
+and `91-import-check-isolation.sh` required no changes; both suites'
+full assertion counts pass unmodified.
+
+Suite now 13 cases, 195 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
