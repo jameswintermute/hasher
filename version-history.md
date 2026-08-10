@@ -4082,6 +4082,110 @@ Restored.
 Full suite: 16 cases, 240 assertions.
 
 ---
+## 2026‑08 — v1.4.13
+**Launcher survival fix, delete-duplicates.sh colour and progress, from a real quarantine run at scale**
+
+Four pieces of live feedback from a NAS session applying a 72,685-entry
+discard plan, each checked against source before being trusted.
+
+### The launcher quit instead of returning to the Import Check menu
+
+Confirmed: `launcher.sh` runs under `set -eu`, and all six
+`run_script "$_ic" <subcommand>` calls in the Import Check dispatch were
+unguarded. Every OTHER `run_script` call site in the entire file already
+guards against exactly this (an `if`/`else _rc=$?` wrapper, or an
+explicit `|| true`) — these six were the only unguarded ones. Import
+Check's own exit-code conventions (2 invalid input, 3 missing
+prerequisite, 4 nothing to do) made this land constantly in ordinary
+use: "nothing to deduplicate" is one of the most common outcomes of
+option 5, not an edge case, so selecting it after an import folder had
+already been cleaned reliably killed the whole launcher.
+
+Fixed with `|| true` on all six calls, matching the established pattern
+everywhere else in the file. Verified two ways: reproduced the exact
+reported failure (launcher's own exit code became the subcommand's
+non-zero code, "Bye." never printed — `set -e` killing the process
+before it reached its own quit path), then confirmed the fix by
+reverting it, watching the new test fail on exactly those two
+assertions, and restoring it.
+
+**Why this shipped across five prior releases.** `tests/cases/90-95`
+extensively test `import-check.sh` directly, but never through
+`launcher.sh`'s own `set -eu` context — driving a subcommand via
+`run_tool`/`run_tool_with_input` bypasses the exact interaction that
+broke. New `tests/cases/96-launcher-import-check-survival.sh` closes
+that gap specifically: it drives the actual interactive launcher for the
+one thing under test, using the already-proven direct helpers only to
+prepare state beforehand.
+
+### delete-duplicates.sh's own output was uncoloured
+
+Confirmed: its `_emit()` has printed plain `[INFO]`/`[WARN]`/`[ERROR]`
+text since the script was written, while `hasher.sh` and
+`import-check.sh` both apply real ANSI colour to the same tags. Reported
+live, where these lines sit directly after `import-check.sh`'s own
+coloured `[INFO]` output and the mismatch is visually jarring
+mid-sequence. `lib/log.sh` was already sourced in this file (for its
+progress-bar helpers); `_emit()` now reuses its `LOG_C_INFO`/
+`LOG_C_WARN`/`LOG_C_ERR`/`LOG_C_RST` variables rather than defining a
+second colour scheme. The file-tee to the apply log stays plain text —
+colour codes have no place in a saved log meant to be read back later.
+Verified with the same TTY-forcing technique used throughout this
+project: confirmed the exact escape sequence now matches
+`import-check.sh`'s own `[INFO]` colour, and confirmed the log file
+stays free of ANSI codes.
+
+### The real cause of "no progress indicator" was bigger than a missing bar
+
+Investigating why nothing appeared between "Detailed apply log:" and
+"Plan carries content hashes..." on a 72,685-entry plan surfaced two
+separate, previously-undiscovered defects in `delete-duplicates.sh`'s
+own plan-validation logic — used by every dedup pathway in this tool,
+not only Import Check, which just happened to be the first workload run
+at a scale large enough to expose them clearly:
+
+- A pure bash loop classifies every DEL entry as hash-verified or not,
+  calling `_split_del_line` — which forks a regex check — once per line.
+  On 72,685 entries that is tens of thousands of forked subprocesses
+  with zero output in between.
+- A second loop, run afterward, is worse: for every hash group it forks
+  a **fresh `awk` process that linearly re-scans the whole keeper-map
+  file**. Cost grows with groups × keeper-map size rather than staying
+  linear in plan size — an O(n²)-shaped pattern.
+
+Given this validates whether a plan is safe to treat as hash-verified
+before mass-quarantining files, it was treated conservatively: progress
+reporting was added (`[SCAN]` for the first pass, `[VERIFY]` for the
+second, alongside the existing `[MOVE]` for the actual quarantine step)
+rather than rewriting the underlying algorithm in the same pass as three
+other fixes. A single-pass awk rewrite of both loops would very likely
+turn minutes into a fraction of a second — flagged explicitly as a
+follow-up for its own dedicated, carefully-tested release, not attempted
+here. Verified correctness is unaffected (200 kept, 200 quarantined at
+test scale) and that both new bars render correctly when TTY-forced.
+
+### On the pinned-manifest warning shown mid-session
+
+One piece of feedback ("interesting rerun") turned out to be the
+v1.4.7 staleness-warning feature working exactly as designed: a newer
+NAS manifest existed than the one the import scan was pinned to, and
+the tool correctly warned about it rather than silently substituting —
+then proceeded using the original pinned manifest, not the newer one.
+No change made; noted here for the record since it was raised as
+observed behaviour worth confirming.
+
+### Test coverage
+
+New `tests/cases/96-launcher-import-check-survival.sh`, 7 assertions:
+the exact reported scenario (`dedup-internal` returning "nothing to do"
+through the launcher), a missing-NAS-manifest summary, and a
+back-to-back discard hitting the v1.4.10 staleness refusal — all three
+driven through the real interactive launcher rather than
+`import-check.sh` directly.
+
+Full suite: 17 cases, 247 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

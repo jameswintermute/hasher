@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.12 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.13 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -1911,12 +1911,12 @@ action_import_check() {
     read -r _choice || return 0
 
     case "${_choice:-}" in
-      1) run_script "$_ic" setup;          printf "Press Enter to continue... "; read -r _ || true ;;
-      2) run_script "$_ic" scan;           printf "Press Enter to continue... "; read -r _ || true ;;
-      3) run_script "$_ic" summary;        printf "Press Enter to continue... "; read -r _ || true ;;
-      4) run_script "$_ic" discard;        printf "Press Enter to continue... "; read -r _ || true ;;
-      5) run_script "$_ic" dedup-internal; printf "Press Enter to continue... "; read -r _ || true ;;
-      6) run_script "$_ic" sort;           printf "Press Enter to continue... "; read -r _ || true ;;
+      1) run_script "$_ic" setup          || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      2) run_script "$_ic" scan           || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      3) run_script "$_ic" summary        || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      4) run_script "$_ic" discard        || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      5) run_script "$_ic" dedup-internal || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      6) run_script "$_ic" sort           || true; printf "Press Enter to continue... "; read -r _ || true ;;
       b|B) return 0 ;;
       *) echo "Unknown option: $_choice"; sleep 1 ;;
     esac
