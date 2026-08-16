@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.16**
+Started Dec 2022. Current version: **v1.4.18**
 
 ### First-run launch screen
 
@@ -522,16 +522,54 @@ it and re-run.
 All dedup operations produce a plain-text plan file in `logs/` before anything
 is moved. Inspect, then apply.
 
-**Applying a large plan.** `delete-duplicates.sh` validates every plan in
-three passes before moving anything — classifying each entry as
-hash-verified or not, building the hash-to-keeper map, then confirming
-every hash group has exactly one keeper — and shows progress (`[SCAN]`,
-`[BUILD]`, `[VERIFY]`) through all three, followed by `[MOVE]` for the
-actual quarantine step. On a plan with tens of thousands of entries these
-verification passes can take real time — minutes, not seconds; this is
-deliberately conservative validation of a destructive operation, not
-something to route around. `[INFO]`/`[WARN]`/`[ERROR]` output from this
+**Applying a large plan.** `delete-duplicates.sh` validates the whole
+plan — classifying every entry as hash-verified or not, building the
+hash-to-keeper map, confirming every hash group has exactly one keeper —
+in two AWK passes over the file, shown as `[VALIDATE]` and `[ANNOTATE]`,
+followed by `[MOVE]` for the actual quarantine step. Earlier releases
+(v1.4.13/v1.4.14) did this validation in bash loops that forked a
+separate `awk` process per plan line or per group, against files that
+grew as the plan was processed — confirmed live on a 72,685-entry plan,
+that cost minutes on its own. v1.4.17 replaced it with the two AWK
+passes above, each reading the plan once and using AWK's own
+associative arrays for lookups; the same 72,685-entry shape now
+validates in under a second. `[MOVE]` itself is unchanged and can still
+take real time on a large plan — it re-verifies each candidate's content
+hash against its keeper immediately before quarantining it, which is a
+separate, deliberately conservative safety check on a destructive
+operation, not something this rewrite touches.
+
+**When candidates get skipped during `[MOVE]`.** A DEL candidate is
+safety-skipped (not quarantined, left exactly where it was) if it or its
+keeper can't be re-verified — the keeper's gone missing, its content
+changed, the DEL path itself is now a symlink, and a handful of other
+routine causes, most often a plan applied some time after the scan that
+built it, against files that have since moved (a live Photos Library
+reorganising its own internal structure is the most common real-world
+case). Every skip is individually logged in full, with its path, to the
+apply log (`logs/delete-duplicates-apply-*.log`) — but the terminal
+shows one categorised line per reason that actually occurred, with its
+count, not one burst of detail per file. On a plan where a large
+fraction of candidates hit the same routine cause, the difference is
+several lines instead of a wall of thousands that can bury the `[MOVE]`
+bar and, in extreme cases, overwhelm a browser-based terminal entirely.
+`[INFO]`/`[WARN]`/`[ERROR]`
+output from this
 script is coloured to match the rest of the tool.
+
+**A large batch of safety skips.** On a plan built from a stale scan —
+common when the manifest a plan was pinned to is days old and the
+underlying content has since moved (a live Apple Photos Library
+reorganising its internal structure is the case that surfaced this) —
+a real fraction of candidates can fail their pre-move keeper check at
+once. Each one is safe (the file is simply left in place, nothing is
+moved without a verified keeper), but printing full detail for every
+single one used to flood the terminal and bury the `[MOVE]` bar under
+thousands of lines, which reads as an error storm rather than the
+routine, expected outcome it actually is. The terminal now shows one
+categorised line per skip *reason* that occurred, with its count, once
+`[MOVE]` finishes; full per-file detail — every path, every reason — is
+unchanged in `logs/delete-duplicates-apply-*.log`.
 
 ```bash
 # See what would be deleted (file dedup):
@@ -639,7 +677,9 @@ hasher/
 │       ├── 94-import-check-meta-corruption.sh
 │       ├── 95-import-check-scan-visibility.sh
 │       ├── 96-launcher-import-check-survival.sh
-│       └── 97-delete-duplicates-build-phase.sh
+│       ├── 97-delete-duplicates-build-phase.sh
+│       ├── 98-delete-duplicates-rewrite.sh
+│       └── 99-delete-duplicates-skip-summary.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -749,7 +789,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (18 cases, ~85s)
+tests/run-tests.sh                # everything (20 cases, ~110s)
 tests/run-tests.sh 20 40          # only cases whose leading number matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -782,6 +822,8 @@ directory of ordinary files would exercise:
 | `95-import-check-scan-visibility` | Configured parallelism honoured; progress tickers stay silent when piped |
 | `96-launcher-import-check-survival` | Launcher survives non-zero returns from Import Check subcommands |
 | `97-delete-duplicates-build-phase` | BUILD-phase progress added; keeper-map error detection unaffected |
+| `98-delete-duplicates-rewrite` | Single-pass AWK validation: correctness preserved, awk invocation count constant regardless of plan size |
+| `99-delete-duplicates-skip-summary` | Categorised skip summary on screen; full per-file detail still in the apply log |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

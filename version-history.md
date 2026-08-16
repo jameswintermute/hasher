@@ -4384,6 +4384,218 @@ behaviour the sandbox-based suite is built to exercise). Full suite
 unchanged at 18 cases, 260 assertions.
 
 ---
+## 2026‑08 — v1.4.17
+**delete-duplicates.sh: single-pass AWK rewrite, the deferred v1.4.15/v1.4.16 work**
+
+Two independent peer reviews of v1.4.14/v1.4.15 both converged on the
+same conclusion: the visibility work in v1.4.13/v1.4.14 (`[SCAN]`,
+`[BUILD]`, `[VERIFY]`) made the cost of plan validation *visible* but
+never removed it. Live evidence from a real 72,685-entry plan made the
+case concretely — `[BUILD]` alone reported a 17-minute-18-second ETA
+against 145,261 total lines. This release is that deferred rewrite.
+
+### What was actually slow
+
+Three loops in `delete-duplicates.sh`, all forking a fresh `awk` process
+against files that grew as the plan was processed:
+
+- The classification loop (`SCAN`): one forked regex check per DEL line.
+- The keeper-map builder (`BUILD`): for nearly every line, a forked
+  `awk` scan of the growing keeper/group-tracking files.
+- The group-verification loop (`VERIFY`): one forked `awk` scan of the
+  keeper map *per hash group*.
+
+A fourth was found while tracing this, not previously flagged by either
+review: `keeper_for_hash()`, called once **per DEL entry** inside the
+`MOVE` loop itself, each call forking its own `awk` scan of the keeper
+map. Four separate instances of the same O(n) or O(n²)-shaped pattern
+in one script.
+
+### The rewrite
+
+Two AWK passes, each reading the plan exactly once, using AWK's native
+associative arrays for O(1) lookups — unaffected by bash version, so no
+bash-4-only dependency (this tool still supports bash 3.2 on macOS).
+
+**PASS 1 (`[VALIDATE]`)** does everything SCAN+BUILD+VERIFY did:
+hashed/unhashed classification, keeper-map construction, and every
+existing rejection condition — duplicate KEEP per hash, a hashed KEEP
+conflicting with a legacy KEEP, two unresolved legacy KEEPs in a row, an
+orphaned legacy KEEP at end of file, a DEL group with no keeper (every
+such group reported, not just the first, matching the original
+accumulate-then-refuse behaviour), and a malformed KEEP entry.
+Hashed/unhashed counts are computed unconditionally for every DEL line
+regardless of whether a fatal condition is also found elsewhere, exactly
+matching the original SCAN loop's unconditional full-file counting —
+bash needs those accurate counts to pick the right branch (mixed /
+legacy / hashed) independent of what else PASS 1 noticed.
+
+**PASS 2 (`[ANNOTATE]`)** replaces `keeper_for_hash()`: one pass that
+loads the (already-built) keeper map into an AWK associative array once,
+then annotates every DEL line with its resolved keeper path. `MOVE`
+reads this directly instead of calling a per-line lookup function — the
+per-file re-verification hashing inside `MOVE` itself (re-hashing each
+candidate and its keeper immediately before quarantining) is unchanged,
+deliberately: that is a separate, distinct safety check on live
+filesystem state, not something a structural-validation rewrite should
+touch.
+
+### Bugs caught before shipping, not after
+
+Three, all found by testing rather than by inspection, which is worth
+recording plainly:
+
+1. An early draft of PASS 2 checked the wrong AWK variables after
+   calling its own path/hash-splitting function (a pseudo-local/global
+   naming mix-up) — silently produced zero output for every plan. Found
+   by testing PASS 2 standalone before wiring it in.
+2. The bash-side error-line parser used word-splitting (`set --
+   $line`) to read AWK's structured error output. A path containing a
+   space breaks that immediately. Found by deliberately testing with a
+   space in a path, not by inspection. Rewritten to TAB-delimited
+   fields parsed with `IFS=$'\t' read`, end to end.
+3. PASS 2's first version skipped unhashed DEL lines entirely (matching
+   the intuition "no hash, nothing to annotate") — which left the
+   annotated file completely empty for a legacy/unverified plan, since
+   *every* DEL line in one is unhashed. Found while designing the
+   `MOVE`-loop unification, before it was wired in. Fixed to annotate
+   every DEL line regardless, with an empty keeper column where there is
+   none.
+
+### Portability
+
+The hash-format check deliberately avoids `/{64}/` — an interval
+expression not universally supported across every awk this tool has to
+run against. `lib/awk-detect.sh` exists precisely because this project
+already hit a real awk-portability gap (BusyBox awk's NUL-record
+handling, v1.3.19); `length(tail)==64` combined with an interval-free
+negated character class is equivalent and has no such dependency.
+
+### Verification
+
+Extensive, in this order: 9 correctness/error scenarios run standalone
+against the AWK logic directly, including the specific "collect ALL
+missing keepers, not just the first" and "DEL line appearing before its
+own KEEP line" behaviours; a full bash+AWK integration harness
+reproducing every scenario with the exact original error wording
+confirmed word-for-word; the real, spliced file re-tested against every
+scenario end to end, including a live duplicate-KEEP refusal with
+untouched files confirmed afterward; a synthetic plan at the exact
+real-world scale (72,685 groups, 145,370 lines) timed at **829ms total**
+for both passes combined, versus the reported 17-minute `[BUILD]` ETA
+alone under the old design; and a direct `awk` invocation count via
+`bash -x`, confirmed at exactly 2 for a 2,000-group plan (previously
+would have been several thousand).
+
+### Test coverage
+
+New `tests/cases/98-delete-duplicates-rewrite.sh`, 16 assertions:
+end-to-end correctness, the space-in-path regression guard, the
+collect-all-missing-keepers guard, the legacy/unverified plan path
+(confirmed genuinely unaffected by this rewrite), and — the actual
+algorithmic-shape proof — `awk` invocation count measured at two very
+different plan sizes (20 groups vs 500 groups) and asserted identical,
+rather than a wall-clock threshold that would only prove "fast enough on
+this machine today." `97-delete-duplicates-build-phase.sh`, which tests
+the exact v1.4.14 behaviour this release entirely replaced
+architecturally, required no changes and continues to pass — confirming
+external behaviour is preserved even though the internal implementation
+changed completely.
+
+Full suite: 19 cases, 276 assertions.
+
+---
+## 2026‑08 — v1.4.18
+**delete-duplicates.sh: categorised MOVE-phase skip summary, plus a header-count bug found and fixed before shipping**
+
+Reported live from a 2.9-second screen recording of a real NAS session:
+a wall of identical `[WARN] Keeper is missing or not a regular file —
+SKIPPING: ...` pairs, one per skipped candidate, scrolling continuously
+with no sign of slowing — severe enough that the browser rendering the
+terminal session crashed under the volume. Every visible line across
+the whole clip was the same reason, repeated without variation.
+
+### What was actually happening
+
+`MOVE` safety-skips a DEL candidate (leaves it in place, quarantines
+nothing) whenever it or its keeper can't be re-verified — most commonly
+because the plan was applied some time after the scan that built it,
+against files that have since moved on disk. The most likely real-world
+cause here: a live Photos Library reorganising its own internal
+structure between when the import scan was taken and when `discard` was
+finally applied, hours later, against v1.4.16's then-unfixed O(n²)
+validation cost. Each individual skip was fully, correctly logged — but
+also printed to the terminal in full, one to four lines per file, with
+nothing folding repeats together. On a plan where most candidates hit
+the same routine cause, that is thousands of near-identical lines
+burying the `[MOVE]` bar and reading as an active error storm to anyone
+watching, even though every single skip was the safe, correct outcome —
+nothing was ever moved incorrectly.
+
+### The fix, and an honest note on how this release came together
+
+The categorised summary itself — one line per skip *reason* that
+actually occurred, with its count, plus a pointer to the full per-file
+detail already sitting untouched in the apply log — was found already
+written in the working tree, complete with its own test coverage,
+correctly diagnosing this exact scenario in its own code comments. It
+had clearly been built in direct response to this report already, but
+never finished being verified, versioned, or shipped — the comments
+already said "v1.4.18" throughout, a version number that did not yet
+exist anywhere. Rather than trust that on inspection alone, it was
+verified from scratch: confirmed all nine skip-reason counters are
+declared and each increments at exactly the right call site, confirmed
+the file parses cleanly, then exercised against real fixtures —
+including deliberately triggering the exact "keeper missing" pattern
+from the video and confirming the terminal now shows one summary line
+instead of a flood.
+
+That verification pass found a real bug the existing test suite had
+missed: two of the nine skip reasons (a DEL path that's now a symlink,
+or one that fails to canonicalise) increment `moves_fail`, a distinct,
+pre-existing counter from `moves_skipped_changed` — but both were being
+listed under one combined header whose total came from only
+`moves_skipped_changed`. A run with 2 keeper-missing skips and 1
+symlink skip printed "2 file(s) skipped..." as the header, then listed
+three items underneath it. Found by deliberately testing two different
+skip categories occurring in the same run — a combination the existing
+test suite's own "mixed reasons" case never actually exercised, since
+both of ITS two reasons happened to share the same counter.
+
+Fixed by splitting into two independently-scoped blocks, matching the
+distinction the final "N failures; N safety skips" summary line has
+always drawn: one for the `moves_skipped_changed` categories (the DEL or
+its keeper couldn't be safely re-verified), one for the `moves_fail`
+categories (the planned path itself couldn't be trusted before
+re-verification even started). Each header's count now always equals
+the sum of what it lists, by construction, since both blocks are gated
+and totalled from the same counter they list categories against.
+
+### Verification
+
+Every fix in this release was proven, not assumed: the categorized
+summary confirmed against a real "15 identical skips" reproduction of
+the video (one summary line, correct count, full detail still in the
+apply log, nothing quarantined); the header-count bug reproduced against
+a genuinely fresh run with mixed counter types, confirmed fixed, then
+confirmed the fix would have been caught by the test suite by reverting
+it — twice, since the first revert attempt was itself incomplete and
+produced a false pass, corrected before trusting the result.
+
+### Test coverage
+
+The existing `tests/cases/99-delete-duplicates-skip-summary.sh` gained a
+third scenario and a fourth assertion style: mixing a
+`moves_skipped_changed` category with a `moves_fail` category in one
+run, and — since checking for a string's mere presence would not have
+caught the actual bug (the symlink line legitimately appears somewhere
+in the output either way) — a positional check that it appears strictly
+under its own `moves_fail` header, not leaked into the
+`moves_skipped_changed` block above it. 16 assertions total, up from 11.
+
+Full suite: 20 cases, 292 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
