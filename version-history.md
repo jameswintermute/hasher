@@ -4660,6 +4660,31 @@ unaffected by the rewrite.
 Full suite: 21 cases, 301 assertions.
 
 ---
+## 2026‑08 — v1.4.20
+**tests/cases/50-exit-status.sh: stale assertion fixed, found by running the full suite against a real merged repo**
+
+Found during a routine sanity check on a fresh upload — the full test
+suite hadn't been re-run against the real, merged repository since
+before v1.4.18, only against local working copies during that release's
+own development. `50-exit-status.sh` predates v1.4.18's skip-summary
+rewrite and asserted the OLD per-item terminal wording ("Keeper is
+missing or not a regular file") for a missing-keeper scenario — wording
+v1.4.18 deliberately moved off the terminal into the apply log only,
+replaced on-screen by a categorised summary line. The product behaviour
+was correct throughout; only this one pre-existing assertion had gone
+stale.
+
+Fixed: the assertion now checks for the current terminal wording ("keeper
+missing or not a regular file", the categorised form), plus a new,
+explicit check that the original detailed message is still present in
+the apply log — confirming the v1.4.18 guarantee (nothing lost, only
+relocated) directly, rather than assuming it from a passing test
+elsewhere in the suite.
+
+No product code changed in this release. Full suite: 21 cases, 302
+assertions (up from 301 — the new apply-log check).
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
