@@ -96,8 +96,26 @@ run_case() {
 
     run_tool delete-duplicates.sh "$_plan"
     assert_rc 4 "apply with a missing keeper"
-    assert_out_contains "Keeper is missing" "keeper verification message"
+    # v1.4.20: this assertion checked for the OLD per-item wording
+    # ("Keeper is missing or not a regular file — SKIPPING: <path>"),
+    # which v1.4.18 deliberately moved off the terminal and into the
+    # apply log only, replaced on-screen by a categorised summary line
+    # (see tests/cases/99-delete-duplicates-skip-summary.sh for why).
+    # This test predates that change and was never updated for it —
+    # found by running the full suite against a real merged repo,
+    # where it failed on exactly this line. The terminal now shows the
+    # category, not the per-item message; the full original wording is
+    # confirmed separately, in the apply log, right below.
+    assert_out_contains "keeper missing or not a regular file" "keeper verification message"
     assert_out_contains "safety skips" "safety-skip summary"
+
+    local _apply_log
+    _apply_log="$(ls -1t "$SANDBOX"/logs/delete-duplicates-apply-*.log 2>/dev/null | head -n1)"
+    if [ -r "$_apply_log" ] && grep -q "Keeper is missing" "$_apply_log"; then
+      _assert_pass
+    else
+      _assert_fail "full per-item detail no longer present in the apply log"
+    fi
 
     # Nothing may have been quarantined.
     assert_glob_count "$SANDBOX/quarantine-*/*" "0" "quarantined files"
