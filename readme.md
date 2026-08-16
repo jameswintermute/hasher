@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.18**
+Started Dec 2022. Current version: **v1.4.19**
 
 ### First-run launch screen
 
@@ -679,7 +679,8 @@ hasher/
 │       ├── 96-launcher-import-check-survival.sh
 │       ├── 97-delete-duplicates-build-phase.sh
 │       ├── 98-delete-duplicates-rewrite.sh
-│       └── 99-delete-duplicates-skip-summary.sh
+│       ├── 99-delete-duplicates-skip-summary.sh
+│       └── 100-self-test-duplicate-detection.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -789,7 +790,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (20 cases, ~110s)
+tests/run-tests.sh                # everything (21 cases, ~115s)
 tests/run-tests.sh 20 40          # only cases whose leading number matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -824,6 +825,7 @@ directory of ordinary files would exercise:
 | `97-delete-duplicates-build-phase` | BUILD-phase progress added; keeper-map error detection unaffected |
 | `98-delete-duplicates-rewrite` | Single-pass AWK validation: correctness preserved, awk invocation count constant regardless of plan size |
 | `99-delete-duplicates-skip-summary` | Categorised skip summary on screen; full per-file detail still in the apply log |
+| `100-self-test-duplicate-detection` | Duplicate-script detection covers launcher.sh and any future script, not a fixed list |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault

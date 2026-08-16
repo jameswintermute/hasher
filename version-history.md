@@ -4596,6 +4596,70 @@ under its own `moves_fail` header, not leaked into the
 Full suite: 20 cases, 292 assertions.
 
 ---
+## 2026‑08 — v1.4.19
+**self-test.sh: duplicate-script detection now covers launcher.sh — found by the third occurrence of the same pattern**
+
+Requested as a routine sanity check on a real uploaded zip, ahead of
+confirming v1.4.18's performance on the NAS (which was excellent —
+`VALIDATE` completing in seconds against 72,576 hash groups on the same
+plan that previously took hours). The structural check found two real
+stray files: `self-test.sh` at the repo root (an older, 353-line copy —
+missing the entire v1.4.15 duplicate-bin-script check, ironically the
+exact mechanism that would have caught its own existence), and
+`default/launcher.sh`, a full 2473-line duplicate of the actual
+`launcher.sh`, differing only in its embedded version string — two
+releases stale.
+
+### The pattern, for the third time
+
+- v1.4.15: a stray `bin/import-check.sh` duplicate went undetected —
+  fixed by adding a `$MENU_TARGETS`-driven duplicate check.
+- v1.4.16: a stray `bin/self-test.sh` duplicate went undetected — fixed
+  by adding `self-test.sh` to that same list.
+- v1.4.19 (this release): a stray `launcher.sh` duplicate went
+  undetected — `launcher.sh` lives at the repo root, in neither
+  `$SOURCED_HELPERS` (lib/ only) nor `$MENU_TARGETS` (bin/ only), so it
+  was never in scope for either existing check.
+
+Three occurrences of "a hand-maintained list didn't include the thing
+that turned out to matter" is a pattern, not a coincidence — the
+recurring failure is the list itself, not any specific missing entry.
+
+### Fix
+
+Removed the hand-maintained list for this specific check entirely.
+Canonical scripts are now discovered directly from the filesystem —
+`launcher.sh` at the repo root, plus every `.sh` file actually present
+under `bin/` and `lib/` at the time self-test runs — rather than an
+enumerated set someone has to remember to update. A script added to
+`bin/` or `lib/` next month is automatically in scope, with nothing to
+edit. The two previous checks (`$SOURCED_HELPERS`-driven and
+`$MENU_TARGETS`-driven) are replaced by this one unified pass; both
+lists remain in use elsewhere in the file for their other purposes
+(checking each helper parses, checking each menu target is executable),
+untouched.
+
+Verified against both real stray files found in the actual upload
+(confirmed caught, with the exact expected message for each), against a
+brand-new hypothetical script never mentioned anywhere (confirmed
+caught, proving the discovery is genuinely dynamic and not just a wider
+static list), and against both of the two original historical
+scenarios from v1.4.15 and v1.4.16 (confirmed still caught under the
+new mechanism). Confirmed the new test would have caught the regression
+by reverting to the old two-list mechanism and watching it fail on
+exactly the assertions that matter, then restoring the fix.
+
+### Test coverage
+
+New `tests/cases/100-self-test-duplicate-detection.sh`, 9 assertions:
+the reported `default/launcher.sh` scenario, a never-before-seen script
+name to prove genuine dynamic discovery, a clean tree still passing with
+no false positives, and both original historical scenarios confirmed
+unaffected by the rewrite.
+
+Full suite: 21 cases, 301 assertions.
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
