@@ -131,54 +131,50 @@ for rel in $SOURCED_HELPERS; do
   fi
 done
 
-# ── 2. No stale duplicate helpers ─────────────────────────────────────────────
-# The exact bug from item 5: a second copy of a sourced helper in bin/ that
-# looks newer but is never loaded. Flag any sourced-helper basename that also
-# appears outside its canonical directory.
-head_ "2. Stale/duplicate helpers"
+# v1.4.19: replaces both loops that used to be here. The pattern so far
+# had been "a stray duplicate of script X went undetected because X's
+# category wasn't in scope yet" -- found for bin/import-check.sh
+# (v1.4.15, fixed by adding a MENU_TARGETS-driven check), then for
+# bin/self-test.sh itself (v1.4.16, fixed by adding self-test.sh to that
+# same list) -- and now for launcher.sh, the single most important script
+# in the whole project, which was NEVER in scope for either check: it
+# lives at the repo root, not under bin/ or lib/, so neither
+# $SOURCED_HELPERS nor $MENU_TARGETS ever covered it. A stray
+# default/launcher.sh -- a full duplicate of the real one, differing only
+# in its embedded version string, two releases stale -- sat undetected
+# through both of the previous fixes.
+#
+# Three times is a pattern, not a one-off: a hand-maintained list of
+# "things to check for duplicates" will keep missing whatever was added
+# most recently, by construction, since remembering to add a new entry
+# is exactly the step that keeps getting skipped. This check does not
+# maintain a list at all -- it discovers what's canonical directly from
+# the filesystem (launcher.sh at root, plus every .sh file actually
+# present under bin/ and lib/, whatever that set is right now) and
+# checks each one for a same-named file anywhere else in the tree. A
+# script added to bin/ or lib/ next month is automatically in scope with
+# no list to remember to update.
+head_ "2. Stale/duplicate scripts"
 dup_found=0
-for rel in $SOURCED_HELPERS; do
+_canon_list="launcher.sh"
+for f in "$BIN_DIR"/*.sh "$ROOT_DIR"/lib/*.sh; do
+  [ -f "$f" ] || continue
+  _canon_list="$_canon_list ${f#$ROOT_DIR/}"
+done
+for rel in $_canon_list; do
   base="$(basename "$rel")"
-  # search anywhere under ROOT_DIR for the same basename
   while IFS= read -r hit; do
     [ -z "$hit" ] && continue
-    # normalise to repo-relative
     relhit="${hit#$ROOT_DIR/}"
     if [ "$relhit" != "$rel" ]; then
-      fail "duplicate helper: $relhit shadows the canonical $rel (delete the stray copy)"
+      fail "duplicate script: $relhit shadows the canonical $rel (delete the stray copy)"
       dup_found=1
     fi
   done <<EOF
 $(find "$ROOT_DIR" -name "$base" -type f 2>/dev/null)
 EOF
 done
-[ "$dup_found" -eq 0 ] && pass "no duplicate copies of sourced helpers"
-
-# v1.4.15 (peer review of v1.4.14): the check above only ever covered
-# $SOURCED_HELPERS (lib/host-detect.sh, lib/log.sh) — it never looked at
-# $MENU_TARGETS, the executable bin/ scripts. A stray duplicate of one of
-# those (e.g. a top-level /import-check.sh left behind by a packaging
-# step, shadowing the canonical bin/import-check.sh) went completely
-# undetected: it isn't a "sourced helper" by this check's own name, so it
-# was never in scope. Same search-and-compare logic, reused for the
-# executable scripts too. A SEPARATE flag from dup_found above, so a
-# failure in one check can never mask (or be masked by) a genuine pass in
-# the other.
-dup_found_bin=0
-for base in $MENU_TARGETS; do
-  rel="bin/$base"
-  while IFS= read -r hit; do
-    [ -z "$hit" ] && continue
-    relhit="${hit#$ROOT_DIR/}"
-    if [ "$relhit" != "$rel" ]; then
-      fail "duplicate script: $relhit shadows the canonical $rel (delete the stray copy)"
-      dup_found_bin=1
-    fi
-  done <<EOF
-$(find "$ROOT_DIR" -name "$base" -type f 2>/dev/null)
-EOF
-done
-[ "$dup_found_bin" -eq 0 ] && pass "no duplicate copies of canonical bin/ scripts"
+[ "$dup_found" -eq 0 ] && pass "no duplicate copies of any canonical script (launcher.sh, bin/*.sh, lib/*.sh)"
 
 # v1.3.13 (recheck item 6 / A1): hasher.conf belongs ONLY in default/ (shipped)
 # and local/ (user override). A stray copy anywhere else — e.g. lib/hasher.conf
