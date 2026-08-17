@@ -44,6 +44,11 @@ if [ -r "$LIB_DIR/host-detect.sh" ]; then
   detect_host
 fi
 
+# v1.4.21: source the import-check UI menu module for Import Check workflow
+if [ -r "$LIB_DIR/import-check-ui.sh" ]; then
+  . "$LIB_DIR/import-check-ui.sh"
+fi
+
 # TTY-aware colour palette
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
   RED="$(printf '\033[31m')"
@@ -109,7 +114,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.20 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.21 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
