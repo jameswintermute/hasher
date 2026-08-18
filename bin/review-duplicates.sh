@@ -260,12 +260,12 @@ path_len(){ printf "%s" "$1" | wc -c | awk '{print $1}'; }
 
 order_group(){
   case "$ORDER" in
-    newest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
-    oldest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    size)      while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
-    sizesmall) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    shortpath) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{print $2}';;
-    longpath)  while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{print $2}';;
+    newest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
+    oldest)    while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_mtime "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
+    size)      while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
+    sizesmall) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(file_size "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
+    shortpath) while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -n  -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
+    longpath)  while IFS= read -r p; do [ -n "$p" ] || continue; printf "%s\t%s\n" "$(path_len "$p")" "$p"; done | sort -nr -k1,1 | awk -F'\t' '{printf "%s\n", $2}';;
     name|*)    sort;;
   esac
 }
