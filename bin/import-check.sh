@@ -47,6 +47,7 @@
 #   bin/import-check.sh discard [--force]         generate + apply the plan
 #   bin/import-check.sh dedup-internal [--force]  dedup import's own duplicates
 #   bin/import-check.sh sort [--force]            move remainder to unique-files/
+#   bin/import-check.sh cleanup-verified [--force] verify & delete NAS matches (v1.4.22)
 #
 # Exit codes: 0 success, 1 hard failure, 2 invalid input/config,
 #             3 missing prerequisite, 4 nothing to do (not an error)
@@ -1291,6 +1292,20 @@ cmd_sort() {
   log_progress_done
   rm -f -- "$_remainder" 2>/dev/null || true
 
+  # Clean up empty folders left behind after moving files
+  # (Only in source folders, not in unique-files/)
+  info "Cleaning up empty folders..."
+  local _empty_before _empty_after _deleted
+  _empty_before="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${_empty_before:-0}" -gt 0 ]; then
+    find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" -delete 2>/dev/null || true
+    _empty_after="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
+    _deleted=$(( _empty_before - _empty_after ))
+    if [ "$_deleted" -gt 0 ]; then
+      ok "Removed $_deleted empty folder(s)"
+    fi
+  fi
+
   ok "Moved $_moved file(s) into $_dest"
   [ "$_fail" -gt 0 ] && warn "$_fail file(s) could not be moved — see warnings above."
 
@@ -1308,6 +1323,161 @@ cmd_sort() {
   fi
 
   [ "$_fail" -gt 0 ] && exit 1
+  exit 0
+}
+
+cmd_cleanup_verified() {
+  # v1.4.22: Verify and clean up files that match on NAS
+  # Performs file-by-file hash verification before deletion with visual feedback
+  # Files that changed or vanished on NAS are automatically preserved
+  require_import_dir
+  local _force=false
+  for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
+
+  local _nas_csv _import_csv
+  load_verified_import_scan || exit 3
+  warn_if_nas_manifest_newer "$_nas_csv"
+  
+  # Stale scan check (same as discard)
+  if import_scan_is_stale; then
+    err "The import folder has changed since this scan."
+    err "Run 'scan' again for a current picture before cleanup."
+    exit 3
+  fi
+
+  local _plan="$VAR_DIR/import-cleanup-plan.$$"
+  local _remainder="$VAR_DIR/import-cleanup-remainder.$$"
+  local _skipped="$VAR_DIR/import-cleanup-skipped.$$"
+  classify_and_plan "$_nas_csv" "$_import_csv" "$_plan" "$_remainder" "$_skipped"
+  rm -f -- "$_skipped" 2>/dev/null || true
+
+  local _del_count
+  _del_count="$(grep -c '^DEL|' "$_plan" 2>/dev/null)" || true
+  [ -z "$_del_count" ] && _del_count=0
+
+  if [ "$_del_count" -eq 0 ]; then
+    info "No verified duplicates to clean up."
+    rm -f -- "$_plan" "$_remainder" 2>/dev/null || true
+    exit 4
+  fi
+
+  # Confirm before proceeding
+  if [ "$_force" != "true" ]; then
+    printf '\nAbout to verify and delete %d file(s) that match your NAS.\n' "$_del_count"
+    printf 'Each file will be re-hashed on both import and NAS for final verification.\n'
+    printf 'Proceed? (y/n): '
+    read -r _confirm || _confirm="n"
+    if [ "$_confirm" != "y" ] && [ "$_confirm" != "Y" ]; then
+      info "Cleanup cancelled."
+      rm -f -- "$_plan" "$_remainder" 2>/dev/null || true
+      exit 4
+    fi
+  fi
+
+  echo
+  printf 'Verification & Cleanup\n'
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+  echo
+
+  local _verified=0 _changed=0 _deleted=0 _preserved=0 _failed=0
+  local _imported_size=0 _deleted_size=0 _preserved_size=0
+  local _file_num=0
+  local _start_time
+  _start_time="$(date +%s)"
+
+  while IFS='|' read -r _tag _import_path _import_hash; do
+    _file_num=$(( _file_num + 1 ))
+    
+    # Parse NAS path from the plan (second DEL entry for the NAS match)
+    local _nas_path
+    _nas_path="$(grep "^KEEP|$_import_hash" "$_plan" | head -1 | cut -d'|' -f2)"
+    
+    if [ -z "$_nas_path" ]; then
+      warn "Could not find NAS match for: $_import_path"
+      _failed=$(( _failed + 1 ))
+      continue
+    fi
+
+    # Progress bar
+    log_progress_bar "VERIFY" "$_file_num" "$_del_count" "$_start_time"
+
+    # Hash import file
+    local _import_current_hash
+    _import_current_hash="$(sha256sum "$_import_path" 2>/dev/null | awk '{print $1}')" || _import_current_hash=""
+    
+    # Hash NAS file  
+    local _nas_current_hash
+    _nas_current_hash="$(sha256sum "$_nas_path" 2>/dev/null | awk '{print $1}')" || _nas_current_hash=""
+
+    # Display file info
+    printf '\nFile %d / %d\n' "$_file_num" "$_del_count"
+    printf '  Import:    %s\n' "$_import_path"
+    printf '  Hash:      %s\n' "$_import_current_hash"
+    printf '\n'
+    printf '  NAS:       %s\n' "$_nas_path"
+    printf '  Hash:      %s\n' "$_nas_current_hash"
+    printf '\n'
+
+    # Verify match
+    if [ "$_import_current_hash" = "$_nas_current_hash" ] && [ -n "$_import_current_hash" ]; then
+      printf '  ✓ MATCH (green, safe to delete)\n' 
+      printf '  → Deleting from import...\n'
+      
+      if rm -f -- "$_import_path" 2>/dev/null; then
+        _deleted=$(( _deleted + 1 ))
+        _deleted_size=$(( _deleted_size + $(stat -c %s "$_import_path" 2>/dev/null || echo 0) ))
+        _verified=$(( _verified + 1 ))
+      else
+        warn "Failed to delete: $_import_path"
+        _failed=$(( _failed + 1 ))
+      fi
+    else
+      printf '  ✗ MISMATCH (preserving)\n'
+      if [ -z "$_import_current_hash" ]; then
+        warn "Could not read import file: $_import_path"
+      fi
+      if [ -z "$_nas_current_hash" ]; then
+        warn "Could not read NAS file: $_nas_path"
+      fi
+      _preserved=$(( _preserved + 1 ))
+      _preserved_size=$(( _preserved_size + $(stat -c %s "$_import_path" 2>/dev/null || echo 0) ))
+    fi
+  done < <(grep '^DEL|' "$_plan")
+  
+  log_progress_done
+  echo
+
+  # Final stats
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+  printf 'Cleanup Complete\n'
+  printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+  echo
+  printf '   Verified & deleted:         %d file(s)\n' "$_deleted"
+  printf '   Preserved (mismatch):       %d file(s)\n' "$_preserved"
+  printf '   Failed:                     %d file(s)\n' "$_failed"
+  echo
+
+  local _duration
+  _duration="$(( $(date +%s) - _start_time ))"
+  local _minutes _seconds
+  _minutes=$(( _duration / 60 ))
+  _seconds=$(( _duration % 60 ))
+
+  printf '   Duration:                   %dm %ds\n' "$_minutes" "$_seconds"
+  echo
+
+  # Verify import folder is ready for next batch
+  local _leftover
+  _leftover="$(find "$IMPORT_DIR" -mindepth 1 -maxdepth 1 -not -name 'unique-files' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${_leftover:-0}" -eq 0 ]; then
+    ok "$IMPORT_DIR is clear — ready for the next card."
+  else
+    info "$_leftover item(s) remain in import folder."
+  fi
+
+  rm -f -- "$_plan" "$_remainder" 2>/dev/null || true
+
+  [ "$_failed" -gt 0 ] && exit 1
   exit 0
 }
 
@@ -1353,13 +1523,14 @@ case "$SUBCOMMAND" in
   discard)  _ic_acquire_lock; cmd_discard "$@"; _ic_release_lock ;;
   dedup-internal) _ic_acquire_lock; cmd_dedup_internal "$@"; _ic_release_lock ;;
   sort)     _ic_acquire_lock; cmd_sort "$@";    _ic_release_lock ;;
+  cleanup-verified) _ic_acquire_lock; cmd_cleanup_verified "$@"; _ic_release_lock ;;
   ""|help|-h|--help)
     sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
     err "Unknown subcommand: $SUBCOMMAND"
-    info "Usage: bin/import-check.sh {setup|scan|summary|discard|dedup-internal|sort}"
+    info "Usage: bin/import-check.sh {setup|scan|summary|discard|dedup-internal|sort|cleanup-verified}"
     exit 2
     ;;
 esac
