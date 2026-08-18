@@ -388,7 +388,8 @@ export onto the NAS without duplicating anything already there.
 The rule is simple and absolute: **the NAS copy always wins.** If a file in
 the import folder matches a file already on the NAS — confirmed by
 SHA-256, re-verified again immediately before anything is moved — the
-import copy is quarantined and the NAS file is never touched.
+import copy is handled according to the operation chosen (normally moved
+to quarantine; optionally permanently deleted with explicit confirmation).
 
 This is enforced two ways, deliberately independent of each other:
 
@@ -409,12 +410,13 @@ This is enforced two ways, deliberately independent of each other:
    a keeper from), not just by convention.
 
 ```bash
-bin/import-check.sh setup     # first time: choose/create the import folder
-bin/import-check.sh scan      # hash the import folder (fast — not a full NAS rescan)
-bin/import-check.sh summary   # see what matches, what doesn't
-bin/import-check.sh discard   # quarantine the NAS duplicates, with confirmation
-bin/import-check.sh dedup-internal # quarantine the import's OWN duplicates, keep shortest path
-bin/import-check.sh sort      # move whatever's left into import/unique-files/
+bin/import-check.sh setup                # first time: choose/create the import folder
+bin/import-check.sh scan                 # hash the import folder (fast — not a full NAS rescan)
+bin/import-check.sh summary              # see what matches, what doesn't
+bin/import-check.sh discard              # quarantine the NAS duplicates, with confirmation
+bin/import-check.sh dedup-internal       # quarantine the import's OWN duplicates, keep shortest path
+bin/import-check.sh sort                 # move whatever's left into import/unique-files/
+bin/import-check.sh cleanup-verified     # permanently delete NAS matches (requires explicit confirmation)
 ```
 
 Also reachable from the launcher's main menu (`i`).
@@ -604,7 +606,7 @@ the implicit keeper is the one *not* listed for each group):
 The folder-dedup finder also writes a `duplicate-folders-groups-*.tsv` sidecar
 holding the full keep/del structure with reclaim sizes, used by the reviewer.
 
-All files marked for deletion are moved to **quarantine**, not permanently deleted.
+In the core dedup workflow, all files marked for deletion are moved to **quarantine**, not permanently deleted. Import Check normally follows the same model; an optional `cleanup-verified` action can permanently delete import copies after re-verifying both files, but requires explicit DELETE confirmation.
 
 ---
 
