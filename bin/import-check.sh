@@ -1292,14 +1292,27 @@ cmd_sort() {
   log_progress_done
   rm -f -- "$_remainder" 2>/dev/null || true
 
+  # Clean up leftover symlinks and empty folders after moving files
+  # Symlinks are skipped during move (warn message shown) but should not remain in import folder
+  info "Cleaning up symlinks and empty folders..."
+  
+  # Find and remove symlinks (except in unique-files/)
+  local _symlink_count
+  _symlink_count=$(find "$IMPORT_DIR" -type l ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${_symlink_count:-0}" -gt 0 ]; then
+    warn "Found $_symlink_count symlink(s) in import folder (skipped during move)"
+    warn "Removing symlinks..."
+    find "$IMPORT_DIR" -type l ! -path "*/unique-files/*" -delete 2>/dev/null || true
+    ok "Removed $_symlink_count symlink(s)"
+  fi
+  
   # Clean up empty folders left behind after moving files
-  # (Only in source folders, not in unique-files/)
-  info "Cleaning up empty folders..."
+  # (Only in source folders, not in unique-files/ directory itself or its contents)
   local _empty_before _empty_after _deleted
-  _empty_before="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
+  _empty_before="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files" ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
   if [ "${_empty_before:-0}" -gt 0 ]; then
-    find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" -delete 2>/dev/null || true
-    _empty_after="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
+    find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files" ! -path "*/unique-files/*" -delete 2>/dev/null || true
+    _empty_after="$(find "$IMPORT_DIR" -type d -empty ! -path "*/unique-files" ! -path "*/unique-files/*" 2>/dev/null | wc -l | tr -d ' ')"
     _deleted=$(( _empty_before - _empty_after ))
     if [ "$_deleted" -gt 0 ]; then
       ok "Removed $_deleted empty folder(s)"
@@ -1361,18 +1374,29 @@ cmd_cleanup_verified() {
     exit 4
   fi
 
-  # Confirm before proceeding
-  if [ "$_force" != "true" ]; then
-    printf '\nAbout to verify and delete %d file(s) that match your NAS.\n' "$_del_count"
-    printf 'Each file will be re-hashed on both import and NAS for final verification.\n'
-    printf 'Proceed? (y/n): '
-    read -r _confirm || _confirm="n"
-    if [ "$_confirm" != "y" ] && [ "$_confirm" != "Y" ]; then
-      info "Cleanup cancelled."
-      rm -f -- "$_plan" "$_remainder" 2>/dev/null || true
-      exit 4
-    fi
+  # Warn before confirmation (not after verification)
+  printf '\n'
+  printf '\033[91m' # Red color
+  printf '════════════════════════════════════════════════════════════\n'
+  printf '[WARNING] THIS OPERATION PERMANENTLY DELETES IMPORT FILES\n'
+  printf '════════════════════════════════════════════════════════════\n'
+  printf '\033[0m' # Reset color
+  printf 'Files will NOT be moved to quarantine and CANNOT be recovered.\n'
+  printf 'The NAS copy will be re-verified before each deletion.\n'
+  printf '\n'
+  printf 'About to process %d file(s) for permanent deletion.\n' "$_del_count"
+  printf '\n'
+  printf 'Type DELETE (all caps) to continue, or press Ctrl-C to abort:\n'
+  printf '> '
+  read -r _confirm || _confirm=""
+  
+  if [ "$_confirm" != "DELETE" ]; then
+    info "Operation cancelled."
+    rm -f -- "$_plan" "$_remainder" 2>/dev/null || true
+    exit 0
   fi
+
+  echo
 
   echo
   printf 'Verification & Cleanup\n'
@@ -1388,9 +1412,9 @@ cmd_cleanup_verified() {
   while IFS='|' read -r _tag _import_path _import_hash; do
     _file_num=$(( _file_num + 1 ))
     
-    # Parse NAS path from the plan (second DEL entry for the NAS match)
-    local _nas_path
-    _nas_path="$(grep "^KEEP|$_import_hash" "$_plan" | head -1 | cut -d'|' -f2)"
+    # Find NAS path by matching hash in field 3 of KEEP lines
+    _nas_path=$(awk -F'|' -v h="$_import_hash" \
+      '$1=="KEEP" && $3==h {print $2; exit}' "$_plan")
     
     if [ -z "$_nas_path" ]; then
       warn "Could not find NAS match for: $_import_path"
@@ -1420,12 +1444,17 @@ cmd_cleanup_verified() {
 
     # Verify match
     if [ "$_import_current_hash" = "$_nas_current_hash" ] && [ -n "$_import_current_hash" ]; then
-      printf '  ✓ MATCH (green, safe to delete)\n' 
+      printf '  ✓ MATCH\n'
+      
+      # Capture size before deletion
+      local _file_size
+      _file_size=$(stat -c %s "$_import_path" 2>/dev/null || echo 0)
+      
       printf '  → Deleting from import...\n'
       
       if rm -f -- "$_import_path" 2>/dev/null; then
         _deleted=$(( _deleted + 1 ))
-        _deleted_size=$(( _deleted_size + $(stat -c %s "$_import_path" 2>/dev/null || echo 0) ))
+        _deleted_size=$(( _deleted_size + _file_size ))
         _verified=$(( _verified + 1 ))
       else
         warn "Failed to delete: $_import_path"
@@ -1446,6 +1475,11 @@ cmd_cleanup_verified() {
   
   log_progress_done
   echo
+
+  # Mark scan stale only if files were actually deleted
+  if [ "$_deleted" -gt 0 ]; then
+    : > "$VAR_DIR/import-check-last-destructive.marker"
+  fi
 
   # Final stats
   printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'

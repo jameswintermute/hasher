@@ -4705,64 +4705,18 @@ This is a housekeeping release, not a feature release.
 
 ---
 ## 2026‑08 — v1.4.22
-## 2026‑08 — v1.4.26
-**Auto-cleanup: remove empty folders after sort operation**
+**Import Check: verified cleanup operation introduced**
 
-Integrated empty-folder cleanup into option 6 (Move new files to sort).
+Added the first `cleanup-verified` Import Check path for administrators who
+want to remove incoming files that are already present on the trusted NAS.
+The operation builds from the Import Check comparison plan and re-hashes the
+incoming file and its NAS keeper before any cleanup action. Files that no
+longer match, cannot be read, or no longer have a valid NAS keeper are
+preserved rather than acted on.
 
-Previously, after moving files to unique-files/, the import folder would be
-left with thousands of empty folders, requiring a manual cleanup script.
-
-Now, cmd_sort() automatically:
-1. Moves files to unique-files/
-2. Removes empty folders left behind (except from unique-files/ itself)
-3. Reports how many folders were removed
-
-Users don't need to remember a separate cleanup step. The import folder is
-ready for the next card immediately after the sort completes.
-
-Exit behavior unchanged: still reports top-level item count and readiness status.
-
----
-## 2026‑08 — v1.4.25
-**Bug fix: preserve trailing spaces in filenames during duplicate review**
-
-Fixed critical bug in review-duplicates.sh that stripped trailing whitespace
-from filenames when ordering duplicate groups by size, date, or path length.
-
-**The issue:**
-- Files with trailing spaces (e.g., "CV2 ") were being hashed correctly
-- But when review-duplicates.sh displayed them for the user to choose which to
-  keep, awk's `print $2` removed trailing spaces
-- Subsequent stat() calls to get file sizes failed because the path no longer
-  matched the actual filesystem filename
-- Result: `[??]` shown instead of file size
-
-**The fix:**
-- Changed order_group() function to use `printf "%s\n", $2` instead of
-  `print $2` in all six ordering cases (newest, oldest, size, sizesmall,
-  shortpath, longpath)
-- printf with %s format preserves exact field content, including trailing spaces
-- File sizes now display correctly for files with trailing spaces in names
-
-**Edge case learned:** Bash and awk treat trailing whitespace differently.
-Always use printf for exact character preservation when paths may contain
-whitespace.
-
----
-## 2026‑08 — v1.4.24
-**Integration: cleanup-verified prompt after summary**
-
-Connect the Delete/Ignore workflow to the launcher:
-
-- After option 3 (Start hash check) displays the summary, if there are files
-  already on your NAS, users are now prompted:
-  - `d) Delete verified duplicates` → runs cleanup-verified with file-by-file
-    re-verification, progress bar, and final stats
-  - `i) Ignore` → returns to Import Check menu
-  
-- Cleanup operation shows per-file hash verification with visual MATCH/MISMATCH
-  confirmation before deletion
+This release established the file-by-file verification model that later
+releases integrated into the launcher and hardened with stronger warnings,
+state handling, and portability fixes.
 
 ---
 ## 2026‑08 — v1.4.23
@@ -4803,6 +4757,167 @@ step needed when the match is verified real-time.
 **Exit codes:** 0 success, 1 failure, 4 nothing to do
 
 ---
+## 2026‑08 — v1.4.24
+**Integration: cleanup-verified prompt after summary**
+
+Connect the Delete/Ignore workflow to the launcher:
+
+- After option 3 (Start hash check) displays the summary, if there are files
+  already on your NAS, users are now prompted:
+  - `d) Delete verified duplicates` → runs cleanup-verified with file-by-file
+    re-verification, progress bar, and final stats
+  - `i) Ignore` → returns to Import Check menu
+  
+- Cleanup operation shows per-file hash verification with visual MATCH/MISMATCH
+  confirmation before deletion
+
+---
+## 2026‑08 — v1.4.25
+**Bug fix: preserve trailing spaces in filenames during duplicate review**
+
+Fixed critical bug in review-duplicates.sh that stripped trailing whitespace
+from filenames when ordering duplicate groups by size, date, or path length.
+
+**The issue:**
+- Files with trailing spaces (e.g., "CV2 ") were being hashed correctly
+- But when review-duplicates.sh displayed them for the user to choose which to
+  keep, awk's `print $2` removed trailing spaces
+- Subsequent stat() calls to get file sizes failed because the path no longer
+  matched the actual filesystem filename
+- Result: `[??]` shown instead of file size
+
+**The fix:**
+- Changed order_group() function to use `printf "%s\n", $2` instead of
+  `print $2` in all six ordering cases (newest, oldest, size, sizesmall,
+  shortpath, longpath)
+- printf with %s format preserves exact field content, including trailing spaces
+- File sizes now display correctly for files with trailing spaces in names
+
+**Edge case learned:** Bash and awk treat trailing whitespace differently.
+Always use printf for exact character preservation when paths may contain
+whitespace.
+
+---
+## 2026‑08 — v1.4.26
+**Auto-cleanup: remove empty folders after sort operation**
+
+Integrated empty-folder cleanup into option 6 (Move new files to sort).
+
+Previously, after moving files to unique-files/, the import folder would be
+left with thousands of empty folders, requiring a manual cleanup script.
+
+Now, cmd_sort() automatically:
+1. Moves files to unique-files/
+2. Removes empty folders left behind (except from unique-files/ itself)
+3. Reports how many folders were removed
+
+Users don't need to remember a separate cleanup step. The import folder is
+ready for the next card immediately after the sort completes.
+
+Exit behavior unchanged: still reports top-level item count and readiness status.
+
+---
+## 2026‑08 — v1.4.27
+**Cleanup enhancement: remove symlinks left in import folder**
+
+Expanded auto-cleanup (option 6) to detect and remove symlinks.
+
+Previously, symlinks in the import folder were skipped during the file move
+(with a warning), but then left behind, cluttering the import folder. Symlinks
+like `.fcpcache` (circular self-reference from old iMovie Libraries) could remain.
+
+Now, after moving files, the cleanup also:
+1. Detects any remaining symlinks (except in unique-files/)
+2. Warns which ones were found
+3. Removes them automatically
+4. Then cleans up empty folders
+
+Users get a complete, ready-to-use import folder after option 6 completes.
+No manual cleanup of stray symlinks needed.
+
+---
+## 2026‑08 — v1.4.28
+**Peer review fixes: cleanup-verified robustness and clarity**
+
+Incorporated independent peer review feedback (v1.4.26 audit). Key improvements:
+
+**Fixes to cleanup-verified operation:**
+- Fixed plan parsing bug: now correctly matches KEEP lines by hash (field 3)
+- Added RED [WARNING] before deletion confirmation (makes permanent removal explicit)
+- Added stale-state marker after cleanup (prevents subsequent operations from using outdated scan)
+- Clarified deletion purpose: stops re-importing duplicates (valid admin workflow)
+
+**Launcher improvements:**
+- Only offers cleanup choice when summary succeeds (fixes test 96 hang)
+- Checks summary return code before prompting for action
+
+**Menu wording clarification:**
+- Option 3: "Check import against NAS" (was "Start hash check")
+  - Clarifies this step compares manifests, doesn't re-hash
+- Option 4: "Quarantine copies already on NAS" (was "Remove NAS copies")
+  - Eliminates ambiguity about which side is affected
+
+**Cleanup robustness:**
+- Fixed unique-files/ exclusion: now excludes directory itself, not just contents
+  - Prevents accidental deletion of empty unique-files/ staging directory
+
+**Known outstanding items from review:**
+- Version-history.md chronological ordering (v1.4.22–26 section order)
+- macOS portability of cleanup hashing (sha256sum vs shasum -a 256)
+  - Current implementation works on Linux/Synology; macOS fallback not yet unified
+
+**Rationale for keeping permanent deletion:**
+Disagreed with reviewer recommendation to remove permanent deletion entirely.
+Quarantine model is appropriate for general duplicates, but Import Check's
+use case is different: stop admins from repeatedly importing same backups.
+Deletion is more effective than moving to quarantine for this scenario.
+Added explicit warning to ensure admin intent is clear and deliberate.
+
+---
+## 2026‑08 — v1.4.29
+**Import Check permanent-cleanup safety corrections**
+
+Follow-up corrective release after peer review of the v1.4.28 cleanup path.
+
+- **Interactive `--force` bypass removed:** the launcher now invokes
+  `cleanup-verified` without `--force`, so the cleanup script's own safety
+  confirmation cannot be skipped by the normal menu workflow.
+- **Warning moved before confirmation:** permanent deletion is now announced
+  before the user makes the decision to continue. The user must type
+  `DELETE` in full; any other input cancels the operation.
+- **Plan lookup corrected:** NAS keeper lookup matches the hash in field 3 of
+  `KEEP|path|hash` plan records.
+- **Summary flow hardened:** the launcher only offers verified cleanup after a
+  successful Import Check summary.
+- **Stale-state handling corrected:** the import scan is marked stale only when
+  at least one incoming file was actually deleted.
+- **Import menu wording clarified:** comparison and quarantine actions now say
+  which side is affected and avoid implying that NAS files are removed.
+- **`unique-files/` protection corrected:** empty-folder cleanup excludes both
+  the managed output directory itself and its contents.
+
+Known portability cleanup around direct `sha256sum`/GNU `stat` use remains a
+separate follow-up item; no claim is made here that the verified-delete path is
+fully portable to macOS.
+
+---
+## 2026‑08 — v1.4.30
+**Release-history repair and version consistency**
+
+Documentation/packaging release only; no Import Check cleanup behaviour was
+changed from v1.4.29.
+
+- Rebuilt the damaged v1.4.22–v1.4.29 tail of `version-history.md` into strict
+  chronological order.
+- Restored one release heading per version and removed the accidental nested
+  `v1.4.22` / `v1.4.28` heading sequence.
+- Added explicit v1.4.22 and v1.4.29 records so the history now describes the
+  introduction and subsequent hardening of `cleanup-verified` coherently.
+- Promoted launcher, default configuration bundle, README current-version
+  marker, and version history consistently to **v1.4.30**.
+
+---
+
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  

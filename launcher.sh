@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.26 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.30 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -1889,8 +1889,9 @@ action_import_check() {
     echo "${BOLD}Import Check — bring new files onto the NAS without duplicating anything${RST}"
     echo "This mode is for SD cards, old backup disks, DVDs, or cloud exports —"
     echo "anything you're folding into the NAS. Files already on the NAS are"
-    echo "never touched; only copies sitting in the import folder are ever"
-    echo "proposed for removal, and always to quarantine, never deleted outright."
+    echo "never touched; only copies sitting in the import folder are proposed for"
+    echo "removal. By default, duplicates are moved to quarantine. An optional"
+    echo "verified-cleanup action can permanently delete import copies (with warning)."
     echo
     if [ -n "$_dir" ]; then
       echo "   Import folder: $_dir"
@@ -1901,8 +1902,8 @@ action_import_check() {
     echo "   1) Set up import folder             (first time, or to change it)"
     echo "   2) Scan (hash the import folder)"
     echo
-    echo "   3) Start hash check (import vs NAS)   Which files match, which are new"
-    echo "   4) Remove NAS copies               Files already on NAS → quarantine"
+    echo "   3) Check import against NAS          Compare files, show matches"
+    echo "   4) Quarantine copies already on NAS  Verified duplicates → quarantine"
     echo "   5) Deduplicate within import       Duplicates inside import → keep shortest path"
     echo "   6) Move new files to sort          Unique files → /unique-files/ for migration to NAS"
     echo
@@ -1915,26 +1916,33 @@ action_import_check() {
       1) run_script "$_ic" setup          || true; printf "Press Enter to continue... "; read -r _ || true ;;
       2) run_script "$_ic" scan           || true; printf "Press Enter to continue... "; read -r _ || true ;;
       3) 
-        run_script "$_ic" summary || true
-        echo
-        printf "Ready to clean up verified duplicates?\n"
-        printf "\n   d) Delete verified duplicates (will re-verify each file before removing)\n"
-        printf "   i) Ignore (quit to Import Check menu)\n"
-        printf "\nSelect: "
-        read -r _cleanup_choice || _cleanup_choice="i"
+        _summary_rc=0
+        run_script "$_ic" summary || _summary_rc=$?
         
-        case "$_cleanup_choice" in
-          d|D)
-            run_script "$_ic" cleanup-verified --force || true
-            printf "Press Enter to continue... "
-            read -r _ || true
-            ;;
-          i|I|*) 
-            printf "Cleanup cancelled.\n"
-            printf "Press Enter to continue... "
-            read -r _ || true
-            ;;
-        esac
+        if [ "$_summary_rc" -eq 0 ]; then
+          echo
+          printf "Ready to clean up verified duplicates?\n"
+          printf "\n   d) Delete verified duplicates (will re-verify each file before removing)\n"
+          printf "   i) Ignore (quit to Import Check menu)\n"
+          printf "\nSelect: "
+          read -r _cleanup_choice || _cleanup_choice="i"
+          
+          case "$_cleanup_choice" in
+            d|D)
+              run_script "$_ic" cleanup-verified || true
+              printf "Press Enter to continue... "
+              read -r _ || true
+              ;;
+            i|I|*) 
+              printf "Cleanup cancelled.\n"
+              printf "Press Enter to continue... "
+              read -r _ || true
+              ;;
+          esac
+        else
+          printf "Press Enter to continue... "
+          read -r _ || true
+        fi
         ;;
       4) run_script "$_ic" discard        || true; printf "Press Enter to continue... "; read -r _ || true ;;
       5) run_script "$_ic" dedup-internal || true; printf "Press Enter to continue... "; read -r _ || true ;;
