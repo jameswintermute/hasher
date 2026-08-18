@@ -4945,12 +4945,31 @@ Corrective release following a focused review of `cleanup-verified`.
   reclaimed-space reporting, and shasum/BSD-stat fallbacks.
 
 ---
+## 2026‑08 — v1.4.32
+**Log-retention correctness and small maintenance tidy-up**
+
+Narrow maintenance release; no hashing, duplicate-detection, review, quarantine,
+or Import Check behaviour was otherwise changed.
+
+- **Fixed log/report retention:** `clean-logs.sh` now receives matched report
+  paths as distinct arguments instead of allowing a glob to shift the function's
+  retention-count and label parameters. It prunes the oldest files using Bash
+  file-age tests without parsing `ls` output, preserving paths containing spaces.
+- **Regression coverage added:** `102-clean-logs-retention.sh` verifies 5- and
+  10-file retention, newest-file preservation, no-match behaviour, unrelated-file
+  safety, and operation from an install path containing spaces.
+- **macOS dependency check corrected:** stock BSD/macOS `stat -f` is now
+  recognised as supported; users are no longer incorrectly told to install GNU
+  `stat`/coreutils when the native command is sufficient.
+- **Documentation refreshed:** test-suite count updated and the already-delivered
+  parallel hashing engine removed from the future roadmap.
+
+---
 
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
 - Dedup analytics export  
-- Parallel hashing engine  
 - JSON structured output  
 - Optional metadata extraction
 
