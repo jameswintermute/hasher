@@ -110,6 +110,53 @@ require_bash() {
   return 1
 }
 
+# ── Shared file primitives (v1.4.31) ───────────────────────────────────
+# Keep cross-platform hashing/stat behaviour in one place so destructive
+# workflows do not silently become less portable than the main hasher.
+# Both helpers print only the requested value and return non-zero on failure.
+
+# hasher_sha256_file PATH
+# Print the SHA-256 digest of PATH using the first working implementation.
+# GNU/Linux and Synology normally provide sha256sum; macOS provides shasum.
+hasher_sha256_file() {
+  [ "$#" -eq 1 ] || return 2
+  _hsf_path=$1
+  _hsf_out=""
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    _hsf_out=$(sha256sum -- "$_hsf_path" 2>/dev/null) && {
+      printf '%s\n' "${_hsf_out%%[[:space:]]*}"
+      return 0
+    }
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    _hsf_out=$(shasum -a 256 -- "$_hsf_path" 2>/dev/null) && {
+      printf '%s\n' "${_hsf_out%%[[:space:]]*}"
+      return 0
+    }
+  fi
+
+  return 1
+}
+
+# hasher_file_size_bytes PATH
+# Print PATH's byte size. GNU/BusyBox stat uses -c; BSD/macOS stat uses -f.
+hasher_file_size_bytes() {
+  [ "$#" -eq 1 ] || return 2
+  _hfs_path=$1
+  _hfs_size=$(stat -c %s "$_hfs_path" 2>/dev/null) || _hfs_size=""
+  case "$_hfs_size" in
+    ''|*[!0-9]*)
+      _hfs_size=$(stat -f %z "$_hfs_path" 2>/dev/null) || _hfs_size=""
+      ;;
+  esac
+  case "$_hfs_size" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$_hfs_size" ;;
+  esac
+}
+
 # ── Default quarantine root for the detected host ──────────────────────
 # Prints (does not export) a directory path suitable as a quarantine root
 # when the user has not set QUARANTINE_DIR in hasher.conf.

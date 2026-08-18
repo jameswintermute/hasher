@@ -1338,6 +1338,44 @@ cmd_sort() {
   exit 0
 }
 
+# v1.4.31 cleanup helpers. These globals are intentionally visible to the
+# process-level EXIT/signal traps so an interrupted permanent-cleanup can put
+# a staged file back before the import-check lock is released.
+_ic_cleanup_stage=""
+_ic_cleanup_original=""
+
+_human_bytes() {
+  local _b="${1:-0}"
+  case "$_b" in ''|*[!0-9]*) _b=0 ;; esac
+  awk -v b="$_b" 'BEGIN {
+    if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+    else if (b >= 1048576) printf "%.2f MB", b/1048576;
+    else if (b >= 1024) printf "%.2f KB", b/1024;
+    else printf "%d B", b;
+  }'
+}
+
+_restore_cleanup_stage() {
+  local _stage="${_ic_cleanup_stage:-}" _original="${_ic_cleanup_original:-}"
+  [ -n "$_stage" ] && { [ -e "$_stage" ] || [ -L "$_stage" ]; } || {
+    _ic_cleanup_stage=""
+    _ic_cleanup_original=""
+    return 0
+  }
+
+  if [ -n "$_original" ] && [ ! -e "$_original" ] && [ ! -L "$_original" ]; then
+    if mv -- "$_stage" "$_original" 2>/dev/null; then
+      _ic_cleanup_stage=""
+      _ic_cleanup_original=""
+      return 0
+    fi
+    warn "Could not restore staged import file to: $_original"
+  else
+    warn "Original import path is occupied; preserved staged file at: $_stage"
+  fi
+  return 1
+}
+
 cmd_cleanup_verified() {
   # v1.4.22: Verify and clean up files that match on NAS
   # Performs file-by-file hash verification before deletion with visual feedback
@@ -1401,8 +1439,8 @@ cmd_cleanup_verified() {
   printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
   echo
 
-  local _verified=0 _changed=0 _deleted=0 _preserved=0 _failed=0
-  local _imported_size=0 _deleted_size=0 _preserved_size=0
+  local _verified=0 _deleted=0 _preserved=0 _failed=0
+  local _deleted_size=0 _preserved_size=0
   local _file_num=0
   local _start_time
   _start_time="$(date +%s)"
@@ -1423,15 +1461,54 @@ cmd_cleanup_verified() {
     # Progress bar
     log_progress_bar "VERIFY" "$_file_num" "$_del_count" "$_start_time"
 
-    # Hash import file
-    local _import_current_hash
-    _import_current_hash="$(sha256sum "$_import_path" 2>/dev/null | awk '{print $1}')" || _import_current_hash=""
-    
-    # Hash NAS file  
-    local _nas_current_hash
-    _nas_current_hash="$(sha256sum "$_nas_path" 2>/dev/null | awk '{print $1}')" || _nas_current_hash=""
+    # v1.4.31: bind verification to the exact object we may delete.
+    # Rename the candidate to a private name in the SAME directory first.
+    # That rename is atomic on the filesystem. A process that recreates the
+    # original pathname while we verify cannot cause its replacement to be
+    # deleted: only the staged object below is ever passed to rm.
+    if [ ! -f "$_import_path" ] || [ -L "$_import_path" ]; then
+      warn "Import candidate is no longer a regular file: $_import_path"
+      _preserved=$(( _preserved + 1 ))
+      _failed=$(( _failed + 1 ))
+      continue
+    fi
 
-    # Display file info
+    local _import_parent _stage_path _stage_try
+    _import_parent="$(dirname -- "$_import_path" 2>/dev/null || dirname "$_import_path")"
+    _stage_try=0
+    _stage_path=""
+    while [ "$_stage_try" -lt 20 ]; do
+      _stage_try=$(( _stage_try + 1 ))
+      _stage_path="${_import_parent%/}/.hasher-delete.$$.$_file_num.$_stage_try"
+      if [ ! -e "$_stage_path" ] && [ ! -L "$_stage_path" ]; then
+        break
+      fi
+      _stage_path=""
+    done
+    if [ -z "$_stage_path" ]; then
+      warn "Could not allocate a private staging name for: $_import_path"
+      _preserved=$(( _preserved + 1 ))
+      _failed=$(( _failed + 1 ))
+      continue
+    fi
+
+    if ! mv -- "$_import_path" "$_stage_path" 2>/dev/null; then
+      warn "Could not stage import candidate safely: $_import_path"
+      _preserved=$(( _preserved + 1 ))
+      _failed=$(( _failed + 1 ))
+      continue
+    fi
+    _ic_cleanup_original="$_import_path"
+    _ic_cleanup_stage="$_stage_path"
+
+    # Hash the STAGED import object and the current NAS keeper using the
+    # shared sha256sum/shasum abstraction. The staged object is the only
+    # object that can subsequently be permanently removed.
+    local _import_current_hash _nas_current_hash
+    _import_current_hash="$(hasher_sha256_file "$_stage_path" 2>/dev/null)" || _import_current_hash=""
+    _nas_current_hash="$(hasher_sha256_file "$_nas_path" 2>/dev/null)" || _nas_current_hash=""
+
+    # Display file info using the user's original import pathname.
     printf '\nFile %d / %d\n' "$_file_num" "$_del_count"
     printf '  Import:    %s\n' "$_import_path"
     printf '  Hash:      %s\n' "$_import_current_hash"
@@ -1440,34 +1517,48 @@ cmd_cleanup_verified() {
     printf '  Hash:      %s\n' "$_nas_current_hash"
     printf '\n'
 
-    # Verify match
+    # Verify match. On every non-delete path restore the staged candidate
+    # to its original pathname when that pathname is still free. If another
+    # process has recreated the original path, leave the staged candidate in
+    # place rather than overwrite either file; the warning gives its location.
     if [ "$_import_current_hash" = "$_nas_current_hash" ] && [ -n "$_import_current_hash" ]; then
       printf '  ✓ MATCH\n'
-      
-      # Capture size before deletion
+
       local _file_size
-      _file_size=$(stat -c %s "$_import_path" 2>/dev/null || echo 0)
-      
-      printf '  → Deleting from import...\n'
-      
-      if rm -f -- "$_import_path" 2>/dev/null; then
+      _file_size="$(hasher_file_size_bytes "$_stage_path" 2>/dev/null)" || _file_size=0
+
+      printf '  → Deleting verified staged import copy...\n'
+
+      if rm -f -- "$_stage_path" 2>/dev/null; then
+        _ic_cleanup_stage=""
+        _ic_cleanup_original=""
         _deleted=$(( _deleted + 1 ))
         _deleted_size=$(( _deleted_size + _file_size ))
         _verified=$(( _verified + 1 ))
       else
-        warn "Failed to delete: $_import_path"
+        warn "Failed to delete verified staged copy for: $_import_path"
+        _preserved_size=$(( _preserved_size + _file_size ))
+        _preserved=$(( _preserved + 1 ))
         _failed=$(( _failed + 1 ))
+        _restore_cleanup_stage || true
       fi
     else
-      printf '  ✗ MISMATCH (preserving)\n'
+      printf '  ✗ MISMATCH / UNREADABLE (preserving)\n'
+      local _verification_failed=0
       if [ -z "$_import_current_hash" ]; then
-        warn "Could not read import file: $_import_path"
+        warn "Could not read staged import file for: $_import_path"
+        _verification_failed=1
       fi
       if [ -z "$_nas_current_hash" ]; then
         warn "Could not read NAS file: $_nas_path"
+        _verification_failed=1
       fi
+      [ "$_verification_failed" -eq 1 ] && _failed=$(( _failed + 1 ))
+      local _preserve_size
+      _preserve_size="$(hasher_file_size_bytes "$_stage_path" 2>/dev/null)" || _preserve_size=0
       _preserved=$(( _preserved + 1 ))
-      _preserved_size=$(( _preserved_size + $(stat -c %s "$_import_path" 2>/dev/null || echo 0) ))
+      _preserved_size=$(( _preserved_size + _preserve_size ))
+      _restore_cleanup_stage || true
     fi
   done < <(grep '^DEL|' "$_plan")
   
@@ -1484,8 +1575,13 @@ cmd_cleanup_verified() {
   printf 'Cleanup Complete\n'
   printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
   echo
+  local _deleted_hr _preserved_hr
+  _deleted_hr="$(_human_bytes "$_deleted_size")"
+  _preserved_hr="$(_human_bytes "$_preserved_size")"
   printf '   Verified & deleted:         %d file(s)\n' "$_deleted"
-  printf '   Preserved (mismatch):       %d file(s)\n' "$_preserved"
+  printf '   Space reclaimed:            %s\n' "$_deleted_hr"
+  printf '   Preserved (change/error):   %d file(s)\n' "$_preserved"
+  printf '   Preserved data:             %s\n' "$_preserved_hr"
   printf '   Failed:                     %d file(s)\n' "$_failed"
   echo
 
@@ -1537,10 +1633,23 @@ _ic_release_lock() {
     _ic_lock_acquired=0
   fi
 }
+_ic_exit_cleanup() {
+  # If cleanup-verified was interrupted after its atomic staging rename,
+  # restore that candidate before releasing the concurrency lock.
+  _restore_cleanup_stage || true
+  _ic_release_lock
+}
+_ic_signal_exit() {
+  local _rc="$1"
+  trap - INT TERM
+  exit "$_rc"
+}
 _ic_acquire_lock() {
   if mkdir "$IC_LOCK" 2>/dev/null; then
     _ic_lock_acquired=1
-    trap _ic_release_lock EXIT INT TERM
+    trap _ic_exit_cleanup EXIT
+    trap '_ic_signal_exit 130' INT
+    trap '_ic_signal_exit 143' TERM
     return 0
   fi
   err "Another import-check operation appears to be running."
