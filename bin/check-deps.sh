@@ -101,11 +101,17 @@ for t in $REQUIRED; do
   if have "$t"; then ok "$t"; else err "$t (missing)"; missing_req=1; fi
 done
 
-# GNU vs BSD stat check (macOS warning)
-if echo "TEST" >/dev/null 2>&1; then
-  if ! stat -c %s "$0" >/dev/null 2>&1; then
-    warn "Your 'stat' may not support GNU -c (macOS/BSD). On macOS install coreutils and set PATH so 'stat' = 'gstat'."
-  fi
+# v1.4.32: both stat dialects are supported by Hasher's shared file helpers.
+# GNU/Linux and Synology use -c; stock macOS/BSD uses -f. Only fail when the
+# installed stat supports neither form — macOS no longer needs GNU coreutils
+# merely to satisfy this check.
+if stat -c %s "$0" >/dev/null 2>&1; then
+  ok "stat (GNU/BusyBox -c syntax)"
+elif stat -f %z "$0" >/dev/null 2>&1; then
+  ok "stat (BSD/macOS -f syntax)"
+else
+  err "stat is present but neither GNU/BusyBox '-c' nor BSD/macOS '-f' size syntax works"
+  missing_req=1
 fi
 
 echo

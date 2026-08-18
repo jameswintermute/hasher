@@ -63,20 +63,39 @@ human_kb() {
 }
 
 keep_latest_n() {
-  pattern="$1"
-  keep="$2"
-  label="$3"
+  # v1.4.32: callers pass KEEP, LABEL, then the shell-expanded file set.
+  # The old PATTERN-first API let an unquoted glob expand *before* function
+  # invocation, shifting KEEP/LABEL into the wrong positional parameters as
+  # soon as more than one report existed. Keep paths as distinct argv entries
+  # and prune the oldest with Bash's -ot test instead of parsing `ls` output.
+  local keep="$1" label="$2" f i oldest_index
+  local -a files=()
+  shift 2
 
-  # Use ls -1t so we get newest first; ignore errors if no matches
-  files="$(ls -1t $pattern 2>/dev/null || true)"
-  [ -z "${files:-}" ] && return 0
+  case "$keep" in
+    ''|*[!0-9]*) warn "Invalid retention count for $label: $keep"; return 1 ;;
+  esac
 
-  echo "$files" | awk -v keep="$keep" 'NR>keep {print}' | while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    if [ -f "$f" ]; then
-      info "Deleting old $label: $(basename "$f")"
-      rm -f -- "$f"
-    fi
+  # A no-match glob is passed literally by Bash; ignore anything that is not
+  # currently a regular file. Quoted argv preserves spaces and other shell
+  # metacharacters in real filenames.
+  for f in "$@"; do
+    [ -f "$f" ] && files[${#files[@]}]="$f"
+  done
+
+  while [ "${#files[@]}" -gt "$keep" ]; do
+    oldest_index=""
+    for i in "${!files[@]}"; do
+      if [ -z "$oldest_index" ] || [ "${files[$i]}" -ot "${files[$oldest_index]}" ]; then
+        oldest_index="$i"
+      fi
+    done
+
+    [ -n "$oldest_index" ] || break
+    f="${files[$oldest_index]}"
+    info "Deleting old $label: $(basename "$f")"
+    rm -f -- "$f"
+    unset "files[$oldest_index]"
   done
 }
 
@@ -136,28 +155,28 @@ info "Applying retention rules…"
 # without this update the new per-run reports accumulate indefinitely.
 # Also legacy-cover any old-format files that may still exist on hosts
 # that were upgraded from v1.3.18-or-earlier.
-keep_latest_n "$LOGS_DIR"/duplicate-hashes-20*.txt 5 "verified duplicate-hashes report"
-keep_latest_n "$LOGS_DIR"/hash-scan-duplicate-summary-20*.txt 5 "preliminary hash-scan duplicate summary"
-keep_latest_n "$LOGS_DIR"/20*-duplicate-hashes.txt 5 "duplicate-hashes report (legacy)"
+keep_latest_n 5 "verified duplicate-hashes report" "$LOGS_DIR"/duplicate-hashes-20*.txt
+keep_latest_n 5 "preliminary hash-scan duplicate summary" "$LOGS_DIR"/hash-scan-duplicate-summary-20*.txt
+keep_latest_n 5 "duplicate-hashes report (legacy)" "$LOGS_DIR"/20*-duplicate-hashes.txt
 
 # Keep last 5 duplicate-groups text reports
-keep_latest_n "$LOGS_DIR"/duplicate-groups-*.txt 5 "duplicate-groups report"
+keep_latest_n 5 "duplicate-groups report" "$LOGS_DIR"/duplicate-groups-*.txt
 
 # v1.3.30: prepared review indexes are paired with verified duplicate reports.
 # Preserve the latest pointer and retain the five newest immutable indexes.
-keep_latest_n "$LOGS_DIR"/duplicate-review-index-20*.tsv 5 "duplicate review index"
+keep_latest_n 5 "duplicate review index" "$LOGS_DIR"/duplicate-review-index-20*.tsv
 
 # Keep last 5 duplicates CSVs
-keep_latest_n "$LOGS_DIR"/duplicates-*.csv 5 "duplicates CSV"
+keep_latest_n 5 "duplicates CSV" "$LOGS_DIR"/duplicates-*.csv
 
 # Keep last 10 large file index lists
-keep_latest_n "$LOGS_DIR"/files-*.lst 10 "file index list"
+keep_latest_n 10 "file index list" "$LOGS_DIR"/files-*.lst
 
 # Keep last 10 review dedupe plans
-keep_latest_n "$LOGS_DIR"/review-dedupe-plan-*.txt 10 "review dedupe plan"
+keep_latest_n 10 "review dedupe plan" "$LOGS_DIR"/review-dedupe-plan-*.txt
 
 # Keep last 10 duplicate-folders plans
-keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-*.txt 10 "duplicate-folders plan"
+keep_latest_n 10 "duplicate-folders plan" "$LOGS_DIR"/duplicate-folders-plan-*.txt
 
 # Keep last 10 folder-review plans
 # v1.3.13 (recheck item 8): retention patterns updated to CURRENT artefact
@@ -165,18 +184,18 @@ keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-*.txt 10 "duplicate-folders pla
 # patterns matched nothing (those artefacts no longer exist). With v1.3.13's
 # timestamped raw folder artefacts, same-day runs accumulate instead of
 # overwriting — so groups TSVs need retention too.
-keep_latest_n "$LOGS_DIR"/duplicate-folders-groups-*.tsv 10 "duplicate-folders groups TSV"
-keep_latest_n "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt 10 "reviewed folder plan"
-keep_latest_n "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv 10 "reviewed folder groups TSV"
-keep_latest_n "$LOGS_DIR"/apply-folder-plan-*.log 10 "apply-folder-plan log"
-keep_latest_n "$LOGS_DIR"/delete-zero-length-*.log 10 "delete-zero-length log"
+keep_latest_n 10 "duplicate-folders groups TSV" "$LOGS_DIR"/duplicate-folders-groups-*.tsv
+keep_latest_n 10 "reviewed folder plan" "$LOGS_DIR"/duplicate-folders-plan-reviewed-*.txt
+keep_latest_n 10 "reviewed folder groups TSV" "$LOGS_DIR"/duplicate-folders-groups-reviewed-*.tsv
+keep_latest_n 10 "apply-folder-plan log" "$LOGS_DIR"/apply-folder-plan-*.log
+keep_latest_n 10 "delete-zero-length log" "$LOGS_DIR"/delete-zero-length-*.log
 
 # v1.3.20 (peer-review recheck observation): per-run zero-length reports
 # under var/zero-length/ now also get retention. Same 5-run policy as
 # duplicate-hashes; the -latest symlink is preserved. Covers both the new
 # CSV_TAG-based naming and any legacy date-only files.
 if [ -d "$ZERO_DIR" ]; then
-  keep_latest_n "$ZERO_DIR"/zero-length-20*.txt 5 "zero-length report"
+  keep_latest_n 5 "zero-length report" "$ZERO_DIR"/zero-length-20*.txt
 fi
 
 # 3) Rotate main logs if they grow too large (> 5 MiB)
