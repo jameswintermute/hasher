@@ -4917,6 +4917,34 @@ changed from v1.4.29.
   marker, and version history consistently to **v1.4.30**.
 
 ---
+## 2026‑08 — v1.4.31
+**Import Check permanent-cleanup safety and portability hardening**
+
+Corrective release following a focused review of `cleanup-verified`.
+
+- **Closed the verification-to-delete race:** each import candidate is now
+  atomically renamed to a private name in the same directory before hashing.
+  The staged object is re-hashed against the current NAS keeper and is the only
+  object that can be permanently deleted. If another process recreates the
+  original pathname during verification, that replacement is left untouched.
+- **Signal-safe cleanup:** `INT` and `TERM` now terminate with signal-derived
+  status codes (130/143) instead of merely dropping the Import Check lock and
+  continuing. The EXIT path attempts to restore any active staged candidate
+  before releasing the lock.
+- **Cross-platform verification helpers:** SHA-256 and file-size checks now use
+  shared helpers in `lib/host-detect.sh`, supporting `sha256sum` or
+  `shasum -a 256` and GNU/BusyBox `stat -c` or BSD/macOS `stat -f`.
+- **Accurate failure reporting:** unreadable/hash-failure candidates are
+  preserved and now increment the failure count, causing a non-zero cleanup
+  result rather than looking like a clean success.
+- **Cleanup statistics completed:** final output now reports reclaimed space and
+  preserved data size as well as file counts and duration.
+- **Regression coverage added:** `101-import-check-cleanup-verified.sh` covers
+  cancellation, successful permanent cleanup, hash failure, pathname
+  replacement during verification, TERM handling/lock release, staging cleanup,
+  reclaimed-space reporting, and shasum/BSD-stat fallbacks.
+
+---
 
 ## Future Roadmap  
 

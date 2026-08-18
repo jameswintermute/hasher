@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.30**
+Started Dec 2022. Current version: **v1.4.31**
 
 ### First-run launch screen
 
@@ -606,7 +606,7 @@ the implicit keeper is the one *not* listed for each group):
 The folder-dedup finder also writes a `duplicate-folders-groups-*.tsv` sidecar
 holding the full keep/del structure with reclaim sizes, used by the reviewer.
 
-In the core dedup workflow, all files marked for deletion are moved to **quarantine**, not permanently deleted. Import Check normally follows the same model; an optional `cleanup-verified` action can permanently delete import copies after re-verifying both files, but requires explicit DELETE confirmation.
+In the core dedup workflow, all files marked for deletion are moved to **quarantine**, not permanently deleted. Import Check normally follows the same model; an optional `cleanup-verified` action can permanently delete import copies, but requires explicit `DELETE` confirmation. Before verification, each import candidate is atomically renamed to a private name in the same directory; Hasher then re-hashes that staged object and the current NAS keeper, and only the staged object can be removed. This prevents a file recreated at the original pathname during verification from being deleted accidentally.
 
 ---
 
