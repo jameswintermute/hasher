@@ -17,15 +17,14 @@
 # check the operator has to trust.
 #
 # Design (agreed with the user before building):
-#   1. Quarantine, never permanent delete — same model as every other
-#      destructive path in this tool (--force-delete may be added later;
-#      not in this release).
-#   2. Only cross-boundary matches are auto-resolved. Two files inside the
-#      import folder that duplicate EACH OTHER, or a file with no match
-#      anywhere, are left alone here — "which of my own two copies do I
-#      keep" is a different decision with no safe default, and bundling it
-#      into "does the NAS already have this" would blur a rule that needs
-#      to stay simple.
+#   1. Quarantine-first by default: cross-boundary NAS duplicates are moved
+#      to quarantine with confirmation. An optional verified-cleanup action
+#      can permanently delete import copies after re-hashing both files;
+#      this requires explicit DELETE confirmation and is higher-risk.
+#   2. Internal dedupe: files inside the import folder that duplicate EACH
+#      OTHER are handled separately by dedup-internal (keep-shortest-path).
+#   3. Only cross-boundary matches (import vs NAS) are resolved here. Files
+#      with no NAS match remain in import/ or can be moved to unique-files/.
 #   3. Scan scope is IMPORT_DIR only, compared against the most recent
 #      complete NAS manifest — not a fresh full-NAS hash. This is what
 #      makes "drop a card in, run a check" fast every time instead of
@@ -47,7 +46,7 @@
 #   bin/import-check.sh discard [--force]         generate + apply the plan
 #   bin/import-check.sh dedup-internal [--force]  dedup import's own duplicates
 #   bin/import-check.sh sort [--force]            move remainder to unique-files/
-#   bin/import-check.sh cleanup-verified [--force] verify & delete NAS matches (v1.4.22)
+#   bin/import-check.sh cleanup-verified        verify & delete NAS matches (v1.4.22)
 #
 # Exit codes: 0 success, 1 hard failure, 2 invalid input/config,
 #             3 missing prerequisite, 4 nothing to do (not an error)
@@ -1343,9 +1342,8 @@ cmd_cleanup_verified() {
   # v1.4.22: Verify and clean up files that match on NAS
   # Performs file-by-file hash verification before deletion with visual feedback
   # Files that changed or vanished on NAS are automatically preserved
+  # Permanent deletion requires explicit DELETE confirmation (no automation)
   require_import_dir
-  local _force=false
-  for _a in "$@"; do [ "$_a" = "--force" ] && _force=true; done
 
   local _nas_csv _import_csv
   load_verified_import_scan || exit 3
