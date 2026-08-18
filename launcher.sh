@@ -44,11 +44,6 @@ if [ -r "$LIB_DIR/host-detect.sh" ]; then
   detect_host
 fi
 
-# v1.4.21: source the import-check UI menu module for Import Check workflow
-if [ -r "$LIB_DIR/import-check-ui.sh" ]; then
-  . "$LIB_DIR/import-check-ui.sh"
-fi
-
 # TTY-aware colour palette
 if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
   RED="$(printf '\033[31m')"
@@ -114,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.21 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.26 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -1905,10 +1900,11 @@ action_import_check() {
     echo
     echo "   1) Set up import folder             (first time, or to change it)"
     echo "   2) Scan (hash the import folder)"
-    echo "   3) Show import summary"
-    echo "   4) Quarantine NAS duplicates         (verified copies only, with confirmation)"
-    echo "   5) Remove duplicate copies within import (keep shortest path, with confirmation)"
-    echo "   6) Move remainder into unique-files/ (for hand-sorting)"
+    echo
+    echo "   3) Start hash check (import vs NAS)   Which files match, which are new"
+    echo "   4) Remove NAS copies               Files already on NAS → quarantine"
+    echo "   5) Deduplicate within import       Duplicates inside import → keep shortest path"
+    echo "   6) Move new files to sort          Unique files → /unique-files/ for migration to NAS"
     echo
     echo "   b) Back"
     echo
@@ -1918,7 +1914,28 @@ action_import_check() {
     case "${_choice:-}" in
       1) run_script "$_ic" setup          || true; printf "Press Enter to continue... "; read -r _ || true ;;
       2) run_script "$_ic" scan           || true; printf "Press Enter to continue... "; read -r _ || true ;;
-      3) run_script "$_ic" summary        || true; printf "Press Enter to continue... "; read -r _ || true ;;
+      3) 
+        run_script "$_ic" summary || true
+        echo
+        printf "Ready to clean up verified duplicates?\n"
+        printf "\n   d) Delete verified duplicates (will re-verify each file before removing)\n"
+        printf "   i) Ignore (quit to Import Check menu)\n"
+        printf "\nSelect: "
+        read -r _cleanup_choice || _cleanup_choice="i"
+        
+        case "$_cleanup_choice" in
+          d|D)
+            run_script "$_ic" cleanup-verified --force || true
+            printf "Press Enter to continue... "
+            read -r _ || true
+            ;;
+          i|I|*) 
+            printf "Cleanup cancelled.\n"
+            printf "Press Enter to continue... "
+            read -r _ || true
+            ;;
+        esac
+        ;;
       4) run_script "$_ic" discard        || true; printf "Press Enter to continue... "; read -r _ || true ;;
       5) run_script "$_ic" dedup-internal || true; printf "Press Enter to continue... "; read -r _ || true ;;
       6) run_script "$_ic" sort           || true; printf "Press Enter to continue... "; read -r _ || true ;;

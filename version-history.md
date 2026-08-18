@@ -4685,6 +4685,124 @@ No product code changed in this release. Full suite: 21 cases, 302
 assertions (up from 301 — the new apply-log check).
 
 ---
+## 2026‑08 — v1.4.21
+**Remediation: peer review corrections and version consistency**
+
+This release addresses findings from peer code review of the active
+development branch:
+
+- **Version drift fixed:** launcher.sh (v1.4.21), default/hasher.conf,
+  readme.md, and version-history.md now consistent. Self-test passes.
+
+- **Dead code removed:** experimental UI module sourcing in launcher.sh
+  was not integrated into action_import_check() and has been removed to
+  keep the codebase clean and prevent false positives in integration tests.
+
+- **No product changes:** Import Check engine remains unchanged. All
+  existing tests continue to pass (21 cases, 302 assertions).
+
+This is a housekeeping release, not a feature release.
+
+---
+## 2026‑08 — v1.4.22
+## 2026‑08 — v1.4.26
+**Auto-cleanup: remove empty folders after sort operation**
+
+Integrated empty-folder cleanup into option 6 (Move new files to sort).
+
+Previously, after moving files to unique-files/, the import folder would be
+left with thousands of empty folders, requiring a manual cleanup script.
+
+Now, cmd_sort() automatically:
+1. Moves files to unique-files/
+2. Removes empty folders left behind (except from unique-files/ itself)
+3. Reports how many folders were removed
+
+Users don't need to remember a separate cleanup step. The import folder is
+ready for the next card immediately after the sort completes.
+
+Exit behavior unchanged: still reports top-level item count and readiness status.
+
+---
+## 2026‑08 — v1.4.25
+**Bug fix: preserve trailing spaces in filenames during duplicate review**
+
+Fixed critical bug in review-duplicates.sh that stripped trailing whitespace
+from filenames when ordering duplicate groups by size, date, or path length.
+
+**The issue:**
+- Files with trailing spaces (e.g., "CV2 ") were being hashed correctly
+- But when review-duplicates.sh displayed them for the user to choose which to
+  keep, awk's `print $2` removed trailing spaces
+- Subsequent stat() calls to get file sizes failed because the path no longer
+  matched the actual filesystem filename
+- Result: `[??]` shown instead of file size
+
+**The fix:**
+- Changed order_group() function to use `printf "%s\n", $2` instead of
+  `print $2` in all six ordering cases (newest, oldest, size, sizesmall,
+  shortpath, longpath)
+- printf with %s format preserves exact field content, including trailing spaces
+- File sizes now display correctly for files with trailing spaces in names
+
+**Edge case learned:** Bash and awk treat trailing whitespace differently.
+Always use printf for exact character preservation when paths may contain
+whitespace.
+
+---
+## 2026‑08 — v1.4.24
+**Integration: cleanup-verified prompt after summary**
+
+Connect the Delete/Ignore workflow to the launcher:
+
+- After option 3 (Start hash check) displays the summary, if there are files
+  already on your NAS, users are now prompted:
+  - `d) Delete verified duplicates` → runs cleanup-verified with file-by-file
+    re-verification, progress bar, and final stats
+  - `i) Ignore` → returns to Import Check menu
+  
+- Cleanup operation shows per-file hash verification with visual MATCH/MISMATCH
+  confirmation before deletion
+
+---
+## 2026‑08 — v1.4.23
+**Menu clarity: option 3 label updated**
+
+Minor UX improvement for Import Check workflow:
+
+- **Option 3 label changed** from "Show summary" to "Start hash check (import vs NAS)"
+  Makes the action clearer: this option runs the comparison hash check between
+  import folder and NAS manifest, not just displaying a pre-computed summary.
+
+---
+**Import Check cleanup: file-by-file verification before deletion**
+
+New `cleanup-verified` operation for safe, confident bulk cleanup of verified
+duplicates. When 100% of imported files match the NAS, users can now opt to
+verify and delete them all in one operation with live feedback.
+
+**New feature:**
+- **Option 3 (Show summary) → Delete/Ignore choice:** After the Import Check
+  summary, if there are NAS matches, users can now select:
+  - `d) Delete verified duplicates` — Re-hashes each file on both sides before
+    removing, with progress feedback and visual confirmation
+  - `i) Ignore` — Skip to Import Check menu
+
+**Per-file verification process:**
+- Each import file is re-hashed immediately before deletion
+- Each NAS file is re-hashed for final cross-check
+- Hash values displayed with visual `✓ MATCH` (green) or `✗ MISMATCH` (red)
+- Mismatches automatically preserved (files that changed/vanished on NAS)
+- Progress bar shows file-by-file status
+- Final stats show deleted count, preserved count, freed space, duration
+
+**Benefit:** Builds admin confidence. Users see exactly what's being verified
+and deleted, with automatic safety for any files that changed. No quarantine
+step needed when the match is verified real-time.
+
+**Exit codes:** 0 success, 1 failure, 4 nothing to do
+
+---
 ## Future Roadmap  
 
 - Lifetime GB‑saved metrics  
