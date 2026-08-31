@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.32**
+Started Dec 2022. Current version: **v1.4.33**
 
 ### First-run launch screen
 
@@ -682,7 +682,10 @@ hasher/
 │       ├── 97-delete-duplicates-build-phase.sh
 │       ├── 98-delete-duplicates-rewrite.sh
 │       ├── 99-delete-duplicates-skip-summary.sh
-│       └── 100-self-test-duplicate-detection.sh
+│       ├── 100-self-test-duplicate-detection.sh
+│       ├── 101-import-check-cleanup-verified.sh
+│       ├── 102-clean-logs-retention.sh
+│       └── 103-hasher-macos-hashcmd-and-host-label.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -792,7 +795,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (23 cases, ~2 min)
+tests/run-tests.sh                # everything (24 cases, ~2 min)
 tests/run-tests.sh 20 40          # only cases whose leading number matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -828,6 +831,9 @@ directory of ordinary files would exercise:
 | `98-delete-duplicates-rewrite` | Single-pass AWK validation: correctness preserved, awk invocation count constant regardless of plan size |
 | `99-delete-duplicates-skip-summary` | Categorised skip summary on screen; full per-file detail still in the apply log |
 | `100-self-test-duplicate-detection` | Duplicate-script detection covers launcher.sh and any future script, not a fixed list |
+| `101-import-check-cleanup-verified` | Import cleanup: atomic delete safety, signals, portability, reclaimed-space stats |
+| `102-clean-logs-retention` | Log housekeeping: correct 5/10 retention, newest preservation, path safety |
+| `103-hasher-macos-hashcmd-and-host-label` | macOS shasum fallback survives the global IFS override; host label reports real OS version |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault
