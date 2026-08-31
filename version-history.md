@@ -4965,6 +4965,109 @@ or Import Check behaviour was otherwise changed.
   parallel hashing engine removed from the future roadmap.
 
 ---
+## 2026‑08 — v1.4.33
+**macOS hash-tool detection: fixed a global IFS regression; host label now reports real OS version per platform**
+
+Reported live from a real macOS Sonoma machine (M1 iMac, confirmed via
+"About This Mac"): hashing failed immediately with `Hash tool 'shasum -a
+256' not found in PATH` — even though running `shasum -a256 readme.md`
+directly in the same terminal worked perfectly and produced a correct
+hash. No Homebrew involved; the tool the error complained about was
+never actually missing.
+
+### Root cause
+
+`hasher.sh` sets a global `IFS=$'\n\t'` (no space) at line 8, for safe
+newline/NUL-aware path handling elsewhere in the script — deliberate and
+correct for its own purpose. `_resolve_hash_cmd()` correctly returns
+`"shasum -a 256"` on a system with no `sha256sum`, but the `read -ra
+hash_cmd <<< "$hash_cmd_str"` meant to split that into an array relies on
+IFS containing a space to split on whitespace. Under the global override,
+it doesn't — so the entire string became a single array element.
+`command -v "${hash_cmd[0]}"` on the next line then looked up a binary
+literally named `shasum -a 256`, which of course doesn't exist, and
+reported it as missing.
+
+Notably, this exact class of bug — a global IFS silently breaking a
+`read` that needed default whitespace splitting — had already been found
+and fixed twice elsewhere in this same file (the `/proc/PID/stat`
+parsing, v1.4.1), complete with a detailed comment explaining the same
+root cause. This one call site was simply missed at the time.
+
+### Fix
+
+`IFS=' ' read -ra hash_cmd <<< "$hash_cmd_str"` — set locally on the
+`read` itself, matching the already-established pattern, rather than
+touching the global setting other code in this file correctly depends
+on. A second `read -ra hash_cmd` call site exists (inside the
+parallel-worker `bash -c` rebuild, line ~2027) — checked and confirmed
+NOT affected: `IFS` is never `export`ed anywhere in this script, so a
+freshly-spawned `bash -c` subshell never inherits the parent's override
+in the first place, confirmed empirically before ruling it out rather
+than assumed.
+
+Verified end-to-end: a real invocation of `bin/hasher.sh` with `command
+-v sha256sum` deliberately forced to fail (an exported bash function
+override, reaching the actual process under test, not a simplified
+stand-in for it) now completes successfully via the `shasum -a 256`
+fallback and produces a CSV with the correct SHA-256 hash. Also verified
+directly against the split itself: without the fix, `read -ra` produces
+one array element containing the whole string; with it, three elements,
+with `hash_cmd[0]="shasum"` exactly as intended.
+
+### Also: the launcher's "Host:" line now reports actual OS version
+
+Raised in the same session: `Host: macOS` (or `Synology DSM` / `Linux`)
+carried no version detail at all, on every platform, regardless of what
+was actually installed. `host_pretty_label()` in `lib/host-detect.sh`
+now reports the real version from each platform's own source of truth:
+
+- **macOS** — `sw_vers -productVersion` (ships with every install, no
+  dependencies): `macOS 14.1.1`
+- **Synology DSM** — DSM has no `/etc/os-release`; version lives in
+  `/etc.defaults/VERSION` as separate `majorversion`/`minorversion`/
+  `smallfixnumber`/`buildnumber` keys, read with `grep`+`sed` (not
+  sourced) and assembled into the same `major.minor[.smallfix]-build`
+  format DSM's own UI uses: `Synology DSM 7.2.1-69057`
+- **Linux** — `/etc/os-release`'s `PRETTY_NAME`, used as-is since it is
+  already a complete, self-describing string: `Ubuntu 24.04.1 LTS`
+
+Every lookup is guarded and falls back to the original bare platform
+name if the platform-specific source is unavailable for any reason — a
+detection quirk on an unusual system degrades the header, it never
+breaks it. `lib/host-detect.sh` is required to stay POSIX-sh-safe (no
+`[[ ]]`, no bash-4 syntax) so it sources cleanly under both Synology DSM
+bash 3.2 and macOS `/bin/bash` 3.2; the new code was checked against
+`dash` (strict POSIX sh) in addition to `bash -n`, and verified correct
+for all three platform branches plus both fallback paths.
+
+### Also: a documentation gap found and closed while packaging this release
+
+The bidirectional check between `tests/cases/*.sh` and the readme's own
+test table — a discipline this project has otherwise kept consistently —
+had quietly slipped for two existing cases, `101-import-check-cleanup-
+verified` and `102-clean-logs-retention`, from work predating this
+session. Both were already correct and passing; only their documentation
+was missing. Closed alongside this release's own new test rather than
+left for later, since finding the gap and only fixing the newest instance
+of it would have been the same kind of drift this project has
+specifically tried to design out.
+
+### Test coverage
+
+New `tests/cases/103-hasher-macos-hashcmd-and-host-label.sh`, 9
+assertions: the exact reported scenario end-to-end (a real `hasher.sh`
+run with `sha256sum` forced unavailable, correct hash confirmed in the
+output CSV), the split mechanism checked directly (element count and
+content, not just the downstream error), and all three `host_pretty_label`
+platform branches plus the macOS no-`sw_vers` fallback, each verified
+against a realistic stubbed version source. Confirmed the fix matters by
+reverting it and watching exactly the four affected assertions fail,
+then restoring it.
+
+Full suite: 24 cases, 356 assertions.
+
+---
 
 ## Future Roadmap  
 
