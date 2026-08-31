@@ -284,13 +284,57 @@ host_default_scan_root() {
 }
 
 # ── Pretty label for the launcher header ───────────────────────────────
+# v1.4.33: includes the actual OS version where it can be determined
+# cheaply and reliably from the platform's own self-reported source
+# (macOS's sw_vers, DSM's own version file, /etc/os-release on generic
+# Linux — the same idea the user pointed at directly), rather than a
+# bare platform name with no detail at all. Every lookup is guarded and
+# falls back to the original bare label on any failure — a detection
+# quirk on an unusual system must never break the launcher header, only
+# make it slightly less detailed.
 host_pretty_label() {
   detect_host
   case "$HASHER_HOST" in
-    synology) printf 'Synology DSM\n' ;;
-    macos)    printf 'macOS\n' ;;
-    linux)    printf 'Linux\n' ;;
-    *)        printf 'unknown host\n' ;;
+    synology)
+      # DSM has no /etc/os-release; version lives in /etc.defaults/VERSION
+      # as separate shell-style KEY="value" lines (majorversion,
+      # minorversion, smallfixnumber, buildnumber). Extracted with
+      # grep+sed rather than sourcing the file — this is a trusted system
+      # file, but reading only the specific keys needed is cheap and
+      # avoids importing anything else the file might define.
+      local ver="" major minor small build
+      if [ -r /etc.defaults/VERSION ]; then
+        major="$(grep -o 'majorversion="[^"]*"' /etc.defaults/VERSION 2>/dev/null | sed 's/.*"\(.*\)"/\1/')"
+        minor="$(grep -o 'minorversion="[^"]*"' /etc.defaults/VERSION 2>/dev/null | sed 's/.*"\(.*\)"/\1/')"
+        small="$(grep -o 'smallfixnumber="[^"]*"' /etc.defaults/VERSION 2>/dev/null | sed 's/.*"\(.*\)"/\1/')"
+        build="$(grep -o 'buildnumber="[^"]*"' /etc.defaults/VERSION 2>/dev/null | sed 's/.*"\(.*\)"/\1/')"
+        if [ -n "$major" ] && [ -n "$minor" ]; then
+          ver="$major.$minor"
+          [ -n "$small" ] && [ "$small" != "0" ] && ver="$ver.$small"
+          [ -n "$build" ] && ver="$ver-$build"
+        fi
+      fi
+      if [ -n "$ver" ]; then printf 'Synology DSM %s\n' "$ver"; else printf 'Synology DSM\n'; fi
+      ;;
+    macos)
+      # sw_vers ships with every macOS install, no dependencies.
+      local ver=""
+      command -v sw_vers >/dev/null 2>&1 && ver="$(sw_vers -productVersion 2>/dev/null)"
+      if [ -n "$ver" ]; then printf 'macOS %s\n' "$ver"; else printf 'macOS\n'; fi
+      ;;
+    linux)
+      # The standard freedesktop.org file; PRETTY_NAME is already a
+      # complete, self-describing string (e.g. "Ubuntu 24.04.1 LTS"),
+      # so it's used as-is rather than prefixed with "Linux ". Read with
+      # grep+sed for the same reason as the DSM branch above, not
+      # sourced, even though /etc/os-release is a well-known safe format.
+      local pretty=""
+      if [ -r /etc/os-release ]; then
+        pretty="$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | sed 's/^PRETTY_NAME=//; s/^"//; s/"$//')"
+      fi
+      if [ -n "$pretty" ]; then printf '%s\n' "$pretty"; else printf 'Linux\n'; fi
+      ;;
+    *) printf 'unknown host\n' ;;
   esac
 }
 
