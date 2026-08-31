@@ -669,8 +669,27 @@ if [[ -z "$hash_cmd_str" ]]; then
     *)      error "No hash tool found for algo '$ALGO' (tried sha256sum, shasum, md5sum, md5)"; exit 1 ;;
   esac
 fi
-# Split into array so multi-word commands (e.g. "shasum -a 256") work correctly
-read -ra hash_cmd <<< "$hash_cmd_str"
+# Split into array so multi-word commands (e.g. "shasum -a 256") work correctly.
+#
+# v1.4.33: the split silently did nothing on macOS. This script sets a
+# global IFS=$'\n\t' (no space) at line 8 -- deliberately, for safe
+# newline/NUL-aware path handling elsewhere -- but a bare `read -ra`
+# relies on IFS containing a space to split on whitespace. Without it,
+# the whole string "shasum -a 256" became ONE array element, so
+# ${hash_cmd[0]} was "shasum -a 256" itself, not "shasum": the very next
+# line's `command -v "${hash_cmd[0]}"` then looked up a binary literally
+# named "shasum -a 256" (which of course doesn't exist) and reported it
+# as missing, even though shasum was sitting right there in PATH. Fully
+# reproduced and confirmed root cause on a real macOS Sonoma machine
+# (M1 iMac) that had shasum working perfectly when invoked directly.
+#
+# This exact class of bug -- global IFS breaking a `read` that needed
+# default whitespace splitting -- had already been found and fixed twice
+# elsewhere in this file (see the /proc/PID/stat parsing above, v1.4.1);
+# this call site was simply missed at the time. Same established fix:
+# set IFS on the `read` itself, which only affects that one command, not
+# the global setting other code in this file depends on.
+IFS=' ' read -ra hash_cmd <<< "$hash_cmd_str"
 # Verify the resolved command is actually callable
 command -v "${hash_cmd[0]}" >/dev/null 2>&1 || { error "Hash tool '${hash_cmd[0]}' not found in PATH"; exit 1; }
 
