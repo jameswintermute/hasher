@@ -109,7 +109,7 @@ header() {
   printf "%s\n" "|  _  | (_| \__ \ | | |  __/ |   "
   printf "%s\n" "|_| |_|\__,_|___/_| |_|\___|_|   "
   printf "\n%s\n" "      NAS File Hasher & Dedupe"
-  printf "\n%s\n" "      v1.4.34 - August 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.35 - August 2026. James Wintermute"
   # FIX (v1.1.9): show the detected host class so the user sees at a
   # glance which set of host-aware defaults will apply.
   if command -v host_pretty_label >/dev/null 2>&1; then
@@ -1159,6 +1159,71 @@ firstrun_performance() {
 }
 
 # Step: ensure paths.txt has at least one real scan root.
+# offer_macos_family_folders — shown once, before the generic single-path
+# prompt in firstrun_paths(), only when running on macOS and only when
+# there's something to offer. Discovers every user account's Documents/
+# Downloads/Pictures (via lib/host-detect.sh's macos_discover_family_
+# folders) and offers to add them all at once, for the common "one Mac,
+# whole family" case someone running Hasher as just their own account
+# would otherwise have no way to know about.
+#
+# Returns 0 if it added at least one path (caller should skip the generic
+# prompt) and 1 otherwise (not macOS, nothing found, or the user
+# declined) — the generic prompt then runs exactly as it always has, so a
+# macOS user who says no here still gets the normal single-path option,
+# and every non-macOS host sees zero behaviour change at all.
+offer_macos_family_folders() {
+  [ -r "$ROOT_DIR/lib/host-detect.sh" ] || return 1
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/lib/host-detect.sh"
+  detect_host
+  [ "$HASHER_HOST" = "macos" ] || return 1
+
+  local _found
+  _found="$(macos_discover_family_folders 2>/dev/null)"
+  [ -n "$_found" ] || return 1
+
+  echo "This looks like a Mac, and it has the usual personal folders set up"
+  echo "for one or more user accounts. On a Mac shared by a family, it's"
+  echo "common for the same photo or document to end up duplicated across"
+  echo "several people's accounts without anyone noticing."
+  echo
+  echo "I can add the following folders to your scan list — just the"
+  echo "everyday personal ones (Documents, Downloads, Pictures). Nothing"
+  echo "under Library, Applications, or any other system or app data is"
+  echo "included."
+  echo
+  printf '%s\n' "$_found" | sed 's/^/    /'
+  echo
+  printf "Add these to local/paths.txt? [y/N]: "
+  local _ans
+  read -r _ans || _ans=""
+  case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      mkdir -p "$LOCAL_DIR" 2>/dev/null || true
+      local _added=0 _line
+      while IFS= read -r _line; do
+        [ -z "$_line" ] && continue
+        if [ -r "$LOCAL_DIR/paths.txt" ] && grep -qxF "$_line" "$LOCAL_DIR/paths.txt" 2>/dev/null; then
+          continue
+        fi
+        printf '%s\n' "$_line" >> "$LOCAL_DIR/paths.txt"
+        _added=$((_added + 1))
+      done <<EOF
+$_found
+EOF
+      info "Added $_added folder(s) to local/paths.txt."
+      info "Add more any time by editing that file (one path per line)."
+      return 0
+      ;;
+    *)
+      info "Skipped — nothing added. You can add these yourself later,"
+      info "or run guided setup again to see this offer once more."
+      return 1
+      ;;
+  esac
+}
+
 firstrun_paths() {
   echo
   echo "${BOLD}Step 3 of 5 — Scan paths${RST}"
@@ -1174,6 +1239,10 @@ firstrun_paths() {
     info "Scan paths already configured in: $pfile"
     grep -vE '^[[:space:]]*(#|$)' "$pfile" | sed 's/^/    /'
     info "Edit that file any time to change what gets scanned."
+    return
+  fi
+
+  if offer_macos_family_folders; then
     return
   fi
 

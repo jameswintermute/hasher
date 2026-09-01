@@ -5130,6 +5130,111 @@ affected assertions fail, then restoring it.
 Full suite: 25 cases, 366 assertions.
 
 ---
+## 2026‑08 — v1.4.35
+**macOS: detects other family accounts' Documents/Downloads/Pictures and offers to add them, once, during first-run setup**
+
+Raised directly: a Mac shared by a whole family typically has one
+account per person under `/Users`, each with the usual personal
+folders. Someone running Hasher as just their own account had no way to
+know a sibling's or parent's account held duplicate copies of the same
+photos or documents — `local/paths.txt` needed every account's folders
+listed explicitly, one at a time, through the only UI that has ever
+existed for adding scan paths: a single manual-entry prompt.
+
+### What was checked before building anything
+
+Two questions needed real answers, not assumptions, before any code:
+whether macOS's default per-user folder names were what they seemed
+(`Pictures`, never `Photographs` — confirmed, this has been the
+standard name since the earliest OS X releases), and whether
+`local/paths.txt` already supported wildcards. It doesn't: the pathfile
+loop tests each line with `[[ -d "$path" ]]`, and bash's `[[ ]]` never
+performs glob expansion on a variable's *contents* — a line like
+`/Users/*/Documents` would be tested as a literal directory named `*`
+and correctly reported as not existing.
+
+Two designs were on the table. Teaching the core pathfile reader to
+expand real globs would auto-pick-up new accounts forever, but that
+reader runs on every hash on every platform (Synology, Linux, macOS
+alike) — real surgery on universal, safety-relevant code, for a
+capability this project's default posture (explicit, literal, auditable
+configuration) doesn't otherwise offer anywhere. Chosen instead: a
+small, macOS-specific discovery step that finds the candidates once and
+writes literal, resolved paths into `paths.txt` — nothing new in the
+core reader at all, and `paths.txt` stays exactly what it has always
+been, a list of exact paths a user can read and edit directly.
+
+### What was built
+
+**`macos_discover_family_folders()`** (`lib/host-detect.sh`): prints one
+candidate path per line — Documents, Downloads, and Pictures under
+every real user account that actually has it. Deliberately narrow:
+`Library`, `Applications`, `Desktop`, `Movies`, `Music`, and `Public`
+are not included — this surfaces the everyday personal content most
+likely to hold accidental duplicates across accounts, not a "scan
+everything" default. `/Users/Shared` (not a personal account) and
+hidden entries are excluded; an account that hasn't created one of the
+three folders yet (Photos never opened, say) is silently skipped, not
+treated as an error. A safe, silent no-op on any non-macOS host or if
+`/Users` doesn't exist. Same POSIX-sh constraint as the rest of this
+file — no arrays, no `[[ ]]` — checked against both `bash -n` and
+`dash -n`.
+
+**`offer_macos_family_folders()`** (`launcher.sh`): calls the above,
+and — only if it finds something — shows exactly what was found with a
+plain explanation of what is and isn't included, then asks once,
+`[y/N]`. Accepting appends every discovered path not already present in
+`paths.txt` (checked line-for-line, so re-running this doesn't
+duplicate anything already added by hand or by a previous run) and
+returns 0; declining changes nothing and returns 1.
+
+**Wired into `firstrun_paths()`** — the single existing place in the
+whole launcher where scan paths are configured through the UI, reached
+both from the guided first-run wizard and from the first-hash settings
+menu — right before its existing single-path prompt. If the offer adds
+anything, the generic prompt is skipped entirely; if it's declined, or
+this isn't macOS, or nothing was found, the exact original prompt runs
+completely unchanged. Every non-macOS host sees zero difference in
+behaviour, byte for byte.
+
+**Scope note, stated plainly rather than decided silently**: this adds
+a folder to a family Mac's *own* home directory, once, during setup.
+There is no companion "run this again to add a new account" menu item
+outside first-run setup — re-running guided setup is the only way to
+see the offer again today. Worth a persistent, always-reachable
+"review/add scan paths" menu item as its own separate piece of work;
+not built here, since it's a real, pre-existing gap independent of this
+feature (there has never been a way to add a scan path through the
+launcher UI once the first hash has already completed, for any reason,
+not just this one).
+
+### Verification
+
+The detection function was tested against a realistic fixture tree
+before anything else was built — three folders for one account, two for
+a second (missing `Downloads` correctly absent, not fabricated), plus
+`Shared` and a hidden entry both correctly excluded. The offer function
+was tested for all three outcomes (accepted, declined, and deduplicated
+against an already-partially-configured `paths.txt`) and for the
+non-macOS no-op, each verified in isolation before testing the full
+`firstrun_paths()` integration end-to-end — confirming the generic
+prompt is genuinely skipped on success and genuinely unchanged on
+decline or on a non-macOS host.
+
+### Test coverage
+
+New `tests/cases/105-macos-family-folder-discovery.sh`, 19 assertions,
+covering every scenario above against a fixture `/Users`-equivalent
+tree (the same technique already used in
+`103-hasher-macos-hashcmd-and-host-label.sh` for testing other
+`host-detect.sh` functions without touching the real filesystem).
+Confirmed the test genuinely catches a regression by removing the new
+detection function entirely and watching 12 of 19 assertions fail with
+"command not found," then restoring it.
+
+Full suite: 26 cases, 385 assertions.
+
+---
 
 ## Future Roadmap  
 
