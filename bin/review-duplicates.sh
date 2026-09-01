@@ -524,7 +524,6 @@ present_group(){
     echo "  - Enter the number (e.g., 1) to keep that file (others go to plan)"
     echo "  - s = skip group (decide later)"
     echo "  - A = add this hash to exceptions list and skip this group"
-    echo "  - D = delete all (disabled in verified plans — one live keeper is required)"
     echo "  - q = quit (plan so far is preserved)"
     printf "Your choice: "
     if [ -t 0 ]; then
@@ -558,21 +557,16 @@ present_group(){
         exit 0
         ;;
 
-      [dD])
-        warn "Delete-all is disabled for verified dedupe plans because apply-time safety requires one live keeper."
-        echo "   -> Choose a file to keep, or skip this group."
-        ;;
-
       *)
         # numeric choice – must be between 1 and $files_in_group
         case "$choice" in
           ''|*[!0-9]*)
-            echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, D, q."
+            echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, q."
             ;;
           *)
             sel="$choice"
             if [ "$sel" -lt 1 ] || [ "$sel" -gt "$files_in_group" ]; then
-              echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, D, q."
+              echo "Invalid choice. Please enter a number between 1 and $files_in_group, or s, A, q."
             else
               # Write a canonical group layout: KEEP first, followed by every
               # DEL entry. The apply tool is order-independent, but a stable layout
