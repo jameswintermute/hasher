@@ -204,6 +204,33 @@ out_plain() {
   sed 's/\x1b\[[0-9;]*m//g' "$RUN_OUT" 2>/dev/null
 }
 
+# run_tool_pty <input> <script> <args...> — as run_tool_with_input, but
+# gives the tool a real pseudo-TTY via `script`, not a plain pipe.
+#
+# Some interactive prompts (review-duplicates.sh's per-group KEEP choice)
+# deliberately fall back to reading from /dev/tty when stdin isn't a real
+# terminal — /dev/tty doesn't exist in this sandbox's plain piped
+# invocations, so run_tool_with_input can drive an initial prompt but
+# hangs or errors on one of these. `script -qec` allocates a real pty for
+# the wrapped command, which resolves /dev/tty correctly; piping <input>
+# INTO script itself (not redirected inside its -c string, which does not
+# reach the pty) is what actually gets the keystrokes to the tool.
+run_tool_pty() {
+  local _input="$1" _script="$2"; shift 2
+  local _quoted="" _a
+  for _a in "$@"; do
+    printf -v _a '%q' "$_a"
+    _quoted="$_quoted $_a"
+  done
+  RUN_OUT="$SANDBOX/.run-out.$$"
+  RUN_RC=0
+  ( cd "$SANDBOX" && \
+    printf '%s\n' "$_input" | \
+    timeout "${TEST_TIMEOUT:-60}" script -qec "bash 'bin/$_script'$_quoted" "$RUN_OUT" >/dev/null 2>&1 \
+  ) || RUN_RC=$?
+  return 0
+}
+
 # ── Fault-injection shims ───────────────────────────────────────────────────
 # Each returns the shim directory path on stdout. Callers pass it to
 # run_hasher_with_shim.
