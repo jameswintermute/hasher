@@ -5068,6 +5068,68 @@ then restoring it.
 Full suite: 24 cases, 356 assertions.
 
 ---
+## 2026‑08 — v1.4.34
+**review-duplicates.sh: removed the disabled "delete all" option instead of building around it**
+
+Raised directly, after looking at a real duplicate pair the reviewer
+wanted gone entirely (not "keep one, discard the other"): the interactive
+per-group menu had a `D = delete all` choice that had been disabled since
+apply-time safety requires exactly one live keeper per hash group — the
+core invariant `delete-duplicates.sh`'s validator enforces (see the
+v1.4.17 rewrite). Pressing `D` only ever printed a warning explaining why
+it wouldn't do anything.
+
+### Two options considered
+
+A proper fix would mean a genuinely new, no-keeper plan format (a
+`DELALL` line type, distinct validator handling for keeper-less groups,
+new UI wording) — real surgery on the same apply-time safety model that
+had just gone through extensive hardening, for a capability outside this
+project's stated scope: a dedup/hash tool, not a general unused-file
+cleaner. Weighed against that: simply remove the option. Decided on
+removal — it never did anything useful in its disabled state, and adding
+real no-keeper support wasn't worth the added complexity and safety
+surface for a need that doesn't come up often enough to justify it.
+
+### What changed
+
+The `D = delete all (disabled...)` menu line, its dedicated case branch
+(the warning that fired on every `d`/`D` keypress), and every reference
+to it are gone. Pressing `d` or `D` now falls through to the existing
+generic invalid-choice handler like any other unrecognised key — updated
+to no longer mention `D` as a valid option in its own hint text. Nothing
+about the plan file format, the numeric keep/discard choice, or
+`delete-duplicates.sh`'s validator changed at all; this is a menu-only
+change.
+
+### Test coverage
+
+This interactive per-group loop had no prior automated coverage — the
+one existing test that touches `review-duplicates.sh` runs it
+non-interactively. Verifying this required actually driving the
+interactive prompts, which don't work through a plain piped stdin: the
+tool deliberately falls back to reading from `/dev/tty` when stdin isn't
+a real terminal, and `/dev/tty` doesn't exist in a plain sandboxed pipe.
+Solved with a new, reusable harness helper, `run_tool_pty()`, which gives
+the tool a genuine pseudo-terminal via `script(1)` — piping input INTO
+`script` itself, since redirecting inside its `-c` string does not reach
+the allocated pty, confirmed by testing both ways before settling on the
+one that actually works. Arguments are safely quoted with `printf '%q'`
+before being spliced into the wrapped command string, rather than left
+unquoted and fragile against spaces.
+
+New `tests/cases/104-review-duplicates-no-delete-all.sh`, 10 assertions:
+the option is gone from the menu text entirely (not just relabelled),
+`d`/`D` produces the plain invalid-choice message with corrected hint
+text (no longer mentioning `D`), and the rest of the interactive loop —
+a normal keep/discard choice made right after an invalid keypress —
+still works and produces a correct plan. Confirmed the test genuinely
+catches a regression by reverting the fix and watching exactly the five
+affected assertions fail, then restoring it.
+
+Full suite: 25 cases, 366 assertions.
+
+---
 
 ## Future Roadmap  
 
