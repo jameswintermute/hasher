@@ -452,3 +452,48 @@ safe_quarantine_destination() {
 
   printf '%s/%s\n' "${_sqd_parent_real%/}" "$_sqd_base"
 }
+
+# ── macOS family/multi-user folder discovery ────────────────────────────
+# v1.4.35: raised directly — a single Mac shared by a whole family
+# typically has one account per person under /Users, each with the usual
+# personal folders (Documents, Downloads, Pictures). Someone running
+# Hasher as one user has no way to know their partner's or kid's account
+# holds duplicate copies of the same photos or documents unless every
+# account's folders are explicitly listed in local/paths.txt.
+#
+# macos_discover_family_folders — prints one candidate path per line: the
+# Documents, Downloads, and Pictures folder under every real macOS user
+# account that actually has it (a fresh account with Photos never opened
+# may not have created Pictures yet — silently skipped, not an error).
+# Deliberately narrow: Library, Applications, Desktop, Movies, Music, and
+# Public are NOT included — this discovers the everyday personal content
+# most likely to hold accidental duplicates across accounts, not a
+# general "scan everything" default. /Users/Shared (not a personal
+# account) and hidden entries (e.g. the .localized marker file) are
+# excluded. Prints nothing at all, safely, on any non-macOS host or if
+# /Users doesn't exist.
+#
+# No arrays, no [[ ]] — same POSIX-sh-safe constraint as the rest of this
+# file. The trailing slash on the glob (`/Users/*/`) is a portable idiom
+# that only matches directory entries; the explicit `[ -d ]` check below
+# is kept anyway for clarity and because it is also what correctly
+# no-ops the whole loop if /Users has zero subdirectories (an unmatched
+# glob with no nullglob set expands to its own literal pattern text,
+# which then simply fails the directory test and is skipped).
+macos_discover_family_folders() {
+  detect_host
+  [ "$HASHER_HOST" = "macos" ] || return 0
+  [ -d /Users ] || return 0
+
+  local _u _uname _sub
+  for _u in /Users/*/; do
+    [ -d "$_u" ] || continue
+    _uname="$(basename "$_u")"
+    case "$_uname" in
+      Shared|.*) continue ;;
+    esac
+    for _sub in Documents Downloads Pictures; do
+      [ -d "${_u}${_sub}" ] && printf '%s\n' "${_u}${_sub}"
+    done
+  done
+}
