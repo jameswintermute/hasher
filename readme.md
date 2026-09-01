@@ -113,7 +113,7 @@ controls while the first run is in progress.
 ## About
 
 A project by **James Wintermute** — jameswintermute@protonmail.ch
-Started Dec 2022. Current version: **v1.4.33**
+Started Dec 2022. Current version: **v1.4.35**
 
 ### First-run launch screen
 
@@ -122,6 +122,19 @@ single recommended action — start the first hash — plus **Settings & prefere
 (scan paths, performance, analysis mode, diagnostics) and **Help & information**
 explaining what the hash run does and does not do. Once the first manifest is
 written, the full workflow menu takes over automatically.
+
+**On macOS, with no scan paths configured yet**, the guided setup's scan-paths
+step checks for other user accounts under `/Users` before asking for a single
+path by hand. A Mac shared by a family typically has one account per person,
+each with its own Documents/Downloads/Pictures — someone running Hasher as
+just their own account has no way to know a sibling's or parent's account
+holds duplicate copies of the same photos or documents unless those folders
+are explicitly listed. If any other account has one of those three folders,
+the launcher shows exactly what it found and asks once, with a plain
+explanation, before adding anything — declining falls through to the normal
+single-path prompt with no change in behaviour. Only Documents, Downloads,
+and Pictures are ever offered; `Library`, `Applications`, and everything else
+under another account is never touched or scanned.
 
 ### Guided main menu
 
@@ -685,7 +698,9 @@ hasher/
 │       ├── 100-self-test-duplicate-detection.sh
 │       ├── 101-import-check-cleanup-verified.sh
 │       ├── 102-clean-logs-retention.sh
-│       └── 103-hasher-macos-hashcmd-and-host-label.sh
+│       ├── 103-hasher-macos-hashcmd-and-host-label.sh
+│       ├── 104-review-duplicates-no-delete-all.sh
+│       └── 105-macos-family-folder-discovery.sh
 │
 ├── default/
 │   └── hasher.conf                      shipped defaults — do not edit
@@ -795,7 +810,7 @@ answers a different question: "does this tool still *behave* correctly when the
 input is hostile".
 
 ```bash
-tests/run-tests.sh                # everything (24 cases, ~2 min)
+tests/run-tests.sh                # everything (26 cases, ~2 min)
 tests/run-tests.sh 20 40          # only cases whose leading number matches
 tests/run-tests.sh --list         # list cases without running them
 tests/run-tests.sh --verbose      # per-case diagnostic notes
@@ -834,6 +849,8 @@ directory of ordinary files would exercise:
 | `101-import-check-cleanup-verified` | Import cleanup: atomic delete safety, signals, portability, reclaimed-space stats |
 | `102-clean-logs-retention` | Log housekeeping: correct 5/10 retention, newest preservation, path safety |
 | `103-hasher-macos-hashcmd-and-host-label` | macOS shasum fallback survives the global IFS override; host label reports real OS version |
+| `104-review-duplicates-no-delete-all` | Removed delete-all option no longer appears; d/D is a plain invalid choice |
+| `105-macos-family-folder-discovery` | Family-account folder discovery: correct detection/exclusions, y/n offer, zero effect off macOS |
 
 **Safety.** Each case runs in its own sandbox under a temporary directory —
 nothing outside it is written, and the install tree is never modified. Fault
