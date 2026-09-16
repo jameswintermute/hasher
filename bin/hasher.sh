@@ -95,6 +95,12 @@ if [ -r "$ROOT_DIR/lib/host-detect.sh" ]; then
   detect_host
 fi
 
+# v1.4.37: count_actionable_file_groups, for the post-hash summary meta
+# below — see lib/exceptions.sh for why this exists.
+if [ -r "$ROOT_DIR/lib/exceptions.sh" ]; then
+  . "$ROOT_DIR/lib/exceptions.sh"
+fi
+
 # v1.3.20 (peer-review recheck finding #2): verify we have a way to enumerate
 # our own process group members BEFORE main() runs. Without either pgrep or
 # `ps -eo pid=,pgid=`, _stop_group cannot see workers to kill; a TERM would
@@ -1112,17 +1118,27 @@ build_file_list() {
   # I/O, duplicate rows can make otherwise-identical folder signatures differ.
   # Paths containing TAB/LF/CR have already been removed above, so it is safe
   # and portable to use a newline sort here and restore NUL delimiters after it.
+  #
+  # v1.4.38 (Richard's Mac report): this step ran a `while read -r | printf`
+  # bash loop once per discovered file — for a real 240,000-file walk, that
+  # is 240,000 bash-level loop iterations, with none of the awk fast paths
+  # the delimiter and glob filters immediately before and after this step
+  # both already have. Confirmed with a synthetic 240,000-entry benchmark:
+  # the loop took ~3.8s even on fast modern hardware; the tr-only rewrite
+  # below took ~0.11s for byte-identical output — roughly 35x, and the gap
+  # would be far larger still on Apple's frozen-since-2007 bash 3.2 build,
+  # which is what every real macOS install (including Richard's) actually
+  # ships. Silent because this step has no progress ticker of its own — the
+  # walk heartbeat above tracks bytes written to $FILES_LIST.tmp during
+  # discovery, which had already stopped growing once `find` itself
+  # finished; a slow dedupe pass here reads as an indefinite freeze with no
+  # visible cause, exactly what was reported (no `find` process running,
+  # yet hasher.sh itself still active and consuming real CPU).
   if [[ -s "$FILES_LIST".tmp ]]; then
     local _dedupe_before _dedupe_after _dedupe_removed
     local _dedupe_tmp="$FILES_LIST.tmp.unique"
     _dedupe_before=$(tr -cd '\0' < "$FILES_LIST".tmp | wc -c | tr -d ' ')
-    {
-      tr '\0' '\n' < "$FILES_LIST".tmp \
-        | LC_ALL=C sort -u \
-        | while IFS= read -r _unique_path; do
-            [[ -n "$_unique_path" ]] && printf '%s\0' "$_unique_path"
-          done
-    } > "$_dedupe_tmp"
+    tr '\0' '\n' < "$FILES_LIST".tmp | LC_ALL=C sort -u | grep -v '^$' | tr '\n' '\0' > "$_dedupe_tmp"
     _dedupe_after=$(tr -cd '\0' < "$_dedupe_tmp" | wc -c | tr -d ' ')
     mv -f -- "$_dedupe_tmp" "$FILES_LIST".tmp
     _dedupe_removed=$((_dedupe_before - _dedupe_after))
@@ -2514,6 +2530,21 @@ _run_post_hash_discovery() {
   _summary_tmp="$LOGS_DIR/post-hash-analysis-latest.meta.tmp.$$"
   _files_hashed=$(( $(wc -l < "$_csv" 2>/dev/null | tr -d ' ' || echo 1) - 1 ))
   (( _files_hashed < 0 )) && _files_hashed=0
+
+  # v1.4.37: how many of the found duplicate-file groups are still
+  # actionable after the exceptions list -- raised directly, from
+  # someone who'd previously marked every current duplicate group as an
+  # accepted exception and still saw "N groups ready" on the main menu,
+  # as if there were N groups of new work waiting. See lib/exceptions.sh
+  # for the full story; this is the automatic-analysis write site, the
+  # other is launcher.sh's manual "rerun duplicate analysis".
+  local _file_groups_actionable="${_file_groups:-0}"
+  if [[ "$_file_status" = ready ]] && command -v count_actionable_file_groups >/dev/null 2>&1; then
+    local _caf_out
+    _caf_out="$(count_actionable_file_groups "$_file_report" "$ROOT_DIR/local/exceptions-hashes.txt" "$VAR_DIR" 2>/dev/null || true)"
+    [[ -n "$_caf_out" ]] && _file_groups_actionable="${_caf_out#* }"
+  fi
+
   {
     printf '# HASHER_POST_HASH_ANALYSIS v1\n'
     printf 'source_csv=%s\n' "$_csv"
@@ -2524,6 +2555,7 @@ _run_post_hash_discovery() {
     printf 'folders_to_quarantine=%s\n' "${_folders_to_quarantine:-0}"
     printf 'file_status=%s\n' "$_file_status"
     printf 'file_groups=%s\n' "${_file_groups:-0}"
+    printf 'file_groups_actionable=%s\n' "${_file_groups_actionable:-0}"
   } > "$_summary_file"
   cp -f -- "$_summary_file" "$_summary_tmp" && mv -f -- "$_summary_tmp" "$LOGS_DIR/post-hash-analysis-latest.meta"
 
