@@ -5235,6 +5235,198 @@ detection function entirely and watching 12 of 19 assertions fail with
 Full suite: 26 cases, 385 assertions.
 
 ---
+## 2026‑08 — v1.4.36
+**macOS family-folder discovery: added Movies**
+
+Raised directly, after the first real-world run of v1.4.35 on a genuine
+shared family Mac (four accounts, confirmed via a real launcher
+screenshot): video exports — the large `.mov`/`.mp4` files a phone or
+camera produces — are exactly the kind of easily-duplicated content this
+feature exists to catch, and `Movies` was missing from the original
+four-folder set.
+
+Added to `macos_discover_family_folders()`'s subfolder list alongside
+Documents, Downloads, and Pictures. Everything else about the feature is
+unchanged: still silently skipped per-account if a Movies folder doesn't
+exist yet, still excluded for `/Users/Shared` and hidden entries, still a
+complete no-op on any non-macOS host.
+
+### Test coverage
+
+`tests/cases/105-macos-family-folder-discovery.sh` updated: a Movies
+fixture added for one test account (to confirm positive discovery) while
+deliberately left absent for the other (to confirm, independently of the
+pre-existing Downloads case, that a missing Movies folder is still
+silently skipped rather than fabricated or treated as an error). Total
+candidate count and the offer-acceptance dedup count both updated to
+match. 21 assertions, up from 19.
+
+Full suite: 26 cases, 387 assertions.
+
+---
+## 2026‑08 — v1.4.37
+**Duplicate-file headline now reflects exceptions, not just what was found — plus a second instance of the same bug caught in the same session**
+
+Raised directly, from a real NAS run: the main menu read `Duplicate
+files: 3 groups ready`, even though all 3 groups had previously been
+marked as accepted exceptions via review-duplicates.sh's "add to
+exceptions" choice. The interactive review step itself has always
+applied exceptions correctly (`Prepared index contains 0 actionable
+groups after exceptions`) — but only once opened, by which point the
+main menu had already told the operator there were 3 groups of new work
+waiting, indistinguishable from genuinely new, unreviewed duplicates.
+
+### Root cause
+
+Two places write the stats meta file the main menu reads — `hasher.sh`'s
+own automatic post-hash analysis, and `launcher.sh`'s manual "rerun
+duplicate analysis" — and both independently computed the headline as a
+bare `grep -c '^HASH '` count of the duplicate-hashes report, with the
+exceptions list never consulted at that stage at all. The exceptions
+filtering has only ever lived inside `review-duplicates.sh`, applied
+much later, when the reviewer actually opens the interactive step.
+
+### Fix
+
+New `lib/exceptions.sh`: a single shared `count_actionable_file_groups()`
+function, returning both the raw total and how many groups remain after
+`local/exceptions-hashes.txt` is applied — the same comment-stripping,
+whitespace-trimming logic `review-duplicates.sh`'s own
+`clean_exceptions_file()` already used, so the two can't quietly
+disagree with each other. `#!/bin/sh`, no process substitution, no
+arrays — matching `lib/log.sh`'s own POSIX-sh convention for files meant
+to stay sourceable from any shell, even though the scripts that source
+it are bash-only. A single source of truth specifically because
+`hasher.sh` and `launcher.sh` don't otherwise share code, and each
+previously carried its own identical, independently-drifting copy of the
+same one-line count — the exact failure mode duplicated logic has
+produced in this project before.
+
+Wired into both write sites, which now also write a new
+`file_groups_actionable=` field. The headline display was updated to
+prefer that field when present — `0 groups ready — 3 in exceptions`
+instead of the misleading bare `3 groups ready` — falling back to the
+original bare-total display unchanged when the field is absent (a meta
+file written before this existed).
+
+### A second instance of the exact same bug, caught while testing the first
+
+Verifying the headline fix by hand surfaced a second, independent
+instance of the identical problem: the **"Next: review duplicate files —
+option 3"** recommendation was *also* still driven by the raw total, not
+the actionable count — so even after the headline correctly read
+"0 groups ready," the very next line still pointed the operator at a
+review step with nothing left to review. Fixed alongside it, using the
+same actionable-count-with-fallback logic.
+
+### Verification
+
+The lib function tested directly against five scenarios (no exceptions
+file, empty exceptions file, partial exceptions, the exact reported
+all-excepted case, and an unreadable report) before touching either
+write site. The display logic tested in isolation against all four
+combinations (all-excepted, partially-excepted, none-excepted, and an
+older meta file with no `file_groups_actionable` key at all, confirming
+the backward-compatible fallback). One write site (`launcher.sh`'s
+`refresh_analysis_summary()`) verified fully end-to-end: a real
+`hasher.sh` + `find-duplicates.sh` run, a genuine duplicate pair, one
+hash added to a real `exceptions-hashes.txt`, and the resulting meta
+file confirmed to contain `file_groups_actionable=0`. Confirmed the test
+genuinely catches a regression by deleting `lib/exceptions.sh` entirely
+and watching 6 of 17 assertions fail — including the write-site test
+correctly falling back to the old, buggy `file_groups_actionable=1`
+value via the existing `command -v` guard, proving that fallback path
+itself works as designed — then restoring it.
+
+### Test coverage
+
+New `tests/cases/106-exceptions-aware-headline.sh`, 17 assertions across
+three groups: the lib function in isolation, the display logic across
+all four scenarios, and one full end-to-end write-site run.
+
+Full suite: 27 cases, 404 assertions.
+
+---
+## 2026‑08 — v1.4.38
+**Fixed a real multi-hour freeze on macOS — a per-file bash loop with no progress ticker, not a hang**
+
+Reported live from a real macOS run (Richard's Mac, ~240,000 files
+across 16 scan paths): "Walking paths" appeared to freeze indefinitely,
+left for hours with no visible progress. Investigated in two stages,
+each ruling something out with real evidence rather than assumption.
+
+### Stage 1: ruling out a blocked syscall
+
+The first hypothesis — a stuck network mount, or a silent macOS
+permission-prompt hang — was ruled out directly: `ps aux | grep
+'[f]ind'` on the live machine found no `find` process running at all.
+But `hasher.sh` itself was still shown as `R+` (actively running, not
+blocked) with real, accumulating CPU time. A blocked syscall shows as a
+sleeping process with near-zero further CPU growth; this was the
+opposite — active CPU consumption with no corresponding visible
+progress. That ruled out the "stuck on a specific file" theory and
+pointed at CPU-bound work happening somewhere the walk's own progress
+heartbeat doesn't cover.
+
+### Stage 2: finding what actually burns CPU with nothing to show for it
+
+Reading `build_file_list()` end to end found it: the discovery-dedupe
+step added in v1.3.27 (collapsing duplicate paths that overlapping scan
+roots can produce) ran a `while read -r | printf` bash loop once per
+discovered file — 240,000 bash-level iterations for a run that size —
+with none of the awk fast paths the delimiter filter and glob-exclude
+filter immediately before and after this exact step both already have.
+Confirmed this really was the odd one out: `hasher_nul_filter_delim()`
+correctly routes through a compiled awk pass on any real Unix system
+(BusyBox, which needs the bash fallback, is DSM-specific — not
+something macOS has); the dedupe step never had an equivalent fast path
+at all, on any platform.
+
+This step has no progress ticker of its own. The walk heartbeat above
+it tracks bytes written to `$FILES_LIST.tmp` during discovery — which
+had already stopped growing the moment `find` itself finished. A slow
+pass in the *next* stage, with no ticker of its own, is invisible: it
+reads as an indefinite freeze with no visible cause, which is exactly
+what was reported, and exactly consistent with `find` no longer running
+while `hasher.sh` stayed active.
+
+### Fix and verification
+
+Replaced the loop with a single `tr '\n' '\0'` (with the original
+loop's empty-line guard preserved via `grep -v '^$'`, at no additional
+per-line cost). Confirmed correct and fast with a synthetic 240,000-
+entry benchmark before touching the real code: the old loop took ~3.8
+seconds even on fast modern hardware; the rewrite took ~0.11 seconds,
+producing byte-for-byte identical output — roughly 35x here, and the
+gap is expected to be substantially larger on Apple's frozen-since-2007
+bash 3.2 build, which is what every real macOS install actually ships,
+including the one that reported this. Also checked every other
+`while read` loop in `hasher.sh` for the same shape of problem
+(iterating once per discovered file rather than once per group or
+config line) — the only other per-file-scale loops are the hashing
+loops themselves, which do genuinely necessary per-file work (reading
+and hashing each file's content), not comparable, avoidable overhead.
+
+### Test coverage
+
+New `tests/cases/107-discovery-dedupe-performance.sh`, 8 assertions:
+correctness with genuinely overlapping scan roots, correctness with no
+overlap at all (no spurious message), a deterministic structural guard
+against the old per-file loop ever reappearing (the primary regression
+guard — timing alone would not reliably fail on fast CI hardware, as
+the 3.8-second benchmark above shows), and a live 3,000-file
+overlapping-root run demonstrating both correctness and sane elapsed
+time together. Confirmed the guard genuinely catches a reintroduction of
+the old loop by reverting the fix and watching exactly the two
+structural assertions fail, then restoring it. One test-writing mistake
+caught and fixed along the way: an early draft placed the structural
+check after `teardown_sandbox` had already invalidated `$SANDBOX`,
+silently referencing a directory that no longer existed — moved inside
+its own sandbox before trusting the result.
+
+Full suite: 28 cases, 412 assertions.
+
+---
 
 ## Future Roadmap  
 
